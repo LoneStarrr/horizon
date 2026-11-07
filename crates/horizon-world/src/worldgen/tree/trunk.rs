@@ -1,9 +1,11 @@
 //! Trunk placers (TrunkPlacer subclasses), in native random-draw order.
+use super::modded::{ModCtx, Phase};
 use super::{
     FoliageAttachment, Layer, Run, TreeDecoder, TreeFeature, TreeResult, kind, read,
     sample_optional, sample_state, unit_float,
 };
 use crate::registry::BlockStateId;
+use crate::worldgen::mod_tree_parts::{ModTrunkPlacer, mod_tree_parts};
 use crate::worldgen::{
     DecodeError, Object,
     feature::FeatureWorld,
@@ -45,6 +47,8 @@ enum Kind {
         trunk_height_above_branches: IntProvider,
         branch_amount: IntProvider,
     },
+    /// A trunk placer a mod registered.
+    Mod(Arc<dyn ModTrunkPlacer>),
 }
 #[derive(Clone, Debug)]
 pub(super) struct TrunkPlacer {
@@ -136,7 +140,16 @@ impl TrunkPlacer {
                 )?,
                 branch_amount: decoder.int_provider(required(&object, "branch_amount")?, 1, 4)?,
             },
-            _ => return Err(DecodeError::Field("trunk placer type")),
+            name => {
+                let ty = mod_tree_parts()
+                    .trunk_placers
+                    .get(name)
+                    .ok_or(DecodeError::Field("trunk placer type"))?;
+                let config: serde_json::Value = serde_json::from_str(raw.get())?;
+                Kind::Mod(ty.decode(&config).map_err(|why| {
+                    DecodeError::Registry(format!("trunk placer type {name}: {why}"))
+                })?)
+            }
         };
         Ok(Self {
             base_height,
@@ -158,7 +171,7 @@ impl TrunkPlacer {
     pub(super) fn is_free(&self, blocks: &TreeBlocks, state: BlockStateId) -> bool {
         self.valid_tree_pos(blocks, state) || blocks.has(state, tb::LOGS)
     }
-    fn place_log<W: FeatureWorld + PlacementContext, R: RandomSource>(
+    pub(super) fn place_log<W: FeatureWorld + PlacementContext, R: RandomSource>(
         &self,
         run: &mut Run<'_, W, R>,
         tree: &TreeFeature,
@@ -176,7 +189,7 @@ impl TrunkPlacer {
         run.set(Layer::Trunk, position, state)?;
         Ok(true)
     }
-    fn place_log_if_free<W: FeatureWorld + PlacementContext, R: RandomSource>(
+    pub(super) fn place_log_if_free<W: FeatureWorld + PlacementContext, R: RandomSource>(
         &self,
         run: &mut Run<'_, W, R>,
         tree: &TreeFeature,
@@ -188,7 +201,7 @@ impl TrunkPlacer {
         }
         Ok(())
     }
-    fn place_below_trunk<W: FeatureWorld + PlacementContext, R: RandomSource>(
+    pub(super) fn place_below_trunk<W: FeatureWorld + PlacementContext, R: RandomSource>(
         run: &mut Run<'_, W, R>,
         tree: &TreeFeature,
         position: [i32; 3],
@@ -209,6 +222,12 @@ impl TrunkPlacer {
     ) -> TreeResult<Vec<FoliageAttachment>, W::Error> {
         let below = tb::offset(origin, 0, -1, 0);
         match &self.kind {
+            Kind::Mod(part) => {
+                let mut ctx = ModCtx::new(run, &tree.blocks, Phase::Trunk(self, tree));
+                let attachments = part.place_trunk(&mut ctx, tree_height, origin);
+                ctx.finish()?;
+                Ok(attachments.into_iter().map(Into::into).collect())
+            }
             Kind::Straight => {
                 Self::place_below_trunk(run, tree, below)?;
                 for y in 0..tree_height {

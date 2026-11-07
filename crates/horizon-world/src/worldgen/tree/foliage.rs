@@ -1,7 +1,9 @@
 //! Foliage placers (FoliagePlacer subclasses), in native random-draw order.
+use super::modded::{Draws, ModCtx, Phase};
 use super::{
     Layer, Run, TreeDecoder, TreeFeature, TreeResult, kind, read, sample_state, unit_float,
 };
+use crate::worldgen::mod_tree_parts::{ModFoliagePlacer, mod_tree_parts};
 use crate::worldgen::{
     DecodeError, Object,
     feature::FeatureWorld,
@@ -13,6 +15,7 @@ use crate::worldgen::{
 };
 use horizon_core::{geometry::Direction, random::RandomSource};
 use serde_json::value::RawValue;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FoliageAttachment {
@@ -31,7 +34,7 @@ impl FoliageAttachment {
             size: [size; 2],
         }
     }
-    fn double_trunk(&self) -> bool {
+    pub(super) fn double_trunk(&self) -> bool {
         self.size == [2, 2]
     }
 }
@@ -62,6 +65,8 @@ enum Kind {
         height: IntProvider,
         side_hole: f32,
     },
+    /// A foliage placer a mod registered.
+    Mod(Arc<dyn ModFoliagePlacer>),
 }
 #[derive(Clone, Debug)]
 pub(super) struct FoliagePlacer {
@@ -124,13 +129,26 @@ impl FoliagePlacer {
                 height: decoder.int_provider(required(&object, "height")?, 5, 16)?,
                 side_hole: chance("side_hole_chance")?,
             },
-            _ => return Err(DecodeError::Field("foliage placer type")),
+            name => {
+                let ty = mod_tree_parts()
+                    .foliage_placers
+                    .get(name)
+                    .ok_or(DecodeError::Field("foliage placer type"))?;
+                let config: serde_json::Value = serde_json::from_str(raw.get())?;
+                Kind::Mod(ty.decode(&config).map_err(|why| {
+                    DecodeError::Registry(format!("foliage placer type {name}: {why}"))
+                })?)
+            }
         };
         Ok(Self {
             radius,
             offset,
             kind,
         })
+    }
+    /// One draw of the config's `offset`, for a mod's placer.
+    pub(super) fn sample_offset<E>(&self, random: &mut impl RandomSource) -> TreeResult<i32, E> {
+        Ok(self.offset.sample(random)?)
     }
     pub(super) fn foliage_height<E>(
         &self,
@@ -145,6 +163,7 @@ impl FoliagePlacer {
             Kind::Pine(h) | Kind::MegaPine(h) => h.sample(random)?,
             Kind::RandomSpread { foliage_height, .. } => foliage_height.sample(random)?,
             Kind::Cherry { height, .. } | Kind::Poplar { height, .. } => height.sample(random)?,
+            Kind::Mod(part) => part.foliage_height(&mut Draws(random), tree_height),
         })
     }
     pub(super) fn foliage_radius<E>(
@@ -155,6 +174,9 @@ impl FoliagePlacer {
         let radius = self.radius.sample(random)?;
         if matches!(self.kind, Kind::Pine(_)) {
             return Ok(radius + random.next_int_bound(trunk_height.wrapping_add(1).max(1))?);
+        }
+        if let Kind::Mod(part) = &self.kind {
+            return Ok(part.foliage_radius(&mut Draws(random), trunk_height, radius));
         }
         Ok(radius)
     }
@@ -217,6 +239,7 @@ impl FoliagePlacer {
                 }
             }
             Kind::Poplar { .. } => unreachable!("poplar uses its own row placement"),
+            Kind::Mod(_) => unreachable!("a mod's placer places its own leaves"),
         })
     }
     fn skip_signed(
@@ -327,11 +350,22 @@ impl FoliagePlacer {
         &self,
         run: &mut Run<'_, W, R>,
         tree: &TreeFeature,
-        _tree_height: i32,
+        tree_height: i32,
         attachment: FoliageAttachment,
         foliage_height: i32,
         leaf_radius: i32,
     ) -> TreeResult<(), W::Error> {
+        if let Kind::Mod(part) = &self.kind {
+            let mut ctx = ModCtx::new(run, &tree.blocks, Phase::Foliage(self, tree));
+            part.create_foliage(
+                &mut ctx,
+                tree_height,
+                attachment.into(),
+                foliage_height,
+                leaf_radius,
+            );
+            return ctx.finish();
+        }
         let offset = self.offset.sample(run.random)?;
         let double = attachment.double_trunk();
         let pos = attachment.pos;
@@ -523,6 +557,7 @@ impl FoliagePlacer {
                 poplar.row(run, tree, p, r - 1, 0)?;
                 poplar.row(run, tree, p, (r - 2).clamp(1, 2), -1)?;
             }
+            Kind::Mod(_) => unreachable!("a mod's placer is run above"),
         }
         Ok(())
     }
