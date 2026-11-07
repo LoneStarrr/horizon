@@ -1,10 +1,12 @@
 //! Tree decorators (TreeDecorator subclasses), in native random-draw order.
+use super::modded::{ModCtx, Phase};
 use super::{
     Layer, NestedPlacer, Run, TreeDecoder, TreeResult, kind, read, sample_optional, sample_state,
     unit_float,
 };
 use crate::heightmap::HeightmapType;
 use crate::registry::BlockStateId;
+use crate::worldgen::mod_tree_parts::{ModTreeDecorator, mod_tree_parts};
 use crate::worldgen::{
     DecodeError, Object,
     feature::FeatureWorld,
@@ -18,6 +20,7 @@ use crate::worldgen::{
 use horizon_core::{geometry::Direction, random::RandomSource};
 use serde_json::value::RawValue;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Catalog-injected configured feature for the pale-moss ground patch, which
 /// vanilla looks up by registry key during decoration.
@@ -92,6 +95,8 @@ pub(crate) enum TreeDecorator {
         provider: BlockStateProvider,
     },
     ShelfMushroom(f32),
+    /// A decorator a mod registered.
+    Mod(Arc<dyn ModTreeDecorator>),
 }
 
 fn directions(raw: &RawValue) -> Result<Vec<Direction>, DecodeError> {
@@ -197,7 +202,16 @@ impl TreeDecorator {
                     .unwrap_or(1),
                 provider: decoder.provider(required(&object, "block_state_provider")?)?,
             },
-            _ => return Err(DecodeError::Field("tree decorator type")),
+            name => {
+                let ty = mod_tree_parts()
+                    .decorators
+                    .get(name)
+                    .ok_or(DecodeError::Field("tree decorator type"))?;
+                let config: serde_json::Value = serde_json::from_str(raw.get())?;
+                Self::Mod(ty.decode(&config).map_err(|why| {
+                    DecodeError::Registry(format!("tree decorator type {name}: {why}"))
+                })?)
+            }
         })
     }
 
@@ -208,6 +222,11 @@ impl TreeDecorator {
         lists: &Lists,
         nested: &mut NestedPlacer<'_, W, R>,
     ) -> TreeResult<(), W::Error> {
+        if let Self::Mod(part) = self {
+            let mut ctx = ModCtx::new(run, blocks, Phase::Decoration);
+            part.place(&mut ctx, &lists.logs, &lists.leaves, &lists.roots);
+            return ctx.finish();
+        }
         let mut d = Decorate { run, blocks };
         match self {
             Self::TrunkVine => {
@@ -468,6 +487,7 @@ impl TreeDecorator {
                 }
             }
             Self::ShelfMushroom(probability) => d.shelf_mushroom(lists, *probability)?,
+            Self::Mod(_) => unreachable!("a mod's decorator is placed above"),
         }
         Ok(())
     }

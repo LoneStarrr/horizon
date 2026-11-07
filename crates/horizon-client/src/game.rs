@@ -24743,6 +24743,14 @@ pub fn run_with(
     {
         log::warn!("Mod feature types already installed; keeping the first table");
     }
+    // Their tree parts, which a `minecraft:tree` config's placers and decorators name.
+    if horizon_world::worldgen::mod_tree_parts::install_mod_tree_parts(
+        mod_api::__private::installed_tree_parts(),
+    )
+    .is_err()
+    {
+        log::warn!("Mod tree parts already installed; keeping the first table");
+    }
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models(options.execution_role);
     mods::register_layer_definitions(options.execution_role);

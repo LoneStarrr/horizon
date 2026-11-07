@@ -6,6 +6,7 @@
 mod decorator;
 mod fallen;
 mod foliage;
+mod modded;
 mod trunk;
 use super::{
     DecodeError, Object,
