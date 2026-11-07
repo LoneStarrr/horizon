@@ -456,9 +456,18 @@ impl Loader {
                     GraphNode::Spline(self.spline(required(&object, "spline")?, depth + 1)?)
                 }
                 _ => {
-                    return Err(DecodeError::Registry(format!(
-                        "unknown density type: {kind}"
-                    )));
+                    let ty = super::mod_density::mod_density_types()
+                        .get(&kind)
+                        .ok_or_else(|| {
+                            DecodeError::Registry(format!("unknown density type: {kind}"))
+                        })?;
+                    let config: serde_json::Value = serde_json::from_str(raw.get())?;
+                    let instance = ty.decode(&config).map_err(|why| {
+                        DecodeError::Registry(format!("density type {kind}: {why}"))
+                    })?;
+                    // Serialising a Value sorts keys, so equal configs share a node.
+                    let text = config.to_string();
+                    GraphNode::Custom(self.graph.register_custom(kind, text, instance))
                 }
             }
         };
@@ -572,6 +581,106 @@ mod tests {
                 )
                 .is_err(),
                 "{json}"
+            );
+        }
+    }
+    #[derive(Debug)]
+    struct Wave {
+        amplitude: f32,
+    }
+    #[derive(Debug)]
+    struct WaveSampler {
+        amplitude: f32,
+        seed: i64,
+    }
+    impl horizon_core::density::DensitySampler for WaveSampler {
+        fn sample_value(
+            &self,
+            _: &mut SamplerContext,
+            p: [i32; 3],
+        ) -> Result<f32, horizon_core::density::SampleError> {
+            Ok(self.amplitude * (p[0] % 4) as f32 + (self.seed & 1) as f32)
+        }
+    }
+    impl horizon_core::density::graph::CustomDensity for Wave {
+        fn range(&self) -> [f32; 2] {
+            [
+                -3.0 * self.amplitude.abs(),
+                3.0 * self.amplitude.abs() + 1.0,
+            ]
+        }
+        fn compile(&self, seed: i64) -> Arc<dyn horizon_core::density::DensitySampler> {
+            Arc::new(WaveSampler {
+                amplitude: self.amplitude,
+                seed,
+            })
+        }
+    }
+    struct WaveType;
+    impl super::super::mod_density::ModDensityType for WaveType {
+        fn decode(
+            &self,
+            config: &serde_json::Value,
+        ) -> Result<Arc<dyn horizon_core::density::graph::CustomDensity>, String> {
+            let amplitude = config["amplitude"].as_f64().ok_or("missing amplitude")?;
+            Ok(Arc::new(Wave {
+                amplitude: amplitude as f32,
+            }))
+        }
+    }
+    #[test]
+    fn a_registered_density_type_decodes_ranges_and_samples_through_the_router() {
+        use super::super::mod_density::install_mod_density_types;
+        let _ = install_mod_density_types(BTreeMap::from([(
+            "test:wave".to_owned(),
+            Arc::new(WaveType) as Arc<dyn super::super::mod_density::ModDensityType>,
+        )]));
+        let densities = BTreeMap::from([
+            (
+                "test:final".into(),
+                r#"{"type":"add","left":{"type":"test:wave","amplitude":2},"right":10}"#.into(),
+            ),
+            (
+                "test:same".into(),
+                r#"{"amplitude":2,"type":"test:wave"}"#.into(),
+            ),
+            (
+                "test:other".into(),
+                r#"{"type":"test:wave","amplitude":1}"#.into(),
+            ),
+        ]);
+        let registry = DensityRegistry::from_json(&BTreeMap::new(), &densities).unwrap();
+        let (root, same, other) = (
+            registry.value("test:final").unwrap(),
+            registry.value("test:same").unwrap(),
+            registry.value("test:other").unwrap(),
+        );
+        // Equal config in another key order is the same node; another config is not.
+        assert!(registry.graph().java_equals(same, same).unwrap());
+        assert!(!registry.graph().java_equals(same, other).unwrap());
+        // Declared range [-6, 7] plus the constant 10.
+        assert_eq!(
+            registry.graph().range(root).unwrap(),
+            horizon_core::density::Interval::new(4.0, 17.0).unwrap()
+        );
+        let mut compiler = DensityCompiler::new_seeded(registry.into_graph(), 5, false);
+        let sampler = compiler.get_sampler(root).unwrap();
+        let mut context = SamplerContext::default();
+        // x % 4 = 3 -> 2 * 3 + (5 & 1) + 10; x % 4 = -1 (x = -1) -> -2 + 1 + 10.
+        assert_eq!(sampler.sample_value(&mut context, [7, 0, 0]), Ok(17.0));
+        assert_eq!(sampler.sample_value(&mut context, [-1, 9, 9]), Ok(9.0));
+        // A type nobody registered still fails, and so does a bad config.
+        for json in [r#"{"type":"test:missing"}"#, r#"{"type":"test:wave"}"#] {
+            let error = DensityRegistry::from_json(
+                &BTreeMap::new(),
+                &BTreeMap::from([("test:a".into(), json.into())]),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("unknown density type: test:missing")
+                    || error.contains("density type test:wave: missing amplitude"),
+                "{error}"
             );
         }
     }
