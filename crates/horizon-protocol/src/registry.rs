@@ -205,6 +205,9 @@ impl Dynamic {
             };
             // DimensionType.defaultClock: the world clock this level's day
             // time follows (absent in the Nether).
+            if let Some(Tag::String(s)) = map.get(&JavaString::from("skybox")) {
+                d.skybox = Skybox::from_name(&s.to_string_lossy()).unwrap_or(d.skybox);
+            }
             d.default_clock = match map.get(&JavaString::from("default_clock")) {
                 Some(Tag::String(s)) => Some(s.to_string_lossy()),
                 Some(Tag::Compound(c)) => match c.get(&JavaString::from("id")) {
@@ -232,6 +235,30 @@ pub struct DimensionType {
     /// `DimensionType.defaultClock`: the `minecraft:world_clock` this level
     /// samples for day time (`None` in the Nether).
     pub default_clock: Option<String>,
+    /// `DimensionType.skybox`: what the level draws as its sky.
+    pub skybox: Skybox,
+}
+/// `DimensionType.Skybox`: how a level draws its sky. Sun, moon, stars and the
+/// sky colour belong to `Overworld`, the End's sky box to `End`; `None` draws
+/// no sky (the fog colour fills it). Clouds do not depend on it: they follow
+/// the type's `visual/cloud_color` and `visual/cloud_height` attributes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Skybox {
+    #[default]
+    Overworld,
+    End,
+    None,
+}
+impl Skybox {
+    /// The codec's name for a sky box, with or without the `minecraft:` prefix.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.strip_prefix("minecraft:").unwrap_or(name) {
+            "overworld" => Some(Self::Overworld),
+            "end" => Some(Self::End),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 impl DimensionType {
     /// `DimensionType.MIN_Y`, `MAX_Y` and `MIN_HEIGHT`: a type's `min_y` and
@@ -265,6 +292,11 @@ impl DimensionType {
             has_ceiling,
             ambient_light,
             default_clock: default_clock.map(str::to_owned),
+            skybox: match name {
+                "minecraft:the_nether" => Skybox::None,
+                "minecraft:the_end" => Skybox::End,
+                _ => Skybox::Overworld,
+            },
         }
     }
     pub fn sections(&self) -> usize {
@@ -405,5 +437,54 @@ mod tests {
             }],
         });
         assert_eq!(d.dimension(0).ambient_light, 0.5);
+    }
+
+    /// A level's sky follows its dimension type's `skybox`, whatever the type's
+    /// name; the values are those of vanilla 26.3's `dimension_type` data
+    /// (the Overworld leaves `skybox` out for its default).
+    #[test]
+    fn the_skybox_comes_from_the_types_data() {
+        let types = |name: &str, skybox: Option<&str>, skylight: bool| {
+            let mut fields = vec![
+                ("min_y", Tag::Int(0)),
+                ("height", Tag::Int(256)),
+                ("has_skylight", Tag::Byte(i8::from(skylight))),
+            ];
+            if let Some(skybox) = skybox {
+                fields.push(("skybox", Tag::String(skybox.into())));
+            }
+            (name.to_owned(), Some(Tag::compound(fields)))
+        };
+        let mut d = Dynamic::default();
+        d.registries.insert(
+            "minecraft:dimension_type".into(),
+            vec![
+                ("minecraft:overworld".into(), None),
+                types("minecraft:the_nether", Some("none"), false),
+                types("minecraft:the_end", Some("end"), true),
+                types("test:skylit", None, true),
+                types("test:end_sky", Some("minecraft:end"), true),
+                types("test:unknown", Some("sideways"), true),
+                // No data: the vanilla defaults of the name.
+                ("test:bare".into(), None),
+            ],
+        );
+        let skybox = |id| d.dimension(id).skybox;
+        assert_eq!(skybox(0), Skybox::Overworld);
+        assert_eq!(skybox(1), Skybox::None);
+        assert_eq!(skybox(2), Skybox::End);
+        assert_eq!(skybox(3), Skybox::Overworld);
+        assert_eq!(skybox(4), Skybox::End);
+        // A value the codec refuses keeps the default.
+        assert_eq!(skybox(5), Skybox::Overworld);
+        assert_eq!(skybox(6), Skybox::Overworld);
+        assert_eq!(
+            DimensionType::vanilla("minecraft:the_nether").skybox,
+            Skybox::None
+        );
+        assert_eq!(
+            DimensionType::vanilla("minecraft:the_end").skybox,
+            Skybox::End
+        );
     }
 }

@@ -533,6 +533,9 @@ pub(super) struct Remote {
     /// The item the player's use began with (`LivingEntity.useItem`).
     pub(super) use_item: Option<Arc<str>>,
     pub(super) dimension: DimensionType,
+    /// The environment attributes of `dimension` when the server's data for it
+    /// is not one of vanilla's three types (`None`: the type of that name).
+    pub(super) environment: Option<Arc<horizon_client::environment::Environment>>,
     /// The level's key (`minecraft:overworld`): where its far terrain is kept.
     pub(super) level: String,
     /// `level`'s key, as mods' handles name the level.
@@ -1117,6 +1120,7 @@ impl Game<'_> {
             camera: None,
             use_item: None,
             dimension: DimensionType::vanilla("minecraft:overworld"),
+            environment: None,
             level: "minecraft:overworld".into(),
             level_key: mod_api::DimensionKey::OVERWORLD,
             hashed_seed: 0,
@@ -2356,6 +2360,12 @@ impl Game<'_> {
             r.chunk_format
                 .with_dimension(&dimension)
                 .in_column(shape.column()),
+        );
+        r.environment = level_environment(
+            &self.pack.data_source,
+            &dimension.name,
+            r.registries
+                .data("minecraft:dimension_type", spawn.dimension_type),
         );
         r.dimension = dimension;
         r.resolve_clocks();
@@ -15458,5 +15468,30 @@ mod player_tick_tests {
                 server.shutdown();
             })
         });
+    }
+}
+
+/// The environment of a level whose dimension type the server sent as data:
+/// its `attributes`, with the Overworld's day cycle when its `timelines` have
+/// it. Vanilla's own types (sent as names) use the game's loaded environments.
+fn level_environment(
+    source: &horizon_assets::resource_source::ResourceSource,
+    type_name: &str,
+    data: Option<&horizon_core::nbt::Tag>,
+) -> Option<Arc<horizon_client::environment::Environment>> {
+    if matches!(
+        type_name,
+        "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+    ) {
+        return None;
+    }
+    let json = horizon_client::scoreboard::tag_to_json(data?);
+    let day_cycle = horizon_client::environment::has_day_cycle(&json["timelines"]);
+    match horizon_client::environment::Environment::from_type(source, &json, day_cycle) {
+        Ok(environment) => Some(Arc::new(environment)),
+        Err(error) => {
+            log::warn!("Horizon: the sky of dimension type {type_name} is not readable: {error}");
+            None
+        }
     }
 }

@@ -18046,13 +18046,15 @@ impl Game<'_> {
         pr.lap("pr_dragon_bolts");
         let (celestial, stars) = if title {
             (Vec::new(), None)
-        } else if self.dim == Dim::Overworld
+        } else if self.level_skybox() == horizon_protocol::registry::Skybox::Overworld
             && self.potions.effects.get("darkness").is_none()
             && self.potions.effects.get("blindness").is_none()
         {
             // Camera.doesMobEffectBlockSky: no sun, moon or stars.
             self.celestial_geometry(&sky, rain)
-        } else if self.dim == Dim::End && self.settings.horizon.sky {
+        } else if self.level_skybox() == horizon_protocol::registry::Skybox::End
+            && self.settings.horizon.sky
+        {
             (self.end_flash_geometry(), None)
         } else {
             (Vec::new(), None)
@@ -18181,8 +18183,10 @@ impl Game<'_> {
                     || self.potions.effects.get("darkness").is_some(),
                 self.boss_overlay.should_create_world_fog(),
             ),
-            skybox: self.dim == Dim::Overworld && self.settings.horizon.sky,
-            end_sky: self.dim == Dim::End && self.settings.horizon.sky,
+            skybox: self.level_skybox() == horizon_protocol::registry::Skybox::Overworld
+                && self.settings.horizon.sky,
+            end_sky: self.level_skybox() == horizon_protocol::registry::Skybox::End
+                && self.settings.horizon.sky,
             end_sky_sprite: self
                 .gui
                 .atlas
@@ -18204,8 +18208,9 @@ impl Game<'_> {
             hud: &hud,
             glint_alpha: self.glint_frame.alpha,
             glint_ticks: self.glint_frame.scroll_ticks(),
+            // Clouds follow the type's `visual/cloud_color` (no alpha: none,
+            // as in the Nether and the End) and `visual/cloud_height`.
             clouds: (!title
-                && self.dim == Dim::Overworld
                 && horizon_client::clouds::visible(&self.settings.clouds, sky.cloud_color[3]))
             .then(|| self.gui.atlas.sprites.get("horizon/white"))
             .flatten()
@@ -18218,6 +18223,7 @@ impl Game<'_> {
                 range: self.settings.cloud_range,
                 fast: self.settings.clouds == "fast",
                 color: sky.cloud_color,
+                height: f64::from(sky.cloud_height),
             }),
             entities: &entities,
             static_block_entities: &static_block_entities,

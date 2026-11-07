@@ -174,6 +174,12 @@ pub struct Clouds {
     pub range: i32,
     pub fast: bool,
     pub color: [f32; 4],
+    /// Captures from before the cloud height was a level's own have the Overworld's.
+    #[serde(default = "default_cloud_height")]
+    pub height: f64,
+}
+fn default_cloud_height() -> f64 {
+    crate::clouds::CLOUD_HEIGHT
 }
 
 /// The frame's camera and the inputs of its globals, sky, fog and lightmap.
@@ -434,6 +440,7 @@ impl Renderer {
                     range: c.range,
                     fast: c.fast,
                     color: c.color,
+                    height: c.height,
                 }),
                 game_time: frame.game_time,
                 shader_game_time: frame.shader_game_time,
@@ -546,6 +553,7 @@ impl Scene {
                 range: c.range,
                 fast: c.fast,
                 color: c.color,
+                height: c.height,
             }),
             lightning: Default::default(),
             additive: &[],

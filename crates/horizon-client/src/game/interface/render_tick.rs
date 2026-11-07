@@ -149,7 +149,7 @@ impl Game<'_> {
             forward: forward.map(|c| c as f32),
             rain,
             thunder,
-            skybox: self.dim == Dim::Overworld,
+            skybox: self.level_skybox() == horizon_protocol::registry::Skybox::Overworld,
             blindness: self
                 .potions
                 .effects
@@ -263,7 +263,7 @@ impl Game<'_> {
         } else {
             63.0
         };
-        self.dim == Dim::Overworld
+        self.level_skybox() == horizon_protocol::registry::Skybox::Overworld
             && camera.y < horizon
             && fog_type(
                 &self.world,
