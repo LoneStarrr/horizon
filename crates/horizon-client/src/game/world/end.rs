@@ -22,6 +22,7 @@ use horizon_core::{
     position::BlockPos,
     random::{LegacyRandom, RandomSource},
 };
+use horizon_protocol::registry::Skybox;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -307,12 +308,36 @@ impl EyeOfEnder {
 }
 
 impl Game<'_> {
-    /// The environment attributes of the current dimension.
+    /// The environment attributes of the current level. A level past vanilla's
+    /// three (or one a server's pack added) has those of its dimension type.
     pub(super) fn dim_environment(&self) -> &Environment {
         match self.dim {
-            Dim::Overworld | Dim::Extra(_) => self.res.environment(),
             Dim::Nether => self.res.nether_environment(),
             Dim::End => self.res.end_environment(),
+            Dim::Overworld | Dim::Extra(_) => {
+                let Some(r) = self.remote.as_ref() else {
+                    return self.res.environment();
+                };
+                match (&r.environment, r.dimension.name.as_str()) {
+                    (Some(environment), _) => environment,
+                    (None, "minecraft:the_nether") => self.res.nether_environment(),
+                    (None, "minecraft:the_end") => self.res.end_environment(),
+                    (None, _) => self.res.environment(),
+                }
+            }
+        }
+    }
+
+    /// What the level draws as its sky, from its dimension type's `skybox`
+    /// (`DimensionType.skybox`: the Overworld's sky, the End's, or none).
+    pub(super) fn level_skybox(&self) -> Skybox {
+        match self.dim {
+            Dim::Nether => Skybox::None,
+            Dim::End => Skybox::End,
+            Dim::Overworld | Dim::Extra(_) => self
+                .remote
+                .as_ref()
+                .map_or(Skybox::Overworld, |r| r.dimension.skybox),
         }
     }
 

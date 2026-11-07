@@ -134,6 +134,8 @@ pub struct Input<'a> {
     pub range: i32,
     pub fast: bool,
     pub color: [f32; 4],
+    /// `visual/cloud_height` of the level's dimension type.
+    pub height: f64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -171,7 +173,7 @@ impl Input<'_> {
         z -= (z / th).floor() * th;
         let cell_x = (x / 12.0).floor() as i64;
         let cell_z = (z / 12.0).floor() as i64;
-        let bottom = (CLOUD_HEIGHT - self.camera.y) as f32;
+        let bottom = (self.height - self.camera.y) as f32;
         let key = MeshKey {
             cell_x,
             cell_z,
@@ -390,6 +392,7 @@ mod tests {
             range: 2,
             fast: false,
             color: [1.0; 4],
+            height: CLOUD_HEIGHT,
         };
         let mut mesh = Mesh::default();
         assert!(mesh.prepare(&input).0);

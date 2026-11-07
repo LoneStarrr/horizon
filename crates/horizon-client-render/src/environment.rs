@@ -151,14 +151,20 @@ impl Environment {
     }
     /// A dimension's base attributes, optionally driven by the day timeline.
     pub fn load_dimension(root: &ResourceSource, dimension: &str, day_cycle: bool) -> Result<Self> {
+        let dimension: Value = serde_json::from_slice(
+            &root.read(&format!("data/minecraft/dimension_type/{dimension}.json"))?,
+        )?;
+        Self::from_type(root, &dimension, day_cycle)
+    }
+    /// The attributes of a dimension type given as JSON (a data pack's or a
+    /// mod's, as the server synchronized it), optionally driven by the day
+    /// timeline.
+    pub fn from_type(root: &ResourceSource, dimension: &Value, day_cycle: bool) -> Result<Self> {
         let timeline: Value = if day_cycle {
             serde_json::from_slice(&root.read("data/minecraft/timeline/day.json")?)?
         } else {
             serde_json::json!({"period_ticks": 24000, "tracks": {}})
         };
-        let dimension: Value = serde_json::from_slice(
-            &root.read(&format!("data/minecraft/dimension_type/{dimension}.json"))?,
-        )?;
         let mut tracks = HashMap::new();
         for (name, track) in timeline["tracks"].as_object().ok_or("invalid timeline")? {
             let easing = match &track["ease"] {
@@ -460,5 +466,35 @@ mod tests {
         assert!(dark(6000, 1.0, 1.0), "thunderstorm at noon");
         assert!(dark(18000, 0.0, 0.0), "clear midnight");
         assert!(!dark(1000, 0.0, 0.0), "clear morning");
+    }
+}
+
+/// Whether a dimension type's `timelines` (a tag, a timeline id or a list of
+/// them) include the Overworld's day cycle, the only timeline the client
+/// samples: `#minecraft:in_overworld` holds `minecraft:day`.
+pub fn has_day_cycle(timelines: &Value) -> bool {
+    match timelines {
+        Value::String(id) => matches!(
+            id.as_str(),
+            "#minecraft:in_overworld" | "minecraft:day" | "day"
+        ),
+        Value::Array(items) => items.iter().any(has_day_cycle),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod day_cycle_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_the_overworlds_timelines_run_the_day_cycle() {
+        // The vanilla types' `timelines` values.
+        assert!(has_day_cycle(&json!("#minecraft:in_overworld")));
+        assert!(!has_day_cycle(&json!("#minecraft:in_nether")));
+        assert!(!has_day_cycle(&json!("#minecraft:in_end")));
+        assert!(!has_day_cycle(&Value::Null));
+        assert!(has_day_cycle(&json!(["minecraft:day"])));
     }
 }
