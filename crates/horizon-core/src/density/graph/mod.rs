@@ -4,7 +4,9 @@
 use super::*;
 use std::collections::HashMap;
 mod compiler;
+mod custom;
 mod seeded;
+pub use custom::{CustomDensity, CustomId};
 #[cfg(test)]
 mod tests;
 pub use compiler::DensityCompiler;
@@ -77,6 +79,8 @@ pub enum GraphNode {
     },
     BlendedNoise(BlendedNoise),
     EndIslands,
+    /// A density type registered from outside the engine.
+    Custom(CustomId),
     WorldField(WorldField),
     BlendDensity(FunctionId),
     /// A direct holder compares by value; a registry holder by identity.
@@ -164,6 +168,7 @@ impl GraphNode {
             | Self::OffsetNoise { .. }
             | Self::BlendedNoise(_)
             | Self::EndIslands
+            | Self::Custom(_)
             | Self::WorldField(_) => vec![],
             Self::Noise {
                 shift_x,
@@ -217,6 +222,7 @@ impl GraphNode {
                 None => vec![22, 0, id(input)],
             },
             Self::EndIslands => vec![17],
+            Self::Custom(custom) => vec![23, custom.0 as u64],
             Self::WorldField(field) => vec![20, field as u64],
             Self::BlendDensity(input) => vec![21, id(input)],
             Self::Power { base, exponent } => vec![19, id(base), id(exponent)],
@@ -343,6 +349,7 @@ pub enum CompileError {
     UnpreparedCache,
     InvalidIntervals,
     UnknownNoise,
+    UnknownCustom,
     DuplicateNoise,
     DuplicateFunction,
     UnknownHolder,
@@ -402,6 +409,7 @@ pub struct DensityGraph {
     interned: HashMap<(Vec<u64>, bool), FunctionId>,
     equal: HashMap<Vec<u64>, FunctionId>,
     noises: Vec<seeded::NoiseEntry>,
+    customs: Vec<custom::CustomEntry>,
     noise_names: HashMap<String, NoiseId>,
     holders: Vec<FunctionId>,
     function_names: HashMap<String, FunctionId>,
@@ -422,6 +430,9 @@ impl DensityGraph {
         }
         if let GraphNode::Noise { noise, .. } | GraphNode::OffsetNoise { noise, .. } = node {
             self.noise_entry(noise)?;
+        }
+        if let GraphNode::Custom(custom) = node {
+            self.custom_entry(custom)?;
         }
         if let GraphNode::IntervalSelect {
             thresholds,
@@ -592,6 +603,9 @@ impl DensityGraph {
         };
         let mask = match node {
             GraphNode::EndIslands => return Ok(5),
+            GraphNode::Custom(custom) => {
+                return Ok(self.custom_entry(custom)?.instance.domain_axes());
+            }
             GraphNode::WorldField(field) => return Ok(field.domain_axes()),
             GraphNode::OffsetNoise { kind, .. } => {
                 return Ok(if kind == ShiftNoiseKind::Shift { 7 } else { 5 });
@@ -629,6 +643,10 @@ impl DensityGraph {
         };
         Ok(match *node {
             GraphNode::EndIslands => Interval::new(-0.84375, 0.5625)?,
+            GraphNode::Custom(custom) => {
+                let [min, max] = self.custom_entry(custom)?.instance.range();
+                Interval::new(min, max)?
+            }
             GraphNode::WorldField(field) => field.range(),
             GraphNode::Noise { noise, .. } => {
                 let [min, max] = self.noise_entry(noise)?.definition.range();

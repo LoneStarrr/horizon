@@ -603,3 +603,77 @@ fn positive_y_bounds_read_a_y_range_choice_with_a_nonpositive_fallback() {
     assert_eq!(graph.positive_y_bounds(not_y), Ok(None));
     assert_eq!(graph.positive_y_bounds(gradient), Ok(None));
 }
+
+#[derive(Debug)]
+struct Ramp {
+    scale: f32,
+}
+#[derive(Debug)]
+struct RampSampler {
+    scale: f32,
+    seed: i64,
+}
+impl DensitySampler for RampSampler {
+    fn sample_value(&self, _: &mut SamplerContext, p: [i32; 3]) -> Result<f32, SampleError> {
+        Ok((p[0] as f32 * self.scale).clamp(-2.0, 2.0) + (self.seed % 10) as f32)
+    }
+}
+impl CustomDensity for Ramp {
+    fn range(&self) -> [f32; 2] {
+        [-2.0, 2.0]
+    }
+    fn domain_axes(&self) -> u8 {
+        1
+    }
+    fn compile(&self, seed: i64) -> Arc<dyn DensitySampler> {
+        Arc::new(RampSampler {
+            scale: self.scale,
+            seed,
+        })
+    }
+}
+
+#[test]
+fn custom_nodes_declare_their_range_and_sample_with_the_world_seed() {
+    let mut graph = DensityGraph::new();
+    let custom = graph.register_custom(
+        "test:ramp".into(),
+        "{\"scale\":0.5}".into(),
+        Arc::new(Ramp { scale: 0.5 }),
+    );
+    // The same type and config share one id and one node; another config does not.
+    assert_eq!(
+        custom,
+        graph.register_custom(
+            "test:ramp".into(),
+            "{\"scale\":0.5}".into(),
+            Arc::new(Ramp { scale: 0.5 })
+        )
+    );
+    let other = graph.register_custom(
+        "test:ramp".into(),
+        "{\"scale\":1}".into(),
+        Arc::new(Ramp { scale: 1.0 }),
+    );
+    assert_ne!(custom, other);
+    let root = graph.insert(GraphNode::Custom(custom)).unwrap();
+    assert_eq!(root, graph.insert(GraphNode::Custom(custom)).unwrap());
+    assert_ne!(root, graph.insert(GraphNode::Custom(other)).unwrap());
+    assert_eq!(graph.domain_axes(root), Ok(1));
+    assert_eq!(
+        graph.range(root).unwrap(),
+        Interval::new(-2.0, 2.0).unwrap()
+    );
+    assert_eq!(
+        DensityCompiler::new(graph.clone())
+            .compile_raw(root)
+            .unwrap_err(),
+        CompileError::MissingSeededContext
+    );
+    let compiler = DensityCompiler::new_seeded(graph, 1237, false);
+    let sampler = compiler.compile_raw(root).unwrap();
+    let mut context = SamplerContext::default();
+    // seed % 10 = 7; x * 0.5 clamps to 2 at x = 8.
+    assert_eq!(sampler.sample_value(&mut context, [-4, 0, 0]), Ok(5.0));
+    assert_eq!(sampler.sample_value(&mut context, [100, 3, 3]), Ok(9.0));
+}

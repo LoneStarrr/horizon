@@ -159,6 +159,11 @@ impl DensityCompiler {
             GraphNode::BlendDensity(input) => Arc::new(BlendDensitySampler {
                 input: self.compile_raw(input)?,
             }),
+            GraphNode::Custom(custom) => self
+                .context
+                .as_ref()
+                .ok_or(CompileError::MissingSeededContext)?
+                .custom(&self.graph, custom)?,
             GraphNode::EndIslands => self
                 .context
                 .as_ref()

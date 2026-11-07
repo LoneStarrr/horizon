@@ -25,6 +25,13 @@ impl SeededContext {
     pub(super) fn end_islands(&self) -> Arc<dyn DensitySampler> {
         Arc::new(EndIslandSampler::new(self.seed))
     }
+    pub(super) fn custom(
+        &self,
+        graph: &DensityGraph,
+        id: CustomId,
+    ) -> Result<Arc<dyn DensitySampler>, CompileError> {
+        Ok(graph.custom_entry(id)?.instance.compile(self.seed))
+    }
     pub(super) fn new(seed: i64, legacy: bool) -> Self {
         let factory = if legacy {
             Factory::Legacy(LegacyRandom::new(seed).fork_positional())
