@@ -2,7 +2,8 @@
 //! launcher's generated `main` builds, with one mod: `dimprobe` registers the level
 //! `dimprobe:pocket` on the game's noise, the chunk generator `dimprobe:slab`, and the level
 //! `dimprobe:slabs` it fills. It also registers the density function type `dimprobe:band`: 1 for y
-//! in the `min_y`..=`max_y` of its JSON, else -1, which a data pack's noise router can use. The server command `dimprobe enter <level>` sends its player there
+//! in the `min_y`..=`max_y` of its JSON, else -1, which a data pack's noise router can use. It registers the tree parts `dimprobe:spiral` (trunk
+//! placer), `dimprobe:cross` (foliage placer) and `dimprobe:lantern` (tree decorator). The server command `dimprobe enter <level>` sends its player there
 //! with `run_command`, inside the command, and `dimprobe later <level>` from the next server tick,
 //! where no player's state is swapped in. The run needs a `horizon-native-mods/dimprobe` package
 //! beside the executable, which the harness writes.
@@ -12,9 +13,11 @@
 use horizon_mod_package::{Side, runtime::BuiltMod};
 use mod_api::{
     ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, CustomDensity,
-    DensityFunctionType, DensitySampler, DimensionSettings, Flow, Hooks, ModEntry, NativeCommand,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
-    ServerTickEvent, ServerTickPhase, Text,
+    DensityFunctionType, DensitySampler, DimensionSettings, Flow, FoliageAttachment, FoliagePlacer,
+    FoliagePlacerType, Hooks, ModEntry, NativeCommand, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
+    TreeAxis, TreeContext, TreeDecorator, TreeDecoratorType, TreeRandom, TrunkPlacer,
+    TrunkPlacerType,
 };
 use std::sync::{Arc, Mutex};
 
@@ -84,6 +87,97 @@ impl DensitySampler for BandAt {
     }
 }
 
+/// The trunk placer `dimprobe:spiral`: a trunk that winds one block around its axis, the
+/// footprint at height y being `[(0,0), (1,0), (1,1), (0,1)][y % 4]`. Leaves attach on top.
+struct Spiral;
+
+#[derive(Debug)]
+struct SpiralTrunk;
+
+impl TrunkPlacerType for Spiral {
+    fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn TrunkPlacer>, String> {
+        Ok(Arc::new(SpiralTrunk))
+    }
+}
+
+impl TrunkPlacer for SpiralTrunk {
+    fn place_trunk(
+        &self,
+        ctx: &mut dyn TreeContext,
+        tree_height: i32,
+        origin: [i32; 3],
+    ) -> Vec<FoliageAttachment> {
+        ctx.place_below_trunk([origin[0], origin[1] - 1, origin[2]]);
+        for y in 0..tree_height {
+            let (dx, dz) = [(0, 0), (1, 0), (1, 1), (0, 1)][y as usize % 4];
+            ctx.place_log(
+                [origin[0] + dx, origin[1] + y, origin[2] + dz],
+                Some(TreeAxis::Y),
+            );
+        }
+        vec![FoliageAttachment {
+            pos: [origin[0], origin[1] + tree_height, origin[2]],
+            radius_offset: 0,
+            double_trunk: false,
+        }]
+    }
+}
+
+/// The foliage placer `dimprobe:cross`: two layers of a plus, its arms `radius` long.
+struct Cross;
+
+#[derive(Debug)]
+struct CrossFoliage;
+
+impl FoliagePlacerType for Cross {
+    fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn FoliagePlacer>, String> {
+        Ok(Arc::new(CrossFoliage))
+    }
+}
+
+impl FoliagePlacer for CrossFoliage {
+    fn foliage_height(&self, _: &mut dyn TreeRandom, _: i32) -> i32 {
+        2
+    }
+    fn create_foliage(
+        &self,
+        ctx: &mut dyn TreeContext,
+        _: i32,
+        attachment: FoliageAttachment,
+        _: i32,
+        radius: i32,
+    ) {
+        let [x, y, z] = attachment.pos;
+        for level in 0..2 {
+            for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                ctx.try_place_leaf([x + dx * radius, y - level, z + dz * radius]);
+            }
+        }
+    }
+}
+
+/// The tree decorator `dimprobe:lantern`: a lantern beside the lowest log, on the side a draw picks.
+struct Lantern;
+
+#[derive(Debug)]
+struct HangLantern;
+
+impl TreeDecoratorType for Lantern {
+    fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn TreeDecorator>, String> {
+        Ok(Arc::new(HangLantern))
+    }
+}
+
+impl TreeDecorator for HangLantern {
+    fn place(&self, ctx: &mut dyn TreeContext, logs: &[[i32; 3]], _: &[[i32; 3]], _: &[[i32; 3]]) {
+        let (Some(&[x, y, z]), Some(lantern)) = (logs.first(), ctx.state("lantern")) else {
+            return;
+        };
+        let [dx, dz] = [[1, 0], [-1, 0], [0, 1], [0, -1]][ctx.next_int_bound(4) as usize];
+        ctx.set_decoration([x + dx, y, z + dz], lantern);
+    }
+}
+
 #[derive(Default)]
 struct DimProbe {
     /// The line the next server tick runs.
@@ -100,6 +194,9 @@ impl Hooks for DimProbe {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         r.register_chunk_generator("slab", Slab);
         r.register_density_function("band", Band);
+        r.register_trunk_placer("spiral", Spiral);
+        r.register_foliage_placer("cross", Cross);
+        r.register_tree_decorator("lantern", Lantern);
         r.register_dimension(
             "pocket",
             DimensionSettings {

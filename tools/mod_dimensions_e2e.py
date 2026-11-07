@@ -17,6 +17,10 @@ client of that server, so a block is read from both sides.
   elsewhere). A world's data pack gives a level noise settings whose `final_density` is that type: the
   band is stone and the air over it is air, on the server and the client, and the level saves and
   reloads. Needs the mod game, like `mod`.
+- tree: the mod registers a trunk placer, a foliage placer and a tree decorator (`dimprobe:spiral`,
+  `dimprobe:cross`, `dimprobe:lantern`). A pack level on a flat band of terrain has a biome whose feature is a
+  `minecraft:tree` naming them: the spiral's logs, the cross of leaves and the lantern are in the world on the
+  server and the client. Needs the mod game, like `mod`.
 - replace: a data pack puts the mod's level on other terrain.
 - dedicated: a headless client on a dedicated server is sent to a pack's level from the console, and to
   the level with no generator. Then that player's own level loses its generator: they join in the
@@ -357,6 +361,71 @@ def density_scenario(s):
     s.check('the band is still mostly solid', len(solids()) * 2 > len(column), solids())
 
 
+def tree_scenario(s):
+    level = 'test:grove'
+    s.use_mod_game()
+    s.launch()
+    world = s.world()
+    s.quit()
+    root = Path(lab.RESOURCES) / 'data/minecraft/worldgen'
+    settings = json.loads((root / 'noise_settings/overworld.json').read_text())
+    # A flat band of terrain, its top at y=63, no sea: the tree stands on it.
+    settings['noise_router']['final_density'] = {'type': 'dimprobe:band', 'min_y': 0, 'max_y': 63}
+    settings['sea_level'] = -64
+    biome = json.loads((root / 'biome/plains.json').read_text())
+    biome['features'] = [[] for _ in biome['features']]
+    biome['features'][9] = ['test:probe_tree']
+    log = {'id': 'minecraft:oak_log', 'properties': {'axis': 'y'}}
+    leaves = {'id': 'minecraft:oak_leaves', 'properties': {'distance': '7', 'persistent': 'false',
+                                                           'waterlogged': 'false'}}
+    write_pack(world, 'grove', {
+        'test/worldgen/noise_settings/grove.json': settings,
+        'test/worldgen/biome/grove.json': biome,
+        'test/worldgen/feature/probe_tree.json': {
+            'type': 'minecraft:tree', 'trunk_provider': log, 'foliage_provider': leaves,
+            'below_trunk_provider': 'minecraft:soil_beneath_tree', 'ignore_vines': True,
+            'minimum_size': {'type': 'minecraft:two_layers_feature_size'},
+            'trunk_placer': {'type': 'dimprobe:spiral', 'base_height': 5, 'height_rand_a': 0, 'height_rand_b': 0},
+            'foliage_placer': {'type': 'dimprobe:cross', 'radius': 1, 'offset': 0},
+            'decorators': [{'type': 'dimprobe:lantern'}]},
+        # No in_square: the feature runs at the chunk's corner, so the tree stands at x=0, z=0.
+        'test/worldgen/placed_feature/probe_tree.json': {'feature': 'test:probe_tree', 'placement': [
+            {'type': 'minecraft:heightmap', 'heightmap': 'WORLD_SURFACE_WG'}, {'type': 'minecraft:biome'}]},
+        'test/dimension_type/grove.json': overworld_type(),
+        'test/dimension/grove.json': {'type': level, 'generator': {
+            'type': 'minecraft:noise', 'settings': 'test:grove',
+            'biome_source': {'type': 'minecraft:fixed', 'biome': 'test:grove'}}},
+    })
+    s.launch()
+    s.command(f'execute in {level} run tp @s 8 120 8')
+    s.check('execute in reaches the level', s.arrived(level, 8, 8), s.where())
+    log_block, leaf = 'minecraft:oak_log', 'minecraft:oak_leaves'
+    s.check('the terrain reaches the client', s.wait(lambda: s.client_block(0, 64, 0) is not None), s.client_block(0, 64, 0))
+    # The tree's foot: the lowest log of the column at 0, 0 (the surface rule decides the exact height).
+    base = None
+    s.wait(lambda: any(s.client_block(0, y, 0) == log_block for y in range(56, 72)))
+    for y in range(56, 72):
+        if s.client_block(0, y, 0) == log_block:
+            base = y
+            break
+    s.check('a tree stands on the band', base is not None)
+    if base is None:
+        return
+    # The spiral: (0,0) (1,0) (1,1) (0,1) (0,0) over five blocks, and nothing straight above the first.
+    for x, dy, z in ((0, 0, 0), (1, 1, 0), (1, 2, 1), (0, 3, 1), (0, 4, 0)):
+        block_on_both_sides(s, f"the spiral's log at {x} +{dy} {z}", x, base + dy, z, log_block)
+    block_on_both_sides(s, 'no straight trunk', 0, base + 1, 0, 'minecraft:air')
+    # The cross, on top of the trunk (attachment at +5), arms one long; the log at +4 stays.
+    for x, dy, z in ((0, 5, 0), (1, 5, 0), (0, 5, -1), (-1, 4, 0), (0, 4, 1)):
+        block_on_both_sides(s, f"the cross's leaves at {x} +{dy} {z}", x, base + dy, z, leaf)
+    block_on_both_sides(s, 'no leaves past the arm', 2, base + 5, 0, 'minecraft:air')
+    sides = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    s.check('a lantern hangs beside the lowest log', s.wait(lambda: any(
+        s.client_block(x, base, z) == 'minecraft:lantern' for x, z in sides)),
+        [s.client_block(x, base, z) for x, z in sides])
+    s.check('the server has it too', any(s.server_block(x, base, z, 'minecraft:lantern') for x, z in sides))
+
+
 def dedicated_scenario(s):
     directory = s.root / 'server'
     directory.mkdir()
@@ -440,7 +509,7 @@ def dedicated_scenario(s):
         shutil.copy2(s.root / f'{name}.log', s.out / f'dedicated-{name}.log')
 
 
-SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'density': density_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
+SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'density': density_scenario, 'tree': tree_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
 
 
 def main():
