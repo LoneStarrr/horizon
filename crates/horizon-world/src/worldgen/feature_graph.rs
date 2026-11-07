@@ -86,6 +86,8 @@ pub enum FeatureDefinition {
     SteppedColumnCluster(Box<super::projected::SteppedColumnClusterFeature>),
     FallenTree(Box<super::tree::FallenTreeFeature>),
     NoOp,
+    /// A feature type a mod registered.
+    Mod(std::sync::Arc<dyn super::mod_features::ModFeature>),
     Template(Box<super::structure::features::TemplateFeature>),
     Fossil(Box<super::structure::features::FossilFeature>),
     WeightedChoice(OptionalWeightedList<PlacedFeatureDefinition>),
@@ -805,7 +807,16 @@ impl FeatureDefinition {
                     )?),
                 })
             }
-            _ => BasicFeature::from_json(json).map(Self::Basic),
+            other => match super::mod_features::mod_feature_types().get(other) {
+                Some(ty) => {
+                    let config: serde_json::Value = serde_json::from_str(json)?;
+                    ty.decode(&config).map(Self::Mod).map_err(|e| {
+                        log::warn!("mod feature {other}: {e}");
+                        DecodeError::Field("mod feature config")
+                    })
+                }
+                None => BasicFeature::from_json(json).map(Self::Basic),
+            },
         }
     }
     pub fn place<W: FeatureWorld + PlacementContext>(
@@ -855,6 +866,11 @@ impl FeatureDefinition {
                 .place(world, random, origin, run.blocks)
                 .map_err(FeatureExecutionError::Basic),
             Self::NoOp => Ok(true),
+            Self::Mod(feature) => Ok(feature.place(
+                &mut super::mod_features::Region(world, run.blocks),
+                &mut super::mod_features::Draws(random),
+                origin,
+            )),
             Self::Template(feature) => feature
                 .place(world, random, origin)
                 .map_err(FeatureExecutionError::Query),

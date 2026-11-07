@@ -151,6 +151,7 @@ pub(crate) struct Installed {
     pub(crate) dimensions: Vec<crate::dimension::DimensionInfo>,
     pub(crate) chunk_generators: Vec<crate::chunk_generator::ChunkGeneratorInfo>,
     pub(crate) density_functions: Vec<crate::density_function::DensityFunctionInfo>,
+    pub(crate) feature_types: Vec<crate::feature_type::FeatureTypeInfo>,
     pub(crate) hook_bits: Vec<bool>,
     pub(crate) tag_hook_bits: Vec<bool>,
 }
@@ -528,6 +529,7 @@ pub struct PartRegistrar {
     pub(crate) dimensions: Vec<crate::dimension::DimensionInfo>,
     pub(crate) chunk_generators: Vec<crate::chunk_generator::ChunkGeneratorInfo>,
     pub(crate) density_functions: Vec<crate::density_function::DensityFunctionInfo>,
+    pub(crate) feature_types: Vec<crate::feature_type::FeatureTypeInfo>,
     pub(crate) refused: Vec<String>,
 }
 
@@ -550,6 +552,7 @@ impl PartRegistrar {
             dimensions: Vec::new(),
             chunk_generators: Vec::new(),
             density_functions: Vec::new(),
+            feature_types: Vec::new(),
             refused: Vec::new(),
         }
     }
@@ -704,6 +707,7 @@ pub(crate) fn install_registrar(mut registrar: PartRegistrar) -> Result<(), Vec<
         dimensions: registrar.dimensions,
         chunk_generators: registrar.chunk_generators,
         density_functions: registrar.density_functions,
+        feature_types: registrar.feature_types,
         hook_bits: Vec::new(),
         tag_hook_bits: vec![false; HOOK_COUNT],
     };

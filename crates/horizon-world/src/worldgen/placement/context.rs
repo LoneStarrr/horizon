@@ -101,6 +101,11 @@ pub trait PlacementContext {
     ) -> Result<(), PlacementQueryError> {
         Ok(())
     }
+    /// The block registry the world's states come from, for a mod feature to
+    /// look states up by name; `None` where the world has no registry at hand.
+    fn block_registry(&self) -> Option<&crate::registry::BlockRegistry> {
+        None
+    }
     /// WorldGenLevel.getSeed: the world seed for seed-derived feature noise.
     fn world_seed(&mut self) -> Result<i64, PlacementQueryError> {
         Err(PlacementQueryError::Unavailable)

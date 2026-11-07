@@ -52,6 +52,7 @@ pub mod material_extensions;
 pub mod material_stage;
 pub mod material_surface;
 pub mod mod_density;
+pub mod mod_features;
 pub mod mod_generators;
 pub mod ore_feature;
 pub mod overrides;
