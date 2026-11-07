@@ -2,7 +2,8 @@
 //! launcher's generated `main` builds, with one mod: `dimprobe` registers the level
 //! `dimprobe:pocket` on the game's noise, the chunk generator `dimprobe:slab`, and the level
 //! `dimprobe:slabs` it fills. It also registers the density function type `dimprobe:band`: 1 for y
-//! in the `min_y`..=`max_y` of its JSON, else -1, which a data pack's noise router can use. The server command `dimprobe enter <level>` sends its player there
+//! in the `min_y`..=`max_y` of its JSON, else -1, which a data pack's noise router can use, and the
+//! feature type `dimprobe:marker`, a column of a block that a data pack's placed feature can put. The server command `dimprobe enter <level>` sends its player there
 //! with `run_command`, inside the command, and `dimprobe later <level>` from the next server tick,
 //! where no player's state is swapped in. The run needs a `horizon-native-mods/dimprobe` package
 //! beside the executable, which the harness writes.
@@ -11,10 +12,11 @@
 //! `testing` feature keeps the mods per thread, and the server thread would see none.
 use horizon_mod_package::{Side, runtime::BuiltMod};
 use mod_api::{
-    ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, CustomDensity,
-    DensityFunctionType, DensitySampler, DimensionSettings, Flow, Hooks, ModEntry, NativeCommand,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
-    ServerTickEvent, ServerTickPhase, Text,
+    ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, ConfiguredFeature,
+    CustomDensity, DensityFunctionType, DensitySampler, DimensionSettings, FeatureRandom,
+    FeatureRegion, FeatureType, Flow, Hooks, ModEntry, NativeCommand, RegisterCommandsEvent,
+    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, ServerTickEvent,
+    ServerTickPhase, Text,
 };
 use std::sync::{Arc, Mutex};
 
@@ -84,6 +86,50 @@ impl DensitySampler for BandAt {
     }
 }
 
+/// The feature type `dimprobe:marker`: a column of `block`, `height` tall, from the position it is
+/// placed at up, over air only.
+struct Marker;
+
+#[derive(Debug)]
+struct MarkerColumn {
+    block: String,
+    height: i32,
+}
+
+impl FeatureType for Marker {
+    fn decode(&self, config: &serde_json::Value) -> Result<Arc<dyn ConfiguredFeature>, String> {
+        let height = config["height"]
+            .as_i64()
+            .ok_or("dimprobe:marker needs an integer height")?;
+        let block = config["block"]
+            .as_str()
+            .ok_or("dimprobe:marker needs a block")?;
+        Ok(Arc::new(MarkerColumn {
+            block: block.to_owned(),
+            height: height as i32,
+        }))
+    }
+}
+
+impl ConfiguredFeature for MarkerColumn {
+    fn place(
+        &self,
+        region: &mut dyn FeatureRegion,
+        _: &mut dyn FeatureRandom,
+        [x, y, z]: [i32; 3],
+    ) -> bool {
+        let Some(state) = region.state(&self.block, &[]) else {
+            return false;
+        };
+        let mut placed = false;
+        for y in y..y + self.height {
+            let air = region.block([x, y, z]).is_some_and(|b| region.is_air(b));
+            placed |= air && region.set_block([x, y, z], state, 2);
+        }
+        placed
+    }
+}
+
 #[derive(Default)]
 struct DimProbe {
     /// The line the next server tick runs.
@@ -100,6 +146,7 @@ impl Hooks for DimProbe {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         r.register_chunk_generator("slab", Slab);
         r.register_density_function("band", Band);
+        r.register_feature_type("marker", Marker);
         r.register_dimension(
             "pocket",
             DimensionSettings {

@@ -17,6 +17,11 @@ client of that server, so a block is read from both sides.
   elsewhere). A world's data pack gives a level noise settings whose `final_density` is that type: the
   band is stone and the air over it is air, on the server and the client, and the level saves and
   reloads. Needs the mod game, like `mod`.
+- feature: the mod registers a feature type, `dimprobe:marker` (a column of a block over air). A world's
+  data pack gives plains a placed feature of that type (Horizon cannot add biomes), in a level with the terrain
+  of `density`: the
+  columns stand at each chunk's corner on the surface, on the server and the client, and survive a reload.
+  Needs the mod game, like `mod`.
 - replace: a data pack puts the mod's level on other terrain.
 - dedicated: a headless client on a dedicated server is sent to a pack's level from the console, and to
   the level with no generator. Then that player's own level loses its generator: they join in the
@@ -357,6 +362,61 @@ def density_scenario(s):
     s.check('the band is still mostly solid', len(solids()) * 2 > len(column), solids())
 
 
+def feature_scenario(s):
+    level = 'test:marked'
+    band = (0, 63)
+    height = 4
+    s.use_mod_game()
+    s.launch()
+    world = s.world()
+    s.quit()
+    path = Path(lab.RESOURCES) / 'data/minecraft/worldgen/noise_settings/overworld.json'
+    settings = json.loads(path.read_text())
+    # A flat floor: the surface of the column at a chunk's corner is known.
+    settings['noise_router']['final_density'] = {'type': 'dimprobe:band', 'min_y': band[0], 'max_y': band[1]}
+    settings['sea_level'] = -64
+    biome = json.loads((Path(lab.RESOURCES) / 'data/minecraft/worldgen/biome/plains.json').read_text())
+    steps = biome['features']
+    steps += [[] for _ in range(11 - len(steps))]
+    steps[9] = ['test:marker']  # VEGETAL_DECORATION
+    write_pack(world, 'marked', {
+        'test/worldgen/noise_settings/marked.json': settings,
+        # Horizon cannot add biomes yet, so the pack gives plains the feature.
+        'minecraft/worldgen/biome/plains.json': dict(biome, features=steps),
+        'test/worldgen/feature/marker.json': {
+            'type': 'dimprobe:marker', 'block': GOLD, 'height': height},
+        'test/worldgen/placed_feature/marker.json': {
+            'feature': 'test:marker', 'placement': [{'type': 'minecraft:heightmap', 'heightmap': 'WORLD_SURFACE_WG'}]},
+        'test/dimension_type/marked.json': overworld_type(),
+        'test/dimension/marked.json': {'type': level, 'generator': {
+            'type': 'minecraft:noise', 'settings': level,
+            'biome_source': {'type': 'minecraft:fixed', 'biome': 'minecraft:plains'}}},
+    })
+    s.launch()
+    s.command(f'execute in {level} run tp @s 8 120 8')
+    s.check('execute in reaches the level', s.arrived(level, 8, 8), s.where())
+    s.check('the terrain reaches the client', s.wait(lambda: s.client_block(8, band[0], 8) not in (None, 'minecraft:air')),
+            s.client_block(8, band[0], 8))
+
+    def column(x, z):
+        return [y for y in range(band[1] - 2, band[1] + 2 * height) if s.client_block(x, y, z) == GOLD]
+
+    # The decorator puts the feature at the chunk's corner, on the heightmap.
+    s.check('the mod feature placed its column at the corner', s.wait(lambda: len(column(0, 0)) == height), column(0, 0))
+    found = column(0, 0)
+    if not found:
+        s.check('the surface at the corner', False, {y: s.client_block(0, y, 0) for y in range(band[1] - 4, band[1] + 3)})
+        return
+    s.check('the column is contiguous', found == list(range(found[0], found[0] + height)), found)
+    s.check('the neighbouring chunk has its own', s.wait(lambda: len(column(16, 0)) == height), column(16, 0))
+    s.check('no column away from the corner', not column(5, 5), column(5, 5))
+    block_on_both_sides(s, 'the column, server and client', 0, found[0], 0, GOLD)
+    s.quit()
+    s.launch()
+    s.check('the player comes back to the level', s.arrived(level, 8, 8), s.where())
+    block_on_both_sides(s, 'the column, reloaded', 0, found[0], 0, GOLD)
+
+
 def dedicated_scenario(s):
     directory = s.root / 'server'
     directory.mkdir()
@@ -440,7 +500,7 @@ def dedicated_scenario(s):
         shutil.copy2(s.root / f'{name}.log', s.out / f'dedicated-{name}.log')
 
 
-SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'density': density_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
+SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'density': density_scenario, 'feature': feature_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
 
 
 def main():
