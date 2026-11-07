@@ -1,7 +1,8 @@
 //! The game with a native mod that adds levels, for `tools/mod_dimensions_e2e.py`. It is what the
 //! launcher's generated `main` builds, with one mod: `dimprobe` registers the level
 //! `dimprobe:pocket` on the game's noise, the chunk generator `dimprobe:slab`, and the level
-//! `dimprobe:slabs` it fills. The server command `dimprobe enter <level>` sends its player there
+//! `dimprobe:slabs` it fills. It also registers the density function type `dimprobe:band`: 1 for y
+//! in the `min_y`..=`max_y` of its JSON, else -1, which a data pack's noise router can use. The server command `dimprobe enter <level>` sends its player there
 //! with `run_command`, inside the command, and `dimprobe later <level>` from the next server tick,
 //! where no player's state is swapped in. The run needs a `horizon-native-mods/dimprobe` package
 //! beside the executable, which the harness writes.
@@ -10,11 +11,12 @@
 //! `testing` feature keeps the mods per thread, and the server thread would see none.
 use horizon_mod_package::{Side, runtime::BuiltMod};
 use mod_api::{
-    ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, DimensionSettings, Flow,
-    Hooks, ModEntry, NativeCommand, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
+    ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, CustomDensity,
+    DensityFunctionType, DensitySampler, DimensionSettings, Flow, Hooks, ModEntry, NativeCommand,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+    ServerTickEvent, ServerTickPhase, Text,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const BUILT: &[BuiltMod] = &[BuiltMod {
     id: "dimprobe",
@@ -41,6 +43,47 @@ impl ChunkGenerator for Slab {
     }
 }
 
+/// The density type `dimprobe:band`: solid (1) for y in a band, empty (-1) elsewhere.
+struct Band;
+
+#[derive(Clone, Copy, Debug)]
+struct BandAt([i32; 2]);
+
+impl DensityFunctionType for Band {
+    fn decode(&self, config: &serde_json::Value) -> Result<Arc<dyn CustomDensity>, String> {
+        let edge = |name: &str| {
+            config[name]
+                .as_i64()
+                .map(|y| y as i32)
+                .ok_or(format!("dimprobe:band needs an integer {name}"))
+        };
+        Ok(Arc::new(BandAt([edge("min_y")?, edge("max_y")?])))
+    }
+}
+
+impl CustomDensity for BandAt {
+    fn range(&self) -> [f32; 2] {
+        [-1.0, 1.0]
+    }
+    /// Only y matters.
+    fn domain_axes(&self) -> u8 {
+        2
+    }
+    fn compile(&self, _: i64) -> Arc<dyn DensitySampler> {
+        Arc::new(*self)
+    }
+}
+
+impl DensitySampler for BandAt {
+    fn sample_value(&self, [_, y, _]: [i32; 3]) -> f32 {
+        if (self.0[0]..=self.0[1]).contains(&y) {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+}
+
 #[derive(Default)]
 struct DimProbe {
     /// The line the next server tick runs.
@@ -56,6 +99,7 @@ fn travel(level: &str, name: &str) -> String {
 impl Hooks for DimProbe {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         r.register_chunk_generator("slab", Slab);
+        r.register_density_function("band", Band);
         r.register_dimension(
             "pocket",
             DimensionSettings {

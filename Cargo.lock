@@ -2074,6 +2074,7 @@ dependencies = [
  "horizon-mod-api",
  "horizon-mod-package",
  "log",
+ "serde_json",
 ]
 
 [[package]]
