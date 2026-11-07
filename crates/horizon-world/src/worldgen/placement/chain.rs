@@ -33,6 +33,9 @@ impl<C: PlacementContext> PlacementContext for Queries<'_, C> {
     ) -> Result<crate::worldgen::biome::BiomeId, PlacementQueryError> {
         self.world.biome_identity(position)
     }
+    fn block_registry(&self) -> Option<&crate::registry::BlockRegistry> {
+        self.world.block_registry()
+    }
     fn top_feature(&self) -> Option<FeatureIdentity> {
         self.top
     }
