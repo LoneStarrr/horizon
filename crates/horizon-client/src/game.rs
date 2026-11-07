@@ -24721,6 +24721,14 @@ pub fn run_with(
     {
         log::warn!("Mod chunk generators already installed; keeping the first table");
     }
+    // Their density function types, which a noise router's JSON names.
+    if horizon_world::worldgen::mod_density::install_mod_density_types(
+        mod_api::__private::installed_density_functions(),
+    )
+    .is_err()
+    {
+        log::warn!("Mod density functions already installed; keeping the first table");
+    }
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models(options.execution_role);
     mods::register_layer_definitions(options.execution_role);
