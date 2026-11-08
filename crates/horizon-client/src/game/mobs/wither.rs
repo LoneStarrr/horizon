@@ -50,10 +50,9 @@ impl Game<'_> {
             let _ = self.level_set(pos, rose);
             return;
         }
-        self.spawn_item(
+        self.spawn_item_own(
             ItemStack::new("minecraft:wither_rose", 1),
             [m.position.x, m.position.y, m.position.z],
-            super::dispenser::new_item_motion(),
             0,
         );
     }
@@ -176,6 +175,7 @@ impl Game<'_> {
                         skull.from,
                         super::creatures::damage_type(kind, false),
                         Some(owner),
+                        false,
                     );
                     if hit && wither_ticks > 0 {
                         self.give_player_effect("minecraft:wither", wither_ticks, 1);

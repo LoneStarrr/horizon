@@ -23,9 +23,9 @@ mod sounds;
 mod survival;
 mod worker;
 
-pub use check::{check, missing_extras, STAMP};
+pub use check::{STAMP, check, missing_extras};
 pub use files::clone_or_copy;
-pub use sounds::{add_assets, fonts, languages, packs, panorama, sounds, BUILT_IN_PACKS};
+pub use sounds::{BUILT_IN_PACKS, add_assets, fonts, languages, packs, panorama, sounds};
 
 use pyjson::Value;
 use sha2::Digest;
@@ -584,7 +584,7 @@ impl Run<'_> {
         let file = self.log_file(log)?;
         for main in mains {
             self.run(side, worker, heap, classpath, main, args, &file, log)
-                .map_err(fail)?;
+                .map_err(|e| java::export_failure(fail(e), &self.jdk.java, log))?;
         }
         (self.log)(&format!("Exported {what}{}", took(started)));
         Ok(())
@@ -1749,10 +1749,12 @@ mod tests {
                 read(&reports.join(name)).unwrap()
             );
         }
-        assert!(read_json(&root.join("items.json"))
-            .unwrap()
-            .get("minecraft:stone")
-            .is_some());
+        assert!(
+            read_json(&root.join("items.json"))
+                .unwrap()
+                .get("minecraft:stone")
+                .is_some()
+        );
         assert!(root.join("biome-parameters/overworld.json").is_file());
         for name in ["registries.json", "commands.json", "items.json"] {
             fs::remove_file(root.join(name)).unwrap();

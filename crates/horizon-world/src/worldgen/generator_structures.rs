@@ -131,7 +131,13 @@ impl RingWork {
         rings
     }
 }
-const START_CACHE_LIMIT: usize = 65536;
+/// Chunks kept per generation of the cache. Each player's generated area
+/// reads the starts of some 2,000 chunks (its view distance plus the
+/// references' reach, at view distance 10): at 65,536, a server with 200
+/// players spread over the map overflowed it every few ticks and rebuilt
+/// outposts' and trial chambers' jigsaws on the server thread, where natural
+/// spawning asks about them. Most entries are chunks with no start.
+const START_CACHE_LIMIT: usize = 262_144;
 const START_SHARDS: usize = 64;
 
 /// The built starts by chunk, in shards: a lookup locks one shard for
@@ -539,7 +545,10 @@ impl StructureState {
             _ => return None,
         };
         let types = super::structure::mod_types::mod_structure_types();
-        types.get(&*id)?.load_piece(map).map(Piece::Legacy)
+        types
+            .get(&*id)?
+            .load_piece(self.resources.registry, map)
+            .map(Piece::Legacy)
     }
     pub(super) fn set_saved_starts(&self, source: Arc<super::generator::SavedStructureStarts>) {
         let _ = self.saved.set(source);

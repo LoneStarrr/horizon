@@ -2559,19 +2559,20 @@ impl Game<'_> {
         }
         self.hurt_cart(i, damage, creative, false);
     }
-    /// `Containers.dropContents(level, entity, container)` at a cart's
-    /// position: each slot, an empty one too, from a spot in the cart's block
-    /// in pieces of 10 to 30 with the level random's scatter, no pickup delay.
-    fn scatter_cart_contents(&mut self, at: [f64; 3], items: &[Option<ItemStack>]) {
-        let cell = horizon_core::position::BlockPos::new(
-            at[0].floor() as i32,
-            at[1].floor() as i32,
-            at[2].floor() as i32,
-        );
+    /// `Containers.dropContents(level, entity, container)` at a vehicle's
+    /// position `at`: each slot (an empty one too) from a spot in its block,
+    /// in pieces of 10 to 30 with the level random's scatter, no pickup
+    /// delay. `AbstractChestBoat.remove` and `AbstractMinecartContainer.remove`
+    /// spill this way for a destroying removal (kill or discard), and
+    /// `chestVehicleDestroyed` again for the emptied container.
+    pub(super) fn drop_vehicle_contents(&mut self, at: [f64; 3], items: &[Option<ItemStack>]) {
         for stack in items {
             let count = stack.as_ref().map_or(0, |s| s.count);
-            let pieces =
-                horizon_world::level::removal::drop_item_stack(&mut self.world.random, cell, count);
+            let pieces = horizon_world::level::removal::drop_item_stack_at(
+                &mut self.world.random,
+                at,
+                count,
+            );
             if let Some(stack) = stack {
                 for piece in pieces {
                     let piece_stack = ItemStack {
@@ -2647,27 +2648,28 @@ impl Game<'_> {
                 self.carts.put_back(i, c);
             } else {
                 let at = [c.position.x, c.position.y, c.position.z];
-                // VehicleEntity.destroy: `kill` (the cart's own ENTITY_DIE),
-                // then the drops; a creative hit only discards it.
+                // AbstractMinecartContainer.remove: `Containers.dropContents`
+                // for every destroying removal (the kill below, and a creative
+                // hit's discard), with no `entity_drops` gate of its own.
+                self.drop_vehicle_contents(at, &c.items);
+                // VehicleEntity.destroy: `kill` (the cart's own ENTITY_DIE
+                // after that removal), then the drops; a creative hit only
+                // discards it.
                 if !creative {
                     self.entity_killed_event(at, false);
                 }
-                if self
-                    .ui
-                    .rules
-                    .bool_at(horizon_client::gamerules::vanilla::ENTITY_DROPS)
+                if !creative
+                    && self
+                        .ui
+                        .rules
+                        .bool_at(horizon_client::gamerules::vanilla::ENTITY_DROPS)
                 {
-                    // AbstractMinecartContainer.remove: dropContents.
-                    self.scatter_cart_contents(at, &c.items);
-                    if !creative {
-                        // `spawnAtLocation`: an ItemEntity's own motion.
-                        let motion = super::dispenser::new_item_motion();
-                        self.spawn_item(ItemStack::new(c.kind.item(), 1), at, motion, 10);
-                        // `chestVehicleDestroyed` drops the emptied container
-                        // again, which only draws each slot's spot.
-                        let empty = vec![None; c.items.len()];
-                        self.scatter_cart_contents(at, &empty);
-                    }
+                    // `spawnAtLocation`: an ItemEntity's own motion.
+                    self.spawn_item_own(ItemStack::new(c.kind.item(), 1), at, 10);
+                    // `chestVehicleDestroyed` drops the emptied container
+                    // again, which only draws each slot's spot.
+                    let empty = vec![None; c.items.len()];
+                    self.drop_vehicle_contents(at, &empty);
                 }
             }
         }
@@ -2999,6 +3001,11 @@ impl Minecart {
             raw,
         );
         if let Tag::Compound(map) = &mut tag {
+            // ContainerEntity.addChestVehicleSaveData belongs only to the
+            // container subclasses, never to a plain or specialized cart.
+            if self.kind.slots() == 0 {
+                map.remove(&JavaString::from("Items"));
+            }
             if self.kind == CartKind::CommandBlock {
                 for key in ["LastOutput", "LastExecution"] {
                     map.remove(&JavaString::from(key));
@@ -3058,7 +3065,13 @@ impl Minecart {
             }
             // A loaded loot table goes back while the items are still its roll;
             // otherwise the items replace it, as vanilla's unpackLootTable does.
-            if !self.loot.as_ref().is_some_and(|l| l.restore(map)) {
+            if self.loot.as_ref().is_some_and(|l| l.restore(map)) {
+                if let Some(table) = horizon_client::save::text(map.get(&"LootTable".into()))
+                    .and_then(|id| horizon_client_core::identifier::normalize_id(&id))
+                {
+                    map.insert("LootTable".into(), Tag::String(table.as_str().into()));
+                }
+            } else {
                 map.remove(&JavaString::from("LootTable"));
                 map.remove(&JavaString::from("LootTableSeed"));
             }
@@ -4039,5 +4052,87 @@ mod cart_push_tests {
             assert_eq!(cart(1).loot.as_ref(), Some(&loot));
             assert_eq!(cart(2).loot, None);
         });
+    }
+}
+
+#[cfg(test)]
+mod container_drop_tests {
+    use super::super::boats::Boat;
+    use super::{CartKind, Minecart};
+    use horizon_client::items::ItemStack;
+    use horizon_core::geometry::Vec3;
+    use horizon_core::random::{LegacyRandom, RandomSource};
+    use std::sync::Arc;
+
+    /// Advances `r` past the draws a spill takes from the level random, as
+    /// vanilla's `Containers.dropContents` takes them: for each slot
+    /// (`Containers.dropItemStack`) its spot, then for each pile the split
+    /// size and the triangle motion. Every count here is at most 10, so a
+    /// slot with items is a single pile.
+    fn vanilla_spill_draws(r: &mut LegacyRandom, counts: &[u32]) {
+        for &count in counts {
+            for _ in 0..3 {
+                r.next_double();
+            }
+            if count > 0 {
+                let _ = r.next_int_bound(21);
+                for _ in 0..3 {
+                    r.triangle(0.0, 0.114_850_001_711_398_36);
+                }
+            }
+        }
+    }
+
+    /// A chest boat or chest minecart broken with entity_drops on spills its
+    /// slots in `remove` and then the emptied container again in
+    /// `chestVehicleDestroyed`; the hull item takes the item entity's own
+    /// random. The level random must end where vanilla's does.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_broken_chest_vehicle_draws_the_level_random_like_vanilla() {
+        let mut slots = vec![None; 27];
+        slots[0] = Some(ItemStack::new("minecraft:diamond", 5));
+        slots[4] = Some(ItemStack::new("minecraft:dirt", 8));
+        let mut counts = vec![0; 27];
+        counts[0] = 5;
+        counts[4] = 8;
+        for boat in [true, false] {
+            crate::game::native_entity_refs::tests::with_game(|game| {
+                assert!(
+                    game.ui
+                        .rules
+                        .bool_at(horizon_client::gamerules::vanilla::ENTITY_DROPS)
+                );
+                let at = Vec3::new(8.5, 64.0, 8.5);
+                if boat {
+                    let mut b = Boat::new(1, Arc::from("oak"), at, 0.0);
+                    b.chest = true;
+                    b.items = slots.clone();
+                    game.boats.push(b);
+                } else {
+                    let mut c = Minecart::new(1, CartKind::Chest, at);
+                    c.items = slots.clone();
+                    game.carts.push(c);
+                }
+                game.world.random = LegacyRandom::new(1234);
+                if boat {
+                    assert_eq!(game.hurt_boat_result(0, 100.0, false), Some(true));
+                    assert!(game.boats.is_empty());
+                } else {
+                    assert!(game.hurt_cart_result(0, 100.0, false, false));
+                    assert!(game.carts.is_empty());
+                }
+                let mut expected = LegacyRandom::new(1234);
+                vanilla_spill_draws(&mut expected, &counts);
+                vanilla_spill_draws(&mut expected, &[0; 27]);
+                assert_eq!(
+                    game.world.random.next_long(),
+                    expected.next_long(),
+                    "boat: {boat}"
+                );
+                // The two piles and the hull item.
+                assert_eq!(game.dropped.len(), 3, "boat: {boat}");
+            });
+        }
     }
 }

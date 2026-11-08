@@ -20,7 +20,7 @@ pub use horizon_client_render::{
     extras, fast_hash, fluid_models, fluid_render, fog, font, gfx, graphics, graphics_style,
     graphics_ui, hdr_calibration, hud, hud_layout, hud_overlays, inventory_effects, java_text,
     jigsaw_block, json_folder, level_loading, light, lod, logging, menu_blur, mesher, minimap,
-    mipmap, mod_browser, mod_chunk_tickets, mod_list, model_library, models, monitor,
+    mipmap, mod_browser, mod_chunk_tickets, mod_list, model_library, models, mods_screen, monitor,
     multiline_edit, native_emissive, options_file, options_fixes, options_ui, overlay,
     pack_browser, pack_screen, packs, pad_cursor, pad_glyph, par, particles, poi_sections,
     post_chain, potent_sulfur, preedit, providers, pvp, pvp_hud, random_source, resource_source,
@@ -89,12 +89,15 @@ pub mod item_render;
 pub mod item_sync;
 pub mod item_tooltip;
 pub mod join_seq;
+/// Game-owned JSON metadata conversion, shared by recipe and API adapters.
+pub use horizon_core::json_nbt;
 pub mod lan;
 pub mod landing;
 pub mod legacy_combat;
 pub mod living_attributes;
 pub mod locator_bar;
 pub mod lod_net;
+pub mod map_decoration_types;
 pub mod menu;
 pub mod merchant;
 pub mod mobs;

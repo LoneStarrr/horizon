@@ -232,8 +232,8 @@ impl Game<'_> {
                 .iter()
                 .find(|s| s.id == id)
                 .map(|s| uuid_text(s.uuid)),
-            // Orbs and projectiles have no UUID here.
-            Target::Orb(_) | Target::Projectile(_) => None,
+            // Orbs, projectiles and dragon parts have no UUID here.
+            Target::Orb(_) | Target::Projectile(_) | Target::DragonPart(_) => None,
         }
     }
     fn holder_for(&mut self, t: Target) -> Option<Holder> {
@@ -275,6 +275,7 @@ impl Game<'_> {
             | Target::Fangs(id)
             | Target::Cloud(id)
             | Target::Hook(id) => self.persist.raw.get(&id),
+            Target::DragonPart(_) => None,
             Target::Player => self.level.player_extra.as_ref(),
             // A server's player: the saved compound the guest's file is written from.
             Target::Guest(conn) => self.command_guest(conn).and_then(|g| g.saved.as_ref()),
@@ -545,13 +546,6 @@ impl Game<'_> {
                 board.for_all_objectives(&criteria, &victim_name, inc);
             }
         }
-    }
-    /// `Scoreboard.entityRemoved`: a dead non-player entity leaves the board.
-    pub(super) fn score_entity_removed(&mut self, id: u32) {
-        let Some(uuid) = self.persist.uuids.get(&id).copied() else {
-            return;
-        };
-        self.score.board.entity_removed(&uuid_text(uuid));
     }
 
     // ---- teams in gameplay -----------------------------------------------------

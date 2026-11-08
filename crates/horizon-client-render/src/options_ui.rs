@@ -1465,19 +1465,15 @@ enum Act {
     Key(&'static str),
     ResetKey(&'static str),
     ResetKeys,
-    ToggleMod(usize),
     /// PvP & HUD's PvP preset (`pvp::apply_preset`).
     PvpPreset,
     /// PvP & HUD's Edit HUD button.
     HudEditor,
-    /// The installed native mod's settings page.
-    ModSettings(usize),
     /// A native mod's key (mod, key) waits for a key; a button of its page.
     /// A key a native mod registered (mod, mapping) waits for a key, or is reset.
     ModKey(usize, usize),
     ResetModKey(usize, usize),
     NativeButton(usize, usize),
-    OpenModFolder,
     /// Browse mods: the page of listing `.0` of `mod_browser`.
     ModProject(usize),
     /// The open project page's Install or Update.
@@ -1602,6 +1598,10 @@ pub enum Event {
     /// Data Packs' Open Pack Folder: create the folder if needed and open it.
     OpenDataPackFolder(std::path::PathBuf),
     OpenModFolder,
+    /// A link on the Mods screen (Homepage, Issues, a license): confirm and open it.
+    OpenLink(String),
+    /// A click on the Mods screen's mod id or version: copy it.
+    CopyText(String),
     /// Browse mods opened: read the registry's index into `mod_browser`.
     BrowseMods,
     /// Install (or update) the registry's content mod with this id.
@@ -1722,11 +1722,10 @@ pub struct OptionsUi {
     pub mod_browser: crate::mod_browser::ModBrowser,
     /// The project whose page is open (`Page::ModProject`).
     pub mod_project: String,
-    /// The Mods page's line about switches that wait for a restart.
+    /// The line about mods that wait for a restart to switch, for Browse mods' message.
     pub mods_note: Option<String>,
-    /// The content mods that switch with a world open: only assets and data,
-    /// in a world this game serves (docs/design/mod-hotload.md).
-    pub mods_live: std::collections::BTreeSet<String>,
+    /// The Mods screen (`Page::Mods`), made when the page opens.
+    pub mods_screen: Option<crate::mods_screen::ModsScreen>,
     /// Horizon's `packBrowser` extra: the pack screen's Add button.
     pub pack_browser: bool,
     /// Packs: the packs found and the selection the screen opens with.
@@ -1755,7 +1754,7 @@ pub struct OptionsUi {
     pub minecart_improvements: bool,
     /// Scroll the selected language into the middle on the next layout.
     center_language: bool,
-    pub graphics: crate::graphics_ui::GraphicsUi,
+    graphics: shell::Shell<crate::graphics_ui::GraphicsScreen>,
     pub controller: crate::controller_ui::ControllerUi,
     /// Horizon Extras, on the settings shell.
     extras: shell::Shell<crate::extras_ui::ExtrasScreen>,
@@ -1823,7 +1822,7 @@ impl Default for OptionsUi {
             mod_browser: Default::default(),
             mod_project: String::new(),
             mods_note: None,
-            mods_live: Default::default(),
+            mods_screen: None,
             pack_browser: false,
             pack_infos: Vec::new(),
             pack_selection: Vec::new(),
@@ -2007,16 +2006,6 @@ fn tooltip_text(s: &Settings, wd: &Widget) -> Option<Text> {
     }
     match act {
         Act::Cycle(opt) if !opt.available() => Some(tr("horizon.options.unavailable")),
-        Act::ToggleMod(i) => match s.mods.installed.get(*i) {
-            Some(installed) => {
-                let description = installed
-                    .problem
-                    .as_deref()
-                    .unwrap_or(&installed.description);
-                Some(Text::literal(format!("{}\n{description}", installed.title)))
-            }
-            None => tip,
-        },
         Act::ModKey(i, k) => {
             let installed = s.mods.installed.get(*i)?;
             let mapping = installed.native.as_ref()?.mappings.get(*k)?;
@@ -2248,9 +2237,10 @@ impl OptionsUi {
                     .pack_screen
                     .as_ref()
                     .is_some_and(|p| p.search_focused()),
-                Page::Graphics | Page::GraphicsAdvanced | Page::GraphicsHdr => {
-                    self.graphics.typing()
-                }
+                Page::Mods => self
+                    .mods_screen
+                    .as_ref()
+                    .is_some_and(|p| p.search_focused()),
                 Page::Controller | Page::PadBinds => self.controller.typing(),
                 _ if Self::shader_page(self.page()).is_some() => self.shader.typing(),
                 _ => match self.shell() {
@@ -2369,8 +2359,8 @@ impl OptionsUi {
         if page == Page::Packs {
             self.pack_screen = None;
         }
-        if let Some(at) = Self::graphics_page(page) {
-            self.graphics.open(at);
+        if page == Page::Mods {
+            self.mods_screen = None;
         }
         if let Some(at) = Self::controller_page(page) {
             self.controller.open(at);
@@ -2380,6 +2370,9 @@ impl OptionsUi {
         }
         if let Some(shell) = self.shell_mut() {
             shell.open();
+        }
+        if let Some(at) = Self::graphics_page(page) {
+            self.graphics.show(at);
         }
         if page == Page::SplitSetup {
             self.split_setup.reset();
@@ -2397,12 +2390,14 @@ impl OptionsUi {
     fn shell(&self) -> Option<&dyn shell::Hosted> {
         match self.page() {
             Page::Extras => Some(&self.extras),
+            page if Self::graphics_page(page).is_some() => Some(&self.graphics),
             _ => None,
         }
     }
     fn shell_mut(&mut self) -> Option<&mut dyn shell::Hosted> {
         match self.page() {
             Page::Extras => Some(&mut self.extras),
+            page if Self::graphics_page(page).is_some() => Some(&mut self.graphics),
             _ => None,
         }
     }
@@ -2411,6 +2406,11 @@ impl OptionsUi {
     pub fn reveal(&mut self, s: &Settings, size: (f32, f32), rect: [f32; 4]) -> Option<f32> {
         self.shell_mut()?.reveal(s, size, rect)
     }
+    /// The window's size, for the graphics screen's vanilla rows that step through its
+    /// resolutions: before each input that can press one.
+    fn graphics_framebuffer(&mut self) {
+        self.graphics.screen.framebuffer = self.framebuffer;
+    }
     /// What a shell screen's outputs do to these options.
     fn shell_events(&mut self, s: &mut Settings, outputs: Vec<shell::Output>) -> Vec<Event> {
         let mut events = Vec::new();
@@ -2418,39 +2418,13 @@ impl OptionsUi {
             match output {
                 shell::Output::Event(event) => events.push(event),
                 shell::Output::BindKey(name) => self.selected_key = Some(name),
-                shell::Output::Push(page) => self.push(page),
+                shell::Output::Push(page) => {
+                    if page == Page::HdrCalibration {
+                        self.calibration = Some(crate::hdr_calibration::Calibration::new(s));
+                    }
+                    self.push(page);
+                }
                 shell::Output::Done => events.extend(self.back(s)),
-            }
-        }
-        events
-    }
-    /// What the graphics screen's actions do to these options.
-    fn graphics_events(
-        &mut self,
-        s: &mut Settings,
-        actions: Vec<crate::graphics_ui::Action>,
-    ) -> Vec<Event> {
-        use crate::graphics_ui::Action;
-        let mut events = Vec::new();
-        for action in actions {
-            match action {
-                Action::ButtonClick => events.push(Event::ButtonClick),
-                Action::Changed => events.push(Event::Changed),
-                Action::SliderDrag => events.push(Event::SliderDrag),
-                Action::BindKey(name) => self.selected_key = Some(name),
-                Action::Calibrate => {
-                    self.calibration = Some(crate::hdr_calibration::Calibration::new(s));
-                    self.push(Page::HdrCalibration);
-                }
-                // The Shaders page's Shader Packs...: the list of either kind, as the page
-                // opens it from anywhere.
-                Action::ShaderPacks => {
-                    events.push(Event::ListShaderPacks);
-                    s.shader_options = None;
-                    events.push(Event::OpenShaderOptions);
-                    self.push(Page::ShaderPacks);
-                }
-                Action::Done => events.extend(self.back(s)),
             }
         }
         events
@@ -2658,17 +2632,9 @@ impl OptionsUi {
         }
         rows
     }
-    /// A registry project's page: what it is, Install or Update, its switch
-    /// once installed, its description and changelog.
-    /// A content mod's set feeds the block-state tables the open world's
-    /// chunks were decoded with: changing it mid-world remaps their ids
-    /// (Forge/Fabric freeze the registry before a world opens). One with only
-    /// assets and data reloads live, and a native mod toggles live through
-    /// `on`, so they stay available.
-    fn mod_frozen(&self, installed: &crate::mod_list::Installed) -> bool {
-        self.in_world && installed.native.is_none() && !self.mods_live.contains(&installed.id)
-    }
-    fn mod_project_rows(&self, s: &Settings) -> Vec<Row> {
+    /// A registry project's page: what it is, Install or Update, its description and
+    /// changelog. An installed mod is on already: the install turned it on.
+    fn mod_project_rows(&self) -> Vec<Row> {
         let b = &self.mod_browser;
         let Some(l) = b.listing(&self.mod_project) else {
             return vec![Row::Note(lang::get("horizon.mods.browse.none"))];
@@ -2732,22 +2698,7 @@ impl OptionsUi {
             tr("horizon.mods.browse.open_page"),
             Act::OpenModPage,
         );
-        let row = s.mods.installed.iter().position(|m| m.id == l.id && !m.dev);
-        match row.filter(|_| l.installed.is_some()) {
-            Some(i) => {
-                let label =
-                    Text::literal(format!("{}: ", lang::get("horizon.mods.browse.enabled")))
-                        .append(on_off(s.mods.is_on(i)));
-                let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
-                let toggle = match self.mod_frozen(&s.mods.installed[i]) {
-                    true => inactive(toggle),
-                    false => toggle,
-                };
-                rows.push(Row::Buttons(install, Some(toggle)));
-                rows.push(Row::Buttons(page, None));
-            }
-            None => rows.push(Row::Buttons(install, Some(page))),
-        }
+        rows.push(Row::Buttons(install, Some(page)));
         if let Some((message, _)) = &b.message {
             rows.extend(wrap(message, 64).into_iter().map(Row::Note));
         }
@@ -3126,63 +3077,8 @@ impl OptionsUi {
                 rows
             }
             Page::Font => pairs(&[Opt::ForceUnicode, Opt::JapaneseGlyphs]),
-            Page::Mods => {
-                let browse = button(
-                    0.0,
-                    0.0,
-                    310.0,
-                    tr("horizon.mods.browse"),
-                    Act::Push(Page::ModBrowser),
-                );
-                let mut rows = vec![Row::Buttons(browse, None)];
-                if let Some(note) = &self.mods_note {
-                    rows.extend(wrap(note, 64).into_iter().map(Row::Note));
-                }
-                if s.mods.installed.is_empty() {
-                    rows.push(Row::Header("horizon.mods.empty"));
-                    return rows;
-                }
-                rows.extend(s.mods.installed.iter().enumerate().map(|(i, installed)| {
-                    let mut label = Text::option_name_value(
-                        Text::literal(installed.title.clone()),
-                        on_off(s.mods.is_on(i)),
-                    );
-                    if installed.problem.as_deref() == Some(crate::mod_list::NOT_BUILT) {
-                        label = label.append(tr("horizon.mods.not_built"));
-                    } else if installed.problem.is_some() {
-                        label = label.append(tr("horizon.mods.stopped"));
-                    } else if installed.dev {
-                        label = label.append(tr("horizon.mods.dev"));
-                    }
-                    let frozen = self.mod_frozen(installed);
-                    if frozen {
-                        label = label.append(tr("horizon.mods.in_world"));
-                    }
-                    let dead = installed.dev || installed.id.is_empty() || frozen;
-                    // Only native mods with actual settings need a second button.
-                    if installed
-                        .native
-                        .as_ref()
-                        .is_some_and(|page| !page.buttons.is_empty())
-                    {
-                        let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
-                        let settings = button(
-                            0.0,
-                            0.0,
-                            150.0,
-                            tr("horizon.mods.settings"),
-                            Act::ModSettings(i),
-                        );
-                        Row::Buttons(if dead { inactive(toggle) } else { toggle }, Some(settings))
-                    } else {
-                        let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
-                        Row::Buttons(if dead { inactive(widget) } else { widget }, None)
-                    }
-                }));
-                rows
-            }
             Page::ModBrowser => self.mod_browser_rows(),
-            Page::ModProject => self.mod_project_rows(s),
+            Page::ModProject => self.mod_project_rows(),
             Page::NativeMod(i) => self.native_rows(s, i),
             _ => {
                 let _ = s;
@@ -3660,8 +3556,8 @@ impl OptionsUi {
                 ));
                 out.push(button(cx + 4.0, h - 28.0, 150.0, tr("gui.done"), Act::Done));
             }
-            // Drawn by `pack_screen`.
-            Page::Packs => {}
+            // Drawn by `pack_screen` and `mods_screen`.
+            Page::Packs | Page::Mods => {}
             _ => {
                 if matches!(page, Page::Video | Page::Controls | Page::ModBrowser) {
                     top = 38.0;
@@ -3743,7 +3639,6 @@ impl OptionsUi {
                     Page::Accessibility => {
                         Some(("options.accessibility.link", Act::AccessibilityHelp))
                     }
-                    Page::Mods => Some(("horizon.mods.open_folder", Act::OpenModFolder)),
                     _ => None,
                 };
                 if let Some((label, act)) = folder {
@@ -3912,11 +3807,6 @@ impl OptionsUi {
             c.draw(batch, atlas, cursor);
             return;
         }
-        if Self::graphics_page(self.page()).is_some() {
-            self.graphics.binding = self.selected_key;
-            self.graphics.draw(s, batch, atlas, cursor, self.in_world);
-            return;
-        }
         if Self::controller_page(self.page()).is_some() {
             self.controller.binding = self.selected_pad_action;
             self.controller.draw(s, batch, atlas, cursor, self.in_world);
@@ -3948,6 +3838,17 @@ impl OptionsUi {
         }
         if self.page() == Page::Studio {
             self.studio.draw(batch, atlas, cursor, self.in_world);
+            return;
+        }
+        if self.page() == Page::Mods {
+            ui::menu_background(batch, atlas, 0.0, 0.0, w, h, self.in_world);
+            let blink = self.pack_focus.elapsed().as_millis() as u64;
+            let m = crate::screen_draw::Measure(&atlas.font);
+            let mouse = (cursor.0.floor() as i32, cursor.1.floor() as i32);
+            let screen = self.mods_page(s, (w, h));
+            let mut draws = screen.draw(&m, mouse, blink, crate::hud_overlays::now_ms());
+            screen.bind_icons(&mut draws, atlas, &mut batch.patches);
+            crate::screen_draw::paint(batch, atlas, &draws);
             return;
         }
         if self.page() == Page::Packs {
@@ -4021,22 +3922,16 @@ impl OptionsUi {
             }
             match &wd.kind {
                 WKind::Button { label, active, act } => {
-                    if matches!(act, Act::Done) {
-                        ui::action_button(
-                            batch,
-                            atlas,
-                            crate::widgets::Action::Done,
-                            wd.x,
-                            wd.y,
-                            wd.w,
-                            wd.h,
-                            label,
-                            *active,
-                            hover,
-                        );
-                    } else {
-                        ui::button(batch, atlas, wd.x, wd.y, wd.w, wd.h, label, *active, hover);
-                    }
+                    ui::focused_button(
+                        batch,
+                        atlas,
+                        [wd.x, wd.y, wd.w, wd.h],
+                        label,
+                        *active,
+                        pointer_over,
+                        is_focused,
+                        matches!(act, Act::Done).then_some(crate::widgets::Action::Done),
+                    );
                     crate::widgets::last_narratable(|n| {
                         narrate_widget(n, s, wd, hover, list_key, framebuffer);
                     });
@@ -4285,21 +4180,6 @@ impl OptionsUi {
             let outcome = c.click((x, y), size, drag);
             return self.calibration_outcome(s, outcome);
         }
-        if Self::graphics_page(self.page()).is_some() {
-            // Waiting on a key: a mouse button binds, as on Key Binds.
-            if self.selected_key.is_some() && !drag {
-                let button = if right {
-                    winit::event::MouseButton::Right
-                } else {
-                    winit::event::MouseButton::Left
-                };
-                return self.bind_mouse(s, button);
-            }
-            let actions =
-                self.graphics
-                    .click(s, (x, y), size, framebuffer, drag, right, self.shift);
-            return self.graphics_events(s, actions);
-        }
         if self.shell().is_some() {
             // Waiting on a key: a mouse button binds, as on Key Binds.
             if self.selected_key.is_some() && !drag {
@@ -4311,6 +4191,8 @@ impl OptionsUi {
                 return self.bind_mouse(s, button);
             }
             let shift = self.shift;
+            self.framebuffer = framebuffer;
+            self.graphics_framebuffer();
             let outputs = self.shell_mut().map_or_else(Vec::new, |shell| {
                 shell.click(s, (x, y), size, drag, right, shift)
             });
@@ -4329,6 +4211,43 @@ impl OptionsUi {
         if Self::shader_page(self.page()).is_some() {
             let actions = self.shader.click(s, (x, y), size, drag, right, self.shift);
             return self.shader_events(s, actions);
+        }
+        if self.page() == Page::Mods {
+            let mut events = Vec::new();
+            if drag {
+                self.mods_page(s, size).drag(y as f64);
+                return events;
+            }
+            if right {
+                return events;
+            }
+            let m = crate::screen_draw::Measure(&atlas.font);
+            let screen = self.mods_page(s, size);
+            let before = screen.search_focused();
+            let (action, sound) = screen.click(&m, x as f64, y as f64);
+            if !before && screen.search_focused() {
+                self.pack_focus = Instant::now();
+            }
+            if sound {
+                events.push(Event::ButtonClick);
+            }
+            use crate::mods_screen::Action as Do;
+            match action {
+                Do::None => {}
+                Do::OpenFolder => events.push(Event::OpenModFolder),
+                Do::Browse => {
+                    events.push(Event::BrowseMods);
+                    self.push(Page::ModBrowser);
+                }
+                Do::Back => events.extend(self.back(s)),
+                Do::Config(i) => {
+                    self.push(Page::NativeMod(i));
+                    events.push(Event::NativeSettings(i));
+                }
+                Do::Link(url) => events.push(Event::OpenLink(url)),
+                Do::Copy(text) => events.push(Event::CopyText(text)),
+            }
+            return events;
         }
         if self.page() == Page::Packs {
             let mut events = Vec::new();
@@ -4452,6 +4371,11 @@ impl OptionsUi {
             if wd.list && (y < top || y >= bottom) {
                 continue;
             }
+            // AbstractWidget.mouseClicked rejects inactive buttons before the
+            // container can focus them.
+            if matches!(wd.kind, WKind::Button { active: false, .. }) {
+                return events;
+            }
             // A click focuses the widget for its highlight only: vanilla's wheel
             // steps a keyboard-focused widget from anywhere, not a clicked one.
             self.focus = Some(focus_id(wd_idx, &wd));
@@ -4512,15 +4436,6 @@ impl OptionsUi {
                             s.mods.keys.clear();
                             events.push(Event::Changed);
                         }
-                        Act::ToggleMod(i) => {
-                            s.mods.toggle(i);
-                            events.push(Event::Changed);
-                        }
-                        Act::ModSettings(i) => {
-                            events.push(Event::ButtonClick);
-                            self.push(Page::NativeMod(i));
-                            events.push(Event::NativeSettings(i));
-                        }
                         Act::ModKey(i, k) => {
                             self.selected_key = Some(MOD_KEY);
                             self.selected_mod_key = Some((i, k));
@@ -4533,7 +4448,6 @@ impl OptionsUi {
                             }
                         }
                         Act::NativeButton(i, b) => events.push(Event::NativeButton(i, b)),
-                        Act::OpenModFolder => events.push(Event::OpenModFolder),
                         Act::ModProject(i) => {
                             if let Some(listing) = self.mod_browser.listings.get(i) {
                                 self.mod_project = listing.id.clone();
@@ -4596,13 +4510,15 @@ impl OptionsUi {
         if let Some(p) = &mut self.pack_screen {
             p.release();
         }
+        if let Some(p) = &mut self.mods_screen {
+            p.release();
+        }
         // AbstractSliderButton suppresses the press sound and plays once on
         // release, even if the pointer has left the widget or its value stayed.
         let slider = self.dragging.take().is_some();
         let (shader_slider, shader_pack) = self.shader.release();
         let shell_slider = self.shell_mut().is_some_and(|shell| shell.release());
-        let graphics_slider =
-            self.graphics.release() | self.controller.release() | shader_slider | shell_slider;
+        let graphics_slider = self.controller.release() | shader_slider | shell_slider;
         let calibration_slider = self.calibration.as_mut().is_some_and(|c| c.release());
         let split_drop = self.split_setup.release();
         if slider || graphics_slider || calibration_slider {
@@ -4672,7 +4588,6 @@ impl OptionsUi {
     /// wheel wherever the cursor is. Focus left by a click does not count
     /// (`focus_from_keyboard`): honouring it toggled the clicked option on every
     /// later wheel event, from anywhere on the screen, while the list never scrolled.
-    /// The graphics screen has its own wheel (`GraphicsUi::wheel`).
     pub fn wheel(
         &mut self,
         s: &mut Settings,
@@ -4686,13 +4601,10 @@ impl OptionsUi {
         if self.resource_error.is_some() {
             return Vec::new();
         }
+        self.graphics_framebuffer();
         if let Some(shell) = self.shell_mut() {
             let outputs = shell.wheel(s, size, cursor, amount);
             return self.shell_events(s, outputs);
-        }
-        if Self::graphics_page(self.page()).is_some() {
-            let actions = self.graphics.wheel(s, size, cursor, framebuffer, amount);
-            return self.graphics_events(s, actions);
         }
         if self.page() == Page::Studio {
             self.studio.wheel(amount);
@@ -4707,7 +4619,8 @@ impl OptionsUi {
             return Vec::new();
         }
         let plain = self.resource_error.is_none()
-            && !(self.pack_screen.is_some() && self.stack.last() == Some(&Page::Packs));
+            && !(self.pack_screen.is_some() && self.stack.last() == Some(&Page::Packs))
+            && self.stack.last() != Some(&Page::Mods);
         if !plain {
             self.scroll_at(s, size, cursor, amount);
             return Vec::new();
@@ -4785,10 +4698,6 @@ impl OptionsUi {
             shell.scroll(s, size, amount);
             return;
         }
-        if Self::graphics_page(self.page()).is_some() {
-            self.graphics.scroll(s, size, amount);
-            return;
-        }
         if self.page() == Page::Studio {
             self.studio.wheel(amount);
             return;
@@ -4799,6 +4708,12 @@ impl OptionsUi {
         }
         if Self::shader_page(self.page()).is_some() {
             self.shader.scroll(s, size, amount);
+            return;
+        }
+        if self.page() == Page::Mods {
+            if let Some(p) = &mut self.mods_screen {
+                p.scroll(cursor.0 as f64, cursor.1 as f64, amount as f64);
+            }
             return;
         }
         match &mut self.pack_screen {
@@ -4834,6 +4749,18 @@ impl OptionsUi {
         s.gui_scale = new as u32;
         self.scroll = 0.0;
         vec![Event::Changed]
+    }
+    /// The Mods screen at this GUI size, made on first use from the installed mods.
+    fn mods_page(&mut self, s: &Settings, size: (f32, f32)) -> &mut crate::mods_screen::ModsScreen {
+        let (w, h) = (size.0 as i32, size.1 as i32);
+        let in_world = self.in_world;
+        let screen = self
+            .mods_screen
+            .get_or_insert_with(|| crate::mods_screen::ModsScreen::new(w, h, in_world, &s.mods));
+        if screen.width != w || screen.height != h {
+            screen.resize(w, h);
+        }
+        screen
     }
     /// The pack screen at this GUI size, made on first use.
     fn packs(&mut self, atlas: &HudAtlas, size: (f32, f32)) -> &mut crate::pack_screen::PackScreen {
@@ -4939,6 +4866,9 @@ impl OptionsUi {
                     events.push(Event::Language(code));
                 }
             }
+            Page::Mods => self.mods_screen = None,
+            // Browse mods may have installed some: the list is made again.
+            Page::ModBrowser => self.mods_screen = None,
             Page::Packs => {
                 // PackSelectionScreen.onClose: PackSelectionModel.commit.
                 let data = self.data_pack_dir.take();
@@ -4977,6 +4907,12 @@ impl OptionsUi {
             p.type_text(&crate::screen_draw::Measure(&atlas.font), text);
             return;
         }
+        if self.page() == Page::Mods
+            && let Some(p) = &mut self.mods_screen
+        {
+            p.type_text(&crate::screen_draw::Measure(&atlas.font), text);
+            return;
+        }
         if self.page() == Page::Language {
             self.language_search.insert_text(text);
             self.scroll = 0.0;
@@ -4986,8 +4922,6 @@ impl OptionsUi {
             if shell.typing() {
                 shell.type_text(text);
             }
-        } else if Self::graphics_page(self.page()).is_some() && self.graphics.typing() {
-            self.graphics.type_text(text);
         } else if Self::controller_page(self.page()).is_some() && self.controller.typing() {
             self.controller.type_text(text);
         } else if Self::shader_page(self.page()).is_some() && self.shader.typing() {
@@ -5014,6 +4948,12 @@ impl OptionsUi {
             let m = crate::screen_draw::Measure(&atlas.font);
             return p.shortcut(&m, shortcut, clipboard);
         }
+        if self.page() == Page::Mods
+            && let Some(p) = &mut self.mods_screen
+        {
+            let m = crate::screen_draw::Measure(&atlas.font);
+            return p.shortcut(&m, shortcut, clipboard);
+        }
         if self.page() == Page::Language {
             if self.language_search.shortcut(shortcut, clipboard) {
                 self.scroll = 0.0;
@@ -5025,9 +4965,6 @@ impl OptionsUi {
         }
         if let Some(shell) = self.shell_mut() {
             return shell.shortcut(shortcut, clipboard);
-        }
-        if Self::graphics_page(self.page()).is_some() {
-            return self.graphics.shortcut(shortcut, clipboard);
         }
         if Self::controller_page(self.page()).is_some() {
             return self.controller.shortcut(shortcut, clipboard);
@@ -5144,6 +5081,26 @@ impl OptionsUi {
                 _ => {}
             }
         }
+        if self.page() == Page::Mods
+            && let Some(p) = &mut self.mods_screen
+        {
+            let m = crate::screen_draw::Measure(&atlas.font);
+            match key {
+                K::Backspace => {
+                    p.erase(&m, 1);
+                    return Vec::new();
+                }
+                K::ArrowUp => {
+                    p.step(-1);
+                    return Vec::new();
+                }
+                K::ArrowDown => {
+                    p.step(1);
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
         if let Some(action) = self.selected_pad_action.take() {
             // As on Key Binds, Escape unbinds; other keys cancel.
             if key == K::Escape {
@@ -5180,26 +5137,13 @@ impl OptionsUi {
             return Vec::new();
         }
 
-        if Self::graphics_page(self.page()).is_some() {
-            let size = (self.size.0.max(480.0), self.size.1.max(240.0));
-            let fb = [self.framebuffer[0].max(480), self.framebuffer[1].max(240)];
-            let (actions, handled) = self.graphics.key_modifiers(s, key, text, shift, size, fb);
-            let mut events = self.graphics_events(s, actions);
-            if key == K::Escape {
-                events.extend(self.back(s));
-                return events;
-            }
-            if handled {
-                return events;
-            }
-            return events;
-        }
         // The size it was drawn at; before the first draw, one its keys can lay out at.
         let gui = if self.size.0 > 0.0 && self.size.1 > 0.0 {
             self.size
         } else {
             MIN_KEY_GUI
         };
+        self.graphics_framebuffer();
         if let Some(shell) = self.shell_mut() {
             let outputs = shell.key(s, key, text, shift, gui);
             return self.shell_events(s, outputs);
@@ -5497,17 +5441,6 @@ impl OptionsUi {
                             s.mods.keys.clear();
                             events.push(Event::Changed);
                         }
-                        Act::ToggleMod(i) => {
-                            s.mods.toggle(i);
-                            events.push(Event::Changed);
-                        }
-                        Act::ModSettings(i) => {
-                            self.focus = None;
-                            self.focus_from_keyboard = false;
-                            self.can_change_value = false;
-                            self.push(Page::NativeMod(i));
-                            events.push(Event::NativeSettings(i));
-                        }
                         Act::ModKey(i, k) => {
                             self.selected_key = Some(MOD_KEY);
                             self.selected_mod_key = Some((i, k));
@@ -5520,7 +5453,6 @@ impl OptionsUi {
                             }
                         }
                         Act::NativeButton(i, b) => events.push(Event::NativeButton(i, b)),
-                        Act::OpenModFolder => events.push(Event::OpenModFolder),
                         Act::ModProject(i) => {
                             if let Some(listing) = self.mod_browser.listings.get(i) {
                                 self.mod_project = listing.id.clone();
@@ -6059,8 +5991,12 @@ mod tests {
         }
     }
 
+    /// The Mods page is NeoForge's list screen: no switches, a footer of folder, browser and
+    /// Back, and Config on the selected native mod. Positions are the layout at 480x240:
+    /// 150 px buttons 4 px apart, centred 27 px above the bottom; the sidebar at x 41 with its
+    /// list at y 32 and 28 px rows; the panel at x 188 with its buttons at y 182, 84 px apart.
     #[test]
-    fn classic_mods_page_toggles_mods_and_keeps_dev_and_invalid_entries_inactive() {
+    fn the_mods_page_opens_folders_the_browser_and_a_native_mods_settings() {
         let atlas = atlas();
         let mut s = Settings::default();
         let mut ui = OptionsUi::default();
@@ -6075,111 +6011,6 @@ mod tests {
                 }
             )
         }));
-        ui.show(Page::Mods);
-        let empty = ui.layout(&s, size.0, size.1).0;
-        assert!(empty.iter().any(|w| {
-            matches!(&w.kind, WKind::Text { text, .. } if text.plain() == "horizon.mods.empty")
-        }));
-        // The empty page points at the bundled key; the English line behind it
-        // is what a player reads, so both halves are checked here.
-        let en = crate::lang::Language::load(&[], "en_us");
-        assert!(
-            en.get("horizon.mods.empty")
-                .is_some_and(|line| line.contains(".hmod"))
-        );
-        let open_folder = empty
-            .iter()
-            .find(|w| {
-                matches!(
-                    &w.kind,
-                    WKind::Button {
-                        act: Act::OpenModFolder,
-                        ..
-                    }
-                )
-            })
-            .expect("Mods page has an Open Mod Folder button");
-        assert_eq!(
-            ui.click(
-                &mut s,
-                &atlas,
-                open_folder.x + 1.0,
-                open_folder.y + 1.0,
-                size,
-                [480, 240],
-                false,
-                false,
-            ),
-            vec![Event::ButtonClick, Event::OpenModFolder]
-        );
-        for (id, dev) in [("normal", false), ("dev", true), ("", false)] {
-            s.mods.installed.push(crate::mod_list::Installed {
-                id: id.into(),
-                title: id.into(),
-                description: "May show HUD panels.".into(),
-                problem: id.is_empty().then(|| "Invalid package".into()),
-                dev,
-                native: None,
-            });
-        }
-        let (widgets, ..) = ui.layout(&s, size.0, size.1);
-        let rows: Vec<_> = widgets
-            .iter()
-            .filter(|w| {
-                matches!(
-                    w.kind,
-                    WKind::Button {
-                        act: Act::ToggleMod(_),
-                        ..
-                    }
-                )
-            })
-            .collect();
-        assert_eq!(rows.len(), 3);
-        for (i, row) in rows.iter().enumerate() {
-            let events = ui.click(
-                &mut s,
-                &atlas,
-                row.x + 1.0,
-                row.y + 1.0,
-                size,
-                [480, 240],
-                false,
-                false,
-            );
-            if i == 0 {
-                assert!(events.contains(&Event::Changed));
-                assert!(events.contains(&Event::ButtonClick));
-            } else {
-                assert!(events.is_empty());
-            }
-        }
-        assert!(s.mods.is_on(0));
-        assert!(s.mods.is_on(1));
-        assert!(!s.mods.is_on(2));
-        assert_eq!(s.mods.serialize(), "mod.normal:true\n");
-        let row = rows[0];
-        ui.click(
-            &mut s,
-            &atlas,
-            row.x + 1.0,
-            row.y + 1.0,
-            size,
-            [480, 240],
-            false,
-            false,
-        );
-        assert!(!s.mods.is_on(0));
-        assert!(!ui.back(&mut s).contains(&Event::Close));
-        assert_eq!(ui.page(), Page::Main);
-    }
-
-    #[test]
-    fn opening_a_native_mods_page_asks_the_game_for_its_labels_again() {
-        let atlas = atlas();
-        let mut s = Settings::default();
-        let mut ui = OptionsUi::default();
-        let size = (480.0, 240.0);
         s.mods.installed.push(crate::mod_list::Installed {
             id: "native".into(),
             title: "Native 1.0".into(),
@@ -6191,83 +6022,61 @@ mod tests {
                 ..Default::default()
             }),
         });
+        let click = |ui: &mut OptionsUi, s: &mut Settings, x: f32, y: f32| {
+            ui.click(s, &atlas, x, y, size, [480, 240], false, false)
+        };
         ui.show(Page::Mods);
-        let (widgets, ..) = ui.layout(&s, size.0, size.1);
-        let settings = widgets
-            .iter()
-            .find(|w| {
-                matches!(
-                    w.kind,
-                    WKind::Button {
-                        act: Act::ModSettings(0),
-                        ..
-                    }
-                )
-            })
-            .expect("a native mod's row has a Settings button");
-        let events = ui.click(
-            &mut s,
-            &atlas,
-            settings.x + 1.0,
-            settings.y + 1.0,
-            size,
-            [480, 240],
-            false,
-            false,
+        assert_eq!(
+            click(&mut ui, &mut s, 86.0, 223.0),
+            vec![Event::ButtonClick, Event::OpenModFolder]
         );
+        // Browse Mods opens the registry's list; coming back makes the list again.
+        assert_eq!(
+            click(&mut ui, &mut s, 240.0, 223.0),
+            vec![Event::ButtonClick, Event::BrowseMods]
+        );
+        assert_eq!(ui.page(), Page::ModBrowser);
+        ui.back(&mut s);
+        assert_eq!(ui.page(), Page::Mods);
+        assert!(ui.mods_screen.is_none());
+        // Config does nothing until a native mod with settings is picked from the list
+        // (Horizon, Minecraft, then Native).
+        assert!(click(&mut ui, &mut s, 397.0, 192.0).is_empty());
+        assert!(click(&mut ui, &mut s, 61.0, 104.0).is_empty());
+        let events = click(&mut ui, &mut s, 397.0, 192.0);
         // Its labels were made with the list, maybe in another language.
-        assert_eq!(events.last(), Some(&Event::NativeSettings(0)));
+        assert_eq!(events, vec![Event::ButtonClick, Event::NativeSettings(0)]);
         assert_eq!(ui.page(), Page::NativeMod(0));
+        ui.back(&mut s);
+        assert_eq!(ui.page(), Page::Mods);
+        // Back leaves the page.
+        let events = click(&mut ui, &mut s, 394.0, 223.0);
+        assert_eq!(events.first(), Some(&Event::ButtonClick));
+        assert_eq!(ui.page(), Page::Main);
     }
 
+    /// Typing goes to the Mods search box once a click focuses it; the one match is selected,
+    /// so Homepage opens Minecraft's link.
     #[test]
-    fn native_mod_without_settings_has_only_a_full_width_toggle() {
+    fn the_mods_search_takes_the_typing_after_a_click() {
         let atlas = atlas();
         let mut s = Settings::default();
         let mut ui = OptionsUi::default();
-        s.mods.installed.push(crate::mod_list::Installed {
-            id: "no_settings".into(),
-            title: "Native 1.0".into(),
-            description: String::new(),
-            problem: None,
-            dev: false,
-            native: Some(crate::mod_list::NativePage::default()),
-        });
+        let size = (480.0, 240.0);
         ui.show(Page::Mods);
-        let (widgets, ..) = ui.layout(&s, 480.0, 240.0);
-        assert!(!widgets.iter().any(|w| matches!(
-            w.kind,
-            WKind::Button {
-                act: Act::ModSettings(_),
-                ..
-            }
-        )));
-        let toggle = widgets
-            .iter()
-            .find(|w| {
-                matches!(
-                    w.kind,
-                    WKind::Button {
-                        act: Act::ToggleMod(0),
-                        ..
-                    }
-                )
-            })
-            .unwrap();
-        assert_eq!(toggle.w, 310.0);
-        let events = ui.click(
-            &mut s,
-            &atlas,
-            toggle.x + 1.0,
-            toggle.y + 1.0,
-            (480.0, 240.0),
-            [480, 240],
-            false,
-            false,
+        assert!(!ui.typing());
+        ui.click(&mut s, &atlas, 60.0, 16.0, size, [480, 240], false, false);
+        assert!(ui.typing());
+        ui.type_text(&atlas, "mine");
+        let events = ui.click(&mut s, &atlas, 229.0, 192.0, size, [480, 240], false, false);
+        assert_eq!(
+            events,
+            vec![
+                Event::ButtonClick,
+                Event::OpenLink("https://minecraft.net".into())
+            ]
         );
-        assert!(events.contains(&Event::Changed));
-        assert!(!s.mods.is_on(0));
-        assert!(s.mods.disabled.contains("no_settings"));
+        assert!(!ui.typing());
     }
 
     #[test]
@@ -6626,6 +6435,159 @@ mod tests {
         assert_eq!(s.video_mode_index(), 2);
         Opt::ExclusiveMode.set_slider(&mut s, 0.0);
         assert_eq!(s.file.fullscreen_resolution, None);
+    }
+
+    #[test]
+    fn pointer_cursor_leaves_a_clicked_option_while_its_focus_stays() {
+        use crate::widgets::{Cursor, take_cursor};
+        let atlas = atlas();
+        let mut s = Settings::default();
+        let mut ui = OptionsUi::default();
+        ui.show(Page::Video);
+        let size = (480.0, 480.0);
+        let (widgets, top, bottom, _) = ui.layout(&s, size.0, size.1);
+        let button = widgets
+            .iter()
+            .find(|wd| {
+                matches!(
+                    wd.kind,
+                    WKind::Button {
+                        active: true,
+                        act: Act::Cycle(_),
+                        ..
+                    }
+                ) && (!wd.list || wd.y >= top && wd.y + wd.h <= bottom)
+            })
+            .expect("visible cycle button");
+        let over = (button.x + 1.0, button.y + 1.0);
+        ui.click(
+            &mut s,
+            &atlas,
+            over.0,
+            over.1,
+            size,
+            [480, 480],
+            false,
+            false,
+        );
+        ui.release();
+        assert!(
+            ui.focus.is_some(),
+            "the accepted click keeps vanilla's focus"
+        );
+        assert!(!ui.focus_from_keyboard);
+        let _ = take_cursor();
+        ui.draw(
+            &s,
+            &mut HudBatch::new(
+                [480, 480],
+                crate::hud::GuiScale {
+                    requested: 0,
+                    unicode: false,
+                },
+            ),
+            &atlas,
+            over,
+        );
+        assert_eq!(take_cursor(), Cursor::PointingHand);
+        ui.draw(
+            &s,
+            &mut HudBatch::new(
+                [480, 480],
+                crate::hud::GuiScale {
+                    requested: 0,
+                    unicode: false,
+                },
+            ),
+            &atlas,
+            (-10.0, -10.0),
+        );
+        assert_eq!(take_cursor(), Cursor::Arrow, "focus is not mouse hover");
+        assert!(
+            ui.focus.is_some(),
+            "moving the pointer does not clear focus"
+        );
+        ui.focus_from_keyboard = true;
+        ui.draw(
+            &s,
+            &mut HudBatch::new(
+                [480, 480],
+                crate::hud::GuiScale {
+                    requested: 0,
+                    unicode: false,
+                },
+            ),
+            &atlas,
+            (-10.0, -10.0),
+        );
+        assert_eq!(
+            take_cursor(),
+            Cursor::Arrow,
+            "keyboard focus is not mouse hover either"
+        );
+    }
+
+    #[test]
+    fn pointer_cursor_leaves_a_disabled_option_without_focusing_it() {
+        use crate::widgets::{Cursor, take_cursor};
+        let atlas = atlas();
+        let mut s = Settings::default();
+        let mut ui = OptionsUi::default();
+        ui.show(Page::KeyBinds);
+        let size = (480.0, 480.0);
+        let (widgets, top, bottom, _) = ui.layout(&s, size.0, size.1);
+        let button = widgets
+            .iter()
+            .find(|wd| {
+                matches!(wd.kind, WKind::Button { active: false, .. })
+                    && (!wd.list || wd.y >= top && wd.y + wd.h <= bottom)
+            })
+            .expect("visible disabled button");
+        let over = (button.x + 1.0, button.y + 1.0);
+        let _ = take_cursor();
+        ui.draw(
+            &s,
+            &mut HudBatch::new(
+                [480, 480],
+                crate::hud::GuiScale {
+                    requested: 0,
+                    unicode: false,
+                },
+            ),
+            &atlas,
+            over,
+        );
+        assert_eq!(take_cursor(), Cursor::NotAllowed);
+        assert!(
+            ui.click(
+                &mut s,
+                &atlas,
+                over.0,
+                over.1,
+                size,
+                [480, 480],
+                false,
+                false
+            )
+            .is_empty()
+        );
+        assert!(
+            ui.focus.is_none(),
+            "an inactive widget rejects the click before focus"
+        );
+        ui.draw(
+            &s,
+            &mut HudBatch::new(
+                [480, 480],
+                crate::hud::GuiScale {
+                    requested: 0,
+                    unicode: false,
+                },
+            ),
+            &atlas,
+            (-10.0, -10.0),
+        );
+        assert_eq!(take_cursor(), Cursor::Arrow);
     }
 
     #[test]
@@ -7919,63 +7881,6 @@ mod tests {
         assert_eq!(s.language, "de_de");
     }
 
-    /// A content mod's set builds the block-state tables an open world's
-    /// chunks were decoded with, so its toggle freezes in-world; a native
-    /// mod gates live through `on` and one of assets and data reloads
-    /// live, so they stay available.
-    #[test]
-    fn in_a_world_only_live_mod_toggles_stay_active() {
-        let mut s = Settings::default();
-        let installed =
-            |id: &str, native: Option<crate::mod_list::NativePage>| crate::mod_list::Installed {
-                id: id.into(),
-                title: id.into(),
-                description: String::new(),
-                problem: None,
-                dev: false,
-                native,
-            };
-        s.mods.installed = vec![
-            installed("content", None),
-            installed("native", Some(crate::mod_list::NativePage::default())),
-        ];
-        let mut ui = OptionsUi::default();
-        let toggles = |ui: &mut OptionsUi, s: &Settings| {
-            let (widgets, ..) = ui.layout(s, 427.0, 240.0);
-            widgets
-                .iter()
-                .filter_map(|w| match w.kind {
-                    WKind::Button {
-                        act: Act::ToggleMod(i),
-                        active,
-                        ..
-                    } => Some((i, active)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        ui.open_at(false, Page::Mods);
-        assert_eq!(toggles(&mut ui, &s), [(0, true), (1, true)]);
-        ui.open_at(true, Page::Mods);
-        assert_eq!(toggles(&mut ui, &s), [(0, false), (1, true)]);
-        ui.mod_browser.listings.push(crate::mod_browser::Listing {
-            id: "content".into(),
-            installed: Some("1.0".into()),
-            ..Default::default()
-        });
-        ui.mod_project = "content".into();
-        ui.open_at(true, Page::ModProject);
-        assert_eq!(toggles(&mut ui, &s), [(0, false)]);
-        ui.open_at(false, Page::ModProject);
-        assert_eq!(toggles(&mut ui, &s), [(0, true)]);
-        // A content mod of assets and data only reloads live in a world this
-        // game serves (`mods_live`, filled by the game).
-        s.mods.installed.push(installed("data_only", None));
-        ui.mods_live.insert("data_only".into());
-        ui.open_at(true, Page::Mods);
-        assert_eq!(toggles(&mut ui, &s), [(0, false), (1, true), (2, true)]);
-    }
-
     /// An Extras or PvP & HUD label wider than half a row takes the whole row, so every label
     /// fits its button: "Keep channels for UI sounds: Off" did not.
     #[test]
@@ -8156,7 +8061,7 @@ mod tests {
     /// Packs... opens the pack list, listed afresh, and Done comes back to that page.
     #[test]
     fn the_graphics_shaders_page_opens_the_shader_pack_list() {
-        use crate::graphics_ui::{H, Item, Target};
+        use crate::graphics_ui::{H, Item};
         use winit::keyboard::KeyCode;
         let atlas = atlas();
         let mut s = Settings::default();
@@ -8165,15 +8070,15 @@ mod tests {
             ..Default::default()
         };
         ui.show(Page::Graphics);
-        ui.graphics.open(crate::graphics_ui::Page::Shaders);
-        let packs = Target::Item(Item::Horizon(H::ShaderPacks));
+        ui.graphics.show(crate::graphics_ui::Page::Shaders);
+        let packs = Item::Horizon(H::ShaderPacks);
         assert!(
             (0..40).any(|_| {
                 ui.key(&mut s, &atlas, KeyCode::Tab, None);
-                ui.graphics.focus == Some(packs)
+                ui.graphics.focused_row() == Some(packs)
             }),
             "{:?}",
-            ui.graphics.focus
+            ui.graphics.focused()
         );
         let events = ui.key(&mut s, &atlas, KeyCode::Enter, None);
         assert_eq!(ui.page(), Page::ShaderPacks);
@@ -8182,7 +8087,10 @@ mod tests {
         assert!(events.contains(&Event::OpenShaderOptions), "{events:?}");
         ui.back(&mut s);
         assert_eq!(ui.page(), Page::Graphics);
-        assert_eq!(ui.graphics.page(), crate::graphics_ui::Page::Shaders);
+        assert_eq!(
+            ui.graphics.open_page(),
+            Some(crate::graphics_ui::Page::Shaders)
+        );
     }
 
     #[test]
@@ -8405,14 +8313,20 @@ mod tests {
 
     #[test]
     fn the_graphics_screens_wheel_scrolls_even_over_a_slider_being_changed() {
-        use crate::graphics_ui::{H, Item, Target};
+        use crate::graphics_ui::{H, Item};
+        use winit::keyboard::KeyCode as K;
         let mut s = Settings::default();
         let mut ui = OptionsUi::default();
         ui.show(Page::Graphics);
+        ui.graphics.show(crate::graphics_ui::Page::Performance);
         let size = (640.0, 360.0);
         s.horizon.chunk_updates = 16;
-        ui.graphics.focus = Some(Target::Item(Item::Horizon(H::ChunkUpdates)));
-        ui.graphics.can_change_value = true;
+        let chunk_updates = Item::Horizon(H::ChunkUpdates);
+        // Tab onto it: the arrows change it.
+        while ui.graphics.focused_row() != Some(chunk_updates) {
+            shell::Hosted::key(&mut ui.graphics, &mut s, K::Tab, None, false, size);
+        }
+        assert!(ui.graphics.changes_value());
         let before = ui.graphics.scroll_amount();
         ui.wheel(&mut s, size, (320.0, 150.0), [1920, 1080], -1.0);
         assert_eq!(s.horizon.chunk_updates, 16);
@@ -8442,29 +8356,21 @@ mod tests {
         // 2. Horizon Graphics page through OptionsUi:
         // Tab onto ChunkUpdates slider, ArrowRight adjusts value, Space toggles can_change_value
         ui.show(Page::Graphics);
-        ui.graphics.open(crate::graphics_ui::Page::Performance);
+        ui.graphics.show(crate::graphics_ui::Page::Performance);
         s.horizon.chunk_updates = 10;
+        let chunk_updates = crate::graphics_ui::Item::Horizon(crate::graphics_ui::H::ChunkUpdates);
         ui.size = size;
         ui.framebuffer = [854, 480];
 
         // Tab into controls
         for _ in 0..80 {
             ui.key(&mut s, &atlas, K::Tab, None);
-            if ui.graphics.focus
-                == Some(crate::graphics_ui::Target::Item(
-                    crate::graphics_ui::Item::Horizon(crate::graphics_ui::H::ChunkUpdates),
-                ))
-            {
+            if ui.graphics.focused_row() == Some(chunk_updates) {
                 break;
             }
         }
-        assert_eq!(
-            ui.graphics.focus,
-            Some(crate::graphics_ui::Target::Item(
-                crate::graphics_ui::Item::Horizon(crate::graphics_ui::H::ChunkUpdates)
-            ))
-        );
-        assert!(ui.graphics.can_change_value);
+        assert_eq!(ui.graphics.focused_row(), Some(chunk_updates));
+        assert!(ui.graphics.changes_value());
 
         // Right arrow steps ChunkUpdates to 11
         let events = ui.key(&mut s, &atlas, K::ArrowRight, None);
@@ -8473,7 +8379,7 @@ mod tests {
 
         // Space toggles can_change_value to false
         ui.key(&mut s, &atlas, K::Space, None);
-        assert!(!ui.graphics.can_change_value);
+        assert!(!ui.graphics.changes_value());
 
         // ArrowRight does not change ChunkUpdates when can_change_value is false
         ui.key(&mut s, &atlas, K::ArrowRight, None);

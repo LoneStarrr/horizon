@@ -9,8 +9,12 @@ use std::sync::Arc;
 
 impl Game<'_> {
     /// Load the configured/placed feature registry used by saplings, fungi
-    /// and bone meal (once per process; shares the generator's bundle).
+    /// and bone meal (for fixtures: the plain bundle, unless one is installed; worlds install
+    /// their own in `prepare_world`).
     pub(super) fn install_live_features(&self) {
+        if self.res.behaviours().live_features().is_some() {
+            return;
+        }
         install_live_features(&self.res, &self.pack, &self.options, &Default::default());
     }
     /// `BonemealEvent` for the acting hand's bone meal `stack` on `pos`:
@@ -137,40 +141,79 @@ fn build_live_features(
     LiveFeatures::new(&data).map_err(|e| e.to_string())
 }
 
-/// Shared by the initialization worker and fixture setup. `overrides` are the
-/// world's: with the plain bundle only, a data pack's configured feature
-/// (a mod sapling's tree) is unknown here and its growth is dropped.
+/// The last bundle built, so a world opened with the same data packs (the
+/// usual re-open) reuses it: the resources folder, the overrides it was built
+/// from, and the features.
+type Built = (
+    std::path::PathBuf,
+    horizon_world::worldgen::overrides::WorldgenOverrides,
+    Arc<LiveFeatures>,
+);
+static LAST_BUILT: std::sync::Mutex<Option<Built>> = std::sync::Mutex::new(None);
+
+/// The feature registry for a world with `overrides`: the cached one when the
+/// last build had the same ones, else a fresh build (which is then cached).
+fn live_features_for(
+    options: &super::Options,
+    pack: &super::PackResources,
+    overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
+) -> std::result::Result<Option<Arc<LiveFeatures>>, String> {
+    let mut last = LAST_BUILT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((dir, built_from, features)) = last.as_ref()
+        && *dir == options.resources
+        && built_from == overrides
+    {
+        return Ok(Some(features.clone()));
+    }
+    let built = build_live_features(
+        &options.resources,
+        pack.assets.registry,
+        &pack.data_changes,
+        overrides,
+    )?
+    .map(Arc::new);
+    if let Some(features) = &built {
+        *last = Some((
+            options.resources.clone(),
+            overrides.clone(),
+            features.clone(),
+        ));
+    }
+    Ok(built)
+}
+
+/// Install the registry for the world being opened, replacing the previous
+/// world's. `overrides` are the world's: with the plain bundle only, a data
+/// pack's configured feature (a mod sapling's tree) is unknown here and its
+/// growth is dropped. Shared by world opening and fixture setup.
 pub(super) fn install_live_features(
     res: &super::Resources,
     pack: &super::PackResources,
     options: &super::Options,
     overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
 ) {
-    if res.behaviours().live_features().is_some() {
-        return;
-    }
     let started = std::time::Instant::now();
-    let features = build_live_features(
-        &options.resources,
-        pack.assets.registry,
-        &pack.data_changes,
-        overrides,
-    );
-    match features {
+    match live_features_for(options, pack, overrides) {
         Ok(Some(features)) => {
-            res.behaviours().set_live_features(Arc::new(features));
+            res.behaviours().set_live_features(features);
             log::info!("Horizon: live features ready in {:?}", started.elapsed());
         }
         Ok(None) => {
+            res.behaviours().clear_live_features();
             log::warn!("Horizon: the worldgen bundle has no features; saplings will not grow")
         }
-        Err(e) => log::warn!("Horizon: live features unavailable: {e}"),
+        Err(e) => {
+            res.behaviours().clear_live_features();
+            log::warn!("Horizon: live features unavailable: {e}")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_live_features;
+    use super::{Arc, Game, build_live_features, install_live_features};
     use horizon_client::items::ItemStack;
     use horizon_core::{geometry::Direction, position::BlockPos};
     use mod_api::{self, BonemealEvent, BonemealSource, Flow, Hooks, HostSide};
@@ -356,5 +399,41 @@ mod tests {
                 .configured("mymod:tree")
                 .is_none()
         );
+    }
+
+    /// The live features follow the world being opened: a world with a data
+    /// pack's feature sees it, the next world without one does not (it used to
+    /// keep the first world's registry for the whole process), and re-opening
+    /// the same packs reuses the registry built for them.
+    #[test]
+    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    fn the_live_features_follow_the_world_being_opened() {
+        use horizon_world::worldgen::overrides::WorldgenOverrides;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let mut with_tree = WorldgenOverrides::default();
+            with_tree.add_file("mymod", "data/mymod/worldgen/feature/tree.json", || {
+                Some(r#"{"type":"minecraft:no_op","config":{}}"#.to_owned())
+            });
+            let has_tree = |game: &Game<'_>| {
+                let features = game.res.behaviours().live_features().unwrap();
+                assert!(features.configured("minecraft:oak").is_some());
+                features.configured("mymod:tree").is_some()
+            };
+            let open = |game: &Game<'_>, overrides: &WorldgenOverrides| {
+                install_live_features(&game.res, &game.pack, &game.options, overrides)
+            };
+            open(game, &WorldgenOverrides::default());
+            assert!(!has_tree(game));
+            open(game, &with_tree);
+            assert!(has_tree(game));
+            let first = game.res.behaviours().live_features().unwrap();
+            open(game, &with_tree);
+            assert!(Arc::ptr_eq(
+                &first,
+                &game.res.behaviours().live_features().unwrap()
+            ));
+            open(game, &WorldgenOverrides::default());
+            assert!(!has_tree(game));
+        });
     }
 }

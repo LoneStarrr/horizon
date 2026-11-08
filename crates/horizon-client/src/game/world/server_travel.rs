@@ -16,6 +16,37 @@ use horizon_client::{lan::hub::TickCtx, world_spawn::PlayerSpawnFinder};
 use horizon_core::{geometry::Vec3, position::BlockPos};
 use horizon_protocol::packets::play::{self, Clientbound as C};
 
+/// Why an entity changes level (`entity_travel_to_dimension`'s `cause`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TravelCause {
+    NetherPortal,
+    EndPortal,
+    EndGateway,
+    /// A teleport into another level (`/tp`, a spectator's teleport).
+    Teleport,
+}
+
+impl TravelCause {
+    /// The name a mod is told.
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::NetherPortal => "nether_portal",
+            Self::EndPortal => "end_portal",
+            Self::EndGateway => "end_gateway",
+            Self::Teleport => "teleport",
+        }
+    }
+
+    /// The portal a plan goes through.
+    pub(super) fn of_plan(plan: &Plan) -> Self {
+        if plan.end {
+            Self::EndPortal
+        } else {
+            Self::NetherPortal
+        }
+    }
+}
+
 /// A trip under way: the player is in the destination's level, whose
 /// chunks are loading around `target`.
 pub(super) struct Trip {
@@ -115,13 +146,14 @@ impl Rideable for minecarts::Minecart {
 /// The hub's view of the server for packets sent outside its own tick.
 macro_rules! server_ctx {
     ($s:ident) => {{
-        let spawn = $s.spawn.map_or([0.5, 80.0, 0.5], |s| [s.x, s.y, s.z]);
+        let spawn = $s.world_spawn_position();
         let clock_rate = $s.network_clock_rate();
         TickCtx {
             world: &mut $s.world,
             entities: &[],
             next_entity: &mut $s.next_entity,
             spawn,
+            spawn_angle: $s.level.world_spawn_angle,
             difficulty: i32::from($s.ui.difficulty),
             difficulty_locked: $s.level.difficulty_locked,
             clock_rate,
@@ -327,7 +359,10 @@ impl Game<'_> {
                         });
                         return true;
                     }
-                    self.start_server_trip(conn, plan.dim, Some(plan), false);
+                    if self.server_player_travel_allowed(conn, plan.dim, TravelCause::NetherPortal)
+                    {
+                        self.start_server_trip(conn, plan.dim, Some(plan), false);
+                    }
                 }
             }
             "end_portal" => {
@@ -335,10 +370,16 @@ impl Game<'_> {
                 // Entity.canTeleport: out of the End only after the credits.
                 if !from_end || seen_credits {
                     let target = if from_end { Dim::Overworld } else { Dim::End };
-                    self.start_server_trip(conn, target, None, false);
+                    if self.server_player_travel_allowed(conn, target, TravelCause::EndPortal) {
+                        self.start_server_trip(conn, target, None, false);
+                    }
                 }
             }
-            _ => self.start_gateway_trip(conn, pos),
+            _ => {
+                if self.server_player_travel_allowed(conn, self.dim, TravelCause::EndGateway) {
+                    self.start_gateway_trip(conn, pos);
+                }
+            }
         }
         true
     }
@@ -357,15 +398,40 @@ impl Game<'_> {
         exists
     }
 
-    /// Whether this guest's dimension change may start (`native_player_portal`).
-    fn server_player_portal_allowed(&mut self, conn: u32, target: Dim, cause: &str) -> bool {
+    /// Whether this guest's dimension change may start
+    /// (`entity_may_travel`).
+    pub(super) fn server_player_travel_allowed(
+        &mut self,
+        conn: u32,
+        target: Dim,
+        cause: TravelCause,
+    ) -> bool {
         let Some(g) = self.lan.as_ref().and_then(|host| host.hub.guest(conn)) else {
             return false;
         };
-        let (player, name) = (g.uuid, g.name.clone());
-        let (from, to) = (self.dim.id(), target.id());
+        let entity = g.entity_id;
+        self.entity_may_travel(entity as u32, target, cause)
+    }
+
+    /// `EntityTravelToDimensionEvent`: whether the entity `id` (the network
+    /// id its handle names) may travel to the level `to`, asked before
+    /// anything of it moves. Only a server asks, and only when a mod listens.
+    pub(super) fn entity_may_travel(&mut self, id: u32, to: Dim, cause: TravelCause) -> bool {
+        if !self.native_authoritative()
+            || !mod_api::__private::listened(mod_api::HookId::EntityTravelToDimension)
+        {
+            return true;
+        }
+        let Some(epoch) = self.native_lifecycle.epoch() else {
+            return true;
+        };
         let mut cancel = false;
-        self.native_player_portal(player, &name, from, to, cause, &mut cancel);
+        self.native_entity_travel_to_dimension(
+            mod_api::EntityRef::new(epoch, id),
+            to.id(),
+            cause.id(),
+            &mut cancel,
+        );
         !cancel
     }
 
@@ -384,9 +450,14 @@ impl Game<'_> {
             g.vehicle.is_some(),
         );
         // Entity.checkInsideBlocks: the Nether portal blocks the box is in.
-        // `canUsePortal(false)` is false for a passenger: its vehicle goes
-        // through and carries it (`carry_riders_through_portals`).
-        if !riding && let Some(pos) = self.nether_portal_inside(at) {
+        // `LivingEntity.canUsePortal` (#943): not a passenger — its vehicle
+        // goes through and carries it (`carry_riders_through_portals`) — and
+        // not asleep.
+        if g.motion
+            .as_deref()
+            .is_some_and(|p| self.can_use_portal_of(p, riding, sleeping))
+            && let Some(pos) = self.nether_portal_inside(at)
+        {
             self.portals.player.set_inside(pos, PLAYER_DELAY);
         }
         // `ServerPlayer.showEndCredits`: the player stays out of the world while the
@@ -400,7 +471,8 @@ impl Game<'_> {
                 .get(&conn)
                 .is_some_and(|play| play.respawn_requested)
             {
-                if !self.server_player_portal_allowed(conn, Dim::Overworld, "end_portal") {
+                if !self.server_player_travel_allowed(conn, Dim::Overworld, TravelCause::EndPortal)
+                {
                     return;
                 }
                 let Some(host) = self.lan.as_mut() else {
@@ -449,7 +521,7 @@ impl Game<'_> {
                 } else {
                     Dim::End
                 };
-                if !self.server_player_portal_allowed(conn, target, "end_portal") {
+                if !self.server_player_travel_allowed(conn, target, TravelCause::EndPortal) {
                     return;
                 }
                 self.start_server_trip(conn, target, None, false);
@@ -475,7 +547,7 @@ impl Game<'_> {
                 if cancel {
                     return;
                 }
-                if !self.server_player_portal_allowed(conn, self.dim, "end_gateway") {
+                if !self.server_player_travel_allowed(conn, self.dim, TravelCause::EndGateway) {
                     return;
                 }
             }
@@ -505,7 +577,7 @@ impl Game<'_> {
         if !self.may_enter(plan.dim) {
             return;
         }
-        if !self.server_player_portal_allowed(conn, plan.dim, "nether_portal") {
+        if !self.server_player_travel_allowed(conn, plan.dim, TravelCause::NetherPortal) {
             // The processor already reached its threshold. Forget this attempt
             // so a canceled trip must complete a fresh portal wait before retrying.
             self.portals.player.process = None;
@@ -543,6 +615,15 @@ impl Game<'_> {
                 && riders
                     .iter()
                     .any(|c| !host.hub.guest(*c).is_some_and(|g| g.seen_credits))
+            {
+                continue;
+            }
+            // The vehicle and each rider are asked; one cancel keeps them all.
+            let cause = TravelCause::of_plan(&plan);
+            if !self.entity_may_travel(vehicle, plan.dim, cause)
+                || !riders
+                    .iter()
+                    .all(|&conn| self.server_player_travel_allowed(conn, plan.dim, cause))
             {
                 continue;
             }
@@ -605,12 +686,12 @@ impl Game<'_> {
         });
         let source = self.dim;
         let end = plan.is_none();
-        // Coordinates scale by 8 between the Overworld and the Nether; an
-        // End portal has fixed destinations.
-        let scale = match (source, target) {
-            (Dim::Overworld, Dim::Nether) | (Dim::End, Dim::Nether) => 1.0 / 8.0,
-            (Dim::Nether, Dim::Overworld) => 8.0,
-            _ => 1.0,
+        // Coordinates scale by the levels' coordinate scales (8 between the Overworld
+        // and the Nether); an End portal has fixed destinations.
+        let scale = if end {
+            1.0
+        } else {
+            Dim::teleportation_scale(source, target)
         };
         self.end_portal_travel = end;
         // Leaving the End: the player's own respawn point.
@@ -714,7 +795,7 @@ impl Game<'_> {
                 // PlayerList.respawn: the block was found, so the new player
                 // copies the respawn point (`copyRespawnPosition`). A cancel
                 // leaves it with none.
-                if self.spawn_point_change(config.dim, config.pos, config.forced) {
+                if self.spawn_point_change(config.dim, Some(config.pos), config.forced) {
                     self.respawn_config = None;
                 }
                 Some((at, yaw))
@@ -1179,6 +1260,29 @@ impl Game<'_> {
             g.native_player_changed_dimension(uuid, &name, from.id(), to.id());
         });
     }
+
+    /// The hub's view of the server for packets sent outside its own tick.
+    #[cfg(test)]
+    pub(super) fn server_ctx(&mut self) -> TickCtx<'_> {
+        let spawn = self.world_spawn_position();
+        let clock_rate = self.network_clock_rate();
+        TickCtx {
+            world: &mut self.world,
+            entities: &[],
+            next_entity: &mut self.next_entity,
+            spawn,
+            spawn_angle: self.level.world_spawn_angle,
+            difficulty: i32::from(self.ui.difficulty),
+            difficulty_locked: self.level.difficulty_locked,
+            clock_rate,
+            tick_rate: self.clock.rate(),
+            tick_frozen: self.clock.frozen(),
+            tick_steps: self.clock.step_state(),
+            collision: Some(self.collision),
+            border: &self.border,
+            streaming: Some(&self.streaming),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1290,59 @@ mod tests {
     use super::*;
     use mod_api::ServerHost;
     use std::sync::Arc;
+
+    #[test]
+    #[ignore = "needs prepared resources"]
+    fn guest_portal_entry_uses_body_sleep_and_vehicle() {
+        super::super::native_guest_turn_tests::with_guests(|game| {
+            let mut chunk = horizon_client::chunk::Chunk::empty(0, 0);
+            chunk.lit = true;
+            game.world.chunks.insert((0, 0), Arc::new(chunk));
+            let portal = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:nether_portal")
+                .unwrap();
+            game.world.set(3, 64, 5, portal).unwrap();
+            for (body, dead, sleeping, riding, expected) in [
+                (true, false, false, false, 9),
+                (true, false, true, false, 4),
+                (true, false, false, true, 4),
+                (true, true, false, false, 4),
+                (false, false, false, false, 4),
+            ] {
+                game.lan.as_mut().unwrap().hub.update_guest(12, |g| {
+                    g.position = [3.5, 64.0, 5.5];
+                    g.sleeping = sleeping;
+                    g.vehicle = riding.then_some(99);
+                    g.motion = body.then(|| {
+                        Box::new(
+                            horizon_client::motion::PlayerMotion::new(
+                                game.motion,
+                                Vec3::new(3.5, 64.0, 5.5),
+                            )
+                            .unwrap(),
+                        )
+                    });
+                    if dead {
+                        g.motion.as_mut().unwrap().set_health(0.0, false).unwrap();
+                    }
+                });
+                game.portals.player.process = Some(horizon_client::nether_portal::Process {
+                    entry: BlockPos::new(3, 64, 5),
+                    time: 8,
+                    inside: false,
+                });
+                game.handle_server_portal(12);
+                assert_eq!(
+                    game.portals.player.process.unwrap().time,
+                    expected,
+                    "body={body} dead={dead} sleeping={sleeping} riding={riding}"
+                );
+            }
+        });
+    }
 
     #[test]
     #[ignore = "needs prepared resources"]

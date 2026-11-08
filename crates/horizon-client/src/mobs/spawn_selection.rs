@@ -331,10 +331,20 @@ pub type MobType = (Species, f32, f32, Category);
 
 pub trait NaturalLevel: SpawnLevel {
     /// `MobSpawnEvent.PositionCheck`: what server mods answer for the new mob
-    /// of type `entity` at `at`; `Default` leaves the checks to vanilla.
-    fn position_check(&self, _entity: &str, _reason: Reason, _at: [f64; 3]) -> NativeSpawnCheck {
+    /// of type `entity` at `at`, described by `pending`; `Default` leaves the
+    /// checks to vanilla.
+    fn position_check(
+        &self,
+        _entity: &str,
+        _reason: Reason,
+        _at: [f64; 3],
+        _pending: Pending,
+    ) -> NativeSpawnCheck {
         NativeSpawnCheck::Default
     }
+    /// The position check just asked refused the mob: what the level made
+    /// for it is dropped.
+    fn position_refused(&self) {}
     /// Whether server mods hear `potential_spawns`.
     fn spawn_hooks(&self) -> bool {
         false
@@ -375,6 +385,13 @@ pub trait NaturalLevel: SpawnLevel {
     /// Where the players `getNearestPlayer(x, y, z, -1, false)` measures to
     /// are: every one that is not a spectator.
     fn nearest_player_positions(&self) -> &[[f64; 3]];
+    /// Those of [`Self::nearest_player_positions`] within `extent` of
+    /// `(x, z)` on both axes, and possibly others: the caller tests each. A
+    /// level with many players indexes them ([`PlayerSquares`]).
+    fn player_positions_near(&self, x: f64, z: f64, extent: f64, out: &mut Vec<[f64; 3]>) {
+        let _ = (x, z, extent);
+        out.extend_from_slice(self.nearest_player_positions());
+    }
     /// The world spawn point, when it is in this dimension.
     fn respawn(&self) -> Option<[i32; 3]>;
     /// `ServerLevel.canSpawnEntitiesInChunk`.
@@ -586,6 +603,18 @@ pub fn spawn_aabb(s: Species, x: f64, y: f64, z: f64, width: f32, height: f32) -
         Vec3::new(x + half, y + f64::from(scale * height), z + half),
     )
 }
+/// The mob a position check is about, which the site has not created yet
+/// (vanilla creates it before the check).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pending {
+    /// The yaw the site creates it with, drawn before the check.
+    pub yaw: f32,
+    /// Whether the site creates it fresh from its type (`EntityType.create`):
+    /// natural spawning, and a spawner whose spawn data is the type alone. A
+    /// spawner with entity data loads it, and chunk generation's packs come
+    /// from the generator.
+    pub fresh: bool,
+}
 /// `Mob.checkSpawnRules` and `checkSpawnObstruction` of a freshly created
 /// mob, unless a mod forces the answer (`MobSpawnEvent.PositionCheck`); then
 /// `vanilla` does not run.
@@ -594,13 +623,18 @@ pub fn position_ok<L: NaturalLevel>(
     entity: &str,
     reason: Reason,
     at: [f64; 3],
+    pending: Pending,
     vanilla: impl FnOnce() -> bool,
 ) -> bool {
-    match l.position_check(entity, reason, at) {
+    let ok = match l.position_check(entity, reason, at, pending) {
         NativeSpawnCheck::Succeed => true,
         NativeSpawnCheck::Fail => false,
         _ => vanilla(),
+    };
+    if !ok {
+        l.position_refused();
     }
+    ok
 }
 /// `checkSpawnObstruction` of a freshly created mob with the given box, with
 /// the mobs already `spawned` in the way; None in a generation region, which
@@ -651,25 +685,13 @@ pub struct StructureSpawns {
     pub overrides: FxHashMap<String, FxHashMap<String, Override>>,
 }
 impl StructureSpawns {
-    /// The overrides of the resource root first asked for, loaded once.
-    pub fn shared(root: &Path) -> &'static Self {
-        static SHARED: std::sync::OnceLock<StructureSpawns> = std::sync::OnceLock::new();
-        SHARED.get_or_init(|| Self::load(root))
-    }
+    /// Read a fresh generation, including mod namespaces and nested structure ids.
     pub fn load(root: &Path) -> Self {
-        let mut overrides = FxHashMap::default();
-        let dir = root.join("data/minecraft/worldgen/structure");
-        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some(v) = fs::read(&path)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            else {
-                continue;
-            };
+        fn insert(
+            overrides: &mut FxHashMap<String, FxHashMap<String, Override>>,
+            id: String,
+            v: &Value,
+        ) {
             let map: FxHashMap<String, Override> = v["spawn_overrides"]
                 .as_object()
                 .into_iter()
@@ -684,8 +706,43 @@ impl StructureSpawns {
                     )
                 })
                 .collect();
-            if !map.is_empty() {
-                overrides.insert(format!("minecraft:{stem}"), map);
+            overrides.insert(id, map);
+        }
+        let mut overrides = FxHashMap::default();
+        if let Some(Value::Object(entries)) = fs::read(root.join("worldgen/structures.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        {
+            for (id, value) in entries {
+                if let Some(value) = value
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                {
+                    insert(&mut overrides, id, &value);
+                }
+            }
+        }
+        for ns in fs::read_dir(root.join("data"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let dir = ns.path().join("worldgen/structure");
+            let Ok(files) = crate::json_folder::list(&dir) else {
+                continue;
+            };
+            for (name, path) in files {
+                let Some(v) = fs::read(path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                else {
+                    continue;
+                };
+                insert(
+                    &mut overrides,
+                    format!("{}:{}", ns.file_name().to_string_lossy(), name),
+                    &v,
+                );
             }
         }
         Self { overrides }
@@ -782,13 +839,27 @@ fn vanilla_mobs_at<L: NaturalLevel>(
         .map_or(&[], Vec::as_slice)
 }
 
+fn total_weight(list: &[SpawnEntry]) -> i64 {
+    list.iter().map(|e| i64::from(e.weight)).sum()
+}
+
+fn has_weight(list: &[SpawnEntry]) -> bool {
+    total_weight(list) > 0
+}
+
 /// `WeightedList.getRandom`.
 pub fn weighted_pick(list: &[SpawnEntry], random: &mut impl RandomSource) -> Option<SpawnEntry> {
-    let total: i64 = list.iter().map(|e| i64::from(e.weight)).sum();
+    let total = total_weight(list);
     if total <= 0 {
         return None;
     }
-    let mut selection = i64::from(random.next_int_bound(total as i32).ok()?);
+    // Keep vanilla's exact draw for representable totals. Larger modded lists use
+    // one unsigned long modulo the total, a bounded, slightly biased fallback.
+    let mut selection = if total <= i64::from(i32::MAX) {
+        i64::from(random.next_int_bound(total as i32).ok()?)
+    } else {
+        ((random.next_long() as u64) % total as u64) as i64
+    };
     for e in list {
         selection -= i64::from(e.weight);
         if selection < 0 {
@@ -1220,6 +1291,7 @@ pub fn spawn_category_for_position<L: NaturalLevel, R: RandomSource>(
                     &entry.entity,
                     Reason::Natural,
                     [xx, f64::from(y), zz],
+                    Pending { yaw, fresh: true },
                     || {
                         mob_spawn_rules(species, l, x, y, z)
                             && spawn_obstruction(species, l, bounds, Some(&spawned), x, y, z)
@@ -1291,18 +1363,68 @@ impl Nearest {
             return all.iter().map(distance).reduce(f64::min);
         }
         // The others are farther than REACH, across, from every point within
-        // MARGIN of the start.
+        // MARGIN of the start. Every one of them is within MARGIN + REACH of
+        // the start on both axes: a level with many players hands over only
+        // those (the nearest is the same in any order).
         let nearby = self.nearby.get_or_insert_with(|| {
-            all.iter()
-                .filter(|p| {
-                    let dx = ((p[0] - sx).abs() - Self::MARGIN).max(0.0);
-                    let dz = ((p[2] - sz).abs() - Self::MARGIN).max(0.0);
-                    dx * dx + dz * dz <= Self::REACH * Self::REACH
-                })
-                .copied()
-                .collect()
+            let mut near = Vec::new();
+            l.player_positions_near(sx, sz, Self::MARGIN + Self::REACH, &mut near);
+            near.retain(|p| {
+                let dx = ((p[0] - sx).abs() - Self::MARGIN).max(0.0);
+                let dz = ((p[2] - sz).abs() - Self::MARGIN).max(0.0);
+                dx * dx + dz * dz <= Self::REACH * Self::REACH
+            });
+            near
         });
         Some(nearby.iter().map(distance).fold(f64::INFINITY, f64::min))
+    }
+}
+/// Player positions by the 256-block square they stand in, for
+/// [`NaturalLevel::player_positions_near`]: every spawn start asks for the
+/// players near it, and a server's players are spread over the map.
+pub struct PlayerSquares {
+    squares: FxHashMap<(i64, i64), Vec<[f64; 3]>>,
+    /// Positions too far out (or not numbers) for a square: always handed over.
+    unsquared: Vec<[f64; 3]>,
+}
+impl PlayerSquares {
+    const SIDE: f64 = 256.0;
+    /// Further out than any world border.
+    const FAR: f64 = 1.0e9;
+    pub fn new(positions: &[[f64; 3]]) -> Self {
+        let mut squares = FxHashMap::<(i64, i64), Vec<[f64; 3]>>::default();
+        let mut unsquared = Vec::new();
+        for &p in positions {
+            if p[0].abs() < Self::FAR && p[2].abs() < Self::FAR {
+                squares.entry(Self::square(p[0], p[2])).or_default().push(p);
+            } else {
+                unsquared.push(p);
+            }
+        }
+        Self { squares, unsquared }
+    }
+    fn square(x: f64, z: f64) -> (i64, i64) {
+        (
+            (x / Self::SIDE).floor() as i64,
+            (z / Self::SIDE).floor() as i64,
+        )
+    }
+    /// Every position within `extent` (at most a square's side) of `(x, z)`
+    /// on both axes, and some others.
+    pub fn near(&self, x: f64, z: f64, extent: f64, out: &mut Vec<[f64; 3]>) {
+        out.extend_from_slice(&self.unsquared);
+        if !(x.abs() < Self::FAR && z.abs() < Self::FAR && extent <= Self::SIDE) {
+            out.extend(self.squares.values().flatten().copied());
+            return;
+        }
+        let (sx, sz) = Self::square(x, z);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if let Some(square) = self.squares.get(&(sx + dx, sz + dz)) {
+                    out.extend_from_slice(square);
+                }
+            }
+        }
     }
 }
 /// `isRightDistanceToPlayerAndSpawnPoint`.
@@ -1361,7 +1483,7 @@ fn valid_position_for_type<L: NaturalLevel, R: RandomSource>(
     if hooked && !in_list() {
         return false;
     }
-    if !spawn_rules::is_spawn_position_ok(species, l, x, y, z) {
+    if !spawn_rules::is_spawn_position_ok(&entry.entity, species, l, x, y, z) {
         return false;
     }
     if !hooked && !listed && !in_list() {
@@ -1409,7 +1531,7 @@ pub fn spawn_mobs_for_chunk_generation<L: NaturalLevel, R: RandomSource, Q: Rand
         .and_then(|b| b.get("creature"))
         .cloned()
         .unwrap_or_default();
-    if mobs.iter().map(|e| e.weight).sum::<u32>() == 0 {
+    if !has_weight(&mobs) {
         return;
     }
     let probability = l.creature_probability(sx, sy, sz);
@@ -1434,7 +1556,14 @@ pub fn spawn_mobs_for_chunk_generation<L: NaturalLevel, R: RandomSource, Q: Rand
                 };
                 let pos = top_non_colliding(l, &entry.entity, x, z);
                 trace(GenEvent::Column(x, z));
-                if spawn_rules::is_spawn_position_ok(species, l, pos[0], pos[1], pos[2]) {
+                if spawn_rules::is_spawn_position_ok(
+                    &entry.entity,
+                    species,
+                    l,
+                    pos[0],
+                    pos[1],
+                    pos[2],
+                ) {
                     let fx = f64::from(x).clamp(
                         f64::from(xo) + f64::from(width),
                         f64::from(xo) + 16.0 - f64::from(width),
@@ -1464,6 +1593,7 @@ pub fn spawn_mobs_for_chunk_generation<L: NaturalLevel, R: RandomSource, Q: Rand
                         &entry.entity,
                         Reason::ChunkGeneration,
                         [fx, fy, fz],
+                        Pending { yaw, fresh: false },
                         || {
                             mob_spawn_rules(species, l, bx, pos[1], bz)
                                 && spawn_obstruction(species, l, bounds, None, bx, pos[1], bz)
@@ -1527,6 +1657,83 @@ fn top_non_colliding<L: NaturalLevel>(l: &L, entity: &str, x: i32, z: i32) -> [i
 mod tests {
     use super::*;
 
+    #[test]
+    fn spawn_weights_do_not_overflow_u32() {
+        let entry = SpawnEntry {
+            entity: "minecraft:zombie".into(),
+            weight: i32::MAX as u32,
+            min: 1,
+            max: 1,
+            constant: true,
+        };
+        assert_eq!(
+            total_weight(&[entry.clone(), entry.clone(), entry]),
+            3 * i64::from(i32::MAX)
+        );
+        assert!(has_weight(&[
+            entry_for_test(),
+            entry_for_test(),
+            entry_for_test()
+        ]));
+        assert!(has_weight(&[entry_for_test(), entry_for_test()]));
+        assert!(!has_weight(&[]));
+        let mut zero = entry_for_test();
+        zero.weight = 0;
+        assert!(!has_weight(&[zero]));
+        let mut random = horizon_core::random::LegacyRandom::new(42);
+        assert!(
+            weighted_pick(
+                &[entry_for_test(), entry_for_test(), entry_for_test()],
+                &mut random
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn in_range_picks_match_old_draw() {
+        for weights in [[1, 1, 1], [1, 3, 7], [5, 0, 2]] {
+            let list: Vec<_> = weights
+                .into_iter()
+                .enumerate()
+                .map(|(i, weight)| {
+                    let mut entry = entry_for_test();
+                    entry.entity = i.to_string();
+                    entry.weight = weight;
+                    entry
+                })
+                .collect();
+            for seed in 0..16 {
+                let mut actual = horizon_core::random::LegacyRandom::new(seed);
+                let mut old = horizon_core::random::LegacyRandom::new(seed);
+                let total: i64 = list.iter().map(|e| i64::from(e.weight)).sum();
+                let mut selection = i64::from(old.next_int_bound(total as i32).unwrap());
+                let expected = list
+                    .iter()
+                    .find(|e| {
+                        selection -= i64::from(e.weight);
+                        selection < 0
+                    })
+                    .unwrap();
+                assert_eq!(
+                    weighted_pick(&list, &mut actual).unwrap().entity,
+                    expected.entity
+                );
+                assert_eq!(actual.next_long(), old.next_long());
+            }
+        }
+    }
+
+    fn entry_for_test() -> SpawnEntry {
+        SpawnEntry {
+            entity: "minecraft:zombie".into(),
+            weight: i32::MAX as u32,
+            min: 1,
+            max: 1,
+            constant: true,
+        }
+    }
+
     /// Vanilla's limits stand until a part answers; an answer replaces them, higher or lower,
     /// and a group stops growing at the size the answer names.
     #[test]
@@ -1589,6 +1796,58 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(found, scan, "chunk ({cx}, {cz})");
+            }
+        }
+    }
+
+    /// The squares hand back every player within the extent of a point on
+    /// both axes, also for points on square edges and players past the
+    /// border; a nearest-player search over them finds what a full one does.
+    #[test]
+    fn player_squares_keep_every_near_player() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |m: f64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0 * 2.0 * m - m
+        };
+        let mut players: Vec<[f64; 3]> = (0..200)
+            .map(|_| [next(3_000.0), next(100.0), next(3_000.0)])
+            .collect();
+        players.extend([
+            [0.0, 64.0, 0.0],
+            [256.0, 64.0, -256.0],
+            [-1.0e-9, 64.0, 255.999],
+            [3.0e9, 64.0, 0.0],
+        ]);
+        let squares = PlayerSquares::new(&players);
+        let mut near = Vec::new();
+        let points = players.iter().map(|p| (p[0] + 100.0, p[2] - 200.0)).chain([
+            (0.0, 0.0),
+            (255.5, -0.5),
+            (2.0e9, 0.0),
+        ]);
+        for (x, z) in points {
+            for extent in [24.0, 160.0, 256.0, 300.0] {
+                near.clear();
+                squares.near(x, z, extent, &mut near);
+                for p in &players {
+                    if (p[0] - x).abs() <= extent && (p[2] - z).abs() <= extent {
+                        assert!(near.contains(p), "{p:?} near ({x}, {z}) within {extent}");
+                    }
+                }
+                let nearest = |list: &[[f64; 3]]| {
+                    list.iter()
+                        .map(|p| (p[0] - x).powi(2) + (p[2] - z).powi(2))
+                        .filter(|d| *d <= extent * extent)
+                        .fold(f64::INFINITY, f64::min)
+                };
+                assert_eq!(
+                    nearest(&near),
+                    nearest(&players),
+                    "({x}, {z}) within {extent}"
+                );
             }
         }
     }

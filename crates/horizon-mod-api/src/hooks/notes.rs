@@ -15,7 +15,7 @@ A native server tick hook can call `native_server_block` with its context, a dim
 
 ### Neighbour observations (draft)
 
-`native_neighbor_changed` observes each authoritative server `neighborChanged` before the block handles it. It supplies the dimension, position, current state ID, changed block ID and moved flag. Resolve IDs with the level's registries during the hook; the hook does not load chunks or change the update queue. Its host is the level with its ticks (`&mut dyn LevelTicksHost`), as vanilla's `neighborChanged` gets the level: a `BlockPart::neighbor_changed` can read its inputs there with `level.signal(pos, direction)`, `direct_signal`, `direct_signal_to`, `best_neighbor_signal` and `has_neighbor_signal`, the same reads as `LevelRef`'s (mods' parts included), and schedule its own tick with `level.schedule_block_tick`, as a diode does (`DiodeBlock.checkTickOnNeighbor`). The reads write nothing and draw nothing, so they leave the update as it was, and cost what the game's own call does. `tick_block` and the other hooks with a `LevelWriteHost` have them too. Contract version `2`: version `1` handed the hook a plain `&dyn LevelHost`. Diverges from upstream.
+`native_neighbor_changed` observes each authoritative server `neighborChanged` before the block handles it. It supplies the dimension, position, current owned `BlockState`, changed `BlockKey` and moved flag. The changed block key comes from the source block's default state through the prepared state index, after the primary state's routing guard. No registry-name lookup or allocation occurs on this path. Use explicit immutable block metadata for property queries; the hook does not load chunks or change the update queue. Its host is the level with its ticks (`&mut dyn LevelTicksHost`), as vanilla's `neighborChanged` gets the level: a `BlockPart::neighbor_changed` can read its inputs there with `level.signal(pos, direction)`, `direct_signal`, `direct_signal_to`, `best_neighbor_signal` and `has_neighbor_signal`, the same reads as `LevelRef`'s (mods' parts included), and schedule its own tick with `level.schedule_block_tick`, as a diode does (`DiodeBlock.checkTickOnNeighbor`). The reads write nothing and draw nothing, so they leave the update as it was, and cost what the game's own call does. `tick_block` and the other hooks with a `LevelWriteHost` have them too. Contract version `2`: version `1` handed the hook a plain `&dyn LevelHost`. Diverges from upstream.
 
 ### Server block changes (draft)
 
@@ -106,9 +106,12 @@ For mods that run where the world is simulated: a dedicated server, a LAN host, 
   respawn point is about to be set, at each `ServerPlayer.setRespawnPosition` call: every sleep in a bed, a new respawn
   anchor point, `/spawnpoint`, and the copy to a respawned player (`pos` none for a player with no point). Set
   `cancel` to keep the old point.
-- **`native_player_portal(player, name, from_dimension, to_dimension, cause, cancel)`**: a server player is about
-  to travel through a Nether portal, End portal or End gateway; `cause` is `nether_portal`, `end_portal` or
-  `end_gateway`. Set `cancel` to leave the player where they are. The player's state is not swapped in.
+- **`native_entity_travel_to_dimension(entity, dimension, cause, cancel)`**: a server entity is about to travel to
+  the level `dimension`, before it moves (NeoForge's `EntityTravelToDimensionEvent`); `cause` is `nether_portal`,
+  `end_portal`, `end_gateway` or `teleport` (a `/tp` or spectator teleport into another level). Set `cancel` to
+  keep it where it is. Players and every other entity that crosses a portal or a command's teleport are asked;
+  a ridden vehicle and its server players are asked together and one cancel keeps them all. The player's state
+  is not swapped in.
 - **`native_block_damage_abort(player, name, pos)`**: a server player stopped digging `pos` before it broke. It is
   heard after the server clears the dig and sends the block state back to the client. The player's state is not
   swapped in.
@@ -663,7 +666,7 @@ handle, an entity the client doesn't track and a level it doesn't show:
 
 - `entity.position(host)`, `block_position`, `rotation` (yaw and pitch), `kind` (`minecraft:zombie`), `uuid` (`&mut`:
   an entity with no UUID yet gets its own) and `level` read the entity.
-- `level.block_state(host, pos)` returns a typed `BlockStateId` without allocating a state string. For text such as
+- `level.block_state(host, pos)` returns a typed `BlockState` without allocating a state string. For text such as
   `minecraft:oak_stairs[facing=east,…]`, pass the ID to `host.block_state_string(id)`. `block` (the name alone),
   `block_property(host, pos, key)`, `is_loaded`, `height` (lowest `y` and height), `game_time` and `day_time` read any
   level the server has loaded, not only the one in place. A block in a chunk that isn't loaded or a `y` outside
@@ -819,6 +822,15 @@ handle, an entity the client doesn't track and a level it doesn't show:
 - `entity.velocity(host)` (a player's is the move its client last reported), `set_velocity(host, v)` (not for players,
   whose client moves them), `on_ground`, `bounding_box` (lowest and highest corner), `eye_height`, `eye_position`,
   `view_vector` and `distance_to_sqr(host, pos)` read and move it.
+- `entity.up_vector(host)` is `Entity.getUpVector`, the view vector turned toward the zenith. `on_block(host)` is
+  `Entity.getOnPos`: the supporting block of an entity on the ground (the solid block under its box nearest it),
+  else the block under its feet. `pick(host, distance)` clips `Entity.pick`'s ray from the eyes along the view
+  against block outlines, no fluids, and returns the `NativeClipHit` (its `miss` set for a miss); entities are
+  `ray_trace_entities`' job. `is_multipart(host)` and `parts(host)` are `Entity.isMultipartEntity` and `getParts`:
+  the ender dragon's eight `EnderDragonPart`s (not the Parts of this API), head, neck, body, three tail segments and
+  two wings, each an `EntityRef` of its own entity id, resolved as any handle is. A part's `kind` is the dragon's, its position, rotation (none: zero), velocity (zero)
+  and `bounding_box` are its own, `level` is the dragon's, and it is no living entity, mob or dragon handle; it
+  stops resolving when its dragon does, and removing one is refused.
 - `entity.nbt(host)` and `merge_nbt(host, compound)` read and change its data as `/data get` and `/data merge entity`
   do (merging works on mobs, dropped items, armor stands and item frames; never on players, as in vanilla);
   `tags`, `add_tag`, `remove_tag` work as `/tag` does, and `name` is its name as plain text.
@@ -1237,7 +1249,7 @@ names the level it means by its `dimension` (`minecraft:overworld`), as `native_
 It names the level it means by its `dimension` (`minecraft:overworld`), as `native_set_block` does.
 
 - `native_edit_blocks(dimension, edit)` makes many blocks at once: `NativeBlockEdit` holds a `palette` of block states and
-  a list of `filters` (block predicates, `#minecraft:logs`), both written as commands write them, and `runs`, each
+  a list of typed `StatePredicate` filters (exact blocks or tags), and `runs`, each
   `height` blocks up column (`x`, `z`) from `y`, set to palette entry `block`, only where filter `only` passes the block
   there. With `surface` (`NativeHeightmap`: `WorldSurface`, `MotionBlocking`, `MotionBlockingNoLeaves` or `OceanFloor`),
   `y` counts from that height of the column, read once a column before anything changes. Runs are made in order, each
@@ -1248,7 +1260,7 @@ It names the level it means by its `dimension` (`minecraft:overworld`), as `nati
   the one `native_set_block` would give it (a mod block's own, included).
 - It answers the number of blocks changed. Runs in chunks that aren't loaded, and the parts of runs outside the level's
   height, are left out. It answers `Err`, changing nothing, on a client, for another dimension, a palette entry or filter
-  that doesn't read or carries NBT (`chest{...}`: refused, set states only), a run naming a palette entry or filter past
+  or predicate that fails validation (NBT is not representable), a run naming a palette entry or filter past
   the end, or more than 65536 filters.
 
 ### Column reads
@@ -1264,7 +1276,7 @@ pieces.
   loaded; at most 65,536 columns a call.
 - `native_read_columns(dimension, columns, heightmap, (below, above))` reads, for each column, the blocks from `below`
   under its height to `above` - 1 over it, bottom first: `NativeColumnBlocks` holds the heights (`bases`), the block
-  names seen (`palette`), the blocks as indexes into it, a column after another, and three biome tints a column (grass,
+  complete `BlockState` values seen (`palette`), the blocks as indexes into it, and three biome tints a column (grass,
   foliage and water, at the column's top). Blocks outside the level's height, and every block of a column not loaded,
   read as air (its tints as 0). `below + above` must be 1 to the level's height, and the read at most 1,048,576 blocks.
   The tints are the biome's own at the column's top, not blended over the biome blend radius as the game draws them, so
@@ -1526,7 +1538,13 @@ mod mixin or use it replaces in its design or PR."#]
   clamps them. It fires for the players, mobs and the ender dragon the game hurts, and runs on the thread that ticks
   the world (the server thread), so state a mod shares with its render thread hooks needs synchronising. `/kill` and
   `native_kill_mob` don't reach it yet: they set the health to 0 instead of hurting with `minecraft:generic_kill` as
-  vanilla does. NeoForge's reduction modifiers (`addReductionModifier`) aren't there yet.
+  vanilla does. A mod may also register reduction modifiers on the container
+  (`container.add_reduction_modifier(Reduction::Armor, ReductionChange::Scale(0.5))`, NeoForge's
+  `addReductionModifier`): each changes what one reduction (the damage cooldown, armor, Resistance, protection
+  enchantments, a witch's innate resistance, the absorption hearts) takes off this hit, in the order added, and
+  the recorded reduction and the damage the sequence goes on with are the changed ones, kept between 0 and what
+  there was to take. A step the hit skips (a source that bypasses armor, no Resistance effect) runs none. They
+  last for the hit.
 
 - `living_damage_post` (NeoForge's `LivingDamageEvent.Post`) observes the hit after it takes health.
   Its `container.should_cause_side_effects()` is `hurtServer`'s fresh-hit decision
@@ -1643,6 +1661,13 @@ one, where vanilla gives the `by` one.
   picks a chunk only as it sends it, so the watch comes just before the send. The hub records them only while a mod listens and
   the game tells them after the hub's network step for that level, so a handler sees the state after that step; the order per
   player and chunk is vanilla's. The far ring's columns past the view distance aren't told, and the server stopping doesn't unwatch.
+- A chunk's ticket level changing, on the server: `native_chunk_ticket_level_updated(chunk, old, new)` (NeoForge's
+  `ChunkTicketLevelUpdatedEvent`). The level is the chunk's loading level from its tickets (a player, a forced chunk, a portal
+  ticket, the dragon fight's arena), on `ChunkLevel`'s scale: 31 and lower entity ticking, 32 block ticking, 33 loaded without
+  ticking, and `ChunkTicketLevel::Unloaded` past it, so a non-ticking or unloaded chunk is never clamped to the ticking range.
+  Horizon keeps no level for a chunk partway through generating, and no chunk holder to hand over. The level's tickets keep each
+  change, in the order they were made, only while a mod listens: with no listener an update of the tickets looks at no chunk
+  and allocates nothing, so the tick costs what it did. A level is told in its own tick, after the tickets were updated for its players.
 
 - [the renderer's hook points](#render-hook-points): `world_drawn`, called once the world is drawn with its colour, depth, matrices and entity geometry, and
   `render_needs`, where a mod asks for the entity runs and the world's depth without a shader pack.
@@ -1759,7 +1784,7 @@ still go on each event or registrar.
 - `Block.entityInside` is `BlockPart::entity_inside(host, event)` (`EntityInsideEvent { state, pos, entity, precise }`; `precise` is `Entity.checkInsideBlocks`' flag), the Part form of what `block_entity_inside` was; there is no global hook (NeoForge has no bus event for it). It fires for mobs, projectiles, dropped items and players on the server, with a `&mut dyn ServerHost`, once per entity and block per move, and only for a block state a Part listens for; with no listening Part nothing is recorded. The contacts are noted during the sweep and delivered after the entity-kind batch has ticked (mobs, then projectiles, then items), in the order they happened, so a Part's own writes and random draws come after the batch's later entities, not mid-sweep. A contact whose entity is gone (an item that merged later in the batch) or whose block changed is dropped. Players fire it too, after their turn. The `InsideBlockEffectApplier`, and the block's `getEntityInsideCollisionShape`/`insideBlock` shape that decides "inside", are not exposed (tracked on #44).
 
 - A consumable's effect of a mod's own kind. The item's `on_consume_effects` entry of a type in a namespace of its own reaches `native_consume_effect(kind, data)` when the
-  item is consumed, on the server thread, for the acting player. The kind and the JSON the file wrote are there;
+  item is consumed, on the server thread, for the acting player. The kind and the payload converted once to a retained `Tag` at definition load are there;
   the game's own effects, sounds, teleports and drops are open to the hook. An unclaimed kind does nothing.
   The hook sees the item's own consumable component, not a patch on the stack; a bare vanilla name and an unknown `minecraft:` kind are the loader's, not the hook's.
 
@@ -1833,7 +1858,7 @@ still go on each event or registrar.
 
 - `native_vanilla_game_event(dimension, event, pos, cause, affected_state, cancel)` (NeoForge's `VanillaGameEvent`) fires on the server for every vanilla game event before the sculk sensors, wardens and allays hear it; canceling keeps them from hearing it. `cause` is the network id of the entity that caused it (`GameEvent.Context.sourceEntity`, None for none) and `affected_state` is the block state the event touched (`GameEvent.Context.affectedState`): the block a player broke or placed, the block a mob stepped on, and None where vanilla passes none (`Context.of(entity)`). Contract version `2`: version `1` had no `affected_state`. With no listener the cost is one `listened` branch per event. Diverges from upstream.
 
-- `native_get_arm_pose(entity_id, hand, stack, pose)` (NeoForge's `IClientItemExtensions.getArmPose`) sets the pose of the arm that holds `stack` in `hand`, as a humanoid player model draws it (`AvatarRenderer.getArmPose`): the window's own player model and other players'. It replaces what the item would give, whatever the use animation, a loaded crossbow or an `arm_pose` declared on the item say (a content mod's data key, see the content-mods how-to, is the answer when no mod listens or none sets one). Return one of vanilla's `ArmPose` values (`empty`, `item`, `block`, `bow_and_arrow`, `crossbow_hold`, `crossbow_charge`, `throw_trident`, `toot_horn`, `spyglass`, `spear`, `brush`); the first mod to answer wins. It is asked once a tick for each player model and non-empty hand, only while a mod listens, and a two-handed pose still moves the other hand as vanilla's does. NeoForge's custom poses made by extending the `ArmPose` enum have no counterpart; mobs' own poses (`getArmPose` on a mob renderer) are not asked. Client-side, with the `ClientHost`. Diverges from upstream: new hook.
+- `native_get_arm_pose(entity_id, hand, stack, humanoid, pose)` (NeoForge's `IClientItemExtensions.getArmPose`) sets the pose of the arm that holds `stack` in `hand`, as a humanoid model draws it: the window's own player, remote players and humanoid mobs. `humanoid` is a borrowed `HumanoidRenderState` exposing both held stacks, the main arm, use hand, use ticks, use animation and the selected main/off-hand poses before listeners answer (including item declarations). It replaces what the item would give, whatever the use animation, a loaded crossbow or an `arm_pose` declared on the item say (a content mod's data key, see the content-mods how-to, is the answer when no mod listens or none sets one). Return one of vanilla's `ArmPose` values (`empty`, `item`, `block`, `bow_and_arrow`, `crossbow_hold`, `crossbow_charge`, `throw_trident`, `toot_horn`, `spyglass`, `spear`, `brush`); the first mod to answer wins. It is asked once a tick for each humanoid model and non-empty hand, only while a mod listens, and a two-handed pose still moves the other hand as vanilla's does. NeoForge's custom poses made by extending the `ArmPose` enum have no counterpart; mob-specific animations run after the humanoid base pose, as in vanilla. API stack snapshots are converted only with subscribers; there is no allocation when no mod listens. Client-side, with the `ClientHost`. Diverges from upstream: new hook.
 
 - `native_item_decorations(stack, x, y, batch)` appends custom GUI drawing after the default bar, cooldown shade and count have been painted for an item icon. The stack is the displayed stack, x/y are its icon's top-left in GUI units, the units the batch takes (no item-local translation remains active). Existing GUI helpers can draw badges, text and overlays. The shared path covers the hotbar, carried stacks, menu slots, recipe book and item tooltip icons, and the item icons of the advancement, beacon, stats and trading screens. `native_item_bar` still controls the bar separately; this hook does not suppress vanilla decorations.
 
@@ -1844,8 +1869,9 @@ still go on each event or registrar.
   (`ItemModelResolver.updateForTopItem` and `ItemStackRenderState.submit`, in the model's `display` transform; with `owner_yaw`, the block
   entity is the item's owner, as a shelf is, so a compass on it points from there). The client's copy of a block entity has
   no item slots: send the stacks you draw in `native_block_entity_update_tag` and read them from `entity.nbt`.
-  `native_block_state_property(state, key)` reads the block's
-  `facing` from the hook's `state` without a world lookup.
+  `BlockState::property(metadata, "facing")` reads an owned state's property without a world lookup.
+  Host callbacks supply `host.block_states()` as metadata; tint workers receive their explicit
+  immutable metadata resource and never need a game host.
 
 - The world's clock for client mods: `native_clock()` is the shown world's game time and time of day in ticks (`i64`; the day time counts on past 24000), none on the title screen.
 
@@ -1874,11 +1900,12 @@ still go on each event or registrar.
 
 - Server experience: `native_experience_orbs(dimension, min, max)` reads the experience orbs in a box; `PlayerRef::give_experience_points` gives points as an orb they touch does (Mending first), and `PlayerRef::give_levels` gives or, for a negative amount, takes levels.
 - Server player death location: `PlayerRef::last_death_location(host)` reads where the player last died as a `GlobalPos`, the dimension's key and the block (`Player.getLastDeathLocation`, saved as `LastDeathLocation`, which the recovery compass follows). The dimension is data: a death in a dimension that is not open still reads, and `host.level(&pos.dimension().to_string())` gives the level when it is. `GlobalPos::new` takes an `Identifier` and `dimension()` returns `&Identifier`, so dimension keys are validated before they enter the typed API. Players resolve as in the other `PlayerRef` reads, so the acting player works too. It is `None` for a player who never died, a stale handle, and a player who is not online or whose record is swapped out. `set_last_death_location(host, location)` stores a location or, for `None`, forgets it (`Player.setLastDeathLocation`); the client hears of it with the player's next respawn, as in vanilla. It returns false in the same cases and for a dead player (so inside `player_died` the read works and the write does not).
+- Server player rules: `PlayerRef::may_use_item_at(host, pos, face, stack)` is `Player.mayUseItemAt`: a player who may build always may, anyone else only with a stack whose `can_place_on` matches the block `pos` lies against (the check the game's own item use asks), `None` for a player in another level than the one in place. `can_harm(host, other)` is `ServerPlayer.canHarmPlayer`: the `pvp` rule and the two teams (attacks, arrows and tridents ask the same). `respawn_config(host)` reads the respawn point as `Some(Some(PlayerRespawnConfig { position, yaw, forced }))`, `Some(None)` for a player with none (the world spawn), and `set_respawn_config(host, config)` is `/spawnpoint`'s write, `None` forgetting it: the yaw wraps, `player_set_spawn` may cancel (false), and a dead player, a dimension the game doesn't have and a yaw that is not finite are refused. `text_filtering(host)` is the client's `ClientInformation.textFilteringEnabled` (false for the player running the server); it is the client's own option, so there is no write. The sleep reads are `sleep_ignored(host)` (what `set_sleep_ignored` left), `counts_for_sleep(host)` (the night's count: not a spectator, not a fake, not ignored while out of bed) and `sleep_timer(host)` (`Player.sleepCounter`: 100 once asleep long enough, 101 to 109 on the way up); `set_sleep_timer(host, ticks)` writes 0 to 109 through the sleep writes' guard (no fake player, no guest in another level). Writes take a `ServerHost`.
 
 - Lead drops to `native_loot_drops`: untying a lead or cutting it with shears (`used`), and the lead a mob a
   player killed while leashed drops on its next tick, naming the killer.
 
-- Native mod particle types to `native_send_particles`: `ParticleOptions::named("mymod:spark")` sends a particle of the mod's own type, drawn by Horizon clients from the sprite set in the mod's `assets/<namespace>/particles/<path>.json` (`"textures": ["mymod:spark/1", ...]`, resolved as `particle/<texture>` in the atlas). The name must be namespaced; a client without that file draws nothing for it, vanilla clients (whose brand isn't Horizon's) aren't sent it, and the call still returns true. The type behaves as vanilla's `SimpleParticleType` with a sprite set: a plain billboard, no tint, 20 to 40 ticks, its motion the game's default spread (the speed sets its direction, not how fast it goes).
+- Native mod particle types to `native_send_particles`: `ParticleOptions::simple(spark_key)` with a load-resolved `ParticleKey` for `mymod:spark` sends a particle of the mod's own type, drawn by Horizon clients from the sprite set in the mod's `assets/<namespace>/particles/<path>.json` (`"textures": ["mymod:spark/1", ...]`, resolved as `particle/<texture>` in the atlas). The name must be namespaced; a client without that file draws nothing for it, vanilla clients (whose brand isn't Horizon's) aren't sent it, and the call still returns true. The type behaves as vanilla's `SimpleParticleType` with a sprite set: a plain billboard, no tint, 20 to 40 ticks, its motion the game's default spread (the speed sets its direction, not how fast it goes).
 
 A mod particle may opt into declarative behaviour in that same particle JSON (no new hook API):
 
@@ -2178,7 +2205,7 @@ registration path.
   grow fuller).
 
 - A server's recipes reach its Horizon clients, as NeoForge's `OnDatapackSyncEvent.sendRecipes` and `RecipesReceivedEvent`: on the server, `native_datapack_sync(recipe_types)` takes the recipe types (`minecraft:smelting`, `mymod:crusher`) a mod's client half needs, asked once per load, the same types for every player (NeoForge asks per joining player); Horizon sends their final recipes (data packs merged, load conditions held) to every Horizon client when it joins and after each `/reload`, in payloads within the clientbound cap, and nothing to a vanilla client. On the client the recipe helpers (`native_recipes`, `native_recipes_of_type`) then give the server's recipes of those types in place of the window's own, single player included, and `native_recipes_received(recipe_types)` says they came. No type asked: nothing is sent and nothing changes; none asked after a load that asked some: the clients go back to their own recipes and `native_recipes_received` comes with no types.
-- `level.craft(host, width, height, &items)` (`RecipeManager.getRecipeFor(CRAFTING, CraftingInput.of(width, height, items), level)`, then `assemble` and `getRemainingItems`) asks what a crafting grid makes, as a mechanical crafter or a compacting press needs: `width` and `height` from 1 to 3, `items` row by row, `None` for an empty slot. It runs the crafting table's own matcher on the world's recipes, data packs' and special ones (fireworks, dyeing, map extending...) included, and answers a `CraftResult`: the `output` stack and the `remainders`, what each slot keeps once the craft takes one item from it (an empty bucket for a milk bucket), in the grid's own order. A grid may sit anywhere in its `width` by `height`, as in the crafting table. `None` when no recipe matches or it makes nothing, for another size, and off the server. A call costs up to one pass over the crafting recipes: 5 to 20 µs on a desktop with vanilla's 1,266 (`benchmarks/craft-match-2026-11-04`), so a mod that asks every tick keeps the answer until its grid changes, as the crafting menu does. Diverges from upstream: new helper.
+- `level.recipe_for(host, &recipe_type, &inputs)` matches through the game's crafting, cooking, stonecutting and smithing matchers, including data-pack recipes of those vanilla types. `RecipeInput` has Crafting, Single and Smithing variants. A `RecipeMatch` carries recipe id, typed output, ordered remainders, experience and processing time. Valid non-matching input is `Ok(None)`; malformed input, invalid items and unavailable levels are typed errors. Mod-owned types return `RecipeLookupError::NotMatchable`: cache `recipes_of_type` once per load/reload and match in mod memory, with no per-tick host crossing. Dynamic custom outputs/contextual predicates stay mod-owned. Lookup does not consume inputs; cache the result until the input changes.
 
 - `native_input_key(key, action, modifiers)` runs after a real window keyboard event finishes handling, including shortcuts, screen consumption and repeats (`InputEvent.Key`). key is vanilla's name for the physical key (`key.keyboard.a`; `key.keyboard.unknown` for one it doesn't name), action is `KeyAction::Press`, `Repeat` or `Release`, and modifiers use the screen hooks' GLFW bits, captured before handling. Not cancellable. Foreign-window and OS synthetic focus events skip it. Window callback only: pad, focus and control-socket input are not window key events.
 
@@ -2266,7 +2293,7 @@ registration path.
 
 - A player's or mob's breathing, on the single player server thread and on a dedicated server: `native_living_breathe(context, entity, kind, can_breathe, consume, refill)` every tick for a player and for a mob with the generic air logic (NeoForge's `LivingBreatheEvent`, vanilla's `LivingEntity.baseTick`), with Horizon's answers as the defaults: set `can_breathe` and how much air `consume` takes or `refill` gives (up to 300); at -20 the entity is set to 0 air and takes 2 drowning damage. It is a free function in `horizon_client::breathing`, so it answers and cannot call helpers. Axolotls and `WaterAnimal`s keep their own air logic.
 
-- Blocks and items a native mod declares in code, as NeoForge's `DeferredRegister.Blocks` and `.Items` drained by `RegisterEvent`, instead of one content file each: `native_blocks(context, blocks)` and `native_items(context, items)`, asked once at start on every side, take `horizon_mod_package::content::Block` and `Item`, the declarations a content mod's `data/<id>/horizon/block/` and `item/` files hold (a vanilla template and what differs; `item: true` gives a block its item). Ids are in the mod's namespace. They join the content mods' blocks and items, inside the content mod whose id is that namespace when it is on (its models, textures, loot and recipes), else on their own with the template's look, so their network ids, saves and the joining client's content check are the files' (docs/mods.md). They pass the files' checks; a namespace whose declarations don't is logged and left out.
+- Blocks and items a native mod declares in code, as NeoForge's `DeferredRegister.Blocks` and `.Items` drained by `RegisterEvent`, instead of one content file each: `native_blocks(context, blocks)` and `native_items(context, items)`, asked once at start on every side, take `mod_api::Block` and `Item`, the declarations a content mod's `data/<id>/horizon/block/` and `item/` files hold (a vanilla template and what differs; `item: true` gives a block its item). Ids are in the mod's namespace. They join the content mods' blocks and items, inside the content mod whose id is that namespace when it is on (its models, textures, loot and recipes), else on their own with the template's look, so their network ids, saves and the joining client's content check are the files' (docs/mods.md). They pass the files' checks; a namespace whose declarations don't is logged and left out.
 
 - Entities ticking, through `native_entity_tick_pre` (NeoForge's `EntityTickEvent.Pre`) and `native_entity_tick_post` (`EntityTickEvent.Post`), with the entity's id and type (`minecraft:zombie`, `minecraft:item`) and the level. Set `canceled` in the Pre and the entity doesn't tick this tick (and its Post isn't told). Told for the mobs, item entities, minecarts and boats that tick in an entity-ticking chunk, on the single player server thread and on a dedicated server; not for a player's own boat or minecart, projectiles, orbs, primed TNT, falling blocks or armor stands. Check `kind`. Mobs and items hear every Pre before the family's first tick and every Post after its last; minecarts and boats hear theirs around each one's tick. A mod that hooks them also hooks `native_entity_tick_listened(listened)` and sets `*listened = true`: otherwise no entity's tick is told. It runs each tick for every ticking entity, so keep it cheap.
 
@@ -2543,7 +2570,7 @@ registration path.
 
 - A server player picked up an arrow after it was removed and its pickup was applied: `native_player_pickup_arrow(player, name, entity_id, item)` gives the pickup item id.
 
-- A server player about to travel through a Nether portal, End portal or End gateway: `native_player_portal(player, name, from_dimension, to_dimension, cause, cancel)` supplies the source and target dimension ids; `cause` is `nether_portal`, `end_portal` or `end_gateway`. Set `cancel` to leave the player where they are. The player's state is not swapped in.
+- A server entity about to travel to another level, a player or not: `native_entity_travel_to_dimension(entity, dimension, cause, cancel)` (NeoForge's `EntityTravelToDimensionEvent`) names the target level; `cause` is `nether_portal`, `end_portal`, `end_gateway` or `teleport`. Set `cancel` to keep the entity where it is. The player's state is not swapped in.
 
 - A server player requests a known recipe be placed in their crafting grid through the recipe book (`native_player_recipe_book_click(player, name, recipe, all)`).
 
@@ -2998,7 +3025,7 @@ registration path.
   and the Options > Mods key editor are removed, with no compatibility route.
 - The `command` hook runs a client command: the local player's typed or clicked chat command, without its slash, before the server and the game's own commands see it; set `ran` when the mod ran it. Client-side, with the `ClientHost`. Contract version `2`: a mod written for `1` was given the side-typed host, and was also asked on a server for commands run there (command blocks, LAN guests, the console, the integrated server thread); now only the client asks, and only for its own player's commands.
 
-- Recipes of any type (`RecipeManager.getAllRecipesFor`), vanilla's (`minecraft:smelting`, `minecraft:campfire_cooking`) and a mod's own (`mymod:crusher`, for a machine or an altar) through one read: `host.recipes_of_type("minecraft:smelting")` gives each recipe in force, in file order, as a `Recipe`: its `id`, `kind`, `group`, typed `ingredients` and `results` (for shaped, shapeless and cooking recipes, as the game parsed them; a recipe the game cannot parse is not in force and not listed), `cooking_time` and `experience` for the cooking types, and its file's `json`, which is all a mod's own type has. The recipes are those of `data/<namespace>/recipe/` in vanilla, content mods (`.hmod`) and the world's data packs, with data packs merged and load conditions held, so a pack's override or removal shows; a type nobody uses gives nothing. `native_recipe_ingredient` and `native_recipe_result` read the usual fields, tags included (a bare id is read as `minecraft:`; items the game doesn't know are left out, and the helper gives nothing if none is left). The recipes are the server's table: on the server thread, a dedicated server or a LAN host; a client, the single-player window included, sees vanilla's and the content mods' recipes, not the world's data packs', unless a mod had the server send it the type (`native_datapack_sync`). All three give nothing outside a world. The game crafts the recipes of its own types itself, and shows none of a mod's own in the recipe book; `/reload` reads a data pack's again, so look them up again when you need them. The lookup borrows the table, with no copy.
+- Recipes of any type (`RecipeManager.getAllRecipesFor`), vanilla's (`minecraft:smelting`, `minecraft:campfire_cooking`) and a mod's own (`mymod:crusher`, for a machine or an altar) through one read: `host.recipes_of_type("minecraft:smelting")` gives each recipe in force, in file order, as a `Recipe`: its `id`, `kind`, `group`, typed `ingredients` and `results` (for shaped, shapeless and cooking recipes, as the game parsed them; a recipe the game cannot parse is not in force and not listed), `cooking_time` and `experience` for the cooking types, and its file's `json`, which is all a mod's own type has. The recipes are those of `data/<namespace>/recipe/` in vanilla, content mods (`.hmod`) and the world's data packs, with data packs merged and load conditions held, so a pack's override or removal shows; a type nobody uses gives nothing. `Host::recipe_ingredient` and `Host::recipe_result` read the usual fields as JSON text, tags included (a bare id is read as `minecraft:`; items the game does not know are left out, and the helper returns `Ok(None)` if none is left). Invalid JSON returns `RecipeJsonError::InvalidJson` rather than panicking. The recipes are the server's table: on the server thread, a dedicated server or a LAN host; a client, the single-player window included, sees vanilla's and the content mods' recipes, not the world's data packs', unless a mod had the server send it the type (`native_datapack_sync`). All three give nothing outside a world. The game crafts the recipes of its own types itself, and shows none of a mod's own in the recipe book; `/reload` reads a data pack's again, so look them up again when you need them. The lookup borrows the table, with no copy.
 
 - [mobs](#mobs) for server mods: spawn one, read the mobs of a level in place, and move, hurt or remove one by its id.
 
@@ -3099,6 +3126,13 @@ registration path.
   the terrain shader skips the lookup.
   When a native mod bundles a Horizon shader pack, naming its folder
   `native-<mod-id>` makes the Mods On/Off control pause that pack too (without
-  changing the player's saved shader selection); other packs are unaffected."#]
+  changing the player's saved shader selection); other packs are unaffected.
+
+### Custom ingredient metadata
+`ingredient` and `ingredient_test` carry an API `Compound`. Recipe JSON is
+converted at load by the shared JsonOps-to-NbtOps boundary; mod code matches
+`Tag` variants rather than JSON fields. Nested null refuses the recipe as an
+unclaimed kind does; numeric and heterogeneous arrays remain lists. Matching
+borrows the retained compound and never converts metadata on the tick."#]
     fn general();
 }

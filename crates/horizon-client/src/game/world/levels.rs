@@ -18,9 +18,15 @@ use super::{
     ominous_item_spawner, persist, raids::Raiding, sculk::SculkState, tnt, trident,
 };
 use horizon_client::{
-    Result, block_entity_anim::BlockEntityAnims, random_tick_sections::RandomTickSections,
-    save::SaveDir, streaming::Streaming, tick_chunk_membership::TickChunkMembership,
-    ticket_levels::ChunkTickets, vanillagen::VanillaTerrain, world::World,
+    Result,
+    block_entity_anim::BlockEntityAnims,
+    random_tick_sections::RandomTickSections,
+    save::SaveDir,
+    streaming::Streaming,
+    tick_chunk_membership::TickChunkMembership,
+    ticket_levels::{ChunkTickets, PortalTicket},
+    vanillagen::VanillaTerrain,
+    world::World,
 };
 use horizon_world::level::{LevelEvent, Ticks};
 use std::{
@@ -131,13 +137,25 @@ pub(super) struct Levels {
     /// The levels whose open the mods heard (`native_level_load`), each to
     /// be told closed once.
     heard_open: Vec<Dim>,
+    /// The levels a mod asked to have saved (`level_request_save`), each once, saved at the start
+    /// of the next server tick.
+    requested_saves: Vec<Dim>,
 }
 
 impl Levels {
+    /// Queue `dim` to be saved at the start of the next server tick; a level already queued is
+    /// not queued twice.
+    pub(in crate::game) fn request_save(&mut self, dim: Dim) {
+        if !self.requested_saves.contains(&dim) {
+            self.requested_saves.push(dim);
+        }
+    }
+
     /// Clear every parked level and dimensions recorded as heard open.
     pub(super) fn clear(&mut self) {
         self.parked.clear();
         self.heard_open.clear();
+        self.requested_saves.clear();
     }
 
     /// A parked level, without opening or loading it.
@@ -309,6 +327,7 @@ impl Game<'_> {
         world.attachments = save.load_attachments();
         world.shape = self.level_shapes.get(dim.id());
         world.fast_lava = self.dimension_type_of(dim).fast_lava;
+        let tickets = ChunkTickets::with_saved_portal(save.load_portal_tickets());
         Ok(Parked {
             world,
             streaming,
@@ -316,7 +335,7 @@ impl Game<'_> {
             save,
             block_ticks: Ticks::new(self.level.seed as i32),
             tick_chunks: Default::default(),
-            tickets: Default::default(),
+            tickets,
             random_tick_sections: Default::default(),
             level_events: Vec::new(),
             portal_states: HashMap::new(),
@@ -364,6 +383,30 @@ impl Game<'_> {
         })
     }
 
+    /// `MinecraftServer.prepareLevels` activates every level's saved tickets:
+    /// a level holding saved `PORTAL` tickets opens with the world and ticks
+    /// while they hold it (`shouldKeepDimensionActive`).
+    pub(super) fn open_saved_portal_levels(&mut self) -> Result<()> {
+        if self.options.execution_role.is_client() {
+            return Ok(());
+        }
+        let back = self.dim;
+        for dim in [Dim::Overworld, Dim::Nether, Dim::End] {
+            if dim == back || self.levels.parked.contains_key(&dim) {
+                continue;
+            }
+            let save = SaveDir::new(
+                horizon_client::save::dimension_dir(&self.world_root, dim.id()),
+                self.level_shapes.get(dim.id()),
+            );
+            if !save.load_portal_tickets().is_empty() {
+                self.enter_level(dim)?;
+                self.enter_level(back)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `MinecraftServer.prepareLevels`: before the first tick, the chunks the
     /// open levels' restored tickets hold (forced chunks, a native mod's) are
     /// loaded (`ChunkLoadCounter`). The first tick then finds them ticking
@@ -392,8 +435,16 @@ impl Game<'_> {
     /// Stream the level in place until each chunk its tickets make block
     /// ticking is a ticking chunk (lit, with its neighbours loaded).
     fn wait_for_ticket_chunks(&mut self, deadline: Instant) {
-        // A `PORTAL` ticket reaches block ticking two chunks out, a forced one one.
-        const REACH: i32 = 2;
+        // Forced chunks are checked two chunks out (their ticket block ticks one).
+        // A `PORTAL` ticket's chunks are streamed as an area of their own (the
+        // network tick does it, which hasn't run yet), whose chunks out to its
+        // radius can become ticking chunks: those are waited for.
+        let portal = self.portal_ticket_areas();
+        for area in &portal {
+            if !self.streaming.extra.contains(area) {
+                self.streaming.extra.push(*area);
+            }
+        }
         loop {
             self.update_chunk_tickets();
             let levels = self.tickets.levels();
@@ -401,11 +452,11 @@ impl Game<'_> {
             let ready = streaming
                 .forced
                 .iter()
-                .copied()
-                .chain(self.tickets.portal_chunks())
-                .all(|(cx, cz)| {
-                    (cz - REACH..=cz + REACH).all(|z| {
-                        (cx - REACH..=cx + REACH).all(|x| {
+                .map(|&c| (c, 2))
+                .chain(portal.iter().copied())
+                .all(|((cx, cz), reach)| {
+                    (cz - reach..=cz + reach).all(|z| {
+                        (cx - reach..=cx + reach).all(|x| {
                             !levels.loaded_ticking(x, z) || super::ticking_chunk(&self.world, x, z)
                         })
                     })
@@ -504,7 +555,10 @@ impl Game<'_> {
                 None => (self.open_level(target)?, true),
             };
             p.world.game_time = self.world.game_time;
-            p.world.day_time = self.world.day_time;
+            // The level's day time is its default clock's; a level without one follows the
+            // Overworld's.
+            let clock = self.level_clock_name(target);
+            p.world.day_time = self.switch_clock(&clock);
             p.world.weather = self.world.weather;
             // The game rules and the difficulty are the server's, not a
             // level's: natural regeneration holds in every dimension.
@@ -536,6 +590,7 @@ impl Game<'_> {
         if let Some(h) = self.lan.as_mut() {
             h.hub.set_dimension(target.id());
         }
+        self.sync_hub_clocks();
         Ok(())
     }
 
@@ -616,6 +671,9 @@ impl Game<'_> {
             None
         };
         let server = self.serving.is_some() || self.options.dedicated.is_some();
+        if server {
+            self.run_requested_saves();
+        }
         // A config edited while the server is paused (empty) still reloads.
         // The parts outside every level get spans of their own, so that a slow
         // tick's line and `horizon-report` say when a mod's tick hook took it.
@@ -842,7 +900,7 @@ impl Game<'_> {
                     || !self.arrival_chunks(*d).is_empty()
                     // A portal ticket keeps its dimension active
                     // (`TicketType.shouldKeepDimensionActive`).
-                    || !self.portal_ticket_chunks(*d).is_empty()
+                    || !self.portal_tickets_in(*d).is_empty()
             })
             .collect();
         if dims.is_empty() {
@@ -851,16 +909,28 @@ impl Game<'_> {
         dims
     }
 
-    /// The chunks holding a portal ticket in `dim`'s level (`placePortalTicket`).
-    pub(super) fn portal_ticket_chunks(&self, dim: Dim) -> Vec<(i32, i32)> {
+    /// The portal tickets of `dim`'s level (`placePortalTicket`, or saved).
+    pub(super) fn portal_tickets_in(&self, dim: Dim) -> &[PortalTicket] {
         if dim == self.dim {
-            self.tickets.portal_chunks().collect()
+            self.tickets.portal_tickets()
         } else {
             self.levels
                 .parked
                 .get(&dim)
-                .map_or_else(Vec::new, |p| p.tickets.portal_chunks().collect())
+                .map_or(&[], |p| p.tickets.portal_tickets())
         }
+    }
+
+    /// The areas the level in place's portal tickets keep streamed: around each
+    /// exit its entity-ticking chunks and their neighbours, and at least the
+    /// chunks its expiry waits for (`portal_ticket_can_expire`).
+    pub(super) fn portal_ticket_areas(&self) -> Vec<((i32, i32), i32)> {
+        let entity_ticking = i32::from(horizon_client::ticket_levels::ENTITY_TICKING);
+        self.tickets
+            .portal_tickets()
+            .iter()
+            .map(|t| (t.chunk, (entity_ticking - t.level).max(1)))
+            .collect()
     }
 
     /// Count the parked levels' empty ticks, and save and close the ones
@@ -939,6 +1009,29 @@ impl Game<'_> {
     pub(super) fn native_levels_closing(&mut self) {
         for dim in Dim::all() {
             self.native_level_closed(dim);
+        }
+    }
+
+    /// Save the levels mods asked for since the last tick, each as an autosave does but with its
+    /// chunks on disk when it ends: `level_save` fires for each that was written, and one that
+    /// could not be is logged. A level not open any more is opened to be saved, like a parked one.
+    /// The level in place is put back.
+    pub(super) fn run_requested_saves(&mut self) {
+        let requested = std::mem::take(&mut self.levels.requested_saves);
+        if requested.is_empty() || self.remote.is_some() {
+            return;
+        }
+        let back = self.dim;
+        for dim in requested {
+            if let Err(e) = self.enter_level(dim).and_then(|()| self.save_level(true)) {
+                log::error!("saving {} on a mod's request failed: {e}", dim.id());
+            }
+        }
+        if let Err(e) = self.enter_level(back) {
+            log::error!(
+                "returning to {} after a requested save failed: {e}",
+                back.id()
+            );
         }
     }
 
@@ -1226,5 +1319,22 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "reopened borders: {failures:#?}");
+    }
+}
+
+#[cfg(test)]
+mod request_save_tests {
+    use super::{Dim, Levels};
+
+    /// A level asked for twice is queued once, and clearing the levels drops the queue.
+    #[test]
+    fn a_level_asked_for_twice_is_saved_once() {
+        let mut levels = Levels::default();
+        levels.request_save(Dim::Nether);
+        levels.request_save(Dim::Nether);
+        levels.request_save(Dim::End);
+        assert_eq!(levels.requested_saves, [Dim::Nether, Dim::End]);
+        levels.clear();
+        assert!(levels.requested_saves.is_empty());
     }
 }

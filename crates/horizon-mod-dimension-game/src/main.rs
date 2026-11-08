@@ -13,7 +13,7 @@
 //! `testing` feature keeps the mods per thread, and the server thread would see none.
 use horizon_mod_package::{Side, runtime::BuiltMod};
 use mod_api::{
-    ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, ConfiguredFeature,
+    BlockKey, ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, ConfiguredFeature,
     CustomDensity, DensityFunctionType, DensitySampler, DimensionSettings, FeatureRandom,
     FeatureRegion, FeatureType, Flow, FoliageAttachment, FoliagePlacer, FoliagePlacerType, Hooks,
     ModEntry, NativeCommand, RegisterCommandsEvent, Registrar, RegistrationContext,
@@ -30,12 +30,15 @@ const BUILT: &[BuiltMod] = &[BuiltMod {
 
 /// A stone floor up to y=0 under a gold block at each chunk's corner, its y the world's seed
 /// modulo 16 above the floor: terrain only this generator makes.
-struct Slab;
+struct Slab {
+    stone: BlockKey,
+    gold: BlockKey,
+}
 
 impl ChunkGenerator for Slab {
     fn build_terrain(&self, chunk: &mut dyn ChunkAccess) {
-        let stone = chunk.state("stone");
-        let gold = chunk.state("gold_block");
+        let stone = chunk.state(self.stone);
+        let gold = chunk.state(self.gold);
         let [x, z] = [chunk.pos().x * 16, chunk.pos().z * 16];
         for (dx, dz) in (0..16).flat_map(|dx| (0..16).map(move |dz| (dx, dz))) {
             for y in chunk.min_y()..=0 {
@@ -237,7 +240,9 @@ fn travel(level: &str, name: &str) -> String {
 #[mod_api::__subscriptions]
 impl Hooks for DimProbe {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
-        r.register_chunk_generator("slab", Slab);
+        let stone = r.block_key("minecraft:stone");
+        let gold = r.block_key("minecraft:gold_block");
+        r.register_chunk_generator("slab", Slab { stone, gold });
         r.register_density_function("band", Band);
         r.register_feature_type("marker", Marker);
         r.register_trunk_placer("spiral", Spiral);
@@ -288,11 +293,14 @@ impl Hooks for DimProbe {
         let line = travel(level, &name);
         if event.command.literals.iter().any(|word| word == "later") {
             *self.later.lock().unwrap() = Some(line);
-            host.commands().feedback(Text::literal("dimprobe queued"));
+            host.commands()
+                .feedback(Text::literal("dimprobe queued"))
+                .expect("bounded probe text");
         } else {
             let ran = host.commands().run_command(&line);
             host.commands()
-                .feedback(Text::literal(format!("dimprobe ran={ran}")));
+                .feedback(Text::literal(format!("dimprobe ran={ran}")))
+                .expect("bounded probe text");
         }
         Flow::Cancel
     }

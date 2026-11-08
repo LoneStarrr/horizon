@@ -9,6 +9,59 @@ Four hooks stand in for the checks and setup around a mob. All run on the server
 | Just before `finalizeSpawn` | `finalize_spawn` | `Flow::Cancel`, `spawn_cancelled`, a new `difficulty`, edits to `mob`, a new `group` |
 | Each tick, before a mob's `checkDespawn` | `mob_despawn` | `NativeDespawn::{Default, Allow, Deny}` |
 
+## Saying where a mod mob spawns
+
+`Registrar::declare_spawn_placement(path, rule)` is NeoForge's `RegisterSpawnPlacementsEvent`: during registration a mod gives its entity type a `SpawnPlacementRule`, and the game's own spawn checks answer from it for that type, wherever they run (natural spawning, chunk generation, spawners, patrols, sieges, reinforcements).
+
+```rust,ignore
+r.declare_spawn_placement("ghoul", mod_api::SpawnPlacementRule {
+    placement: mod_api::NativeSpawnPlacementType::OnGround,
+    heightmap: mod_api::NativeHeightmap::MotionBlockingNoLeaves,
+    spawnable_on: Some("mymod:ghoul_ground".to_owned()), // a block tag the block below is in
+    light: mod_api::NativeSpawnLight::Dark,              // Any, Dark (a monster's) or Bright (an animal's)
+    biome_tag: Some("mymod:haunted".to_owned()),         // a biome tag the spot's biome is in
+}).unwrap();
+```
+
+The placement type is `SpawnPlacements.isSpawnPositionOk`'s first check, and the rule stands in for the type's spawn predicate: every field that is set must hold, and a trial spawner ignores `light`. A type with no declaration keeps its template's rules. The game resolves the declarations once at load, so a check reads one table and never walks the mods. A tag is a namespaced name written without `#`; an id outside the mod's namespace, a bad tag or a second declaration of the same type refuses the mods at startup, and a type no content file defines refuses the resource load.
+
+`mob_spawn_placement_check` is the separate per-check moment: it runs after the rule and is told its answer as `default_result`, so a listener can still overturn it for one position.
+
+## Checking a spawn
+
+`mob_spawn_placement_check` and `mob_spawn_position_check` both get the `level` the mob would join (a `LevelRef`, so a
+listener can read the blocks around `pos` through the host) and the `spawner` that asked: `Spawner::Block { pos }` for a
+spawner block, `Spawner::Trial { pos }` for a trial spawner, and `None` for natural spawning, chunk generation, patrols,
+sieges, reinforcements and a spawner minecart. Set `*event.result` to `NativeSpawnCheck::Succeed` or `Fail` to force the
+check; `Default` keeps vanilla's answer.
+
+```rust,ignore
+fn mob_spawn_placement_check(&self, _: &dyn mod_api::Host, event: &mut mod_api::MobSpawnPlacementCheckEvent<'_>) {
+    // spawner blocks work as usual; nothing else spawns zombies here
+    if event.kind == "minecraft:zombie" && event.spawner.is_none() {
+        *event.result = mod_api::NativeSpawnCheck::Fail;
+    }
+}
+```
+
+The position check also gets `event.mob`, the mob about to spawn, as an `UnspawnedMobRef` with the same reads as
+`finalize_spawn`'s (no editor: the hook only reads). Vanilla creates the mob before this check; Horizon creates it there
+only when the hook has a listener, the same way the spawn would, and the spawn then goes on with that very mob, so what
+the listener read is what joins the level. A refused check drops the mob: it never joins the level. Creating it draws
+nothing from the level's random, so a listener that answers `Default` changes no draw.
+
+```rust,ignore
+fn mob_spawn_position_check(&self, host: &dyn mod_api::Host, event: &mut mod_api::MobSpawnPositionCheckEvent<'_>) {
+    if event.mob.custom_name(host).is_ok_and(|name| name.is_some()) {
+        *event.result = mod_api::NativeSpawnCheck::Succeed;
+    }
+}
+```
+
+Where the game does not create the mob fresh, the handle answers only `kind` and `position` (the rest is
+`UnspawnedMobError::Unsupported`): chunk generation's packs, which the world generator creates and finalizes after the
+check, and a spawner or trial spawner whose spawn data carries entity data, which the game loads after the tick.
+
 ## Stopping a spawn or leaving a mob plain
 
 `finalize_spawn` has two cancels, as in NeoForge. Returning `Flow::Cancel` skips finalization: the mob still spawns, but with no equipment, attributes or class setup. Setting `event.spawn_cancelled = true` adds no mob at all.

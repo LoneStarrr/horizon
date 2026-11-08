@@ -345,6 +345,8 @@ struct BlockFile {
     close_sound: Option<String>,
     block_item: Option<String>,
     #[serde(default)]
+    pick_item: Option<String>,
+    #[serde(default)]
     components: BTreeMap<String, serde_json::Value>,
 }
 fn yes() -> bool {
@@ -384,6 +386,10 @@ pub struct Block {
     /// it is not a block item of its own: an item of this mod or a vanilla
     /// one, checked to exist when the content loads. Needs `item` false.
     pub block_item: Option<String>,
+    /// The item pick-block takes from this block (`getCloneItemStack`), when it is not
+    /// the block's item: a mature crop picks its seed. An item of this mod or a vanilla
+    /// one, checked to exist when the content loads. Absent is the block's item.
+    pub pick_item: Option<String>,
     /// Its item's component patch, as an [`Item`]'s.
     pub components: BTreeMap<String, serde_json::Value>,
     /// A connecting block (template `minecraft:chorus_plant`, a `PipeBlock`
@@ -714,6 +720,31 @@ pub struct MenuType {
     /// crafting table does (`CraftingMenu`).
     #[serde(default)]
     pub crafting: Option<MenuCrafting>,
+    /// slots that show other containers' slots instead of the block
+    /// entity's, as a crafting station shows the chests beside it; a native
+    /// mod names the containers (`native_menu_links`).
+    #[serde(default)]
+    pub links: Option<MenuLinks>,
+}
+
+/// a mod menu type's linked slots (`links`): `count` slots from `from` on,
+/// which show the slots of the containers a native mod links them to
+/// (`native_menu_links`), in order, rather than the block entity's. The
+/// block entity never holds them; a linked slot with nothing behind it holds
+/// nothing and takes nothing.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MenuLinks {
+    /// the first linked slot.
+    pub from: u16,
+    /// how many slots, 1 or more.
+    pub count: u16,
+}
+
+impl MenuLinks {
+    fn range(&self) -> std::ops::Range<u32> {
+        u32::from(self.from)..u32::from(self.from) + u32::from(self.count)
+    }
 }
 
 /// a mod menu type's crafting grid (`crafting`): `size`x`size` slots from
@@ -745,6 +776,7 @@ pub const MAX_MENU_SLOTS: u16 = 256;
 #[derive(Debug, Clone)]
 enum Source {
     Dir(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
     Zip(PathBuf),
     /// No files: content a native mod declares in code.
     Code,
@@ -774,6 +806,7 @@ pub struct Content {
 /// Reads a mod's content files ([`Content::reader`]).
 pub enum FileReader<'a> {
     Dir(&'a Path),
+    #[cfg(not(target_arch = "wasm32"))]
     Zip(Box<zip::ZipArchive<std::fs::File>>),
 }
 impl FileReader<'_> {
@@ -784,6 +817,7 @@ impl FileReader<'_> {
             Self::Dir(root) => {
                 Box::new(std::fs::File::open(root.join(name)).map_err(|e| format!("{name}: {e}"))?)
             }
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Zip(zip) => Box::new(zip.by_name(name).map_err(|e| format!("{name}: {e}"))?),
         };
         let mut out = Vec::new();
@@ -825,16 +859,22 @@ impl Content {
         let (source, sized) = if path.is_dir() {
             (Source::Dir(path.to_owned()), folder_files(path)?)
         } else {
-            let mut zip = open_zip(path)?;
-            let mut out = Vec::new();
-            for i in 0..zip.len() {
-                let entry = zip.by_index_raw(i).map_err(|e| e.to_string())?;
-                let name = entry.name().map_err(|e| e.to_string())?.into_owned();
-                if (name.starts_with("assets/") || name.starts_with("data/")) && !entry.is_dir() {
-                    out.push((name.to_owned(), entry.size()));
+            #[cfg(target_arch = "wasm32")]
+            return Err("archive I/O is unavailable on wasm32".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut zip = open_zip(path)?;
+                let mut out = Vec::new();
+                for i in 0..zip.len() {
+                    let entry = zip.by_index_raw(i).map_err(|e| e.to_string())?;
+                    let name = entry.name().map_err(|e| e.to_string())?.into_owned();
+                    if (name.starts_with("assets/") || name.starts_with("data/")) && !entry.is_dir()
+                    {
+                        out.push((name.to_owned(), entry.size()));
+                    }
                 }
+                (Source::Zip(path.to_owned()), out)
             }
-            (Source::Zip(path.to_owned()), out)
         };
         let mut files = Vec::with_capacity(sized.len());
         let mut total = 0u64;
@@ -962,7 +1002,9 @@ impl Content {
     /// Where the files are read from: the mod's folder or its `.hmod`.
     pub fn source(&self) -> &Path {
         match &self.source {
-            Source::Dir(path) | Source::Zip(path) => path,
+            Source::Dir(path) => path,
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::Zip(path) => path,
             Source::Code => Path::new(""),
         }
     }
@@ -1067,6 +1109,7 @@ impl Content {
                 open_sound: file.open_sound,
                 close_sound: file.close_sound,
                 block_item: file.block_item,
+                pick_item: file.pick_item,
                 components: file.components,
                 connects_to: file
                     .connects_to
@@ -1296,6 +1339,26 @@ impl Content {
                     return Err(format!(
                         "{name}: results lists a crafting slot (the result is take-only already)"
                     ));
+                }
+            }
+            if let Some(l) = file.links {
+                let linked = l.range();
+                if l.count == 0 || linked.end > u32::from(file.slots) {
+                    return Err(format!(
+                        "{name}: links are 1 or more slots below {}",
+                        file.slots
+                    ));
+                }
+                if file.results.iter().any(|&r| linked.contains(&u32::from(r))) {
+                    return Err(format!("{name}: results lists a linked slot"));
+                }
+                if let Some(c) = file.crafting {
+                    let end = u32::from(c.grid) + u32::from(c.size) * u32::from(c.size);
+                    if linked.contains(&u32::from(c.result))
+                        || (u32::from(c.grid)..end).any(|s| linked.contains(&s))
+                    {
+                        return Err(format!("{name}: links overlap the crafting slots"));
+                    }
                 }
             }
             self.menu_types.push(MenuType { id: menu, ..file });
@@ -1544,6 +1607,11 @@ fn check_block(file: &Block) -> Result<(), String> {
             return Err("block_item is an item id, namespace:path".into());
         }
     }
+    if let Some(item) = &file.pick_item
+        && !namespaced_id(item)
+    {
+        return Err("pick_item is an item id, namespace:path".into());
+    }
     if let Some(wall) = &file.wall_block {
         if !sign || file.template.contains("_wall_") {
             return Err("wall_block needs a standing or ceiling sign template".into());
@@ -1588,6 +1656,11 @@ fn check_sign_walls(blocks: &[&Block]) -> Result<(), String> {
                 "{id}: wall_block {wall} has this sign's item, so it declares no block_item"
             ));
         }
+        if block.pick_item.is_some() {
+            return Err(format!(
+                "{id}: wall_block {wall} picks this sign's item, so it declares no pick_item"
+            ));
+        }
         if block.item {
             return Err(format!(
                 "{id}: wall_block {wall} has this sign's item, so its own \"item\" is false"
@@ -1616,11 +1689,13 @@ fn check_sign_walls(blocks: &[&Block]) -> Result<(), String> {
 fn reader_of(source: &Source) -> Result<FileReader<'_>, String> {
     Ok(match source {
         Source::Dir(root) => FileReader::Dir(root),
+        #[cfg(not(target_arch = "wasm32"))]
         Source::Zip(path) => FileReader::Zip(Box::new(open_zip(path)?)),
         Source::Code => FileReader::Dir(Path::new("")),
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     zip::ZipArchive::new(file).map_err(|e| e.to_string())
@@ -1912,6 +1987,7 @@ capabilities = ["registries"]
                 open_sound: None,
                 close_sound: None,
                 block_item: None,
+                pick_item: None,
                 components: BTreeMap::new(),
                 connects_to: None,
                 thickness: None,
@@ -2109,7 +2185,7 @@ capabilities = ["registries"]
             ("data/ruby/horizon/menu/bag.json", br#"{"slots": 4}"#),
             (
                 "data/ruby/horizon/menu/station.json",
-                br#"{"slots": 12, "results": [11], "crafting": {"grid": 1, "result": 0}}"#,
+                br#"{"slots": 16, "results": [11], "crafting": {"grid": 1, "result": 0}, "links": {"from": 12, "count": 4}}"#,
             ),
         ];
         let content = hmod("menus", MANIFEST_TEXT, files).unwrap();
@@ -2123,8 +2199,13 @@ capabilities = ["registries"]
             [
                 ("ruby:bag", 4, 0, vec![]),
                 ("ruby:press", 9, 2, vec![7, 8]),
-                ("ruby:station", 12, 0, vec![11])
+                ("ruby:station", 16, 0, vec![11])
             ]
+        );
+        let links: Vec<_> = content.menu_types.iter().map(|m| m.links).collect();
+        assert_eq!(
+            links,
+            [None, None, Some(super::MenuLinks { from: 12, count: 4 })]
         );
         let crafting: Vec<_> = content.menu_types.iter().map(|m| m.crafting).collect();
         assert_eq!(
@@ -2186,6 +2267,31 @@ capabilities = ["registries"]
             (
                 "craft-key",
                 r#"{"slots": 10, "crafting": {"grid": 0, "result": 9, "width": 3}}"#,
+                "unknown field",
+            ),
+            (
+                "links-past",
+                r#"{"slots": 10, "links": {"from": 8, "count": 3}}"#,
+                "links are 1 or more slots below 10",
+            ),
+            (
+                "links-empty",
+                r#"{"slots": 10, "links": {"from": 2, "count": 0}}"#,
+                "links are 1 or more slots below 10",
+            ),
+            (
+                "links-results",
+                r#"{"slots": 10, "results": [5], "links": {"from": 4, "count": 2}}"#,
+                "results lists a linked slot",
+            ),
+            (
+                "links-grid",
+                r#"{"slots": 20, "crafting": {"grid": 1, "result": 0}, "links": {"from": 9, "count": 4}}"#,
+                "links overlap the crafting slots",
+            ),
+            (
+                "links-key",
+                r#"{"slots": 10, "links": {"from": 2, "count": 2, "rows": 1}}"#,
                 "unknown field",
             ),
             ("menu-missing", r#"{"data_slots": 1}"#, "missing field"),
@@ -2588,6 +2694,39 @@ capabilities = ["registries"]
         ] {
             let e = block(bad).unwrap_err();
             assert!(e.contains(word), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn pick_item_names_an_item_whatever_the_blocks_own_is() {
+        let block = |json: &str| {
+            hmod(
+                "pickitem",
+                MANIFEST_TEXT,
+                &[("data/ruby/horizon/block/crop.json", json.as_bytes())],
+            )
+        };
+        for json in [
+            r#"{"template": "minecraft:stone", "item": false, "pick_item": "ruby:seed"}"#,
+            r#"{"template": "minecraft:stone", "pick_item": "ruby:seed"}"#,
+            r#"{"template": "minecraft:stone", "item": false, "block_item": "ruby:fruit", "pick_item": "ruby:seed"}"#,
+        ] {
+            let parsed = block(json).unwrap();
+            assert_eq!(parsed.blocks[0].pick_item.as_deref(), Some("ruby:seed"));
+        }
+        assert_eq!(
+            block(r#"{"template": "minecraft:stone"}"#).unwrap().blocks[0].pick_item,
+            None
+        );
+        for bad in ["seed", "none", ""] {
+            let e = block(&format!(
+                r#"{{"template": "minecraft:stone", "pick_item": "{bad}"}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                e.contains("pick_item") && e.contains("namespace:path"),
+                "{bad}: {e}"
+            );
         }
     }
 

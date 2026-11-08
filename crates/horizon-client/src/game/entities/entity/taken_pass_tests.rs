@@ -293,6 +293,7 @@ fn lifecycle_fixture_walks_other_owners() {
                     yaw: 0.0,
                     pitch: 0.0,
                     item_transformation: None,
+                    interaction: None,
                 });
             }
         },

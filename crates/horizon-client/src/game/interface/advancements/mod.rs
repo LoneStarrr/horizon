@@ -163,6 +163,9 @@ impl AdvState {
 /// The game's world for predicates.
 struct View<'a, 'g>(&'a Game<'g>);
 impl adv::World for View<'_, '_> {
+    fn predicate(&self, id: &str) -> Option<&Value> {
+        self.0.fns.store.predicates.get(id)
+    }
     fn dimension(&self) -> &str {
         self.0.dim.id()
     }
@@ -274,7 +277,7 @@ impl adv::World for View<'_, '_> {
 type Tags = std::collections::HashMap<String, std::collections::HashSet<String>>;
 /// The game's own `worldgen/structure` tags (a world without data packs has
 /// no `WorldTables` to hold them), loaded once for the resource root first
-/// asked for, as `StructureSpawns::shared`.
+/// asked for.
 fn vanilla_structure_tags(root: &std::path::Path) -> &'static Tags {
     static TAGS: std::sync::OnceLock<Tags> = std::sync::OnceLock::new();
     TAGS.get_or_init(|| {
@@ -546,6 +549,10 @@ impl Game<'_> {
             tool: None,
             block_pos: None,
         };
+        // An invalid reference anywhere fails the whole tree, even under an inversion.
+        if !adv::references_valid(v, &View(self)) {
+            return false;
+        }
         adv::conditions_with(v, &ctx, &mut |leaf, ctx| {
             adv::literal_random_chance(leaf, &mut || self.world.random.next_float())
                 .unwrap_or_else(|| adv::conditions(leaf, ctx, &View(self)))
@@ -2440,7 +2447,7 @@ pub(super) fn adv_name(a: &adv::Advancement) -> Text {
     };
     let color = frame_color(d.frame);
     let title = text_of(&d.title).with_style(&Style {
-        hover: Some(Box::new(decorate_name(d))),
+        hover: Some(std::sync::Arc::new(decorate_name(d))),
         ..Style::default()
     });
     Text::translate("chat.square_brackets", &[title]).with_color(color)
@@ -2695,11 +2702,14 @@ mod tests {
         #[mod_api::__subscriptions]
         impl Hooks for Listener {
             fn toast_add(&self, _: &dyn ClientHost, event: &mut ToastAddEvent<'_>) -> Flow {
-                match event.description.as_ref().map(Text::plain).as_deref() {
-                    Some("cancel") => Flow::Cancel,
-                    Some("edit") => {
-                        *event.title = Text::literal("replacement").with_color(0x12_3456);
-                        *event.description = Some(Text::literal("changed"));
+                match event.description.as_ref().map(|text| &text.content) {
+                    Some(mod_api::text::TextContent::Literal(value)) if value == "cancel" => {
+                        Flow::Cancel
+                    }
+                    Some(mod_api::text::TextContent::Literal(value)) if value == "edit" => {
+                        *event.title = mod_api::Text::literal("replacement");
+                        event.title.style.color = Some("#123456".into());
+                        *event.description = Some(mod_api::Text::literal("changed"));
                         Flow::Continue
                     }
                     _ => Flow::Continue,

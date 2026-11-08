@@ -187,8 +187,20 @@ impl Game<'_> {
                     let Some(i) = self.orbs.locate(join) else {
                         continue;
                     };
+                    // ExperienceOrb.tick runs scanForMerges before it moves.
+                    // An orb absorbed here is gone before its own turn's
+                    // find_join finds it.
+                    if self.remote.is_none() {
+                        self.merge_orb(i);
+                    }
+                    let Some(i) = self.orbs.locate(join) else {
+                        continue;
+                    };
                     let followed = followed.get_or_insert_with(|| self.orb_followed());
                     let target = self.orb_target(i, followed);
+                    let Some(i) = self.orbs.locate(join) else {
+                        continue;
+                    };
                     // A block of slack around the move: gravity and the pull
                     // towards a player change it before it is made.
                     let o = &self.orbs[i];

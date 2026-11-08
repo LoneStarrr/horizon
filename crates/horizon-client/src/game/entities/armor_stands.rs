@@ -192,7 +192,8 @@ impl ArmorStandAssets {
     /// `TrimTextureKey`: the trim texture of `stack` on its humanoid
     /// layer (`humanoid` or `humanoid_leggings`), if it has a trim.
     fn trim_texture(&self, asset: &str, kind: &str, stack: &ItemStack) -> Option<TrimTexture> {
-        let (material, pattern) = stack.extra.as_ref()?.trim.as_ref()?;
+        let (material, pattern) =
+            horizon_client::item_data::trim::named(stack.extra.as_ref()?.trim.as_ref()?)?;
         let overrides = self
             .trim_overrides
             .get(asset)
@@ -785,7 +786,7 @@ impl Game<'_> {
         let Some((sprite, tint)) = self.particle_sprite(state, block) else {
             return;
         };
-        let options = mod_api::particles::ParticleOptions::block(
+        let options = horizon_client::particles::ParticleOptions::block(
             horizon_client::particles::ParticleType::Block,
             sprite,
             tint,
@@ -804,6 +805,17 @@ impl Game<'_> {
         let time = self.world.game_time;
         let at = self.armor_stands[i].position;
         let at = [at.x, at.y, at.z];
+        // `Entity.isInvulnerableTo` before ArmorStand's own branches (#916):
+        // the saved flag or window refuses the hit — past only for
+        // #bypasses_invulnerability damage and a creative player's hit
+        // (`DamageSource.isCreativePlayer`).
+        if self.saved_refuses_damage(
+            self.armor_stands[i].id,
+            "minecraft:player_attack",
+            self.creative,
+        ) {
+            return false;
+        }
         if self.creative {
             let (width, height) = stand_box(&self.armor_stands[i]);
             self.armor_stands.remove(i);
@@ -864,6 +876,9 @@ impl Game<'_> {
                 continue;
             }
             self.armor_stands[i].first_tick = false;
+            // Entity.baseTick: the saved invulnerability window counts down
+            // (#916).
+            self.tick_saved_invulnerable_time(self.armor_stands[i].id);
             self.armor_stand_location_effects(i, false);
             let a = &mut self.armor_stands[i];
             a.previous = a.position;
@@ -1077,9 +1092,7 @@ impl Game<'_> {
             source,
             recently_hit: false,
         };
-        self.drop_death_items(&dying, Vec::new(), 10, |_| {
-            super::dispenser::new_item_motion()
-        });
+        self.drop_death_items(&dying, Vec::new(), 10, |_| None);
     }
     /// `ArmorStand.brokenByAnything`, then `kill`, as burning out or a blast
     /// breaks a stand: its equipment pops above its block, the stand item does

@@ -439,6 +439,10 @@ pub struct Attributes {
     /// The transient modifiers mods added: in the value and synced, never
     /// saved.
     pub transient: Vec<Modifier>,
+    /// The transient minecraft:baby speed modifier was taken away
+    /// (`/attribute ... modifier remove`) until the next setBaby. Not
+    /// saved: a load runs setBaby again.
+    pub baby_speed_removed: bool,
 }
 /// The attribute `/attribute` names (`follow_range`, not
 /// `minecraft:follow_range`) when gameplay reads it from this store. Armor
@@ -472,7 +476,13 @@ pub fn base_value_with(m: &Mob, a: Attr, default: impl FnOnce() -> Option<f64>) 
 }
 /// The transient modifiers of the mob's state (`SPEED_MODIFIER_BABY`).
 pub fn transient(m: &Mob, a: Attr) -> Option<(f64, Op)> {
-    if a != Attr::MovementSpeed || !m.is_baby() {
+    if a != Attr::MovementSpeed
+        || !m.is_baby()
+        || m.extra
+            .attributes
+            .as_ref()
+            .is_some_and(|s| s.baby_speed_removed)
+    {
         return None;
     }
     match m.species() {
@@ -959,6 +969,14 @@ pub fn set_baby(m: &mut Mob, baby: bool) {
     match s {
         _ if zombie(s) || s == Species::Piglin => {
             m.extra.age = if baby { NON_AGEABLE_BABY } else { 0 };
+            // Zombie/Piglin.setBaby: removeModifier(minecraft:baby), then the
+            // transient one again for a baby.
+            if let Some(a) = m.extra.attributes.as_mut() {
+                a.baby_speed_removed = false;
+            }
+            if has_modifier(m, Attr::MovementSpeed, "minecraft:baby") {
+                remove_modifier(m, Attr::MovementSpeed, "minecraft:baby");
+            }
         }
         Species::Zoglin => {
             m.extra.age = if baby { NON_AGEABLE_BABY } else { 0 };
@@ -1108,13 +1126,9 @@ pub fn equip_stack(
         let trim = stack
             .components
             .iter()
+            .rev()
             .find(|(id, _)| id == "minecraft:trim")
-            .and_then(|(_, v)| {
-                Some((
-                    Arc::from(v["material"].as_str()?),
-                    Arc::from(v["pattern"].as_str()?),
-                ))
-            });
+            .and_then(|(_, v)| v.as_ref().and_then(crate::item_data::trim::from_nbt));
         gear::set_trim(m, gear_slot(slot), trim);
     }
     if let Some(chance) = drop_chance {
@@ -2699,7 +2713,7 @@ mod tests {
         let mut m = crate::mobs::Mob::new(1, kind, horizon_core::geometry::Vec3::ZERO, 0.0);
         set_item(&mut m, CHEST, "minecraft:iron_chestplate");
         set_slot_enchantments(&mut m, CHEST, vec![(Arc::from("minecraft:thorns"), 3)]);
-        let trim: gear::Trim = (Arc::from("minecraft:gold"), Arc::from("minecraft:coast"));
+        let trim: gear::Trim = ("minecraft:gold".into(), "minecraft:coast".into());
         gear::set_trim(&mut m, gear::CHEST, Some(trim.clone()));
         set_slot_damage(&mut m, CHEST, 2);
         set_slot_damage(&mut m, CHEST, 5);

@@ -145,7 +145,14 @@ impl PackResources {
         item_data: &horizon_world::item_defaults::ItemData,
     ) -> Result<Self> {
         let visibility = models::load_visibility(root.prepared(), assets.registry)?;
-        let tables = Arc::new(MeshTables::new(&assets, &render, facts, visibility)?);
+        api_values::resolve_block_definitions(assets.registry)?;
+        let tables = Arc::new(MeshTables::new(
+            &assets,
+            &render,
+            facts,
+            visibility,
+            api_values::mod_tint_values(assets.registry)?,
+        )?);
         let item_renderer = horizon_client::item_render::ItemRenderer::load_with_library(
             root,
             render.model_library.clone(),
@@ -188,6 +195,32 @@ impl PackResources {
         biomes: Arc<Biomes>,
         light: Arc<LightTables>,
     ) -> Self {
+        // These pack-local resources do not depend on one another. Decode the
+        // images and language map together so a custom-sky pack cannot put all
+        // of the pack assembly on the critical path behind its own files.
+        let (names, clouds, forcefield, custom_sky) = std::thread::scope(|scope| {
+            let names = named_scope(scope, "pack.names", || Names::load(root.source()));
+            let clouds = named_scope(scope, "pack.clouds", || load_clouds(root.source()));
+            let forcefield =
+                named_scope(scope, "pack.forcefield", || load_forcefield(root.source()));
+            let custom_sky = named_scope(scope, "pack.custom_sky", || {
+                horizon_client::custom_sky::CustomSky::load(root.source())
+            });
+            (
+                names
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                clouds
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                forcefield
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                custom_sky
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            )
+        });
         Self {
             layer_names: Arc::new(
                 render
@@ -212,10 +245,10 @@ impl PackResources {
             data_source: root.data().clone(),
             data_changes: root.data_changes().clone(),
             additional_data: Arc::from([]),
-            names: Arc::new(Names::load(root.source())),
-            clouds: Arc::new(load_clouds(root.source())),
-            forcefield: Arc::new(load_forcefield(root.source())),
-            custom_sky: Arc::new(horizon_client::custom_sky::CustomSky::load(root.source())),
+            names: Arc::new(names),
+            clouds: Arc::new(clouds),
+            forcefield: Arc::new(forcefield),
+            custom_sky: Arc::new(custom_sky),
         }
     }
 }

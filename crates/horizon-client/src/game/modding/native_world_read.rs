@@ -1,14 +1,16 @@
 //! Read-only block, tag and fluid queries for native mods.
+use super::native_level_signals::ReadLevel;
 use super::{Dim, Game};
 use horizon_client::{items::Items, world::World};
+use horizon_core::{geometry::Direction, position::BlockPos};
 use horizon_world::{
     chunk::BlockState,
-    fluid::{FluidKind, FluidState as EngineFluidState},
-    level::Behaviours,
+    fluid::{FluidHeightWorld, FluidKind, FluidState as EngineFluidState},
+    level::{Behaviours, fluid_can_be_replaced_with, fluid_tick_delay},
     registry::{BlockRegistry, BlockStateId},
 };
 use mod_api::BlockKey;
-use mod_api::{FluidState, LevelRef, NativeLifecycleContext, UnresolvedFluid};
+use mod_api::{FluidKey, FluidState, LevelRef, NativeLifecycleContext, UnresolvedFluid};
 
 /// Why a server block cannot be read.
 #[allow(dead_code)]
@@ -25,22 +27,21 @@ pub(super) enum NativeBlockReadError {
 
 thread_local! {
     // Like the key-to-state mapping, this snapshot belongs to the thread resolving the world.
-    static BLOCK_TAGS: std::cell::RefCell<std::collections::HashMap<String, horizon_world::level::data::BlockSet>> = Default::default();
+    static BLOCK_TAGS: std::cell::RefCell<std::collections::HashMap<String, std::collections::HashSet<BlockKey>>> = Default::default();
 }
 
 /// Bind the world's merged tags alongside its block mappings, including the resource-only case.
 /// Never cache on Items: its string tables also serve tools and client network snapshots.
 pub(super) fn prepare_block_tags(
     items: &Items,
-    mut resolve: impl FnMut(&str) -> Option<horizon_world::level::states::BlockId>,
-) -> std::collections::HashMap<String, horizon_world::level::data::BlockSet> {
+) -> std::collections::HashMap<String, std::collections::HashSet<BlockKey>> {
     items
         .block_tags
         .iter()
         .map(|(tag, members)| {
-            let mut set = horizon_world::level::data::BlockSet::default();
+            let mut set = std::collections::HashSet::<BlockKey>::default();
             for name in members {
-                if let Some(block) = resolve(name) {
+                if let Some(block) = mod_api::__private::block_key(name) {
                     set.insert(block);
                 }
             }
@@ -50,21 +51,21 @@ pub(super) fn prepare_block_tags(
 }
 
 pub(super) fn install_block_tags(
-    tags: std::collections::HashMap<String, horizon_world::level::data::BlockSet>,
+    tags: std::collections::HashMap<String, std::collections::HashSet<BlockKey>>,
 ) {
     BLOCK_TAGS.with(|snapshot| *snapshot.borrow_mut() = tags);
 }
 
-/// One numeric key mapping, one tag-name lookup and one bit test; no block name lookup.
+/// One availability check, one tag-name lookup and one API key membership test.
 /// An unavailable owning-thread mapping is not a missing tag.
 pub(super) fn block_in_tag(block: BlockKey, tag: &str) -> Option<bool> {
-    let block = mod_api::__private::resolved_block(block)?.block;
+    super::api_values::default_state(block)?;
     let tag = horizon_client::command::args::normalized(tag);
     Some(BLOCK_TAGS.with(|snapshot| {
         snapshot
             .borrow()
             .get(tag.as_ref())
-            .is_some_and(|set| set.contains(block))
+            .is_some_and(|set| set.contains(&block))
     }))
 }
 
@@ -80,9 +81,14 @@ pub(super) fn state_fluid(
 
 /// Convert the engine's state using the load-owned kind-to-key mapping.
 pub(super) fn api_fluid_state(state: EngineFluidState) -> Option<FluidState> {
-    Some(mod_api::__private::engine_fluid_state(
-        mod_api::__private::world_fluid_key(state.kind())?,
-        state,
+    Some(mod_api::__private::fluid_state(
+        match state.kind().vanilla_index() {
+            Some(index) => mod_api::__private::world_fluid_key(usize::from(index))?,
+            None => mod_api::__private::fluid_key(state.kind().name())?,
+        },
+        state.amount(),
+        state.falling(),
+        state.is_source(),
     ))
 }
 
@@ -113,6 +119,45 @@ fn fluid_kind(fluid: &str) -> Option<FluidKind> {
     FluidKind::from_name(&horizon_client::command::args::normalized(fluid))
 }
 
+/// The world fluid a registered key names. None for a tank-only fluid, which has no world
+/// form, and for a key the registry doesn't hold.
+pub(super) fn engine_fluid_kind(fluid: FluidKey) -> Option<FluidKind> {
+    FluidKind::from_name(mod_api::__private::fluid_id(fluid)?)
+}
+
+/// The blocks around one position of a level, as `FluidState.getHeight` reads them: an unloaded
+/// block is empty and has no sturdy underside.
+struct FluidColumn<'a, 'g> {
+    game: &'a Game<'g>,
+    level: LevelRef,
+}
+impl FluidColumn<'_, '_> {
+    fn fluid_at(&self, pos: [i32; 3]) -> EngineFluidState {
+        self.game
+            .level_block_state(self.level, pos)
+            .map_or(EngineFluidState::EMPTY, |state| {
+                self.game.res.behaviours().fluid(state)
+            })
+    }
+}
+impl FluidHeightWorld for FluidColumn<'_, '_> {
+    type Error = std::convert::Infallible;
+    fn fluid(&mut self, pos: [i32; 3]) -> Result<EngineFluidState, Self::Error> {
+        Ok(self.fluid_at(pos))
+    }
+    fn sturdy_down(&mut self, pos: [i32; 3]) -> Result<bool, Self::Error> {
+        Ok(self
+            .game
+            .level_block_state(self.level, pos)
+            .is_some_and(|state| {
+                self.game
+                    .res
+                    .behaviours()
+                    .is_face_sturdy(state, Direction::Down)
+            }))
+    }
+}
+
 impl Game<'_> {
     /// The saved name for an engine-issued unresolved fluid.
     pub(super) fn unresolved_fluid_id(&self, fluid: UnresolvedFluid) -> String {
@@ -129,17 +174,12 @@ impl Game<'_> {
         self.session_lock.is_some().then(|| self.items())
     }
 
-    /// `items`' block tags, over this game's block ids.
+    /// `items`' block tags, over this game's resolved block keys.
     pub(super) fn block_tag_sets(
         &self,
         items: &Items,
-    ) -> std::collections::HashMap<String, horizon_world::level::data::BlockSet> {
-        let registry = self.pack.assets.registry;
-        prepare_block_tags(items, |name| {
-            registry
-                .default_state(name)
-                .map(|state| self.res.behaviours().block(state))
-        })
+    ) -> std::collections::HashMap<String, std::collections::HashSet<BlockKey>> {
+        prepare_block_tags(items)
     }
 
     /// Whether the resolved block is in the world's merged block tag, on a client the tag its
@@ -198,6 +238,78 @@ impl Game<'_> {
         Some(fluid_shape(fluid, above).into_iter().collect())
     }
 
+    /// `Fluid.getTickDelay(level)` of `fluid` at `pos` in the level in place: vanilla's by its
+    /// family and the dimension (`World::fast_lava`), a mod fluid's as registered and as its
+    /// `fluid_rules` parts change it there (the one rule path the flow itself reads). None for
+    /// another level, a stale handle, a client, an unloaded or out-of-height position and a
+    /// fluid with no world form.
+    pub(super) fn level_fluid_tick_delay(
+        &self,
+        level: LevelRef,
+        fluid: FluidKey,
+        pos: [i32; 3],
+    ) -> Option<i32> {
+        let [x, y, z] = pos;
+        if !self.level_in_place(level) || !self.world.is_loaded_at(x, y, z) {
+            return None;
+        }
+        let kind = engine_fluid_kind(fluid)?;
+        let view = ReadLevel { game: self, level };
+        Some(fluid_tick_delay(kind, self.world.fast_lava, || {
+            let fluid = kind.mod_fluid()?;
+            Some(super::GameLevel::answered_fluid_rules(
+                self.dim.level(),
+                BlockPos::new(x, y, z),
+                fluid,
+                fluid.get().rules,
+                |call| mod_api::dispatch_fluid_rules(&view, call),
+            ))
+        }))
+    }
+
+    /// `FluidState.getHeight(level, pos)` of the fluid at `pos`. None for a stale handle or a
+    /// position that isn't loaded, as `level_block_state`.
+    pub(super) fn level_fluid_height(&self, level: LevelRef, pos: [i32; 3]) -> Option<f32> {
+        let mut column = FluidColumn { game: self, level };
+        self.level_block_state(level, pos)?;
+        let Ok(height) = column.fluid_at(pos).height_at(&mut column, pos);
+        Some(height)
+    }
+
+    /// The surface height the camera's immersion test reads at `pos`
+    /// (`FluidState::camera_height_at`). None as for `level_fluid_height`.
+    pub(super) fn level_fluid_height_for_camera(
+        &self,
+        level: LevelRef,
+        pos: [i32; 3],
+    ) -> Option<f32> {
+        let mut column = FluidColumn { game: self, level };
+        self.level_block_state(level, pos)?;
+        let Ok(height) = column.fluid_at(pos).camera_height_at(&mut column, pos);
+        Some(height)
+    }
+
+    /// `FluidState.canBeReplacedWith(level, pos, fluid, direction)` for the fluid at `pos`. False
+    /// for a `fluid` with no world form; None as for `level_fluid_height`.
+    pub(super) fn level_fluid_can_be_replaced_with(
+        &self,
+        level: LevelRef,
+        pos: [i32; 3],
+        fluid: FluidKey,
+        direction: Direction,
+    ) -> Option<bool> {
+        let mut column = FluidColumn { game: self, level };
+        self.level_block_state(level, pos)?;
+        let here = column.fluid_at(pos);
+        let Some(other) = engine_fluid_kind(fluid) else {
+            return Some(false);
+        };
+        Some(fluid_can_be_replaced_with(here, other, direction, || {
+            let Ok(height) = here.height_at(&mut column, pos);
+            height
+        }))
+    }
+
     /// Whether `fluid` and `other` are the same fluid (`Fluid.isSame`): a source and its
     /// flowing form are, so `minecraft:water` and `minecraft:flowing_water` are the same, water
     /// and lava not. Names are fluid ids, with or without `minecraft:`; false when either
@@ -212,8 +324,8 @@ impl Game<'_> {
     /// The bucket item that picks `fluid` up (`Fluid.getBucket`), `minecraft:water_bucket` for
     /// water and flowing water. None for `minecraft:empty`, whose bucket is air, and for a name
     /// no fluid has.
-    pub(super) fn fluid_bucket(&self, fluid: &str) -> Option<&'static str> {
-        horizon_world::level::fluid_bucket(fluid_kind(fluid)?)
+    pub(super) fn fluid_bucket(&self, fluid: &str) -> Option<mod_api::ItemKey> {
+        mod_api::__private::item_key(horizon_world::level::fluid_bucket(fluid_kind(fluid)?)?)
     }
 
     /// The sound event a bucket plays as it picks `fluid` up (`Fluid.getPickupSound`),
@@ -235,12 +347,10 @@ impl Game<'_> {
         if !self.native_lifecycle.permits_read(context) {
             return Err(NativeBlockReadError::InactiveContext);
         }
-        let dim = match dimension {
-            "minecraft:overworld" => Dim::Overworld,
-            "minecraft:the_nether" => Dim::Nether,
-            "minecraft:the_end" => Dim::End,
-            _ => return Err(NativeBlockReadError::UnavailableDimension),
-        };
+        if !Dim::exists(dimension) {
+            return Err(NativeBlockReadError::UnavailableDimension);
+        }
+        let dim = Dim::from_id(dimension);
         let world = if dim == self.dim {
             Some(&self.world)
         } else {
@@ -330,9 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn numeric_block_tags_rebind_the_merged_snapshot_without_changing_keys() {
-        use horizon_world::level::states::BlockId;
-        use mod_api::__private::{ResolvedBlock, part_tests, resolve_blocks};
+    fn api_block_tags_rebind_the_merged_snapshot_without_changing_keys() {
+        use mod_api::__private::part_tests;
         mod_api::__private::install(Default::default());
         crate::game::api_values::register_game_keys([
             "minecraft:stone".into(),
@@ -348,21 +457,14 @@ mod tests {
             "minecraft:base_stone_overworld".into(),
             ["minecraft:stone".into()].into(),
         );
-        for (stone_index, machine_index) in [(2, 71), (96, 5)] {
-            let resolve = |name: &str| match name {
-                "minecraft:stone" => Some(BlockId(stone_index)),
-                "test:machine" => Some(BlockId(machine_index)),
-                _ => None,
-            };
-            resolve_blocks(|name| {
-                Some(ResolvedBlock {
-                    block: resolve(name)?,
-                    default: BlockStateId(0),
-                    states: mod_api::BlockStateRange::new(BlockStateId(0), 1),
-                })
-            })
-            .unwrap();
-            install_block_tags(prepare_block_tags(&items, resolve));
+        for facts in [
+            r#"{"defaults":{"minecraft:air":2,"minecraft:stone":0,"test:machine":1},"states":[["s",false,false,"","minecraft:stone"],["m",false,false,"","test:machine"],["a",true,false,"","minecraft:air"]]}"#,
+            r#"{"defaults":{"minecraft:air":2,"minecraft:stone":1,"test:machine":0},"states":[["m",false,false,"","test:machine"],["s",false,false,"","minecraft:stone"],["a",true,false,"","minecraft:air"]]}"#,
+        ] {
+            // Build reordered numeric registries from the same API definitions.
+            let registry = BlockRegistry::from_facts_json(facts.as_bytes()).unwrap();
+            crate::game::api_values::resolve_block_definitions(&registry).unwrap();
+            install_block_tags(prepare_block_tags(&items));
             assert_eq!(block_in_tag(machine, "test:machines"), Some(true));
             assert_eq!(block_in_tag(stone, "test:machines"), Some(false));
             assert_eq!(block_in_tag(stone, "base_stone_overworld"), Some(true));
@@ -377,11 +479,7 @@ mod tests {
         items
             .block_tags
             .insert("test:machines".into(), ["minecraft:stone".into()].into());
-        install_block_tags(prepare_block_tags(&items, |name| match name {
-            "minecraft:stone" => Some(BlockId(96)),
-            "test:machine" => Some(BlockId(5)),
-            _ => None,
-        }));
+        install_block_tags(prepare_block_tags(&items));
         assert_eq!(block_in_tag(machine, "test:machines"), Some(false));
         assert_eq!(block_in_tag(stone, "test:machines"), Some(true));
         // Valid key, no owning world: never answer false using another thread's tags.
@@ -653,10 +751,20 @@ mod tests {
             });
             game.options.dedicated = Some(Vec::new());
             let bounds = game.level_height(level).unwrap();
-            let parsed = game.block_state_id("minecraft:oak_slab[waterlogged=true]");
-            let default = game.block_state_default(mod_api::__private::part_tests::block_key(
-                "minecraft:oak_slab",
-            ));
+            use super::super::api_values::TryIntoApi;
+            let stone = stone.try_into_api().unwrap();
+            let slab = slab.try_into_api().unwrap();
+            let invalid = mod_api::BlockStateRecord::new(stone.block(), u16::MAX).into();
+            let parsed = game
+                .block_state_id("minecraft:oak_slab[waterlogged=true]")
+                .try_into_api()
+                .unwrap();
+            let default = game
+                .block_state_default(mod_api::__private::part_tests::block_key(
+                    "minecraft:oak_slab",
+                ))
+                .try_into_api()
+                .unwrap();
             game.with_level(|_, host, ticks| {
                 assert_eq!(
                     host.block_state_id("minecraft:oak_slab[waterlogged=true]"),
@@ -692,7 +800,7 @@ mod tests {
                         .unwrap()
                         .contains("waterlogged=true")
                 );
-                assert_eq!(host.state_string(BlockStateId(u32::MAX)), None);
+                assert_eq!(host.state_string(invalid), None);
                 assert_eq!((host.min_y(), host.height()), bounds);
                 assert_eq!(
                     host.block_in_tag(
@@ -750,7 +858,7 @@ mod tests {
 
                 assert_eq!(hit.state_string(stone).as_deref(), Some("minecraft:stone"));
                 assert!(hit.state_string(slab).unwrap().contains("waterlogged=true"));
-                assert_eq!(hit.state_string(BlockStateId(u32::MAX)), None);
+                assert_eq!(hit.state_string(invalid), None);
                 assert_eq!((hit.min_y(), hit.height()), bounds);
                 assert_eq!(
                     hit.block_in_tag(
@@ -822,10 +930,15 @@ mod tests {
             assert!(!host.fluid_is_same("nope:missing", "nope:missing"));
 
             assert_eq!(
-                host.fluid_bucket("minecraft:flowing_water"),
+                host.fluid_bucket("minecraft:flowing_water")
+                    .and_then(mod_api::__private::item_key_id),
                 Some("minecraft:water_bucket")
             );
-            assert_eq!(host.fluid_bucket("lava"), Some("minecraft:lava_bucket"));
+            assert_eq!(
+                host.fluid_bucket("lava")
+                    .and_then(mod_api::__private::item_key_id),
+                Some("minecraft:lava_bucket")
+            );
             assert_eq!(host.fluid_bucket("minecraft:empty"), None);
             assert_eq!(host.fluid_bucket("nope:missing"), None);
 

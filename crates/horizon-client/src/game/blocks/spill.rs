@@ -4,7 +4,7 @@
 //! moment vanilla draws them. The item entities they make are added to the
 //! world as soon as the behaviour returns, within the same tick.
 use super::api_values::{TryIntoApi, TryIntoEngine};
-use super::{Game, GameLevel, Screen, dispenser::new_item_motion, storage::is_shulker_box};
+use super::{Game, GameLevel, Screen, storage::is_shulker_box};
 use horizon_client::{
     block_entity_item, block_entity_nbt,
     containers::{Banner, BlockEntity},
@@ -209,9 +209,38 @@ impl Pending {
     }
 }
 
+/// Constructor random retained while drop hooks edit a not-yet-joined item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ItemRandom {
+    pub uuid: [i32; 4],
+    pub bob: f32,
+    pub yaw: f32,
+    pub velocity: [f64; 3],
+}
+
+/// The one ItemEntity constructor random sequence, shared by immediate and
+/// deferred spawning: UUID, bob offset, yaw, then optional default motion.
+pub(super) fn prepare_item_random(velocity: Option<[f64; 3]>) -> ItemRandom {
+    let mut own = horizon_client::random_source::entity();
+    let uuid = horizon_client::save::insecure_uuid(&mut own);
+    let bob = own.next_float() * std::f32::consts::PI * 2.0;
+    let yaw = own.next_float() * 360.0;
+    let velocity = velocity.unwrap_or_else(|| {
+        let x = own.next_double() * 0.2 - 0.1;
+        [x, 0.2, own.next_double() * 0.2 - 0.1]
+    });
+    ItemRandom {
+        uuid,
+        bob,
+        yaw,
+        velocity,
+    }
+}
+
 /// An item entity to add: where, its motion (None: `new ItemEntity`'s own
 /// random motion) and its pickup delay.
 pub(super) struct Spawn {
+    pub(super) random: Option<ItemRandom>,
     pub(super) stack: ItemStack,
     pub(super) pos: [f64; 3],
     pub(super) motion: Option<[f64; 3]>,
@@ -221,7 +250,8 @@ pub(super) struct Spawn {
 /// What a broken block spawns (`GameLevel::block_dropped`).
 /// Prepared engine item entity; API snapshots exist only while a listener runs.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct BlockItemDrop {
+pub(crate) struct BlockItemDrop {
+    pub(super) random: Option<ItemRandom>,
     pub(super) stack: ItemStack,
     pub(super) position: [f64; 3],
     pub(super) velocity: [f64; 3],
@@ -287,6 +317,7 @@ fn retell_runs(
             .into_iter()
             .enumerate()
             .map(|(i, stack)| Spawn {
+                random: run.get(i).and_then(|s| s.random),
                 stack,
                 pos: run.get(i).or(run.last()).map_or(top, |s| s.pos),
                 motion: run.get(i).and_then(|s| s.motion),
@@ -417,6 +448,7 @@ impl GameLevel<'_> {
         self.pending.attach(pos, &mut stack);
         let at = pop_position(&mut self.world.random, pos);
         self.spill.spawns.push(Spawn {
+            random: None,
             stack,
             pos: at,
             motion: None,
@@ -435,6 +467,7 @@ impl GameLevel<'_> {
     pub(super) fn pop_above(&mut self, pos: BlockPos, item: std::sync::Arc<str>) {
         let at = removal::jukebox_pop_position(&mut self.world.random, pos);
         self.spill.spawns.push(Spawn {
+            random: None,
             stack: ItemStack::new(&item, 1),
             pos: at,
             motion: None,
@@ -514,6 +547,7 @@ impl GameLevel<'_> {
                 kept.push(item.stack);
             } else {
                 self.spill.spawns.push(Spawn {
+                    random: item.random,
                     stack: item.stack,
                     pos: item.position,
                     motion: Some(item.velocity),
@@ -612,10 +646,12 @@ impl GameLevel<'_> {
     pub(super) fn block_drop_item(&mut self, at: [i32; 3], mut stack: ItemStack) -> BlockItemDrop {
         self.pending.attach(at, &mut stack);
         let position = pop_position(&mut self.world.random, at);
+        let random = prepare_item_random(None);
         BlockItemDrop {
+            random: Some(random),
             stack,
             position,
-            velocity: new_item_motion(),
+            velocity: random.velocity,
             pickup_delay: 10,
         }
     }
@@ -637,21 +673,24 @@ impl GameLevel<'_> {
         } = dropped;
         if self.native_authoritative
             && mod_api::__private::listened(mod_api::HookId::BlockDrops)
-            && let (Ok(tool), Ok(mut snapshots)) = (tool.try_into_api(), items.try_into_api())
+            && let Ok(mut snapshots) = items.try_into_api()
         {
             let mut next_experience = experience;
             let mut next_canceled = canceled;
-            self.native_block_drops(mod_api::__private::BlockDropsCall {
+            self.native_block_drops(crate::game::native_hooks::BlockDropsCall {
                 dimension: self.dimension,
                 pos,
                 state,
                 breaker,
-                tool: tool.as_ref(),
+                tool,
                 drops: &mut snapshots,
                 experience: &mut next_experience,
                 cancel: &mut next_canceled,
             });
-            if let Ok(next_items) = snapshots.try_into_engine(self.items) {
+            if let Ok(mut next_items) = snapshots.try_into_engine(self.items) {
+                for (next, original) in next_items.iter_mut().zip(&items) {
+                    next.random = original.random;
+                }
                 items = next_items;
                 experience = next_experience;
                 canceled = next_canceled;
@@ -785,6 +824,7 @@ impl GameLevel<'_> {
                         }
                         let at = removal::jukebox_pop_position(&mut self.world.random, pos);
                         self.spill.spawns.push(Spawn {
+                            random: None,
                             stack: record,
                             pos: at,
                             motion: None,
@@ -809,6 +849,7 @@ impl GameLevel<'_> {
                         && let Some(book) = l.book.clone()
                     {
                         self.spill.spawns.push(Spawn {
+                            random: None,
                             stack: book,
                             pos: removal::lectern_book_position(pos, step),
                             motion: None,
@@ -934,6 +975,7 @@ impl GameLevel<'_> {
         for piece in removal::drop_item_stack(&mut self.world.random, pos, count) {
             let Some(stack) = &stack else { break };
             self.spill.spawns.push(Spawn {
+                random: None,
                 stack: ItemStack {
                     count: piece.count,
                     ..stack.clone()
@@ -977,7 +1019,13 @@ impl Game<'_> {
     /// Apply the shared block-drop event's item entities and experience unchanged.
     pub(super) fn spawn_block_drops(&mut self, pos: [i32; 3], dropped: BlockDrops) {
         for item in dropped.items {
-            self.spawn_item(item.stack, item.position, item.velocity, item.pickup_delay);
+            self.add_item_entity_prepared(
+                item.stack,
+                item.position,
+                Some(item.velocity),
+                item.pickup_delay,
+                item.random,
+            );
         }
         if dropped.experience > 0 {
             self.spawn_orbs(pos.map(|v| f64::from(v) + 0.5), dropped.experience);
@@ -1006,8 +1054,7 @@ impl Game<'_> {
             );
         });
         for s in spill.spawns {
-            let motion = s.motion.unwrap_or_else(new_item_motion);
-            self.spawn_item(s.stack, s.pos, motion, s.delay);
+            self.add_item_entity_prepared(s.stack, s.pos, s.motion, s.delay, s.random);
         }
         for (at, value, merge_id) in spill.orbs {
             self.award_orb(at, value, merge_id);
@@ -1252,6 +1299,7 @@ mod tests {
     #[test]
     fn a_used_run_is_retold_in_place() {
         let spawn = |item: &str, x: f64| Spawn {
+            random: None,
             stack: ItemStack::new(item, 1),
             pos: [x, 0.0, 0.0],
             motion: None,

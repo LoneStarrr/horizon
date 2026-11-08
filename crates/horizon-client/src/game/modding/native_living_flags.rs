@@ -674,6 +674,7 @@ mod tests {
             entities: &[],
             next_entity: &mut game.next_entity,
             spawn: [0.0, 64.0, 0.0],
+            spawn_angle: [0.0; 2],
             difficulty: 1,
             difficulty_locked: false,
             clock_rate: 1.0,

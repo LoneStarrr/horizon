@@ -28,7 +28,9 @@ from tools import lab
 
 KNOWN = Path(__file__).with_name("ignored-tests-known-failures.txt")
 RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED)$")
-SUMMARY = re.compile(r"^test result: ")
+SUMMARY = re.compile(r"^test result: \S+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;")
+TARGET = re.compile(r"^\s+Running (?:unittests|tests/)")
+COUNT = re.compile(r"^running (\d+) tests?$")
 PANIC = re.compile(r"^thread '([^']+)'.* panicked at (\S+):$")
 # Packages whose integration tests (`tests/*.rs`) run too, beside their library tests.
 INTEGRATION_TESTS = {"horizon-client"}
@@ -77,20 +79,46 @@ def run(package, skip):
         )
     results = {}
     summaries = []
+    print(f"{package}: cargo exit {process.returncode}")
+    target_count = None
+    target_number = 0
+    awaiting_count = False
+    incomplete = False
     for line in process.stdout.splitlines():
+        if TARGET.match(line):
+            incomplete |= target_count is not None or awaiting_count
+            target_number += 1
+            awaiting_count = True
+        elif awaiting_count and (found := COUNT.match(line)):
+            target_count = int(found[1])
+            print(f"{package}: target {target_number} started {target_count} tests")
+            awaiting_count = False
         if found := RESULT.match(line):
             results[found[1]] = found[2] == "ok"
         elif found := PANIC.match(line):
             print(f"  {found[1]} panicked at {found[2]}")
         elif line.startswith("screen-effect event loop error: "):
             print(line)
-        elif SUMMARY.match(line):
-            summaries.append(line)
+        elif found := SUMMARY.match(line):
+            # Resource fixtures launch filtered copies of this test executable.
+            # Their summaries are not evidence that the parent target finished.
+            if target_count == sum(map(int, found.groups())):
+                summaries.append(line)
+                target_count = None
+                print(f"{package}: {line}")
+        elif status := re.search(r"\((?:signal|exit status): \d+", line):
+            # Emit only the numeric status, never adjacent test output.
+            print(f"{package}: {status[0]})")
+    if incomplete or awaiting_count or target_count is not None:
+        print(f"{package}: test target did not finish (cargo exit {process.returncode})")
+        return None
+    if process.returncode and all(results.values()):
+        print(f"{package}: cargo exited {process.returncode} without a parsed test failure")
+        return None
     if not summaries:
         # A build failure: the compiler's output quotes only this repository's code.
         print(process.stdout[-20000:])
         return None
-    print(f"{package}: {summaries[-1]}")
     return results
 
 
@@ -104,7 +132,7 @@ def main(packages):
         skip = [test for (listed, test), mark in known.items() if listed == package and mark in skipped]
         results = run(package, skip)
         if results is None:
-            problems.append(f"{package}: the tests didn't build")
+            problems.append(f"{package}: the test run did not complete")
             continue
         for test, passed in sorted(results.items()):
             listed = (package, test) in known

@@ -1040,6 +1040,7 @@ impl Game<'_> {
         // a sculk tick does loads, unloads or lights a chunk or moves a ticket.
         let levels = self.tickets.levels();
         let chunks = &self.world.chunks;
+        let pending = &self.world.entities_pending;
         let mut ticking = FxHashMap::<(i32, i32), bool>::default();
         let mut ticks = |cx: i32, cz: i32| {
             *ticking.entry((cx, cz)).or_insert_with(|| {
@@ -1058,7 +1059,9 @@ impl Game<'_> {
             .iter()
             .filter_map(|&key| {
                 let (cx, cz) = (key.0 >> 4, key.2 >> 4);
+                // `LevelChunk.isTicking`: its own chunk's entities loaded too.
                 if !ticks(cx, cz)
+                    || pending.contains(&(cx, cz))
                     || matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle())
                 {
                     return None;
@@ -2026,7 +2029,7 @@ impl Game<'_> {
                 };
             }
             self.particles.add(
-                &mod_api::particles::ParticleOptions::dust([1.0, 0.0, 0.0], 1.0),
+                &horizon_client::particles::ParticleOptions::dust([1.0, 0.0, 0.0], 1.0),
                 [
                     f64::from(pos[0]) + at[0],
                     f64::from(pos[1]) + at[1],
@@ -2266,7 +2269,11 @@ impl Game<'_> {
     }
     /// `Entity.checkSupportingBlock`: the block under this box closest to the
     /// entity. Everything but the player works it out when it asks.
-    fn supporting_block(&self, position: Vec3, bounds: Aabb) -> Option<BlockPos> {
+    pub(in crate::game) fn supporting_block(
+        &self,
+        position: Vec3,
+        bounds: Aabb,
+    ) -> Option<BlockPos> {
         let (min, max) = (bounds.min_position(), bounds.max_position());
         let foot = Aabb::new(
             Vec3::new(min.x, min.y - 1.0e-6, min.z),
@@ -2585,7 +2592,13 @@ mod tests {
                 _host: &mut dyn mod_api::ServerHost,
                 event: &mut VanillaGameEventEvent<'_>,
             ) -> mod_api::Flow {
-                self.0.lock().unwrap().push(event.affected_state);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.affected_state.map(|state| {
+                        crate::game::api_values::TryIntoEngine::try_into_engine(&state, &())
+                            .unwrap()
+                    }));
                 mod_api::Flow::Continue
             }
         }

@@ -261,6 +261,33 @@ pub fn who_uuid(who: Who, uuid_of: &mut impl FnMut(u32) -> Option<[i32; 4]>) -> 
         Who::Mob(id) => uuid_of(id),
     }
 }
+/// Replace every reference to the player `old` in a saved entity with `new`. Older
+/// Horizon worlds named their single player by the offline UUID (`Owner` on tamed
+/// animals and horses, a projectile's `Owner` and an item's `Thrower`, a fox's
+/// `Trusted`, `angry_at`, a leash's `UUID`); when such a world opens under the
+/// account (`lan::playerdata::migrate_owner`), a chunk's entities are rewritten as
+/// they load, and their next save keeps the account's UUID. A reference is the
+/// player's four ints, wherever the entity keeps it; an entity's own `UUID` never
+/// names the player.
+pub fn migrate_player_uuid(tag: &mut Tag, old: [i32; 4], new: [i32; 4]) {
+    if old == new {
+        return;
+    }
+    match tag {
+        Tag::IntArray(uuid) if uuid.as_slice() == old.as_slice() => uuid.copy_from_slice(&new),
+        Tag::List(list) => {
+            for tag in list {
+                migrate_player_uuid(tag, old, new);
+            }
+        }
+        Tag::Compound(map) => {
+            for tag in map.values_mut() {
+                migrate_player_uuid(tag, old, new);
+            }
+        }
+        _ => {}
+    }
+}
 /// The entity a stored UUID names, while it is in the level: `player` (the
 /// player's own UUID, when one is in the level), or the mob `uuids` gives that
 /// UUID to. `uuids` is the game layer's id -> UUID map, so this is the read half
@@ -732,9 +759,11 @@ pub fn mob_to_nbt(
         "Invulnerable".into(),
         Tag::Byte(i8::from(m.invulnerable_flag)),
     );
-    // Entity.saveWithoutId: the hurt immunity left, only while there is some.
-    if m.invulnerable > 0 {
-        map.insert("invulnerable_time".into(), Tag::Int(m.invulnerable));
+    // Entity.saveWithoutId: `invulnerable_time` — the entity-level window
+    // (#916), not the hurt cooldown (LivingEntity saves none) — only while
+    // it runs.
+    if m.invulnerable_time > 0 {
+        map.insert("invulnerable_time".into(), Tag::Int(m.invulnerable_time));
     } else {
         map.remove(&horizon_core::nbt::JavaString::from("invulnerable_time"));
     }
@@ -1408,12 +1437,20 @@ pub fn mob_to_nbt(
     // the attack damage.
     use crate::mobs::finalize::Attr;
     // Every other living entity's first tick makes the movement_speed instance
-    // (LivingEntity.removeFrost reads it through getAttribute).
-    let made = if species == crate::mobs::Species::Rabbit {
-        vec![Attr::MovementSpeed, Attr::AttackDamage]
-    } else {
-        vec![Attr::MovementSpeed]
-    };
+    // (LivingEntity.removeFrost reads it through getAttribute); before it, the
+    // mob has only the instances it was loaded with (the kept list above).
+    let speed_at_load =
+        crate::mobs::doors::is_zombie(species) || species == crate::mobs::Species::Piglin;
+    let mut made = Vec::new();
+    if speed_at_load || m.age > 0 {
+        made.push(Attr::MovementSpeed);
+    }
+    if species == crate::mobs::Species::Rabbit {
+        made.push(Attr::AttackDamage);
+    }
+    // AttributeMap.pack writes the list even when no instance exists.
+    map.entry("attributes".into())
+        .or_insert_with(|| Tag::List(Vec::new()));
     for attr in made {
         let base = crate::mobs::finalize::base_value(m, attr);
         let mut list = match map.get(&"attributes".into()) {
@@ -1450,6 +1487,15 @@ pub fn mob_to_nbt(
     // including zero and negative values, rather than stale loaded NBT.
     if matches!(m.species(), S::Evoker | S::Illusioner) {
         map.insert("SpellTicks".into(), Tag::Int(m.extra.counter));
+    }
+    // Vindicator.addAdditionalSaveData: `Johnny` only while the flag is set
+    // (`if (this.isJohnny) output.putBoolean("Johnny", true)`).
+    if m.species() == S::Vindicator {
+        if m.extra.johnny {
+            map.insert("Johnny".into(), Tag::Byte(1));
+        } else {
+            map.remove(&"Johnny".into());
+        }
     }
     crate::mobs::raider::write_nbt(m, map);
     crate::mobs::riders::write_nbt(m, map);
@@ -2031,11 +2077,22 @@ pub fn mob_from_nbt(
                 m.extra.ambient_effects.push(effect);
             }
         }
+        if m.extra
+            .effects
+            .iter()
+            .any(|e| e.id == "minecraft:health_boost")
+        {
+            crate::mobs::finalize::health_boost_changed(&mut m);
+        }
     }
     m.silent = flag(tag, "Silent");
     m.invulnerable_flag = flag(tag, "Invulnerable");
-    // Entity.load: `getIntOr("invulnerable_time", 0)`.
-    m.invulnerable = number(tag.get("invulnerable_time")).unwrap_or(0) as i32;
+    // Entity.load: `getIntOr("invulnerable_time", 0)` — the entity-level
+    // window (#916); the hurt cooldown never loads.
+    m.invulnerable_time = match tag.get("invulnerable_time") {
+        Some(Tag::Int(ticks)) => *ticks,
+        _ => 0,
+    };
     if m.species() == crate::mobs::Species::Bat {
         // Bat.readAdditionalSaveData: BatFlags bit 0, resting.
         m.extra.flag = number(tag.get("BatFlags")).unwrap_or(0) & 1 != 0;
@@ -2077,12 +2134,9 @@ pub fn mob_from_nbt(
         if m.species() == crate::mobs::Species::Piglin
             && let Some(Tag::List(items)) = tag.get("Inventory")
         {
-            // InventoryCarrier.readInventoryFromTag (eight slots).
-            m.extra.inventory = items
-                .iter()
-                .filter_map(crate::save::item_from_nbt)
-                .take(8)
-                .collect();
+            // InventoryCarrier.readInventoryFromTag -> SimpleContainer
+            // .fromItemList (eight slots).
+            m.extra.inventory = crate::mobs::villager::load_container(&m, items, 8);
         }
     }
     if matches!(
@@ -2535,6 +2589,11 @@ pub fn mob_from_nbt(
     ) {
         m.extra.counter = number(tag.get("SpellTicks")).unwrap_or(0) as i32;
     }
+    // Vindicator.readAdditionalSaveData: `Johnny`, false when absent. A name
+    // that is Johnny latches the flag again on the next AI step.
+    if m.species() == crate::mobs::Species::Vindicator {
+        m.extra.johnny = flag(tag, "Johnny");
+    }
     crate::mobs::raider::read_nbt(&mut m, tag);
     crate::mobs::riders::read_nbt(&mut m, tag);
     // A mannequin is an `Avatar`, not a `Mob`: it reads none of
@@ -2635,6 +2694,7 @@ pub fn tnt_to_nbt(
     position: Vec3,
     motion: Vec3,
     on_ground: bool,
+    fall_distance: f64,
     fuse: i32,
     power: f32,
     block_state: Tag,
@@ -2650,7 +2710,7 @@ pub fn tnt_to_nbt(
         motion,
         rotation,
         on_ground,
-        fall_distance: 0.0,
+        fall_distance,
     }
     .tag(raw);
     put(&mut tag, "fuse", Tag::Short(fuse as i16));
@@ -2859,6 +2919,9 @@ pub fn orbs_from_nbt(tag: &Tag) -> Vec<ExperienceOrb> {
         count,
         ticks: 0,
         health: number(tag.get("Health")).unwrap_or(5) as i32,
+        // ExperienceOrb's followingPlayer is transient: never saved, so a
+        // loaded orb starts without one.
+        following: None,
     };
     vec![orb]
 }
@@ -3908,8 +3971,9 @@ pub fn armor_stand_from_nbt(tag: &Tag, id: u32) -> Option<ArmorStand> {
     }
     Some(a)
 }
-/// A boat entity (`minecraft:<wood>_boat`, `minecraft:bamboo_chest_raft`...):
-/// chest boats keep their slots in `Items` (`ContainerHelper.saveAllItems`).
+/// `AbstractBoat.addAdditionalSaveData` / `ContainerEntity.addChestVehicleSaveData`:
+/// only chest boats own container fields; a pending table replaces `Items`.
+/// Ordinary slots use `ContainerHelper.saveAllItems` through the existing item encoder.
 pub fn boat_to_nbt(
     id: &str,
     position: Vec3,
@@ -3929,8 +3993,22 @@ pub fn boat_to_nbt(
         fall_distance: 0.0,
     }
     .non_mob_tag(raw);
-    if let (Some(items), Tag::Compound(map)) = (items, &mut tag) {
-        map.insert("Items".into(), crate::save::encode_items(items));
+    if let Tag::Compound(map) = &mut tag {
+        map.remove(&"Items".into());
+        if let Some(items) = items {
+            let table = crate::save::text(map.get(&"LootTable".into()))
+                .and_then(|id| horizon_client_core::identifier::normalize_id(&id));
+            if let Some(table) = table {
+                map.insert("LootTable".into(), Tag::String(table.as_str().into()));
+            } else {
+                map.remove(&"LootTable".into());
+                map.remove(&"LootTableSeed".into());
+                map.insert("Items".into(), crate::save::encode_items(items));
+            }
+        } else {
+            map.remove(&"LootTable".into());
+            map.remove(&"LootTableSeed".into());
+        }
     }
     tag
 }
@@ -4168,6 +4246,7 @@ mod tnt_power_tests {
             Vec3::ZERO,
             Vec3::ZERO,
             false,
+            0.0,
             20,
             10.0,
             string("minecraft:tnt"),
@@ -4181,6 +4260,7 @@ mod tnt_power_tests {
             Vec3::ZERO,
             Vec3::ZERO,
             false,
+            0.0,
             20,
             4.0,
             string("minecraft:tnt"),
@@ -4200,6 +4280,7 @@ mod tnt_power_tests {
                 Vec3::new(1.5, 200.0, 4.5),
                 Vec3::ZERO,
                 false,
+                0.0,
                 80,
                 power,
                 block.clone(),
@@ -4255,6 +4336,7 @@ mod tnt_power_tests {
                 Vec3::ZERO,
                 Vec3::ZERO,
                 false,
+                0.0,
                 80,
                 4.0,
                 t,
@@ -4383,6 +4465,50 @@ mod tests {
     }
     use super::*;
     use crate::items::ItemStack;
+
+    /// Older worlds name their single player by the offline UUID; the migration rewrites
+    /// every reference to it (owner, thrower, trusted list, anger, leash) and nothing else.
+    #[test]
+    fn a_players_offline_uuid_becomes_the_accounts_everywhere_in_an_entity() {
+        let old = [1, 2, 3, 4];
+        let new = [5, 6, 7, 8];
+        let mut tag = Tag::compound([
+            ("id", string("minecraft:wolf")),
+            ("UUID", Tag::IntArray(vec![9, 9, 9, 9])),
+            ("Owner", Tag::IntArray(old.to_vec())),
+            ("Thrower", Tag::IntArray(old.to_vec())),
+            ("angry_at", Tag::IntArray(old.to_vec())),
+            (
+                "Trusted",
+                Tag::List(vec![
+                    Tag::IntArray(old.to_vec()),
+                    Tag::IntArray(vec![3, 3, 3, 3]),
+                ]),
+            ),
+            (
+                "leash",
+                Tag::compound([("UUID", Tag::IntArray(old.to_vec()))]),
+            ),
+            ("Health", Tag::Float(20.0f32.to_bits())),
+        ]);
+        migrate_player_uuid(&mut tag, old, new);
+        assert_eq!(tag.get("Owner"), Some(&Tag::IntArray(new.to_vec())));
+        assert_eq!(tag.get("Thrower"), Some(&Tag::IntArray(new.to_vec())));
+        assert_eq!(tag.get("angry_at"), Some(&Tag::IntArray(new.to_vec())));
+        assert_eq!(
+            tag.get("Trusted"),
+            Some(&Tag::List(vec![
+                Tag::IntArray(new.to_vec()),
+                Tag::IntArray(vec![3, 3, 3, 3]),
+            ]))
+        );
+        assert_eq!(
+            tag.get("leash").and_then(|leash| leash.get("UUID")),
+            Some(&Tag::IntArray(new.to_vec()))
+        );
+        // The entity's own UUID is not the player's.
+        assert_eq!(tag.get("UUID"), Some(&Tag::IntArray(vec![9, 9, 9, 9])));
+    }
 
     #[test]
     fn empty_saved_tags_are_omitted_without_changing_raw_or_nonempty_tags() {
@@ -5773,6 +5899,7 @@ mod tests {
             Vec3::ZERO,
             Vec3::ZERO,
             false,
+            0.0,
             20,
             4.0,
             string("minecraft:tnt"),
@@ -5819,6 +5946,7 @@ mod tests {
             count: 1,
             ticks: 0,
             health: 5,
+            following: None,
         };
         let tag = orb_to_nbt(&orb, [0; 4]);
         assert_eq!(tag.get("Fire"), Some(&Tag::Short(0)));
@@ -5883,6 +6011,7 @@ mod tests {
             count: 3,
             ticks: 0,
             health: 5,
+            following: None,
         };
         let tag = orb_to_nbt(&o, [0; 4]);
         let back = orbs_from_nbt(&tag);
@@ -8585,7 +8714,7 @@ mod held_item_name_tests {
         let mut helmet = crate::items::ItemStack::new("minecraft:iron_helmet", 1);
         helmet.damage = 40;
         helmet.data_mut().custom_name = Some(horizon_core::nbt::Tag::String("Hat".into()));
-        helmet.data_mut().trim = Some((Arc::from("minecraft:gold"), Arc::from("minecraft:coast")));
+        helmet.data_mut().trim = Some(("minecraft:gold".into(), "minecraft:coast".into()));
         assert!(mob.set_equipment_stack(5, Some(helmet.clone())));
         assert!(mob.set_equipment_stack(0, Some(helmet)));
         let raw = mob_to_nbt(&mob, [1, 2, 3, 4], None, None, |_| None);
@@ -8597,11 +8726,11 @@ mod held_item_name_tests {
             crate::mobs::finalize::item_stack(&loaded, crate::mobs::finalize::MAINHAND).unwrap();
         assert_eq!(
             held.data().unwrap().trim,
-            Some((Arc::from("minecraft:gold"), Arc::from("minecraft:coast")))
+            Some(("minecraft:gold".into(), "minecraft:coast".into()))
         );
         assert_eq!(
             worn.data().unwrap().trim,
-            Some((Arc::from("minecraft:gold"), Arc::from("minecraft:coast")))
+            Some(("minecraft:gold".into(), "minecraft:coast".into()))
         );
         // Replacing the item forgets the old stack.
         let mut loaded = loaded;

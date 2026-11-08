@@ -537,6 +537,10 @@ pub struct Menu {
     /// A mount menu's entity type (`minecraft:horse`): what its saddle and
     /// body slots take.
     pub mount: Option<String>,
+    /// Containers a recipe placement may also take ingredients from, after
+    /// the player's inventory (`native_recipe_sources`): the caller fills
+    /// them before and reads them back after.
+    pub sources: Vec<Vec<Option<ItemStack>>>,
 }
 
 /// `AnvilMenu`'s state besides its slots and `cost`.
@@ -1018,6 +1022,7 @@ impl Menu {
             enchant_button: None,
             may_build: true,
             mount: None,
+            sources: Vec::new(),
         }
         .with_initial_data()
     }
@@ -4073,7 +4078,12 @@ pub(crate) mod tests {
         let mut fuel = ItemStack::new("minecraft:stone", 2);
         fuel.data_mut().set_loot_component(
             "minecraft:brewing_fuel",
-            &serde_json::json!({"uses": 7, "speed_multiplier": 2.5}),
+            &Some(
+                horizon_core::json_nbt::json_to_tag(
+                    &serde_json::json!({"uses": 7, "speed_multiplier": 2.5}),
+                )
+                .unwrap(),
+            ),
         );
         let mut menu = Menu::new(Kind::Brewing);
         assert!(menu.may_place(&env, 4, &fuel));
@@ -4941,6 +4951,7 @@ pub(crate) mod tests {
             slots: 1,
             data_slots: 0,
             results: vec![],
+            links: None,
             crafting: None,
         })));
         let mut menu = Menu::new(kind);
@@ -5230,6 +5241,7 @@ pub(crate) mod tests {
             slots: 4,
             data_slots: 0,
             results: vec![3],
+            links: None,
             crafting: None,
         })))
     }
@@ -5332,6 +5344,7 @@ pub(crate) mod tests {
             slots: 10,
             data_slots: 0,
             results: vec![],
+            links: None,
             crafting: Some(crate::containers::ModCrafting {
                 grid: 1,
                 size: 3,
@@ -5452,6 +5465,43 @@ pub(crate) mod tests {
             let (.., transfer, (slots, ..)) = &places[1];
             assert_eq!(*transfer, Ok(()));
             assert_eq!(slots[0], stack("stick", 4));
+        });
+    }
+
+    /// Extra sources (`native_recipe_sources`) count as more inventory: the
+    /// grid fills as the table's does when the player holds what the sources
+    /// hold, the inventory gives first, then the sources in order, and a
+    /// refused transfer leaves them as they were.
+    #[test]
+    fn recipe_placement_takes_from_the_sources_after_the_inventory() {
+        with_menu(Kind::Crafting, |env, table| {
+            let station = &mut Menu::new(mod_crafting_table());
+            table.set_player_item(0, stack("oak_planks", 10));
+            station.set_player_item(0, stack("oak_planks", 1));
+            station.sources = vec![
+                vec![None, stack("dirt", 5)],
+                vec![stack("oak_planks", 2), stack("oak_planks", 7)],
+            ];
+            for menu in [&mut *table, &mut *station] {
+                menu.place_recipe(env, "minecraft:crafting_table", false, false, None);
+            }
+            let grid = |m: &Menu| (0..10).map(|s| m.slot(s).cloned()).collect::<Vec<_>>();
+            assert_eq!(grid(station), grid(table));
+            assert_eq!(station.slot(0), stack("crafting_table", 1).as_ref());
+            // 1 from the inventory, then 2 and 1 from the second source.
+            assert_eq!(station.player_item(0), None);
+            assert_eq!(
+                station.sources,
+                vec![
+                    vec![None, stack("dirt", 5)],
+                    vec![None, stack("oak_planks", 6)]
+                ]
+            );
+            // A furnace needs 8 cobblestone, which no one has: nothing moves.
+            let before = station.sources.clone();
+            let refused = station.transfer_recipe(env, "minecraft:furnace");
+            assert_eq!(refused, Err(place::TransferError::Missing));
+            assert_eq!(station.sources, before);
         });
     }
 

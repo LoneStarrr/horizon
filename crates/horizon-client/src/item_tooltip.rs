@@ -9,6 +9,15 @@ use crate::{
 use horizon_core::nbt::Tag;
 use mod_api::TooltipPlacement;
 pub use mod_api::item_tooltip::TooltipDisplay;
+/// Borrow the engine's modelled visibility without allocating an API stack.
+pub fn tooltip_display(stack: &ItemStack) -> TooltipDisplay<'_> {
+    TooltipDisplay::from_component(
+        stack
+            .data()
+            .and_then(|data| data.other("minecraft:tooltip_display")),
+        stack.data().is_some_and(|data| data.ominous_banner),
+    )
+}
 
 /// `EquipmentSlotGroup` in declaration order, the order tooltips list them in.
 const SLOT_GROUPS: [&str; 11] = [
@@ -305,7 +314,11 @@ pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) 
     if let Some(name) = stack.custom_name() {
         return name.to_owned();
     }
-    if let Some(name) = stack.item_name() {
+    // A potion's or tipped arrow's own name comes before its `item_name`.
+    let contents = crate::brewing::contents_name_key(stack);
+    if contents.is_none()
+        && let Some(name) = stack.item_name()
+    {
         return name;
     }
     if stack.data().is_some_and(|d| d.ominous_banner) {
@@ -315,8 +328,8 @@ pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) 
     if let Some(head) = player_head_name(stack) {
         return head.title(translate);
     }
-    let key = if is_potion_item(&stack.item) {
-        Some(crate::brewing::potion_name_key(&stack.item, stack.potion()))
+    let key = if contents.is_some() {
+        contents
     } else if let Some(pattern) = path.strip_suffix("_armor_trim_smithing_template") {
         Some(format!("trim_pattern.minecraft.{pattern}"))
     } else if path == "netherite_upgrade_smithing_template" {
@@ -381,7 +394,7 @@ pub fn bundle_tooltip(
     y: f32,
     box_width: f32,
 ) -> Option<TooltipLayout> {
-    TooltipDisplay::for_stack(stack)
+    tooltip_display(stack)
         .shows("minecraft:bundle_contents")
         .then(|| crate::bundle::tooltip_layout(items, stack, x, y, box_width))
         .flatten()
@@ -1018,7 +1031,7 @@ pub fn add_appender_lines<'a, A: ?Sized + 'a>(
     registered: impl Iterator<Item = (&'a str, &'a TooltipPlacement, bool, &'a A)>,
 ) {
     let starts = marks.starts.as_deref().unwrap_or(&[]);
-    let display = TooltipDisplay::for_stack(stack);
+    let display = tooltip_display(stack);
     let mut added = Vec::new();
     for (seq, (component, placement, enabled, appender)) in registered.enumerate() {
         if !enabled || !display.shows(component) || !stack.carries_component(info, component) {
@@ -1106,7 +1119,7 @@ pub fn detail_lines(
             .map(|l| l.0),
     );
     lines.extend(disc_fragment_line(stack, translate));
-    let display = TooltipDisplay::for_stack(stack);
+    let display = tooltip_display(stack);
     lines.extend(bees_line(stack, &display, translate));
     lines.extend(honey_line(stack, &display, translate));
     let data = stack.data();
@@ -1142,7 +1155,10 @@ pub fn detail_lines(
     }
     lines.extend(jukebox_line(stack, info, &display, translate));
     // Trim.addToTooltip.
-    if let Some((material, pattern)) = data.and_then(|d| d.trim.as_ref()) {
+    if let Some((material, pattern)) = data
+        .and_then(|d| d.trim.as_ref())
+        .and_then(crate::item_data::trim::named)
+    {
         let short = |s: &str| s.trim_start_matches("minecraft:").to_owned();
         lines.push(text("item.minecraft.smithing_template.upgrade"));
         lines.push(format!(
@@ -1228,7 +1244,7 @@ pub fn firework_lines(
             ));
         }
     };
-    let display = TooltipDisplay::for_stack(stack);
+    let display = tooltip_display(stack);
     let data = stack.data();
     let mut lines = Vec::new();
     let fireworks = match data.and_then(|d| d.fireworks.as_ref()) {
@@ -1306,7 +1322,7 @@ pub fn lines(
     translate: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut lines = vec![name_line(stack, translate)];
-    if TooltipDisplay::for_stack(stack).shows("minecraft:lore") {
+    if tooltip_display(stack).shows("minecraft:lore") {
         lines.extend(lore_texts(stack).into_iter().map(|t| t.plain()));
     }
     lines.extend(detail_lines(stack, info, attributes, translate));
@@ -1354,7 +1370,10 @@ pub fn styled_name(stack: &ItemStack, fallback: impl FnOnce() -> String) -> crat
             ..Default::default()
         });
     }
-    if let Some(component) = stack.data().and_then(|d| d.other("minecraft:item_name")) {
+    // A potion or tipped arrow is named by its contents, not its `item_name`.
+    if crate::brewing::contents_name_key(stack).is_none()
+        && let Some(component) = stack.data().and_then(|d| d.other("minecraft:item_name"))
+    {
         return crate::entity_nbt::name_text(component);
     }
     crate::text::Text::legacy(&fallback())
@@ -1441,7 +1460,7 @@ mod tests {
             Some(crate::text::DARK_PURPLE)
         );
         assert!(lines[1].spans[0].style.is_italic());
-        assert!(TooltipDisplay::for_stack(&stack).shows("minecraft:lore"));
+        assert!(tooltip_display(&stack).shows("minecraft:lore"));
         stack.data_mut().set_other(
             "minecraft:tooltip_display",
             Some(Tag::compound([(
@@ -1449,13 +1468,13 @@ mod tests {
                 Tag::List(vec![Tag::String("minecraft:lore".into())]),
             )])),
         );
-        assert!(!TooltipDisplay::for_stack(&stack).shows("minecraft:lore"));
+        assert!(!tooltip_display(&stack).shows("minecraft:lore"));
     }
 
     #[test]
     fn tooltip_display_controls_name_and_component_visibility() {
         let mut stack = ItemStack::new("minecraft:diamond_sword", 1);
-        let display = TooltipDisplay::for_stack(&stack);
+        let display = tooltip_display(&stack);
         assert!(display.name_visible(false));
         assert!(display.shows("minecraft:attribute_modifiers"));
 
@@ -1466,7 +1485,7 @@ mod tests {
                 Tag::List(vec![Tag::String("minecraft:attribute_modifiers".into())]),
             )])),
         );
-        let display = TooltipDisplay::for_stack(&stack);
+        let display = tooltip_display(&stack);
         assert!(display.name_visible(false));
         assert!(!display.shows("minecraft:attribute_modifiers"));
         assert!(display.shows("minecraft:enchantments"));
@@ -1475,7 +1494,7 @@ mod tests {
             "minecraft:tooltip_display",
             Some(Tag::compound([("hide_tooltip", Tag::Byte(1))])),
         );
-        let display = TooltipDisplay::for_stack(&stack);
+        let display = tooltip_display(&stack);
         assert!(!display.name_visible(false));
         assert!(display.name_visible(true));
         assert!(!display.shows("minecraft:attribute_modifiers"));
@@ -1539,12 +1558,7 @@ mod tests {
         };
         let (blue, red) = (rgba(85, 85, 255, 255), rgba(255, 85, 85, 255));
         let lines = |stack: &ItemStack, creative: bool| {
-            stew_lines(
-                stack,
-                creative,
-                &TooltipDisplay::for_stack(stack),
-                &translate,
-            )
+            stew_lines(stack, creative, &tooltip_display(stack), &translate)
         };
         let mut stew = ItemStack::new("minecraft:suspicious_stew", 1);
         // The item's default, an empty list.
@@ -1591,7 +1605,7 @@ mod tests {
         let blue = rgba(85, 85, 255, 255);
         // The item's default amplifier, 0: no potency.
         let mut bottle = ItemStack::new("minecraft:ominous_bottle", 1);
-        let line = |s: &ItemStack| ominous_bottle_line(s, &TooltipDisplay::for_stack(s), &lang);
+        let line = |s: &ItemStack| ominous_bottle_line(s, &tooltip_display(s), &lang);
         assert_eq!(
             line(&bottle),
             Some((format!("Bad Omen ({duration})"), blue))
@@ -1613,8 +1627,7 @@ mod tests {
             other => lang(other),
         };
         assert_eq!(
-            ominous_bottle_line(&bottle, &TooltipDisplay::for_stack(&bottle), &numbered)
-                .map(|l| l.0),
+            ominous_bottle_line(&bottle, &tooltip_display(&bottle), &numbered).map(|l| l.0),
             Some(format!("{duration}: Bad Omen IV"))
         );
         bottle.data_mut().set_other(
@@ -1633,14 +1646,14 @@ mod tests {
     #[test]
     fn ominous_banner_keeps_its_default_hidden_pattern_tooltip() {
         let mut banner = crate::mobs::raider::ominous_banner();
-        let display = TooltipDisplay::for_stack(&banner);
+        let display = tooltip_display(&banner);
         assert!(!display.shows("minecraft:banner_patterns"));
 
         banner.data_mut().set_other(
             "minecraft:tooltip_display",
             Some(Tag::Compound(Default::default())),
         );
-        let display = TooltipDisplay::for_stack(&banner);
+        let display = tooltip_display(&banner);
         assert!(display.shows("minecraft:banner_patterns"));
     }
 
@@ -1715,7 +1728,36 @@ mod tests {
         assert_eq!(lore[0].plain(), "Simple Custom Lore");
         assert_eq!(lore[0].spans[0].style.italic, Some(false));
         assert_eq!(lore[0].spans[0].style.color, Some(crate::text::DARK_PURPLE));
-        assert!(TooltipDisplay::for_stack(&stack).shows("minecraft:lore"));
+        assert!(tooltip_display(&stack).shows("minecraft:lore"));
+    }
+
+    /// `PotionItem.getName`: the hotbar's and the tooltip's name of a potion
+    /// with an `item_name` is its contents', and an arrow's the same.
+    #[test]
+    fn a_potion_with_an_item_name_is_named_by_its_contents() {
+        let comp = horizon_items::item_data::command_components(
+            r#"[item_name="Bottle",potion_contents={potion:"minecraft:long_swiftness"}]"#,
+        )
+        .unwrap();
+        let (damage, extra) = horizon_items::item_data::decode_components(Some(&comp));
+        let mut stack = ItemStack {
+            item: "minecraft:potion".into(),
+            count: 1,
+            damage,
+            extra,
+        };
+        let translate = |key: &str| match key {
+            "item.minecraft.potion.effect.swiftness" => Some("Potion of Swiftness".to_owned()),
+            "item.minecraft.tipped_arrow.effect.swiftness" => Some("Arrow of Swiftness".to_owned()),
+            _ => None,
+        };
+        let name = styled_name(&stack, || name_line(&stack, &translate));
+        assert_eq!(name.plain(), "Potion of Swiftness");
+        stack.item = "minecraft:tipped_arrow".into();
+        assert_eq!(name_line(&stack, &translate), "Arrow of Swiftness");
+        // Any other item keeps its item_name.
+        stack.item = "minecraft:stick".into();
+        assert_eq!(styled_name(&stack, || "fallback".into()).plain(), "Bottle");
     }
 
     #[test]
@@ -1837,7 +1879,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("items.json"), "{}").unwrap();
         let defaults = horizon_world::item_defaults::read(&root).unwrap();
-        let enchantments = crate::enchant::Enchantments::load(&root, &defaults);
+        let enchantments = crate::enchant::Enchantments::load(&root, &defaults).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         let translate = |key: &str| enchantments.translate(key).map(str::to_owned);
         let mut rocket = ItemStack::new("minecraft:firework_rocket", 1);
@@ -1921,7 +1963,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("items.json"), "{}").unwrap();
         let defaults = horizon_world::item_defaults::read(&root).unwrap();
-        let enchantments = crate::enchant::Enchantments::load(&root, &defaults);
+        let enchantments = crate::enchant::Enchantments::load(&root, &defaults).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         let lang = |key: &str| enchantments.translate(key).map(str::to_owned);
         let green = rgba(0, 170, 0, 255);
@@ -2093,7 +2135,7 @@ mod tests {
         );
         let defaults = horizon_world::item_defaults::read(&root).unwrap();
         let items = crate::items::Items::catalog(&root, &PackOverlay::NONE, &defaults).unwrap();
-        let enchantments = crate::enchant::Enchantments::load(&root, &defaults);
+        let enchantments = crate::enchant::Enchantments::load(&root, &defaults).unwrap();
         let translate = |key: &str| enchantments.translate(key).map(str::to_owned);
         for (item, expected) in [
             (
@@ -2176,7 +2218,7 @@ mod tests {
             |k: &str| (k == "item.spawn_egg.peaceful").then(|| "Disabled in Peaceful".to_owned());
         let monsters = |id: &str| !matches!(id, "minecraft:zombie" | "minecraft:creeper");
         let line = |s: &ItemStack, peaceful| {
-            spawn_egg_peaceful_line(s, peaceful, &TooltipDisplay::for_stack(s), &monsters, &lang)
+            spawn_egg_peaceful_line(s, peaceful, &tooltip_display(s), &monsters, &lang)
         };
         let zombie = ItemStack::new("minecraft:zombie_spawn_egg", 1);
         assert_eq!(line(&zombie, true).as_deref(), Some("Disabled in Peaceful"));

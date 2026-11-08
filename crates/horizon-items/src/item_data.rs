@@ -54,6 +54,8 @@ use std::sync::Arc;
 
 /// Enchantment id and level, in insertion order.
 pub type Levels = Vec<(Arc<str>, u32)>;
+pub mod trim;
+pub use trim::Trim;
 
 /// A stack's modelled and preserved components. Start with `Default` (or
 /// `ItemStack::data_mut`) and use the fields and setters; component storage may
@@ -76,13 +78,14 @@ pub struct StackData {
     kinetic_weapon: Option<crate::kinetic_weapon::KineticComponent>,
     /// Saved consumable and its typed runtime value, replaced together.
     consumable: Option<Arc<ConsumableComponent>>,
+    death_protection: Option<Arc<Vec<crate::items::ConsumeEffect>>>,
     /// `minecraft:potion_contents.potion`.
     pub potion: Option<Arc<str>>,
     /// The rest of `minecraft:potion_contents` (`custom_color`, `custom_effects`,
     /// `custom_name`), kept as saved.
     pub potion_extra: Vec<(String, Tag)>,
     /// `minecraft:trim`: (material, pattern).
-    pub trim: Option<(Arc<str>, Arc<str>)>,
+    pub trim: Option<Trim>,
     /// `minecraft:container` (shulker boxes): the non-empty slots.
     pub container: Vec<(u8, ItemStack)>,
     /// `minecraft:charged_projectiles` (a loaded crossbow).
@@ -132,9 +135,10 @@ struct ConsumableComponent {
     value: crate::items::ItemConsumable,
 }
 impl ConsumableComponent {
-    fn new(raw: Tag) -> Arc<Self> {
+    fn new(raw: Tag) -> Option<Arc<Self>> {
         let mut value =
-            crate::items::parse_consumable(&horizon_client_core::scoreboard::tag_to_json(&raw));
+            crate::items::parse_consumable(&horizon_client_core::scoreboard::tag_to_json(&raw))
+                .ok()?;
         value.seconds = raw
             .get("consume_seconds")
             .and_then(crate::properties::component_float)
@@ -143,7 +147,7 @@ impl ConsumableComponent {
             .get("has_consume_particles")
             .and_then(component_bool)
             .unwrap_or(true);
-        Arc::new(Self { raw, value })
+        Some(Arc::new(Self { raw, value }))
     }
 }
 /// The component patch a server sent for a stack, as the creative slot packet
@@ -273,32 +277,77 @@ impl StackData {
         let tag = horizon_client_core::scoreboard::json_to_tag(text);
         self.set_other(id, Some(tag));
     }
-    /// `SetComponentsFunction`: one component of a loot patch, in its JSON
-    /// form. Trim is modelled; the rest keep their saved components.
-    /// A null value removes the component.
-    pub fn set_loot_component(&mut self, id: &str, value: &serde_json::Value) {
-        let tag = (!value.is_null()).then(|| horizon_client_core::scoreboard::json_to_tag(value));
+    /// Apply an ordered loot component patch without changing its NBT type.
+    /// None removes the component. Trim retains its modelled representation.
+    pub fn set_loot_component(&mut self, id: &str, value: &Option<Tag>) {
+        let tag = value.clone();
         match id {
+            // `set_banner_pattern` (and `set_components`) write the layers a
+            // banner or shield wears; the renderer and the tooltip read them
+            // from `banner_patterns`, not from a tag in `other`.
+            "minecraft:banner_patterns" => {
+                self.banner_patterns = crate::banner_layer::layers_from_nbt(tag.as_ref());
+            }
+            // `set_book_cover` (and `set_components`) write the book's title,
+            // author, generation and pages as one component: the fields the
+            // tooltip and the reading screen use come back out of it.
+            "minecraft:written_book_content" => {
+                self.written = tag.as_ref().map(written_book_from_tag);
+            }
             "minecraft:trim" => {
-                self.trim = match (value["material"].as_str(), value["pattern"].as_str()) {
-                    (Some(material), Some(pattern)) => {
-                        Some((Arc::from(material), Arc::from(pattern)))
-                    }
-                    _ => None,
+                self.trim = tag.as_ref().and_then(trim::from_nbt);
+            }
+            // The stack's damage is outside its data; a name keeps its own reading.
+            "minecraft:damage" | "minecraft:custom_name" => self.set_other(id, tag),
+            _ if MODELLED.contains(&id) => {
+                let mut saved = match components_tag(0, Some(self)) {
+                    Some(Tag::Compound(c)) => c,
+                    _ => Default::default(),
                 };
+                saved.remove(&JavaString::from(id));
+                if let Some(tag) = tag {
+                    saved.insert(JavaString::from(id), tag);
+                }
+                // A damage set before stays where it was: reading would take it.
+                let damage = self.other("minecraft:damage").cloned();
+                let (_, read) = decode_components(Some(&Tag::Compound(saved)));
+                *self = read.map_or_else(Default::default, |data| *data);
+                self.set_other("minecraft:damage", damage);
             }
             _ => self.set_other(id, tag),
         }
     }
     /// Set (or with None remove) a preserved component.
+    /// This setter deliberately remains infallible. Invalid opaque effect payloads
+    /// refuse replacement without changing either the previous raw value or cache.
     pub fn set_other(&mut self, id: &str, value: Option<Tag>) {
+        if id == "minecraft:death_protection" {
+            let replacement = match value.as_ref() {
+                Some(raw) => match crate::items::parse_death_effects(
+                    &horizon_client_core::scoreboard::tag_to_json(raw),
+                ) {
+                    Ok(effects) => Some(Arc::new(effects)),
+                    Err(_) => return,
+                },
+                None => None,
+            };
+            self.death_protection = replacement;
+        }
+        if id == "minecraft:consumable" {
+            let replacement = match value {
+                Some(raw) => match ConsumableComponent::new(raw) {
+                    Some(component) => Some(component),
+                    None => return,
+                },
+                None => None,
+            };
+            self.other.retain(|(k, _)| k != id);
+            self.consumable = replacement;
+            return;
+        }
         self.other.retain(|(k, _)| k != id);
         if id == "minecraft:kinetic_weapon" {
             self.kinetic_weapon = value.map(crate::kinetic_weapon::KineticComponent::new);
-            return;
-        }
-        if id == "minecraft:consumable" {
-            self.consumable = value.map(ConsumableComponent::new);
             return;
         }
         if id == "minecraft:custom_name" {
@@ -435,6 +484,23 @@ impl ItemStack {
             return false;
         }
         info.is_some_and(|info| info.components.iter().any(|c| c == id))
+    }
+    /// Death protection effects retained at patch or prototype load.
+    pub fn death_protection<'a>(
+        &'a self,
+        info: Option<&'a ItemInfo>,
+    ) -> Option<&'a [crate::items::ConsumeEffect]> {
+        if let Some(data) = self.data() {
+            if let Some(value) = &data.death_protection {
+                return Some(value);
+            }
+            if data.other("!minecraft:death_protection").is_some()
+                || data.other("minecraft:death_protection").is_some()
+            {
+                return None;
+            }
+        }
+        info.and_then(|i| i.death_protection.as_deref())
     }
     /// Effective consumable, decoded when the patch/prototype is loaded, with no tick allocation.
     pub fn consumable<'a>(
@@ -783,6 +849,28 @@ fn plain_component(t: &Tag) -> Tag {
     }
     t.clone()
 }
+/// `WrittenBookContent` from its component: the title and author (a
+/// `Filterable`'s raw text), the generation and the pages, whose component
+/// tags are kept apart from their plain text for click events.
+fn written_book_from_tag(b: &Tag) -> WrittenBook {
+    WrittenBook {
+        title: b.get("title").and_then(filterable_text).unwrap_or_default(),
+        author: b.get("author").and_then(string).unwrap_or_default(),
+        generation: b.get("generation").and_then(int).unwrap_or(0).clamp(0, 3) as u8,
+        pages: match b.get("pages") {
+            Some(Tag::List(pages)) => pages.iter().filter_map(filterable_text).collect(),
+            _ => Vec::new(),
+        },
+        page_tags: match b.get("pages") {
+            Some(Tag::List(pages)) => pages
+                .iter()
+                .map(|p| plain_component(p.get("raw").unwrap_or(p)))
+                .collect(),
+            _ => Vec::new(),
+        },
+    }
+}
+
 fn filterable_text(t: &Tag) -> Option<String> {
     match t.get("raw") {
         Some(raw) => read_text(raw),
@@ -1133,14 +1221,8 @@ fn components_tag_inner(
                 Tag::compound(potion.into_iter().chain(extra)),
             ));
         }
-        if let Some((material, pattern)) = &d.trim {
-            entries.push((
-                "minecraft:trim",
-                Tag::compound([
-                    ("material", Tag::String((&**material).into())),
-                    ("pattern", Tag::String((&**pattern).into())),
-                ]),
-            ));
+        if let Some(trim) = &d.trim {
+            entries.push(("minecraft:trim", trim::to_nbt(trim)));
         }
         if let Some(id) = d.map_id {
             entries.push(("minecraft:map_id", Tag::Int(id)));
@@ -1349,10 +1431,19 @@ pub fn decode_components(components: Option<&Tag>) -> (u32, Option<Box<StackData
             .map(collapsed_text),
         potion,
         potion_extra,
+        death_protection: c
+            .get("minecraft:death_protection")
+            .and_then(|raw| {
+                crate::items::parse_death_effects(&horizon_client_core::scoreboard::tag_to_json(
+                    raw,
+                ))
+                .ok()
+            })
+            .map(Arc::new),
         consumable: c
             .get("minecraft:consumable")
             .cloned()
-            .map(ConsumableComponent::new),
+            .and_then(ConsumableComponent::new),
         kinetic_weapon: c
             .get("minecraft:kinetic_weapon")
             .cloned()
@@ -1372,22 +1463,7 @@ pub fn decode_components(components: Option<&Tag>) -> (u32, Option<Box<StackData
         },
         written: c
             .get("minecraft:written_book_content")
-            .map(|b| WrittenBook {
-                title: b.get("title").and_then(filterable_text).unwrap_or_default(),
-                author: b.get("author").and_then(string).unwrap_or_default(),
-                generation: b.get("generation").and_then(int).unwrap_or(0).clamp(0, 3) as u8,
-                pages: match b.get("pages") {
-                    Some(Tag::List(pages)) => pages.iter().filter_map(filterable_text).collect(),
-                    _ => Vec::new(),
-                },
-                page_tags: match b.get("pages") {
-                    Some(Tag::List(pages)) => pages
-                        .iter()
-                        .map(|p| plain_component(p.get("raw").unwrap_or(p)))
-                        .collect(),
-                    _ => Vec::new(),
-                },
-            }),
+            .map(written_book_from_tag),
         fireworks: c
             .get("minecraft:fireworks")
             .map(|f| {
@@ -1468,12 +1544,7 @@ pub fn decode_components(components: Option<&Tag>) -> (u32, Option<Box<StackData
             .get("minecraft:ominous_bottle_amplifier")
             .and_then(int)
             .map(|v| v.clamp(0, 4) as u8),
-        trim: c.get("minecraft:trim").and_then(|t| {
-            Some((
-                Arc::from(t.get("material").and_then(string)?.as_str()),
-                Arc::from(t.get("pattern").and_then(string)?.as_str()),
-            ))
-        }),
+        trim: c.get("minecraft:trim").and_then(trim::from_nbt),
         bundle_selected: BundleSelected::default(),
         other: Vec::new(),
         wire: Wire::default(),
@@ -1551,6 +1622,71 @@ pub fn command_components(text: &str) -> Result<Tag, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::banner_layer::BannerLayer;
+
+    /// `set_banner_pattern` (and `set_components`) hand a banner's layers over
+    /// as a component; the renderer and the tooltip read `banner_patterns`, so
+    /// they have to come out of it.
+    #[test]
+    fn a_loot_banner_patterns_component_dresses_the_banner() {
+        let mut stack = ItemStack::new("minecraft:white_banner", 1);
+        stack.data_mut().set_loot_component(
+            "minecraft:banner_patterns",
+            &Some(
+                horizon_core::json_nbt::json_to_tag(&serde_json::json!([
+                    {"pattern": "minecraft:stripe_bottom", "color": "red"},
+                    {"pattern": "minecraft:border", "color": "blue"},
+                ]))
+                .unwrap(),
+            ),
+        );
+        let layers = &stack.data().expect("a component box").banner_patterns;
+        assert_eq!(
+            layers,
+            &[
+                BannerLayer::new("minecraft:stripe_bottom", "red"),
+                BannerLayer::new("minecraft:border", "blue"),
+            ]
+        );
+        // A null component takes them off again.
+        stack
+            .data_mut()
+            .set_loot_component("minecraft:banner_patterns", &None);
+        assert!(stack.data().is_none_or(|d| d.banner_patterns.is_empty()));
+    }
+
+    /// `set_book_cover` (and `set_components`) hand a written book's content
+    /// over as a component; the fields the tooltip and the reading screen read
+    /// have to come out of it, not just sit in `other` unread.
+    #[test]
+    fn a_loot_written_book_component_fills_the_book() {
+        let mut stack = ItemStack::new("minecraft:written_book", 1);
+        stack.data_mut().set_loot_component(
+            "minecraft:written_book_content",
+            &Some(
+                horizon_core::json_nbt::json_to_tag(&serde_json::json!({
+                    "title": {"raw": "A Guide"},
+                    "author": "Cartographer",
+                    "generation": 2,
+                    "pages": [{"raw": "page one"}, {"raw": "page two"}],
+                }))
+                .unwrap(),
+            ),
+        );
+        let book = stack
+            .data()
+            .and_then(|d| d.written.as_ref())
+            .expect("content");
+        assert_eq!(book.title, "A Guide");
+        assert_eq!(book.author, "Cartographer");
+        assert_eq!(book.generation, 2);
+        assert_eq!(book.pages, ["page one", "page two"]);
+        // A null component is no component.
+        stack
+            .data_mut()
+            .set_loot_component("minecraft:written_book_content", &None);
+        assert!(stack.data().is_none_or(|d| d.written.is_none()));
+    }
 
     /// A stack's own `attribute_modifiers` replace its type's whole; a removed
     /// component leaves none (`getOrDefault`).
@@ -1660,6 +1796,31 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(encode_components(&stack), Some(expected));
+    }
+
+    #[test]
+    fn inline_trim_is_modeled_and_saved_without_raw_fallback() {
+        let source = horizon_core::nbt::parse_snbt(r#"{id:"minecraft:diamond_chestplate",count:1,components:{"minecraft:custom_data":{keep:284},"minecraft:trim":{material:{palette_id:"minecraft:gold",description:"Inline material"},pattern:{asset_id:"minecraft:coast",description:"Inline pattern",decal:0b}}}}"#).unwrap().0;
+        let decoded = crate::item_nbt::item_from_nbt(&source).unwrap();
+        let data = decoded.data().unwrap();
+        assert!(
+            data.trim.is_some(),
+            "inline trim must be adopted into the actual model"
+        );
+        assert!(data.other("minecraft:trim").is_none(), "not a raw fallback");
+        let mut fresh = ItemStack::new("minecraft:diamond_chestplate", 1);
+        fresh.data_mut().trim = data.trim.clone();
+        fresh.data_mut().set_other(
+            "minecraft:custom_data",
+            Some(Tag::compound([("keep", Tag::Int(284))])),
+        );
+        for stack in [&decoded, &fresh] {
+            assert_eq!(
+                components_tag(0, stack.data()),
+                source.get("components").cloned()
+            );
+            assert_eq!(crate::item_nbt::item_to_nbt(stack), source);
+        }
     }
 
     fn check_lodestone_saved_default(decoded: bool) {
@@ -2338,9 +2499,10 @@ mod tests {
     fn loot_component_keeps_a_styled_custom_name() {
         let name = serde_json::json!({"text":"Prize","color":"#ff8800"});
         let mut stack = ItemStack::new("minecraft:stick", 1);
-        stack
-            .data_mut()
-            .set_loot_component("minecraft:custom_name", &name);
+        stack.data_mut().set_loot_component(
+            "minecraft:custom_name",
+            &Some(horizon_core::json_nbt::json_to_tag(&name).unwrap()),
+        );
         assert_eq!(stack.custom_name().as_deref(), Some("Prize"));
         let expected = horizon_client_core::scoreboard::json_to_tag(&name);
         assert_eq!(
@@ -2351,8 +2513,61 @@ mod tests {
         );
         stack
             .data_mut()
-            .set_loot_component("minecraft:custom_name", &serde_json::Value::Null);
+            .set_loot_component("minecraft:custom_name", &None);
         assert!(stack.custom_name().is_none());
+    }
+
+    /// A chest's `set_components` patch: a potion's contents land where
+    /// drinking and splashing read them, not only in its saved form, and the
+    /// components Horizon keeps as saved stay so.
+    #[test]
+    fn a_loot_component_horizon_models_lands_in_its_field() {
+        use serde_json::json;
+        let mut swift = ItemStack::new("minecraft:splash_potion", 1);
+        swift.data_mut().set_loot_component(
+            "minecraft:potion_contents",
+            &Some(
+                horizon_core::json_nbt::json_to_tag(&json!({"potion": "minecraft:swiftness"}))
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(swift.potion(), Some("minecraft:swiftness"));
+        let mut custom = ItemStack::new("minecraft:potion", 1);
+        let data = custom.data_mut();
+        data.set_loot_component(
+            "minecraft:custom_data",
+            &Some(horizon_core::json_nbt::json_to_tag(&json!({"page": 3})).unwrap()),
+        );
+        data.set_loot_component(
+            "minecraft:damage",
+            &Some(horizon_core::json_nbt::json_to_tag(&json!(5)).unwrap()),
+        );
+        let effects = json!({"custom_effects": [{"id": "minecraft:resistance", "amplifier": 1, "duration": 1800}]});
+        data.set_loot_component(
+            "minecraft:potion_contents",
+            &Some(horizon_core::json_nbt::json_to_tag(&effects).unwrap()),
+        );
+        assert_eq!(
+            custom.custom_potion_effects(),
+            [("minecraft:resistance".to_owned(), 1800, 1)]
+        );
+        let data = custom.data().unwrap();
+        assert!(data.other("minecraft:custom_data").is_some());
+        assert!(
+            data.other("minecraft:damage").is_some(),
+            "a damage set before stays"
+        );
+        // Saved as before: the patch's contents, with the codec's icon flag.
+        let saved = encode_components(&custom).unwrap();
+        assert_eq!(
+            saved.get("minecraft:potion_contents").unwrap(),
+            &horizon_core::json_nbt::json_to_tag(&json!({"custom_effects": [{"id": "minecraft:resistance", "amplifier": 1, "duration": 1800, "show_icon": true}]})).unwrap()
+        );
+        // A null value takes the potion away again.
+        swift
+            .data_mut()
+            .set_loot_component("minecraft:potion_contents", &None);
+        assert_eq!(swift.potion(), None);
     }
 
     #[test]
@@ -2502,6 +2717,83 @@ mod carried_component_tests {
     use super::*;
 
     #[test]
+    fn invalid_payload_replacements_leave_existing_component_unchanged() {
+        for (id, field) in [
+            ("minecraft:consumable", "on_consume_effects"),
+            ("minecraft:death_protection", "death_effects"),
+        ] {
+            let good = Tag::compound([(
+                field,
+                Tag::List(vec![Tag::compound([
+                    ("type", Tag::String("example:charge".into())),
+                    ("amount", Tag::Int(42)),
+                ])]),
+            )]);
+            let bad = Tag::compound([(
+                field,
+                Tag::List(vec![Tag::compound([
+                    ("type", Tag::String("example:charge".into())),
+                    ("amount", Tag::End),
+                ])]),
+            )]);
+            let mut data = StackData::default();
+            data.set_other(id, Some(good.clone()));
+            let consumable = data.consumable.clone();
+            let death = data.death_protection.clone();
+            data.set_other(id, Some(bad));
+            assert_eq!(data.other(id), Some(&good));
+            if let Some(before) = consumable {
+                assert!(Arc::ptr_eq(&before, data.consumable.as_ref().unwrap()));
+            }
+            if let Some(before) = death {
+                assert!(Arc::ptr_eq(
+                    &before,
+                    data.death_protection.as_ref().unwrap()
+                ));
+            }
+            data.set_other(id, None);
+            assert!(data.other(id).is_none());
+        }
+    }
+
+    #[test]
+    fn death_payload_is_decoded_once_and_replaced_with_component() {
+        use crate::items::ConsumeEffect;
+        let component = Tag::compound([(
+            "death_effects",
+            Tag::List(vec![Tag::compound([
+                ("type", Tag::String("example:charge".into())),
+                ("amount", Tag::Int(42)),
+            ])]),
+        )]);
+        let patch = Tag::compound([("minecraft:death_protection", component.clone())]);
+        let (_, extra) = decode_components(Some(&patch));
+        let mut stack = ItemStack::new("minecraft:stick", 1);
+        stack.extra = extra;
+        let copied = stack.clone();
+        let (ConsumeEffect::Native { data: a, .. }, ConsumeEffect::Native { data: b, .. }) = (
+            &stack.death_protection(None).unwrap()[0],
+            &copied.death_protection(None).unwrap()[0],
+        ) else {
+            panic!("native effect")
+        };
+        assert!(Arc::ptr_eq(a, b));
+        assert_eq!(a.get("amount"), Some(&Tag::Byte(42)));
+        assert_eq!(components_tag(0, stack.data()), Some(patch));
+        stack
+            .data_mut()
+            .set_other("minecraft:death_protection", Some(component));
+        assert!(matches!(
+            &stack.death_protection(None).unwrap()[0],
+            ConsumeEffect::Native { .. }
+        ));
+        stack
+            .data_mut()
+            .set_other("minecraft:death_protection", None);
+        assert!(stack.death_protection(None).is_none());
+    }
+
+    #[test]
     fn damage_keeps_a_canonical_int_including_explicit_zero() {
         for damage in [0, 5] {
             let original = Tag::compound([("minecraft:damage", Tag::Int(damage))]);
@@ -2576,7 +2868,7 @@ mod carried_component_tests {
         );
         stack
             .data_mut()
-            .set_loot_component("minecraft:repair_cost", &serde_json::json!(5));
+            .set_loot_component("minecraft:repair_cost", &Some(Tag::Int(5)));
         assert!(stack.carries_component(None, "minecraft:repair_cost"));
     }
 

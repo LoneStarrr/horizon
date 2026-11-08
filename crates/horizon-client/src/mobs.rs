@@ -1312,6 +1312,9 @@ pub struct Extra {
     pub party_jukebox: Option<[i32; 3]>,
     /// The owner's UUID (tamed animals).
     pub owner: Option<[i32; 4]>,
+    /// `Vindicator.isJohnny`: a custom name that was ever `Johnny`, which
+    /// `setCustomName` latches and nothing clears.
+    pub johnny: bool,
     /// Slime/magma cube size (0 = not sized).
     pub size: i32,
     /// Sheep eat-grass / iron golem attack / ravager animation ticks.
@@ -1344,7 +1347,7 @@ pub struct Extra {
     /// a player model's arm pose and `isBlocking` follow it.
     pub use_animation: horizon_core::use_animation::UseAnimation,
     /// The `arm_pose` the items in the main and off hand declare, if any: the pose
-    /// a player model's arm takes holding it, in place of vanilla's.
+    /// a humanoid model's arm takes holding it, in place of vanilla's.
     pub held_arm_pose: [Option<horizon_core::arm_pose::ArmPose>; 2],
     pub fall_flying: bool,
     pub fall_fly_ticks: i32,
@@ -1463,6 +1466,10 @@ pub struct Extra {
     /// attachment (`getPassengerRidingPosition(this).y` is its feet plus this)
     /// and the vehicle's box (`Mob.getAttackBoundingBox`, `getHitbox`).
     pub seat: Option<(u32, f64, Aabb)>,
+    /// The living vehicle `positionRider` last seated this rider on, with
+    /// its `yBodyRotO` and `yBodyRot`: a rider of a living vehicle is drawn
+    /// from that body (`LivingEntityRenderer.solveBodyRot`), not its own.
+    pub vehicle_body: Option<(u32, f32, f32)>,
     /// `Entity.boardingCooldown`: ticks after leaving a boat before a boat
     /// can pick this mob up again.
     pub boarding_cooldown: i32,
@@ -1739,7 +1746,13 @@ pub struct Mob {
     pub gear_knockback_resistance: Option<f64>,
     pub health: f32,
     pub hurt_time: i32,
+    /// `LivingEntity.damageCooldownTime`: 20 after a hit, counting down;
+    /// while it is above 10 a weaker hit does only the difference.
     pub invulnerable: i32,
+    /// `Entity.invulnerableTime` (#916): the entity-level invulnerability
+    /// window, its own field — never the damage cooldown beside it
+    /// (`Entity.isTemporarilyInvulnerable`), decremented by the base tick.
+    pub invulnerable_time: i32,
     pub death_time: i32,
     pub age: u32,
     pub limb_position: f32,
@@ -2778,6 +2791,8 @@ pub struct SpawnSetup {
     pub owner_mob: Option<u32>,
     pub home: Option<[i32; 3]>,
     pub life: Option<i32>,
+    /// Whether to skip `finalizeSpawn`'s rolls (e.g. conversions or EntityType.create).
+    pub skip_finalize: bool,
 }
 /// A snapshot of another entity mobs can see this tick.
 #[derive(Clone, Debug)]
@@ -2791,8 +2806,9 @@ pub struct Seen {
     pub bounds: Aabb,
     pub eye_y: f64,
     pub alive: bool,
-    /// `invulnerable_flag`, which `asValidTarget` refuses a target by
-    /// (#1175): a valid-target rule the tick's view asks.
+    /// `Entity.isInvulnerable` (the ability flag or the temporary window,
+    /// #916), which `asValidTarget` refuses a target by (#1175): a
+    /// valid-target rule the tick's view asks.
     pub invulnerable: bool,
     pub baby: bool,
     pub in_love: bool,
@@ -3045,7 +3061,7 @@ impl Mob {
             hitbox: m.hitbox(),
             eye_y: m.eye_y(),
             alive: m.alive(),
-            invulnerable: m.invulnerable_flag,
+            invulnerable: m.is_invulnerable(),
             baby: m.is_baby(),
             // A villager is "in love" when it is willing to breed (`canBreed`).
             in_love: if villager {
@@ -3135,12 +3151,17 @@ impl Mob {
 /// `events[from..]` into `pending`, which the caller adds to each mob's
 /// velocity before its tick (and to every mob once all have ticked). The
 /// other events keep their order.
-/// The part of `Entity.canUsePortal` a mob's own state decides: it is alive,
+/// The part of `LivingEntity.canUsePortal` a mob's own state decides: it is alive,
+/// not sleeping (including fox sleep, but not bat resting or cat lying),
 /// it is not a boss that never travels, and — over `Monster.canUsePortal` —
 /// it is not a creaking bound to a heart (`Creaking.canUsePortal`). The
 /// rides and the players a side carries are the caller's half.
 pub fn mob_can_use_portal(m: &Mob) -> bool {
-    m.alive() && m.species() != Species::Wither && creaking::can_use_portal(m)
+    m.alive()
+        && !villager::sleeping(m)
+        && !(m.species() == Species::Fox && fox::flag(m, fox::SLEEPING))
+        && m.species() != Species::Wither
+        && creaking::can_use_portal(m)
 }
 pub fn take_mob_pushes(events: &mut Vec<MobEvent>, from: usize, pending: &mut PendingPushes) {
     // One pass: a crowd's tick holds a push per neighbour, and removing each
@@ -3363,8 +3384,9 @@ pub struct PlayerView {
     pub bounds: Aabb,
     pub eye: [f64; 3],
     pub alive: bool,
-    /// The `invulnerable` ability, which `asValidTarget` refuses a target
-    /// by (#1175): a valid-target rule a goal tick's view asks.
+    /// The `invulnerable` ability, the `Invulnerable` flag or its window,
+    /// which `asValidTarget` refuses a target by (#1175, #916): a
+    /// valid-target rule a goal tick's view asks.
     pub invulnerable: bool,
     pub creative: bool,
     pub sneaking: bool,
@@ -3735,6 +3757,7 @@ impl Mob {
             gear_knockback_resistance: None,
             hurt_time: 0,
             invulnerable: 0,
+            invulnerable_time: 0,
             death_time: 0,
             age: 0,
             limb_position: 0.0,
@@ -3905,6 +3928,13 @@ impl Mob {
     pub fn alive(&self) -> bool {
         self.health > 0.0
     }
+    /// `Entity.isInvulnerable` (#916): the permanent `Invulnerable` flag or
+    /// the temporary window `invulnerableTime > 0` — what damage refusal
+    /// (`isInvulnerableToBase`) and enemy targeting (`canBeSeenAsEnemy`)
+    /// both read.
+    pub fn is_invulnerable(&self) -> bool {
+        self.invulnerable_flag || self.invulnerable_time > 0
+    }
     pub fn hostile(&self) -> bool {
         self.kind.category == "monster"
     }
@@ -3988,10 +4018,11 @@ impl Mob {
     pub fn refuses_damage(&self, source: &Damage) -> bool {
         !self.alive()
             || self.removed
-            || (self.invulnerable_flag && !source.kind.bypasses_invulnerability())
+            || (self.is_invulnerable() && !source.kind.bypasses_invulnerability())
             || (source.is_fire() && self.kind.flags.fire_immune && !self.reflected_fireball(source))
     }
-    /// `Ghast.isReflectedFireball`: its fire immunity does not refuse a player's return hit.
+    /// `Ghast.isReflectedFireball`: its fire immunity does not refuse a
+    /// player's return hit.
     fn reflected_fireball(&self, source: &Damage) -> bool {
         &*self.kind.id == "minecraft:ghast"
             && source.kind == DamageKind::Fireball
@@ -4112,13 +4143,25 @@ impl Mob {
         if !amount.is_finite() {
             amount = f32::MAX;
         }
+        // LivingEntity.hurtServer: inside the hurt cooldown a hit is compared
+        // with `lastHurt` by this incoming amount, before armor and Resistance,
+        // and `actuallyHurt` gets only what it adds.
+        let incoming = amount;
+        let cooldown = self.invulnerable as f32 > 10.0;
+        if cooldown {
+            if incoming <= self.last_hurt {
+                return false;
+            }
+            amount = incoming - self.last_hurt;
+        }
         // LivingEntity.getDamageAfterArmorAbsorb asks `hurtArmor` *before*
         // `CombatRules.getDamageAfterAbsorb`, so a worn piece wears by the
         // damage the armour, toughness and enchantment reductions have not
         // touched yet, and only a hit outside `#bypasses_armor` asks at all.
         let armor_hit = (!source.bypasses_armor() && amount > 0.0).then_some(amount);
         let entered = amount;
-        if !source.bypasses_armor() {
+        let armor_ran = !source.bypasses_armor();
+        if armor_ran {
             let (armor, armor_toughness) = armor::values(self);
             if armor > 0.0 {
                 // CombatRules.getDamageAfterAbsorb
@@ -4131,10 +4174,17 @@ impl Mob {
                 amount *= 1.0 - fraction;
             }
         }
+        amount = container.reduce(
+            Reduction::Armor,
+            entered,
+            entered - amount,
+            amount,
+            armor_ran,
+        );
         let after_armor = amount;
-        container.record_reduction(Reduction::Armor, entered - after_armor);
         // LivingEntity.getDamageAfterMagicAbsorb: Resistance takes 20% per level off
         // (`#bypasses_resistance` and `#bypasses_effects` skip it) ...
+        let mut resisted = false;
         if !source.kind.bypasses_effects()
             && !source.kind.bypasses_resistance()
             && let Some(&StoredEffect { amplifier: amp, .. }) = self
@@ -4145,24 +4195,39 @@ impl Mob {
         {
             let remainder = 25i32.wrapping_sub(amp.wrapping_add(1).wrapping_mul(5));
             amount = (amount * remainder as f32 / 25.0).max(0.0);
+            resisted = true;
             // actuallyHurt is void: zero health damage still lets hurtServer set hurt state.
         }
-        container.record_reduction(Reduction::MobEffects, after_armor - amount);
+        amount = container.reduce(
+            Reduction::MobEffects,
+            after_armor,
+            after_armor - amount,
+            amount,
+            resisted,
+        );
         let after_effects = amount;
         // ... then, with damage left and outside `#bypasses_enchantments` (a
         // warden's sonic boom), CombatRules.getDamageAfterMagicAbsorb's
         // enchantment protection (#11308).
-        if amount > 0.0 && !source.kind.bypasses_enchantments() {
+        let enchanted = amount > 0.0 && !source.kind.bypasses_enchantments();
+        if enchanted {
             let epf = gear::protection(self, source.kind);
             if epf > 0.0 {
                 amount *= 1.0 - epf / 25.0;
             }
         }
-        container.record_reduction(Reduction::Enchantments, after_effects - amount);
+        amount = container.reduce(
+            Reduction::Enchantments,
+            after_effects,
+            after_effects - amount,
+            amount,
+            enchanted,
+        );
         let after_enchantments = amount;
         // Witch.getDamageAfterMagicAbsorb: none from its own doing, else
         // 85% less from `#witch_resistant_to`.
-        if self.species() == Species::Witch {
+        let witch = self.species() == Species::Witch;
+        if witch {
             if source.attacker == Some(Who::Mob(self.id)) {
                 amount = 0.0;
             } else if matches!(
@@ -4175,21 +4240,22 @@ impl Mob {
                 amount *= 0.15;
             }
         }
-        container.record_reduction(Reduction::InnateResistance, after_enchantments - amount);
+        amount = container.reduce(
+            Reduction::InnateResistance,
+            after_enchantments,
+            after_enchantments - amount,
+            amount,
+            witch,
+        );
         // Wolf.actuallyHurt: wolf armor takes the damage instead of the wolf.
         let absorbed = self.wolf_armor_absorbs(&source);
         let mut knock = true;
-        let window = self.invulnerable as f32 > 10.0;
+        let window = cooldown;
         container.record_should_cause_side_effects(!window);
-        if window && amount <= self.last_hurt {
-            return false;
-        }
-        let mut dealt = if window {
+        if window {
             container.record_reduction(Reduction::Invulnerability, self.last_hurt);
-            amount - self.last_hurt
-        } else {
-            amount
-        };
+        }
+        let mut dealt = amount;
         // The cooldown the hit leaves: what is left of it within it, else vanilla's 20 or
         // what `LivingIncomingDamageEvent` set.
         if window {
@@ -4205,13 +4271,13 @@ impl Mob {
         if absorbed {
             self.hurt_wolf_armor(dealt);
         } else {
-            through = self.soak_hit(dealt, &source);
+            through = self.soak_hit(dealt, &source, &container);
             container.record_reduction(Reduction::Absorption, dealt - through);
             self.health -= through;
         }
         // NeoForge bubbles what Pre left up to `lastHurt`: vanilla's value plus what Pre
         // added, so a hit no listener changes keeps vanilla's.
-        self.last_hurt = amount + container.pre_change();
+        self.last_hurt = incoming + container.pre_change();
         self.invulnerable = container.post_attack_invulnerability_ticks();
         if window {
             knock = false;
@@ -4726,8 +4792,8 @@ impl Mob {
     }
     /// [`Mob::soak_absorption`] for a hit from `source`: `LivingEntity.actuallyHurt`
     /// credits a `ServerPlayer` attacker with the absorbed damage in tenths.
-    fn soak_hit(&mut self, damage: f32, source: &Damage) -> f32 {
-        let through = self.soak_absorption(damage);
+    fn soak_hit(&mut self, damage: f32, source: &Damage, container: &DamageContainer) -> f32 {
+        let through = self.soak_absorption(damage, container);
         let absorbed = damage - through;
         if absorbed > 0.0
             && absorbed < 3.402_823_5e37
@@ -4741,8 +4807,17 @@ impl Mob {
     }
     /// `LivingEntity.actuallyHurt`: the absorption amount takes the damage first;
     /// what is left reaches the health.
-    pub fn soak_absorption(&mut self, damage: f32) -> f32 {
-        let through = (damage - self.absorption).max(0.0);
+    /// A modifier registered for the absorption reduction (`container`) changes what the
+    /// hearts take, within the damage and the hearts there are.
+    pub fn soak_absorption(&mut self, damage: f32, container: &DamageContainer) -> f32 {
+        let mut through = (damage - self.absorption).max(0.0);
+        if let Some(taken) = container.modified_reduction(
+            Reduction::Absorption,
+            damage - through,
+            damage.min(self.absorption),
+        ) {
+            through = damage - taken;
+        }
         self.absorption = (self.absorption - (damage - through)).max(0.0);
         through
     }
@@ -4813,17 +4888,24 @@ impl Mob {
     ) {
         use crate::items::ConsumeEffect;
         match effect {
-            // `LivingEntity.removeAllEffects`: the absorption hearts go with it.
+            // `LivingEntity.removeAllEffects` -> `onEffectsRemoved` ->
+            // `refreshDirtyAttributes` -> `onAttributeUpdated(MAX_ABSORPTION)`:
+            // the absorption amount is clamped to the remaining maximum.
             ConsumeEffect::ClearAllEffects => {
+                let had_absorption = self.has_effect("minecraft:absorption");
+                let had_boost = self.has_effect("minecraft:health_boost");
                 self.extra.effect_chains.clear();
-                for e in std::mem::take(&mut self.extra.effects) {
-                    if e.id == "minecraft:absorption" {
-                        self.absorption =
-                            (self.absorption - 4.0 * (e.amplifier + 1) as f32).max(0.0);
-                    }
+                self.extra.effects.clear();
+                if had_absorption {
+                    self.absorption = self.absorption.min(armor::max_absorption(self));
+                }
+                if had_boost {
+                    finalize::health_boost_changed(self);
                 }
             }
             ConsumeEffect::RemoveEffects(ids) => {
+                let had_absorption = self.has_effect("minecraft:absorption");
+                let had_boost = self.has_effect("minecraft:health_boost");
                 self.extra.effects.retain(|e| {
                     let held = e.id.trim_start_matches("minecraft:");
                     !ids.iter()
@@ -4832,6 +4914,12 @@ impl Mob {
                 self.extra
                     .effect_chains
                     .retain(|h| self.extra.effects.iter().any(|e| e.id == h.id));
+                if had_absorption && !self.has_effect("minecraft:absorption") {
+                    self.absorption = self.absorption.min(armor::max_absorption(self));
+                }
+                if had_boost && !self.has_effect("minecraft:health_boost") {
+                    finalize::health_boost_changed(self);
+                }
             }
             // `ApplyStatusEffectsConsumeEffect.apply`: one random draw, even at
             // probability 1.
@@ -7221,6 +7309,107 @@ mod visibility_percent_tests {
     }
 }
 
+/// Added controls (H248): `LivingEntity.hurtServer` compares a hit inside
+/// the hurt cooldown, and keeps `lastHurt`, by its incoming amount; the
+/// reductions (`actuallyHurt`) get only the accepted difference.
+#[cfg(test)]
+mod hurt_cooldown_incoming_tests {
+    use super::*;
+
+    fn mob(species: Species) -> Mob {
+        let mut kind = (*sensor_scan_tests::kind()).clone();
+        kind.species = species;
+        let mut m = Mob::new(1, Arc::new(kind), Vec3::ZERO, 0.0);
+        m.attrs.max_health = 40.0;
+        m.health = 40.0;
+        m
+    }
+
+    #[test]
+    fn full_resistance_keeps_the_incoming_amounts_and_takes_a_stronger_hit() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
+        let mut m = mob(Species::Pig);
+        m.extra
+            .effects
+            .push(StoredEffect::new("minecraft:resistance", 600, 4));
+        assert!(m.damage(level, 1.0, Damage::of(DamageKind::Generic)));
+        assert_eq!((m.health, m.invulnerable, m.last_hurt), (40.0, 20, 1.0));
+        assert!(!m.damage(level, 1.0, Damage::of(DamageKind::Generic)));
+        assert!(m.damage(level, 2.0, Damage::of(DamageKind::Generic)));
+        assert_eq!((m.health, m.invulnerable, m.last_hurt), (40.0, 20, 2.0));
+        assert!(!m.damage(level, 1.5, Damage::of(DamageKind::Generic)));
+        assert_eq!(m.last_hurt, 2.0);
+    }
+
+    #[test]
+    fn the_armor_effectiveness_callback_runs_only_for_accepted_hits() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
+        let mut m = mob(Species::Pig);
+        // This damage-boundary fixture supplies effective armor directly;
+        // equipment attributes are normally prepared by the equipment tick.
+        Arc::make_mut(&mut m.kind).armor = 6.0;
+        let mut calls = 0;
+        let mut breach = |f: f32, _: &mut LegacyRandom| {
+            calls += 1;
+            f
+        };
+        assert!(m.damage_with(
+            level,
+            4.0,
+            Damage::of(DamageKind::Cactus),
+            Some(&mut breach)
+        ));
+        assert!(!m.damage_with(
+            level,
+            4.0,
+            Damage::of(DamageKind::Cactus),
+            Some(&mut breach)
+        ));
+        assert!(m.damage_with(
+            level,
+            8.0,
+            Damage::of(DamageKind::Cactus),
+            Some(&mut breach)
+        ));
+        assert_eq!(calls, 2);
+        assert_eq!(m.last_hurt, 8.0);
+    }
+
+    #[test]
+    fn absorption_soaks_the_accepted_difference() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
+        let mut m = mob(Species::Pig);
+        m.absorption = 1.5;
+        assert!(m.damage(level, 1.0, Damage::of(DamageKind::Generic)));
+        assert_eq!((m.health, m.absorption), (40.0, 0.5));
+        // 3 after 1: the difference 2, the last 0.5 absorption first.
+        assert!(m.damage(level, 3.0, Damage::of(DamageKind::Generic)));
+        assert_eq!((m.health, m.absorption, m.last_hurt), (38.5, 0.0, 3.0));
+    }
+
+    #[test]
+    fn a_horse_armor_wears_by_the_accepted_difference() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
+        let mut m = mob(Species::Horse);
+        m.extra.set_body(Some("minecraft:iron_horse_armor".into()));
+        assert!(m.damage(level, 4.0, Damage::of(DamageKind::Cactus)));
+        assert!(m.damage(level, 8.0, Damage::of(DamageKind::Cactus)));
+        let worn: Vec<f32> = m
+            .outbox
+            .iter()
+            .filter_map(|e| match e {
+                MobEvent::ArmorHurt { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(worn, [4.0, 4.0]);
+    }
+}
+
 #[cfg(test)]
 mod hidden_speed_mob_tick_tests {
     use super::*;
@@ -7368,5 +7557,115 @@ mod hidden_speed_mob_tick_tests {
         assert!(m.extra.hidden_effects.contains(&"minecraft:speed"));
         assert!(!m.extra.effect_chains[0].ambient);
         assert!(m.extra.effect_chains[0].visible);
+    }
+
+    #[test]
+    fn health_boost_death_effect_clear_clamps_health() {
+        let mut kind = (*sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:pig".into();
+        kind.species = Species::Pig;
+        let mut m = Mob::new(202, Arc::new(kind), Vec3::ZERO, 0.0);
+        finalize::set_base(&mut m, finalize::Attr::MaxHealth, 10.0);
+        m.add_effect("health_boost", 200, 1);
+        assert_eq!(m.attrs.max_health, 18.0);
+        m.health = 18.0;
+        m.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::ClearAllEffects,
+        );
+        assert_eq!(m.attrs.max_health, 10.0);
+        assert_eq!(m.health, 10.0);
+    }
+
+    #[test]
+    fn consume_effect_removal_clamps_absorption_to_remaining_maximum() {
+        use horizon_world::attributes::entity::Catalog;
+        let bits = |v: f64| format!("{:016x}", v.to_bits());
+        let catalog = Arc::new(
+            Catalog::from_json(&serde_json::json!({
+                "data_version": horizon_world::DATA_VERSION,
+                "attributes": [
+                    {"id":"minecraft:max_absorption", "default":bits(0.0), "min":bits(0.0), "max":bits(2048.0), "syncable":true}
+                ],
+                "entities": {"minecraft:pig":{"minecraft:max_absorption":bits(0.0)}}
+            }))
+            .unwrap(),
+        );
+        let key = catalog.id("minecraft:max_absorption").unwrap();
+
+        let mut kind = (*sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:pig".into();
+        kind.species = Species::Pig;
+        let kind = Arc::new(kind);
+
+        // Case 1: Base 0 mob with Absorption I (granting 4.0 absorption hearts, max_absorption 4.0).
+        // On ClearAllEffects, max_absorption becomes 0.0, amount drops to 0.0.
+        let mut m0 = Mob::new(1, kind.clone(), Vec3::ZERO, 0.0);
+        m0.add_effect("absorption", 600, 0);
+        assert_eq!(armor::max_absorption(&m0), 4.0);
+        assert_eq!(m0.absorption, 4.0);
+        m0.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::ClearAllEffects,
+        );
+        assert_eq!(
+            m0.absorption, 0.0,
+            "base 0 mob loses absorption on ClearAllEffects"
+        );
+
+        // Case 2: Base 20 mob with Absorption I (granting 4.0 absorption hearts, max_absorption 24.0).
+        // On ClearAllEffects, max_absorption becomes 20.0; amount 4.0 is <= 20.0, so it keeps 4.0.
+        let mut m20 = Mob::new(2, kind.clone(), Vec3::ZERO, 0.0);
+        let mut attrs = catalog.create("minecraft:pig").unwrap();
+        attrs.edit(key, |value, observer| {
+            value.set_base_value(20.0, observer).unwrap();
+        });
+        m20.extra.armor_attributes = Some(Box::new(attrs));
+        m20.add_effect("absorption", 600, 0);
+        assert_eq!(armor::max_absorption(&m20), 24.0);
+        assert_eq!(m20.absorption, 4.0);
+        m20.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::ClearAllEffects,
+        );
+        assert_eq!(
+            m20.absorption, 4.0,
+            "base 20 mob keeps absorption on ClearAllEffects"
+        );
+
+        // Case 3: Base 20 mob with Absorption I and absorption raised to 24.0.
+        // On RemoveEffects(["minecraft:absorption"]), remaining max_absorption is 20.0,
+        // so amount 24.0 is clamped to 20.0.
+        let mut m20_clamp = Mob::new(3, kind.clone(), Vec3::ZERO, 0.0);
+        let mut attrs3 = catalog.create("minecraft:pig").unwrap();
+        attrs3.edit(key, |value, observer| {
+            value.set_base_value(20.0, observer).unwrap();
+        });
+        m20_clamp.extra.armor_attributes = Some(Box::new(attrs3));
+        m20_clamp.add_effect("absorption", 600, 0);
+        m20_clamp.absorption = 24.0;
+        m20_clamp.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::RemoveEffects(vec!["minecraft:absorption".into()]),
+        );
+        assert_eq!(
+            m20_clamp.absorption, 20.0,
+            "base 20 mob clamps absorption to 20.0 on RemoveEffects"
+        );
+
+        // Case 4: Base 0 mob with Absorption I (granting 4.0 absorption hearts, max_absorption 4.0).
+        // On RemoveEffects(["minecraft:absorption"]), remaining max_absorption is 0.0,
+        // so amount drops to 0.0.
+        let mut m0_remove = Mob::new(4, kind, Vec3::ZERO, 0.0);
+        m0_remove.add_effect("absorption", 600, 0);
+        assert_eq!(m0_remove.absorption, 4.0);
+        m0_remove.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::RemoveEffects(vec!["minecraft:absorption".into()]),
+        );
+        assert_eq!(
+            m0_remove.absorption, 0.0,
+            "base 0 mob loses absorption on RemoveEffects"
+        );
     }
 }

@@ -138,6 +138,7 @@ pub(super) struct GuestSwap {
     i: usize,
     play: GuestPlay,
     player: Option<PlayerMotion>,
+    player_save_projection: (Option<i32>, Option<bool>),
     /// The guest's eye height and the game's.
     eye: (f32, f32),
     yaw: f32,
@@ -208,6 +209,7 @@ pub(super) struct GuestSwap {
         Option<u128>,
         Option<u8>,
         Option<u32>,
+        Option<i32>,
     ),
     /// Whether the outer turn is a fake player.
     acting_fake: bool,
@@ -429,6 +431,7 @@ fn reset_use_attack_strength(ticker: &mut u32, before: u32, after: u32) {
 #[cfg(test)]
 mod tests {
     use super::{copied_respawn_point, eye_columns, reset_use_attack_strength};
+    use crate::game::api_values::TryIntoApi;
     use horizon_client::pose::Pose;
     #[test]
     fn use_swing_resets_attack_charge_only_when_started() {
@@ -521,6 +524,7 @@ mod tests {
                     data_slots: 0,
                     results: Vec::new(),
                     crafting: None,
+                    links: None,
                 }));
                 for is_mod in [false, true] {
                     game.world.block_entities.insert(
@@ -914,12 +918,15 @@ mod tests {
                 .default_state("minecraft:chest")
                 .unwrap();
             let pos = (0, 64, 0);
-            assert!(game.level_set_block(
-                level,
-                [pos.0, pos.1, pos.2],
-                chest,
-                NativeBlockUpdateFlags::NEIGHBORS
-            ));
+            assert_eq!(
+                game.level_set_block(
+                    level,
+                    [pos.0, pos.1, pos.2],
+                    chest,
+                    NativeBlockUpdateFlags::NEIGHBORS
+                ),
+                Ok(true)
+            );
             // A handle starts here, without an earlier use's `open_menu`.
             assert_eq!(game.open_block_menu(12, pos), super::MenuOpen::Opened);
             assert_eq!(game.lid_openers.get(&pos), Some(&1));
@@ -989,7 +996,10 @@ mod tests {
                 .default_state("minecraft:shulker_box")
                 .unwrap();
             let at = [pos.0, pos.1, pos.2];
-            assert!(game.level_set_block(level, at, shulker, NativeBlockUpdateFlags::NEIGHBORS));
+            assert_eq!(
+                game.level_set_block(level, at, shulker, NativeBlockUpdateFlags::NEIGHBORS),
+                Ok(true)
+            );
             assert!(
                 game.as_guest(12, |game| game.open_block_effect_menu(at))
                     .is_some()
@@ -1022,12 +1032,10 @@ mod tests {
                 .registry
                 .default_state("minecraft:chest")
                 .unwrap();
-            assert!(game.level_set_block(
-                level,
-                [0, 64, 0],
-                chest,
-                NativeBlockUpdateFlags::NEIGHBORS
-            ));
+            assert_eq!(
+                game.level_set_block(level, [0, 64, 0], chest, NativeBlockUpdateFlags::NEIGHBORS),
+                Ok(true)
+            );
             assert!(!game.lan_open_container(12, (2, 64, 0)));
             let mut guest = game.lan.as_mut().unwrap().hub.guests.remove(0);
             guest.kind = GuestKind::Fake;
@@ -1099,12 +1107,15 @@ mod tests {
                 let replacement = self.replace_with.lock().unwrap().take();
                 if let Some(state) = replacement {
                     let level = host.level("minecraft:overworld").unwrap();
-                    assert!(level.set_block(
-                        host,
-                        event.click.pos,
-                        state,
-                        mod_api::NativeBlockUpdateFlags::KNOWN_SHAPE,
-                    ));
+                    assert_eq!(
+                        level.set_block(
+                            host,
+                            event.click.pos,
+                            state.try_into_api().unwrap(),
+                            mod_api::NativeBlockUpdateFlags::KNOWN_SHAPE,
+                        ),
+                        Ok(true)
+                    );
                 }
                 self.clicks
                     .lock()
@@ -1122,10 +1133,11 @@ mod tests {
                     let player = host.player(event.click.player).unwrap();
                     assert!(player.set_food_level(host, level));
                 }
-                self.empty_clicks
-                    .lock()
-                    .unwrap()
-                    .push((event.state, event.click.player));
+                self.empty_clicks.lock().unwrap().push((
+                    crate::game::api_values::TryIntoEngine::try_into_engine(&event.state, &())
+                        .unwrap(),
+                    event.click.player,
+                ));
                 *self.empty_answer.lock().unwrap()
             }
         }
@@ -2421,6 +2433,7 @@ mod pickup_xp_tests {
                 ticks: 0,
                 health: 5,
                 no_gravity: true,
+                following: None,
             });
             game.guest_orbs(0);
             let left = game.orbs.iter().any(|o| o.id == 40);

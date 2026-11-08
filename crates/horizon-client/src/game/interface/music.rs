@@ -36,7 +36,15 @@ impl Game<'_> {
         };
         self.music.set_off(off);
         // LevelLoadingScreen: no new track before the player is in the world.
-        let loading = self.title.is_none() && self.player.is_none() && self.win.is_none();
+        // A reconfiguration's ServerReconfigScreen is a plain Screen, not a
+        // LevelLoadingScreen: its menu music starts as on any other screen.
+        let loading = self.title.is_none()
+            && self.player.is_none()
+            && self.win.is_none()
+            && !self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.reconfiguring.is_some());
         self.music
             .tick(music.as_ref(), volume, loading, &mut self.audio);
         // Options.musicToast's listener: ToastManager.setMusicToastDisplayState.
@@ -96,7 +104,7 @@ impl Game<'_> {
 
     /// `NowPlayingToast.getNowPlayingString` of the song the music manager
     /// plays: its file's short language key, slashes as dots.
-    fn now_playing_song(&self) -> Option<mod_api::Text> {
+    fn now_playing_song(&self) -> Option<horizon_client::text::Text> {
         let id = self.music.current_instance()?;
         let location = self
             .audio
@@ -114,9 +122,9 @@ impl Game<'_> {
             format!("{namespace}.{path}")
         }
         .replace('/', ".");
-        Some(mod_api::Text::literal(horizon_client::lang::get_or(
-            &key, &key,
-        )))
+        Some(horizon_client::text::Text::literal(
+            horizon_client::lang::get_or(&key, &key),
+        ))
     }
     /// `ToastManager.update` (it plays no toast sound for this toast) and
     /// `extractRenderState` for the Now Playing toast, which slides in at the
@@ -226,13 +234,15 @@ impl Game<'_> {
         // The title screen has no player (and no level for the camera probe).
         // A server's client has its player from handleLogin on, before the
         // first teleport makes it here: the camera is still at the origin.
+        // A reconfiguration's clearClientLevel drops it again (menu music),
+        // so the last server's columns are never probed.
         let eye = if self.title.is_some() {
             None
         } else {
             self.eye_position().or_else(|| {
                 self.remote
                     .as_ref()
-                    .is_some_and(|r| r.logged_in)
+                    .is_some_and(|r| r.has_level())
                     .then_some([0.0; 3])
             })
         };
@@ -271,9 +281,7 @@ impl Game<'_> {
             .chunks
             .get(&(x >> 4, z >> 4))
             .map_or("minecraft:plains", |c| {
-                world_biomes!(self).list[c.biome(x, y, z) as usize]
-                    .name
-                    .as_str()
+                world_biomes!(self).name(c.biome(x, y, z))
             })
     }
     /// `isEyeInFluid(WATER)`: the eye inside the water of its block column.

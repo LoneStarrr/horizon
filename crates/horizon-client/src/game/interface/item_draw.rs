@@ -82,7 +82,12 @@ impl ItemEnv for Env<'_, '_> {
         );
         value
     }
-    fn item_tint_source(&self, source: &str, config: &Value, stack: &StackView) -> i32 {
+    fn item_tint_source(
+        &self,
+        source: &str,
+        config: &horizon_core::nbt::Tag,
+        stack: &StackView,
+    ) -> i32 {
         if !mod_api::__private::listened(mod_api::HookId::ItemTintSource) {
             return -1;
         }
@@ -314,7 +319,10 @@ impl Game<'_> {
     fn level_state_now(&self, dimension: &'static str) -> LevelState {
         let sky = self
             .dim_environment()
-            .sample(self.world.day_time, None, None);
+            .sample(&horizon_client::environment::Sample {
+                day_time: self.world.day_time,
+                ..Default::default()
+            });
         LevelState {
             dimension: dimension.to_owned(),
             game_time: self.world.game_time,
@@ -1061,7 +1069,12 @@ mod tests {
         ) {
             if event.source == "example:charge" {
                 event.color = match event.stack.count() {
-                    1 => event.config["low"].as_i64().unwrap_or(0) as u32,
+                    1 => {
+                        (match event.config.get("low") {
+                            Some(horizon_core::nbt::Tag::Long(v)) => *v,
+                            _ => 0,
+                        }) as u32
+                    }
                     _ => 0xFF11_2233,
                 };
             }
@@ -1087,7 +1100,10 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources"]
     fn item_tint_source_reads_the_mods_colour() {
-        let config = serde_json::json!({"type": "example:charge", "low": 0xFFAA_BBCC_u32});
+        let config = horizon_core::json_nbt::json_to_tag(
+            &serde_json::json!({"type": "example:charge", "low": 0xFFAA_BBCC_u32}),
+        )
+        .unwrap();
         let one = StackView::new("minecraft:stick", 1);
         let two = StackView::new("minecraft:stick", 2);
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("charge", Box::new(Charge))].into();

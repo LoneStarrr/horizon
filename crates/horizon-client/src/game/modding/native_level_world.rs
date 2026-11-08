@@ -5,10 +5,14 @@
 use super::{Dim, Game};
 use horizon_client::command::vanilla::DIFFICULTIES;
 use horizon_client::world::World;
+use horizon_client_core::gamerules::Value as GameRuleValue;
 use horizon_core::position::BlockPos;
 use horizon_core::random::LegacyRandom;
 use horizon_world::registry::BlockStateId;
-use mod_api::{BoolGameRuleKey, FeatureFlags, GameRuleValue, LevelDimensionShape, LevelRef};
+use mod_api::{
+    BoolGameRuleKey, FeatureFlags, LevelDimensionShape, LevelDimensionType, LevelReadError,
+    LevelRef,
+};
 use std::sync::Arc;
 use {horizon_core::dimension::Dimension as LevelDimension, horizon_world::level::LevelAccess};
 
@@ -88,17 +92,30 @@ impl LevelAccess for RainView<'_> {
 impl Game<'_> {
     /// `Level.getSkyDarken`: the same dimension, time and weather calculation used by gameplay.
     pub(super) fn sky_darken_in(&self, world: &World, dimension: Dim) -> i32 {
-        let environment = match dimension {
-            Dim::Overworld | Dim::Extra(_) => self.res.environment(),
-            Dim::Nether => self.res.nether_environment(),
-            Dim::End => self.res.end_environment(),
+        // A client of a server has the environment its server's type made for a mod's level.
+        let environment = match self
+            .remote
+            .as_ref()
+            .and_then(|r| r.level_environment.as_ref())
+        {
+            Some(own) => own,
+            None => match dimension {
+                Dim::Overworld => self.res.environment(),
+                Dim::Extra(_) => horizon_client::environment::Environment::for_level(
+                    dimension.id(),
+                    self.res.environment(),
+                ),
+                Dim::Nether => self.res.nether_environment(),
+                Dim::End => self.res.end_environment(),
+            },
         };
         let (rain, thunder) = weather_for_level(
             world.shape,
             dimension == Dim::End,
             self.world.weather.levels(1.0),
         );
-        horizon_client::environment::sky_darken(environment, self.world.day_time, rain, thunder)
+        let day_time = self.command_clock_time(&self.level_clock_name(dimension));
+        horizon_client::environment::sky_darken(environment, day_time, rain, thunder)
     }
 
     /// `Level.getSkyDarken` for an active or parked level, without switching dimensions.
@@ -129,6 +146,67 @@ impl Game<'_> {
         ))
     }
 
+    /// The level's dimension type with its gameplay attributes, from the facts the game uses.
+    pub(super) fn level_dimension_type(&self, level: LevelRef) -> Option<LevelDimensionType> {
+        use horizon_world::dimension_type::{CardinalLight, DimensionFacts, Skybox};
+        use horizon_world::worldgen::value_provider::IntProvider;
+        self.native_level_read_world(level)?;
+        let key = horizon_core::LevelKey::parse(level.dimension_id()).ok()?;
+        let facts = DimensionFacts::of_level(key);
+        Some(LevelDimensionType {
+            id: facts.id.clone(),
+            min_y: facts.height.min_y,
+            height: facts.height.height,
+            logical_height: facts.height.logical_height,
+            has_skylight: facts.height.has_skylight,
+            has_ceiling: facts.height.has_ceiling,
+            has_fixed_time: facts.has_fixed_time,
+            has_ender_dragon_fight: facts.has_ender_dragon_fight,
+            coordinate_scale: facts.coordinate_scale,
+            ambient_light: facts.ambient_light,
+            infiniburn: facts.infiniburn.clone(),
+            monster_spawn_light_level: match facts.monster_spawn_light_level {
+                IntProvider::Constant(n) => Some((n, n)),
+                IntProvider::Uniform { min, max } => Some((min, max)),
+                _ => None,
+            },
+            monster_spawn_block_light_limit: facts.monster_spawn_block_light_limit,
+            skybox: match facts.skybox {
+                Skybox::None => "none".to_owned(),
+                Skybox::Overworld => "overworld".to_owned(),
+                Skybox::End => "end".to_owned(),
+            },
+            cardinal_light: match facts.cardinal_light {
+                CardinalLight::Default => "default".to_owned(),
+                CardinalLight::Nether => "nether".to_owned(),
+            },
+            water_evaporates: facts.water_evaporates,
+            fast_lava: facts.fast_lava,
+            respawn_anchor_works: facts.respawn_anchor_works,
+            nether_portal_spawns_piglin: facts.nether_portal_spawns_piglin,
+            piglins_zombify: facts.piglins_zombify,
+            snow_golem_melts: facts.snow_golem_melts,
+            can_start_raid: facts.can_start_raid,
+            sky_light_level: facts.sky_light_level,
+            timelines: facts.timelines.clone(),
+            default_clock: facts.default_clock.clone(),
+            bed_can_sleep: facts.bed_rule.can_sleep.name().to_owned(),
+            bed_can_set_spawn: facts.bed_rule.can_set_spawn.name().to_owned(),
+            bed_destroy_on_use: facts.bed_rule.destroy_on_use,
+            bed_destroy_on_leave: facts.bed_rule.destroy_on_leave,
+            straw_bed_can_sleep: facts.straw_bed_rule.can_sleep.name().to_owned(),
+            straw_bed_can_set_spawn: facts.straw_bed_rule.can_set_spawn.name().to_owned(),
+            straw_bed_destroy_on_use: facts.straw_bed_rule.destroy_on_use,
+            straw_bed_destroy_on_leave: facts.straw_bed_rule.destroy_on_leave,
+        })
+    }
+
+    /// The sea level the game uses for the level (`Dim::sea_level`). None as the host call says.
+    pub(super) fn level_sea_level(&self, level: LevelRef) -> Option<i32> {
+        self.native_level_world(level)?;
+        Some(Dim::sea_level_of_id(level.dimension_id()))
+    }
+
     /// The world's seed (`WorldOptions.seed`), as `/seed` shows it.
     pub(super) fn level_seed(&self, level: LevelRef) -> Option<i64> {
         self.native_level_world(level)?;
@@ -153,22 +231,27 @@ impl Game<'_> {
     }
     /// Game rule `rule` (`minecraft:keep_inventory` or `keep_inventory`), as
     /// `/gamerule` queries it: None for an unknown rule.
-    pub(super) fn level_game_rule(&self, level: LevelRef, rule: &str) -> Option<GameRuleValue> {
-        self.native_level_world(level)?;
-        self.ui.rules.get(rule)
+    pub(super) fn level_game_rule(
+        &self,
+        level: LevelRef,
+        rule: &str,
+    ) -> Result<Option<GameRuleValue>, LevelReadError> {
+        self.native_level_world_result(level)?;
+        Ok(self.ui.rules.get(rule))
     }
     /// Every game rule the world has (`GameRules`) with its current value, by `minecraft:` id
     /// (`max_minecart_speed` only with minecart improvements): None for a stale handle and on
     /// a client.
-    pub(super) fn level_game_rules(&self, level: LevelRef) -> Option<Vec<(String, GameRuleValue)>> {
-        self.native_level_world(level)?;
+    pub(super) fn level_game_rules(
+        &self,
+        level: LevelRef,
+    ) -> Result<Vec<(String, GameRuleValue)>, LevelReadError> {
+        self.native_level_world_result(level)?;
         let rules = &self.ui.rules;
-        Some(
-            rules
-                .available_rules()
-                .filter_map(|r| Some((r.name.clone(), rules.get(&r.name)?)))
-                .collect(),
-        )
+        Ok(rules
+            .available_rules()
+            .filter_map(|r| Some((r.name.clone(), rules.get(&r.name)?)))
+            .collect())
     }
     /// The rain and thunder levels, each 0.0 to 1.0 (`Level.getRainLevel`,
     /// `getThunderLevel` at partial tick 1.0): both 0 in a level with no weather.
@@ -420,7 +503,7 @@ mod tests {
         ) {
             let rules = host
                 .level("minecraft:overworld")
-                .and_then(|level| level.game_rules(host))
+                .and_then(|level| level.game_rules(host).ok())
                 .unwrap_or_default();
             let value = |id: &str| rules.iter().find(|(rule, _)| rule == id).map(|(_, v)| *v);
             self.0.lock().unwrap().push((
@@ -449,13 +532,13 @@ mod tests {
                 assert!(
                     game.ui
                         .rules
-                        .set("random_tick_speed", GameRuleValue::Int(7))
+                        .set("random_tick_speed", gamerules::Value::Int(7))
                 );
                 let keep_inventory = gamerules::rule_registry()
                     .rule("keep_inventory")
                     .unwrap()
                     .clone();
-                game.set_game_rule(&keep_inventory, GameRuleValue::Bool(true), None);
+                game.set_game_rule(&keep_inventory, gamerules::Value::Bool(true), None);
             });
         });
         assert_eq!(
@@ -469,6 +552,69 @@ mod tests {
                 58,
             )]
         );
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn rule_reads_distinguish_unknown_stale_and_unavailable_and_snapshot_values() {
+        use super::super::execution_role::ExecutionRole;
+        use mod_api::{LevelReadError, NativeWorldEpoch};
+        with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            assert!(
+                game.ui
+                    .rules
+                    .set("keep_inventory", gamerules::Value::Bool(true))
+            );
+            assert!(
+                game.ui
+                    .rules
+                    .set("random_tick_speed", gamerules::Value::Int(7))
+            );
+            assert_eq!(level.game_rule(game, "missing:rule"), Ok(None));
+            assert_eq!(
+                level.game_rule(game, "keep_inventory"),
+                Ok(Some(GameRuleValue::Bool(true)))
+            );
+            assert_eq!(
+                level.game_rule(game, "random_tick_speed"),
+                Ok(Some(GameRuleValue::Int(7)))
+            );
+            let rules = level.game_rules(game).unwrap();
+            assert!(rules.contains(&("minecraft:random_tick_speed".into(), GameRuleValue::Int(7))));
+            let stale = mod_api::LevelRef::new(
+                NativeWorldEpoch::new(level.epoch().get() + 1),
+                level.dimension(),
+            );
+            let gone = mod_api::LevelRef::new(
+                level.epoch(),
+                mod_api::__private::dimension_key("missing:level"),
+            );
+            for handle in [stale, gone] {
+                assert_eq!(
+                    handle.game_rule(game, "keep_inventory"),
+                    Err(LevelReadError::Stale)
+                );
+                assert_eq!(handle.game_rules(game), Err(LevelReadError::Stale));
+                assert!(game.native_level_world(handle).is_none());
+            }
+            {
+                let _scope =
+                    mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::Setup);
+                assert_eq!(
+                    level.game_rule(game, "keep_inventory"),
+                    Err(LevelReadError::Unavailable)
+                );
+                assert_eq!(level.game_rules(game), Err(LevelReadError::Unavailable));
+            }
+            game.options.execution_role = ExecutionRole::Client;
+            assert_eq!(
+                level.game_rule(game, "keep_inventory"),
+                Err(LevelReadError::Unavailable)
+            );
+            assert_eq!(level.game_rules(game), Err(LevelReadError::Unavailable));
+            assert!(game.native_level_world(level).is_none());
+        });
     }
 
     #[test]

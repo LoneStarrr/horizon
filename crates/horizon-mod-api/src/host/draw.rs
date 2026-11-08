@@ -31,7 +31,7 @@ pub trait DrawContext {
     /// Item `item`'s icon drawn with model `model` (`minecraft:paper` as
     /// `mymod:wheel_icon`, an `item_model` of a content mod's), as `native_item`
     /// draws one; false for an unknown item.
-    fn item_model(&mut self, item: &str, model: &str, at: [f32; 2], size: f32) -> bool {
+    fn item_model(&mut self, item: ItemKey, model: &str, at: [f32; 2], size: f32) -> bool {
         unimplemented!("DrawContext::item_model")
     }
     /// A quad of corners `points` (in order round it) in GUI pixels, `argb`:
@@ -53,7 +53,7 @@ pub trait DrawContext {
     }
     /// Item `item`'s icon (`mymod:machine`) with its top left at `at`,
     /// `size` GUI pixels square (16 in a slot); false for an unknown item.
-    fn item(&mut self, item: &str, at: [f32; 2], size: f32) -> bool {
+    fn item(&mut self, item: ItemKey, at: [f32; 2], size: f32) -> bool {
         unimplemented!("DrawContext::item")
     }
     /// A line of text at `(x, y)` in GUI pixels, in `argb` as vanilla's `GuiGraphics` takes it
@@ -68,7 +68,8 @@ pub trait DrawContext {
         unimplemented!("DrawContext::item_stack")
     }
     /// Paint GUI extraction calls through this window's atlas, including player faces.
-    fn gui_paint(&mut self, draws: &[GuiDraw]) {
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn gui_paint(&mut self, draws: &[GuiDraw]) -> Result<(), TextFormError> {
         unimplemented!("DrawContext::gui_paint")
     }
     /// Vanilla's nine-slice widget rendering. `color` is ARGB, as `fill` uses.
@@ -76,7 +77,8 @@ pub trait DrawContext {
         unimplemented!("DrawContext::gui_nine_slice")
     }
     /// A vanilla tooltip at the cursor, in GUI pixels.
-    fn gui_tooltip(&mut self, lines: &[Text], at: [f32; 2]) {
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn gui_tooltip(&mut self, lines: &[Text], at: [f32; 2]) -> Result<(), TextFormError> {
         unimplemented!("DrawContext::gui_tooltip")
     }
     /// The width of `text` in GUI pixels, as `native_text` draws it on `draw` (`Font.width`).
@@ -127,7 +129,14 @@ pub trait DrawContext {
     /// grey when not `active`), scrolling when it doesn't fit, and recorded for the narrator and
     /// a controller's focus. `rect` is `[x, y, w, h]` in GUI pixels. What
     /// [`crate::widgets::Widgets`] draws its buttons with.
-    fn widget_button(&mut self, rect: [f32; 4], label: &Text, active: bool, highlighted: bool) {
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn widget_button(
+        &mut self,
+        rect: [f32; 4],
+        label: &Text,
+        active: bool,
+        highlighted: bool,
+    ) -> Result<(), TextFormError> {
         unimplemented!("DrawContext::widget_button")
     }
     /// A text field as the game's screens draw one (`EditBox`): its text from the first
@@ -221,7 +230,7 @@ pub trait BlockEntityDrawContext {
     /// an entity's place: a block's baked model, with its default tints. A
     /// moving part that is no block is a standalone model
     /// (`native_draw_model`). False for an unknown block or property.
-    fn block(&mut self, block: &str, properties: &[(&str, &str)]) -> bool {
+    fn block(&mut self, block: BlockKey, properties: &[(&str, &str)]) -> bool {
         unimplemented!("BlockEntityDrawContext::draw_block")
     }
     /// Draws `stack` under `draw`'s pose as an item is drawn in the world
@@ -262,6 +271,23 @@ pub trait BlockEntityDrawContext {
     fn model(&mut self, model: ModelRef, tint: u32) -> Result<(), ModelError> {
         unimplemented!("BlockEntityDrawContext::draw_model")
     }
+    /// Draws the resolved standalone model under `draw`'s pose, as [`Self::model`] places it,
+    /// with the terrain's own materials: the block sprites (animated, mipmapped as the options
+    /// set), back faces culled, colour and depth written as opaque terrain, lit by
+    /// `draw.light` raised by each quad's own emission. `options` picks the material
+    /// (each quad's `solid`, `cutout` or `cutout_mipped`, or one for all: cutout discards
+    /// under alpha 0.1 without mipmaps, cutout-mipped under 0.5 with them), the directional
+    /// shading (independent of light), one sprite drawn as another with moved UVs, a UV
+    /// shrink, and a `0xRRGGBB` tint on quads with a tint index. What a machine's belts,
+    /// shafts and casings draw with. A refusal draws nothing.
+    /// Not on wasm: the generated record loses the options' borrowed lifetime.
+    fn terrain_model(
+        &mut self,
+        model: ModelRef,
+        options: TerrainModelOptions<'_>,
+    ) -> Result<(), TerrainModelError> {
+        unimplemented!("BlockEntityDrawContext::draw_terrain_model")
+    }
     /// Draws `text` under `draw`'s pose as a sign draws its lines
     /// (`Font.drawInBatch` in a `BlockEntityRenderer`): in the pose's x-y
     /// plane, one unit a font pixel, y down, its left end at `at`, facing
@@ -272,7 +298,15 @@ pub trait BlockEntityDrawContext {
     /// `draw.light`; a nonzero 0xRRGGBB `outline` rings each glyph, as glowing
     /// sign text's. Returns the width drawn, in font pixels: centre a line
     /// by starting it at minus half its width. API @API:draw_text@.
-    fn text(&mut self, text: &Text, at: [f32; 2], color: u32, glowing: bool, outline: u32) -> f32 {
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn text(
+        &mut self,
+        text: &Text,
+        at: [f32; 2],
+        color: u32,
+        glowing: bool,
+        outline: u32,
+    ) -> Result<f32, TextFormError> {
         unimplemented!("BlockEntityDrawContext::draw_text")
     }
     /// The width of `text` in font pixels, as `draw_text` draws it, to centre a
@@ -294,6 +328,24 @@ pub trait BlockEntityDrawContext {
     /// sprite. API @API:model_layers@.
     fn model_part(&mut self, part: &ModelPart, sprite: &str, tint: u32) -> bool {
         unimplemented!("BlockEntityDrawContext::draw_model_part")
+    }
+    /// Draws `stack` as a still fluid filling `bounds` (`[x0, y0, z0, x1, y1, z1]` in blocks
+    /// under `draw`'s pose), as a tank's contents: `minecraft:water` or `minecraft:lava` with no
+    /// components. Each face tiles the fluid's animated still sprite (`block/water_still`), one
+    /// tile per block, cut at whole-block lines and keeping each part's place in its tile, with
+    /// no inset of the box. The tint is the stack's, not the biome's water colour, unless
+    /// `options.argb` replaces it. Sky light stays as `draw.light`; block light rises to the
+    /// fluid's own (15 for lava). No face is shaded by direction. Faces are sorted far to
+    /// near, alpha blended, culled from behind and write depth, drawn with the block entities
+    /// before the level's translucent terrain. A stack of 0 draws nothing and is `Ok` without
+    /// checking `bounds`; a refusal draws nothing.
+    fn fluid_box(
+        &mut self,
+        stack: &FluidStack,
+        bounds: [f32; 6],
+        options: FluidBoxOptions,
+    ) -> Result<(), FluidBoxError> {
+        unimplemented!("BlockEntityDrawContext::draw_fluid_box")
     }
 }
 /// What `block_screen_effect_draw` draws with, one per hook call: quads in camera space, in

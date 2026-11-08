@@ -26,7 +26,15 @@ class IgnoredTestsHomeTest(unittest.TestCase):
             for key in ("HORIZON_LAUNCHER_TRASH", "HORIZON_LAUNCHER_CLIPBOARD", "HORIZON_LAUNCHER_DESKTOP"):
                 self.assertEqual(Path(env[key]).parent, home.parent)
             homes.append(home)
-            return SimpleNamespace(stdout="test fixture ... ok\ntest result: ok. 1 passed\n")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "     Running unittests src/lib.rs (target/debug/deps/example)\n"
+                    "running 1 test\n"
+                    "test fixture ... ok\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;\n"
+                ),
+            )
 
         with patch.dict(os.environ, HORIZON_HOME="parent-home", HORIZON_TEST_RESOURCES="prepared-fixture"):
             with patch.object(ignored_tests.lab, "game_env", wraps=lab.game_env) as sandbox:

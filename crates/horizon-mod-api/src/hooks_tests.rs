@@ -96,15 +96,8 @@ fn eager_subscribers_are_shared_across_dispatch_threads() {
         [1]
     );
     let barrier = Barrier::new(2);
-    let load = horizon_world::native_load_context::LoadContext::new(
-        horizon_world::native_load_context::DataLoadOrigin::ServerDataLoad,
-        std::sync::Arc::new(horizon_world::native_load_context::LoadInputs::new(
-            Default::default(),
-            std::path::PathBuf::new(),
-        )),
-        [],
-    );
-    let context = crate::OwningLoad::new(&load);
+    let load = crate::phase::TestReader::default();
+    let context = crate::OwningLoad::new(crate::DataLoadOrigin::ServerDataLoad, &load);
     let context = &context;
     std::thread::scope(|scope| {
         for _ in 0..2 {
@@ -364,6 +357,58 @@ fn server_inventory_operations_take_a_server_host(
     )
 }
 
+/// Compile-only: a server mod schedules and cancels a delayed task through the `&mut dyn ServerHost`
+/// its hooks get.
+#[allow(dead_code)]
+fn delayed_tasks_take_a_server_host(
+    host: &mut dyn ServerHost,
+) -> (Result<TaskId, ScheduleError>, bool) {
+    (host.schedule_task(20, 7), host.cancel_task(TaskId(1)))
+}
+
+/// Compile-only: a mod reads a level's dimension type, and registers a dimension with its own.
+#[allow(dead_code)]
+fn dimension_types_take_a_host(
+    host: &dyn Host,
+    level: LevelRef,
+) -> Option<(f64, bool, DimensionSettings)> {
+    let ty = level.dimension_type(host)?;
+    let nether_like = DimensionSettings {
+        coordinate_scale: 8.0,
+        has_fixed_time: true,
+        fast_lava: true,
+        ..Default::default()
+    };
+    Some((ty.coordinate_scale, ty.fast_lava, nether_like))
+}
+
+/// Compile-only: a mod reads the time of a level's own clock from a handle on a shared host.
+#[allow(dead_code)]
+fn clock_time_takes_a_host(host: &dyn Host, level: LevelRef) -> Option<i64> {
+    level.clock_time(host)
+}
+
+/// Compile-only: a mod reads a level's sea level from a handle on a shared host.
+#[allow(dead_code)]
+fn sea_level_takes_a_host(host: &dyn Host, level: LevelRef) -> Option<i32> {
+    level.sea_level(host)
+}
+
+/// Compile-only: a client mod reads column heights of the world its window shows.
+#[allow(dead_code)]
+fn client_heights_take_a_client_host(host: &dyn ClientHost) -> Result<Vec<Option<i32>>, String> {
+    host.client_surface_heights(&[(0, 0), (16, -16)], NativeHeightmap::MotionBlocking)
+}
+
+/// Compile-only: a client mod moves the view onto an entity and back through the `&mut dyn ClientHost`
+/// its hooks get.
+#[allow(dead_code)]
+fn camera_entity_takes_a_client_host(host: &mut dyn ClientHost, mob: EntityRef) -> bool {
+    let moved = host.set_camera_entity(mob);
+    let own = host.camera_entity();
+    moved && own.is_some()
+}
+
 /// Compile-only: a client mod reads the open inventory screen's slot boxes through its menu handle.
 #[allow(dead_code)]
 fn menu_slot_boxes_take_a_client_host(
@@ -403,9 +448,65 @@ fn level_queries_take_their_hosts(
     tool: &ItemStack,
 ) {
     let _: Option<Vec<[f64; 6]>> = level.fluid_shape(read, [0, 64, 0]);
+    let _: Option<i32> = level.fluid_tick_delay(read, FluidKey(0), [0, 64, 0]);
+    let _: Option<f32> = level.fluid_height(read, [0, 64, 0]);
+    let _: Option<f32> = level.fluid_height_for_camera(read, [0, 64, 0]);
+    let _: Option<bool> =
+        level.fluid_can_be_replaced_with(read, [0, 64, 0], FluidKey(0), Direction::Down);
     let _: Option<bool> = level.has_collisions(read, [0.0, 64.0, 0.0, 1.0, 65.0, 1.0]);
     let _: Option<Vec<EntityRayHit>> =
         level.ray_trace_entities(read, [0.0; 3], [8.0, 0.0, 0.0], 0.3, Some(shooter));
     let _: Result<Option<Vec<ItemStack>>, StackWriteError> =
         level.block_drops(server, [0, 64, 0], Some(tool), Some(shooter));
+    let _: bool = level.fluid_tick(server, [0, 64, 0]);
+}
+
+/// Compile-only: the entity queries for contact, picking and multipart parts as a mod calls
+/// them, all reads on a shared host.
+#[allow(dead_code)]
+fn entity_queries_take_a_shared_host(read: &dyn Host, entity: EntityRef) {
+    let _: Option<[f64; 3]> = entity.up_vector(read);
+    let _: Option<[i32; 3]> = entity.on_block(read);
+    let _: Option<NativeClipHit> = entity.pick(read, 4.5);
+    let _: Option<bool> = entity.is_multipart(read);
+    let _: Option<Vec<EntityRef>> = entity.parts(read);
+}
+
+/// Compile-only: an entity is sent to another dimension from a server host.
+#[allow(dead_code)]
+fn entity_travel_takes_a_server_host(server: &mut dyn ServerHost, entity: EntityRef) {
+    let _: bool = entity.teleport_to_level(server, "mymod:pocket", [8.5, 100.0, 8.5], None);
+    let _: bool = entity.teleport_to_level(
+        server,
+        "minecraft:the_nether",
+        [0.0, 64.0, 0.0],
+        Some([90.0, 0.0]),
+    );
+}
+
+/// Compile-only: a level is asked to be saved from a server host.
+#[allow(dead_code)]
+fn level_save_takes_a_server_host(server: &mut dyn ServerHost, level: LevelRef) -> bool {
+    level.request_save(server)
+}
+
+/// Compile-only: the player rule reads on any host, and the writes on a server host.
+#[allow(dead_code)]
+fn player_rules_take_their_hosts(
+    read: &dyn Host,
+    server: &mut dyn ServerHost,
+    player: PlayerRef,
+    other: PlayerRef,
+    stack: &ItemStack,
+    config: PlayerRespawnConfig,
+) {
+    let _: Option<bool> = player.may_use_item_at(read, [0, 64, 0], NativeBlockFace::Up, stack);
+    let _: Option<bool> = player.can_harm(read, other);
+    let _: Option<Option<PlayerRespawnConfig>> = player.respawn_config(read);
+    let _: Option<bool> = player.text_filtering(read);
+    let _: Option<bool> = player.sleep_ignored(read);
+    let _: Option<bool> = player.counts_for_sleep(read);
+    let _: Option<u32> = player.sleep_timer(read);
+    let _: bool = player.set_respawn_config(server, Some(config));
+    let _: bool = player.set_sleep_timer(server, 0);
 }

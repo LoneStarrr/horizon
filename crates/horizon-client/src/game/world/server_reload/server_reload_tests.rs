@@ -229,15 +229,17 @@ fn reload_command_uses_applied_listener_state_and_preserves_tables_on_refusal() 
 }
 
 fn request(root: &Path) -> WorldRequest {
-    WorldRequest {
-        rule_registry: std::sync::Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
-        save_root: root.to_owned(),
-        folder: "test".into(),
-        name: Some("test".into()),
-        seed: Some(1),
-        creative: true,
-        create: None,
-    }
+    let mut request = WorldRequest::new(
+        "test",
+        Some("test"),
+        Some(1),
+        true,
+        None,
+        std::sync::Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
+    )
+    .unwrap();
+    request.save_root = root.to_owned();
+    request
 }
 
 #[test]
@@ -333,15 +335,15 @@ fn missing_original_at_reload_preserves_the_published_data_and_reports_its_owner
             .reload_datapacks(true, &game.level.enabled_features.clone())
             .err()
             .unwrap();
-        let ReloadStageError::OriginalJars(horizon_mod_package::manifest::JarInputsError::Missing(
-            missing,
-        )) = error
+        let ReloadStageError::OriginalJars(mod_api::JarInputsError::Missing(missing)) = error
         else {
             panic!("expected typed missing original, got {error:?}");
         };
         assert_eq!(missing.owners, ["reload_test"]);
-        assert_eq!(missing.jar, jar);
-        assert_eq!(missing.path, jar_file);
+        assert_eq!(missing.id, jar.id());
+        assert_eq!(missing.version, jar.version());
+        assert_eq!(missing.sha512, jar.sha512());
+        assert_eq!(missing.path, jar_file.display().to_string());
         let reported = game.cmd_reload().unwrap_err().message.plain();
         assert!(reported.contains("reload_test: original 1:"), "{reported}");
         assert!(reported.contains(jar.sha512()), "{reported}");

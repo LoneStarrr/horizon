@@ -1317,15 +1317,26 @@ where
     }
     /// `Blender.of(region)` for the chunk at `pos`.
     fn blender_at(&self, pos: ChunkPos) -> Arc<super::blending::Blender> {
+        fn empty_blender() -> Arc<super::blending::Blender> {
+            static EMPTY: OnceLock<Arc<super::blending::Blender>> = OnceLock::new();
+            EMPTY
+                .get_or_init(|| Arc::new(super::blending::Blender::empty()))
+                .clone()
+        }
         // `SharedConstants.DEBUG_DISABLE_BLENDING`.
         static DISABLED: OnceLock<bool> = OnceLock::new();
         if *DISABLED.get_or_init(|| std::env::var_os("HORIZON_DISABLE_BLENDING").is_some()) {
-            return Arc::new(super::blending::Blender::empty());
+            return empty_blender();
         }
-        Arc::new(match self.old_world.get() {
-            Some(world) => super::blending::Blender::of(world.as_ref(), pos),
-            None => super::blending::Blender::empty(),
-        })
+        let Some(world) = self.old_world.get() else {
+            return empty_blender();
+        };
+        let blender = super::blending::Blender::of(world.as_ref(), pos);
+        if blender.is_empty() {
+            empty_blender()
+        } else {
+            Arc::new(blender)
+        }
     }
     fn biome_chunk(
         &self,
@@ -1518,8 +1529,11 @@ where
         );
         let mut clock = std::time::Instant::now();
         let mut neighbors = Vec::with_capacity(9);
-        // The biome ids present, as a bitset: ascending like a sorted set.
-        let mut seen: Vec<u64> = Vec::new();
+        // The biome ids present, as a bitset: ascending like a sorted set. The
+        // registry's ordinary ids fit in the stack array; retain a spill only
+        // for unusually large modded registries.
+        let mut seen = [0u64; 128];
+        let mut seen_spill = Vec::new();
         // Build the neighbours no other thread is building first, then wait
         // for the rest (each is built once, by whichever thread gets it).
         let around =
@@ -1543,26 +1557,35 @@ where
                         }
                         last = Some(id);
                         let word = id.0 as usize / 64;
-                        if seen.len() <= word {
-                            seen.resize(word + 1, 0);
+                        if let Some(bits) = seen.get_mut(word) {
+                            *bits |= 1 << (id.0 % 64);
+                        } else {
+                            let spill_word = word - seen.len();
+                            if seen_spill.len() <= spill_word {
+                                seen_spill.resize(spill_word + 1, 0);
+                            }
+                            seen_spill[spill_word] |= 1 << (id.0 % 64);
                         }
-                        seen[word] |= 1 << (id.0 % 64);
                     }
                     section += 1;
                 }
                 neighbors.push((*chunk).clone());
             }
         }
-        let possible = seen.iter().enumerate().flat_map(|(word, &bits)| {
-            let mut bits = bits;
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros();
-                    bits &= bits - 1;
-                    BiomeId(word as u32 * 64 + bit)
-                })
-            })
-        });
+        let possible =
+            seen.iter()
+                .chain(seen_spill.iter())
+                .enumerate()
+                .flat_map(|(word, &bits)| {
+                    let mut bits = bits;
+                    std::iter::from_fn(move || {
+                        (bits != 0).then(|| {
+                            let bit = bits.trailing_zeros();
+                            bits &= bits - 1;
+                            BiomeId(word as u32 * 64 + bit)
+                        })
+                    })
+                });
         let center = neighbors[4].clone();
         let biomes =
             BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
@@ -1847,16 +1870,24 @@ where
     /// ChunkGenerator.getBaseColumn: opacity of each noise-column state for
     /// a heightmap type, indexed from the minimum Y.
     fn base_column(&self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.base_columns(x, z, &[kind]).pop().unwrap_or_default()
+        self.base_columns_by(x, z, 1, &|_| kind)
+            .pop()
+            .unwrap_or_default()
     }
     /// One noise-column pass, as opacities for each heightmap kind.
-    fn base_columns(&self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
+    fn base_columns_by(
+        &self,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>> {
         let (min, height) = self.column_range();
-        let mut columns = vec![vec![false; height as usize]; kinds.len()];
+        let mut columns = vec![vec![false; height as usize]; count];
         self.noise_column(x, z, &mut |y, state| {
             let state = self.data.states.get(state);
-            for (column, kind) in columns.iter_mut().zip(kinds) {
-                column[(y - min) as usize] = kind.is_opaque(state);
+            for (index, column) in columns.iter_mut().enumerate() {
+                column[(y - min) as usize] = kind(index).is_opaque(state);
             }
             false
         });
@@ -1865,14 +1896,19 @@ where
     /// ChunkGenerator.getBaseColumn's blocks, by what structures test
     /// (BlockState.isSolid is blocksMotion for the noise's blocks, which
     /// are never cobwebs or bamboo saplings).
-    fn noise_blocks(&self, x: i32, z: i32) -> super::structure::start::NoiseColumn {
-        use super::structure::start::{NoiseBlock, NoiseColumn};
+    fn noise_blocks_into(
+        &self,
+        x: i32,
+        z: i32,
+        column: &mut dyn super::structure::start::NoiseColumnTarget,
+    ) {
+        use super::structure::start::NoiseBlock;
         let (min, height) = self.column_range();
-        let mut blocks = vec![NoiseBlock::Air; height as usize];
+        column.resize(min, height as usize);
         let registry = self.data.registry;
         self.noise_column(x, z, &mut |y, state| {
             let props = self.data.states.get(state);
-            blocks[(y - min) as usize] = if props.is_air() {
+            let block = if props.is_air() {
                 NoiseBlock::Air
             } else {
                 match registry.state(state).map(|s| s.name.as_str()) {
@@ -1882,9 +1918,9 @@ where
                     _ => NoiseBlock::Other,
                 }
             };
+            column.set((y - min) as usize, block);
             false
         });
-        NoiseColumn { min, blocks }
     }
     /// iterateNoiseColumn from the top down until `visit` returns true.
     fn noise_column(&self, x: i32, z: i32, visit: &mut dyn FnMut(i32, BlockStateId) -> bool) {
@@ -2053,11 +2089,22 @@ where
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
         self.pipeline.base_column(x, z, kind)
     }
-    fn base_columns(&mut self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns(x, z, kinds)
+    fn base_columns_by(
+        &mut self,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>> {
+        self.pipeline.base_columns_by(x, z, count, kind)
     }
-    fn noise_column(&mut self, x: i32, z: i32) -> super::structure::start::NoiseColumn {
-        self.pipeline.noise_blocks(x, z)
+    fn noise_column_into(
+        &mut self,
+        x: i32,
+        z: i32,
+        column: &mut dyn super::structure::start::NoiseColumnTarget,
+    ) {
+        self.pipeline.noise_blocks_into(x, z, column)
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         let sea = self.pipeline.settings.sea_level;

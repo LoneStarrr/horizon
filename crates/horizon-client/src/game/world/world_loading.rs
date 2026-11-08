@@ -11,6 +11,9 @@ pub(super) struct WorldRequest {
     pub creative: bool,
     pub create: Option<horizon_client::title::WorldOptions>,
     pub rule_registry: Arc<horizon_client::gamerules::RuleRegistry>,
+    /// The account the world opens under, for an integrated server
+    /// (`IntegratedServer.getSingleplayerProfile`): its name and UUID.
+    owner: Option<(String, u128)>,
 }
 
 pub(super) struct PreparedWorld {
@@ -25,6 +28,9 @@ pub(super) struct PreparedWorld {
     pub rand_sequences: horizon_client::random_sequences::RandomSequences,
     pub locator: Option<Arc<VanillaTerrain>>,
     pub loot: horizon_client::structure_blocks::LootSnapshot,
+    /// The owner's offline UUID and the account's, when an older world moved its
+    /// owner at open (`playerdata::migrate_owner`): entities migrate as they load.
+    pub owner_migration: Option<(u128, u128)>,
 }
 
 impl WorldRequest {
@@ -44,7 +50,16 @@ impl WorldRequest {
             creative,
             create: create.cloned(),
             rule_registry,
+            owner: None,
         })
+    }
+
+    /// The account this world opens under (`IntegratedServer.getSingleplayerProfile`):
+    /// a world older builds made under the offline profile moves its owner to it at
+    /// open. A dedicated server has no single-player owner and leaves it unset.
+    pub fn owned_by(mut self, player: &str, owner: u128) -> Self {
+        self.owner = Some((player.to_owned(), owner));
+        self
     }
 
     pub fn prepare(
@@ -99,6 +114,7 @@ impl WorldRequest {
             creative,
             create,
             rule_registry,
+            owner,
         } = self;
         let name = name.as_deref();
         let create = create.map(|mut create| {
@@ -172,6 +188,28 @@ impl WorldRequest {
             ..Level::default()
         });
         let mut level = level;
+        // `IntegratedServer.setSingleplayerProfile`: a world older Horizon builds made
+        // under the offline profile moves its owner to the account at open — the player
+        // file, its `UUID` and level.dat's `singleplayer_uuid`. Its entities follow as
+        // their chunks load (`owner_migration`, `entity_nbt::migrate_player_uuid`).
+        let owner_migration = owner.and_then(|(player, account)| {
+            let old = horizon_protocol::crypto::offline_uuid(&player);
+            (old != account).then(|| {
+                if created {
+                    // `IntegratedServer.initServer` saves with the profile before the first
+                    // tick: a world made under the account names it from its first level.dat.
+                    level.player_uuid = Some(horizon_client::lan::playerdata::uuid_ints(account));
+                } else if horizon_client::lan::playerdata::migrate_owner(
+                    &save_root, &mut level, old, account,
+                ) {
+                    log::info!(
+                        "Horizon: \"{folder}\" was made under the offline profile; \
+                         its owner moved to the account's UUID"
+                    );
+                }
+                (old, account)
+            })
+        });
         // CreateWorldScreen's choices, before streaming reads the generator.
         if created && let Some(o) = create {
             level.hardcore = o.hardcore;
@@ -271,8 +309,8 @@ impl WorldRequest {
         let mut world = World::new(res.facts().air, level.seed);
         world.attachments = save.load_attachments();
         world.shape = shape;
-        world.fast_lava = horizon_world::dimension_type::DimensionFacts::of_builtin_level(
-            horizon_core::LevelKey::builtin_or_overworld(dim.id()),
+        world.fast_lava = horizon_world::dimension_type::DimensionFacts::of_level(
+            horizon_core::LevelKey::parse(dim.id()).unwrap_or(horizon_core::LevelKey::OVERWORLD),
         )
         .fast_lava;
         world.game_time = level.time;
@@ -307,6 +345,7 @@ impl WorldRequest {
             rand_sequences,
             locator,
             loot,
+            owner_migration,
         })
     }
 }
@@ -659,7 +698,82 @@ pub(super) fn level_shapes(
     // What the packs leave out is logged when the generator reads them.
     let (overrides, _) =
         horizon_client::datapack::worldgen_overrides(&enabled, |b| biomes.contains(b));
-    shapes_of(&overrides)
+    let shapes = shapes_of(&overrides);
+    set_level_sea_levels(
+        &overrides,
+        horizon_world::worldgen::overrides::mod_dimensions(),
+        resources,
+    );
+    shapes
+}
+
+/// The sea levels of the levels whose stem the mods or the data packs give: a mod's own
+/// (`DimensionSettings::sea_level`), else the `sea_level` of the noise settings their stem names,
+/// the packs' over the game's. The game's spawning, weather and maps then use them. A level of a
+/// generator that reads no noise settings has its built-in level's, and the three built-in levels
+/// too unless the packs replace their stem or their noise settings.
+fn set_level_sea_levels(
+    overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
+    mods: &[horizon_world::worldgen::overrides::ModDimension],
+    resources: &std::path::Path,
+) {
+    use horizon_world::worldgen::overrides::{DIMENSIONS, NOISE_SETTINGS, stem_sea_level};
+    let read = |id: &str| -> Option<serde_json::Value> {
+        if let Some((_, json)) = overrides
+            .entries(NOISE_SETTINGS)
+            .find(|(entry, _)| *entry == id)
+        {
+            return serde_json::from_str(json).ok();
+        }
+        let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+        let file = resources.join(format!(
+            "data/{namespace}/worldgen/noise_settings/{path}.json"
+        ));
+        serde_json::from_slice(&std::fs::read(file).ok()?).ok()
+    };
+    let mut levels: Vec<(horizon_core::LevelKey, i32)> = Vec::new();
+    for (id, stem) in overrides.entries(DIMENSIONS) {
+        let own = mods.iter().find(|d| d.id == id).and_then(|d| d.sea_level);
+        // The noise settings are what the terrain is built with; `sea_level` of the mod is for
+        // a generator that has none.
+        let stem = serde_json::from_str::<serde_json::Value>(stem).ok();
+        // A superflat generator builds at -63 (`FlatLevelSource.getSeaLevel`) whatever its level
+        // is told; a mod's explicit sea level still wins for it.
+        let flat = stem
+            .as_ref()
+            .is_some_and(|stem| stem["generator"]["type"].as_str() == Some("minecraft:flat"));
+        let sea = stem
+            .and_then(|stem| stem_sea_level(&stem, &read))
+            .or(own)
+            .or(flat.then_some(-63));
+        if let (Some(sea), Ok(key)) = (sea, horizon_core::LevelKey::parse(id)) {
+            levels.push((key, sea));
+        }
+    }
+    // A built-in level the packs gave no stem: its default noise settings, which a pack may replace.
+    for (id, settings) in [
+        ("minecraft:overworld", "minecraft:overworld"),
+        ("minecraft:the_nether", "minecraft:nether"),
+        ("minecraft:the_end", "minecraft:end"),
+    ] {
+        let Ok(key) = horizon_core::LevelKey::parse(id) else {
+            continue;
+        };
+        if levels.iter().any(|(level, _)| *level == key) {
+            continue;
+        }
+        let replaced = overrides
+            .entries(NOISE_SETTINGS)
+            .any(|(entry, _)| entry == settings);
+        let sea = replaced
+            .then(|| read(settings))
+            .flatten()
+            .and_then(|json| i32::try_from(json["sea_level"].as_i64()?).ok());
+        if let Some(sea) = sea {
+            levels.push((key, sea));
+        }
+    }
+    horizon_world::level::set_sea_levels(levels);
 }
 
 /// The levels' shapes the mods' and packs' worldgen entries give.
@@ -722,7 +836,47 @@ fn shapes_of(
         })
         .collect();
     shapes.extra = extra.leak();
+    set_level_types(overrides, &shapes);
     shapes
+}
+
+/// The dimension types the mods and packs changed or added, for the levels `shapes` holds: what
+/// `DimensionFacts::of_level` answers for them. A type the game refuses keeps the level's own.
+fn set_level_types(
+    overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
+    shapes: &horizon_client::chunk::LevelShapes,
+) {
+    use horizon_core::LevelKey;
+    let levels = [
+        "minecraft:overworld",
+        "minecraft:the_nether",
+        "minecraft:the_end",
+    ]
+    .into_iter()
+    .chain(shapes.extra.iter().map(|level| level.id));
+    let mut facts = Vec::new();
+    for level in levels {
+        match overrides.level_facts(level) {
+            Some(Ok(found)) => facts.extend(LevelKey::parse(level).ok().map(|key| (key, found))),
+            Some(Err(why)) => log::warn!(
+                "Horizon: data pack worldgen: the dimension type of {level} sets a field the game                  refuses ({why}); the level keeps the type it would have without it"
+            ),
+            None => {}
+        }
+    }
+    horizon_world::dimension_type::DimensionFacts::set_levels(facts);
+    // The attributes and timelines (the sky, fog and cloud over the day) of the levels a mod or a
+    // pack added.
+    let attributes = shapes
+        .extra
+        .iter()
+        .filter_map(|level| {
+            let (_, json) = overrides.level_type_json(level.id)?;
+            let named = json.get("attributes").is_some() || json.get("timelines").is_some();
+            named.then(|| (level.id.to_owned(), json))
+        })
+        .collect();
+    horizon_client::environment::Environment::set_level_attributes(attributes);
 }
 
 /// The terrain of a level whose stem names a generator a mod registered, the
@@ -875,6 +1029,17 @@ pub(super) fn make_streaming(
             }
         }
     });
+    // The sea level the level's rules and the mods read is the one its generator builds with
+    // (`ChunkGenerator.getSeaLevel`), so a pack's noise settings or a superflat world are seen:
+    // the superflat generators' is -63 (`FlatLevelSource.getSeaLevel`).
+    let register_sea_level = |sea_level: i32| {
+        if let Ok(key) = horizon_core::LevelKey::parse(dim.id()) {
+            horizon_world::level::register_sea_level(key, sea_level);
+        }
+    };
+    if flat.is_some() || flat_vanilla.is_some() {
+        register_sea_level(-63);
+    }
     let mut streaming = if let Some(inner) = debug {
         Streaming::new(
             Arc::new(Persistent {
@@ -986,6 +1151,7 @@ pub(super) fn make_streaming(
             })?;
         inner.set_loot_source(loot);
         inner.add_mod_signs(res.facts());
+        register_sea_level(inner.sea_level());
         let inner = Arc::new(inner);
         if dim == Dim::Overworld && structures {
             inner.search_rings_behind();
@@ -1047,6 +1213,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_levels_sea_level_comes_from_its_mod_or_its_noise_settings() {
+        use horizon_client::datapack::worldgen_overrides_over;
+        use horizon_world::worldgen::overrides::ModDimension;
+        let level = |id: &str, stem: &str, sea_level| ModDimension {
+            id: id.into(),
+            stem: stem.into(),
+            dimension_type: "{}".into(),
+            sea_level,
+        };
+        let mods = [
+            level(
+                "test:own",
+                r#"{"type":"test:own","generator":{"type":"test:floor"}}"#,
+                Some(10),
+            ),
+            level(
+                "test:inline",
+                r#"{"type":"test:inline","generator":{"type":"minecraft:noise","settings":{"sea_level":20}}}"#,
+                None,
+            ),
+            level(
+                "test:plain",
+                r#"{"type":"test:plain","generator":{"type":"test:floor"}}"#,
+                None,
+            ),
+        ];
+        let (overrides, _) = worldgen_overrides_over(&mods, &[], |_| true);
+        set_level_sea_levels(&overrides, &mods, std::path::Path::new("."));
+        let sea = |id: &str| {
+            horizon_world::level::sea_level_of(horizon_core::LevelKey::parse(id).unwrap())
+        };
+        assert_eq!(sea("test:own"), 10);
+        assert_eq!(sea("test:inline"), 20);
+        assert_eq!(sea("test:plain"), 63);
+        assert_eq!(sea("minecraft:the_nether"), 32);
+        horizon_world::level::set_sea_levels(Vec::new());
+    }
+
+    #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn creation_rule_selection_reaches_the_saved_world() {
         use super::super::native_entity_refs::tests::with_game;
@@ -1072,6 +1277,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         with_game(|game| {
             let request = WorldRequest {
+                owner: None,
                 save_root: dir.clone(),
                 folder: "test".into(),
                 name: Some("test".into()),
@@ -1112,6 +1318,7 @@ mod tests {
             dimension_type:
                 r#"{"min_y":-128,"height":448,"logical_height":320,"has_skylight":false,"has_ceiling":true}"#
                     .into(),
+            sea_level: None,
         };
         let (overrides, _) = worldgen_overrides_over(&[pocket], &[], |_| true);
         let shapes = shapes_of(&overrides);
@@ -1148,6 +1355,7 @@ mod tests {
             id: "test:pocket".into(),
             stem: r#"{"type":"test:pocket","generator":{"type":"test:floor"}}"#.into(),
             dimension_type: r#"{"min_y":-128,"height":448,"logical_height":448}"#.into(),
+            sea_level: None,
         }])
         .unwrap();
         let floor: Arc<dyn ModChunkGenerator> = Arc::new(Floor);

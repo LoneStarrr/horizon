@@ -1036,7 +1036,7 @@ pub fn dimension_stems(packs: &[&DataPack]) -> BTreeMap<String, serde_json::Valu
             // An id that is no safe folder name (`..`, an empty segment) would open a level
             // outside the world's `dimensions` folder.
             let id = format!("{namespace}:{path}");
-            if !overrides::valid_level_id(&id) {
+            if !horizon_core::level_id::valid_level_id(&id) {
                 continue;
             }
             if let Some(json) = pack
@@ -1156,6 +1156,7 @@ mod tests {
             id: "test:pocket".into(),
             stem: r#"{"type":"test:pocket"}"#.into(),
             dimension_type: r#"{"min_y":-128,"height":448,"logical_height":448}"#.into(),
+            sea_level: None,
         }];
         let height = |packs: &[&DataPack]| {
             let (o, _) = worldgen_overrides_over(&mods, packs, |_| true);

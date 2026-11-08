@@ -6,6 +6,38 @@ through `RenderAssets::model` after resources are published. World render hooks 
 copies in a group. GUI scenes, mobs and kept/spinning renderers use their existing
 CPU routes; groups are a world-drawing facility, not another renderer.
 
+## Terrain materials in a block entity
+
+`draw.model(model, tint)` draws a resolved model as an entity model. A block entity, mob or
+player submit hook that wants the terrain's own materials calls
+`draw.terrain_model(model, options)` instead. That covers a machine's belts, shafts and
+casings, cut out and shaded as blocks are:
+
+```rust,ignore
+let belt = TerrainUvShift::new("mymod:block/belt", "mymod:block/belt_scroll", [1.0, 0.5], [0.0, scroll]);
+let options = TerrainModelOptions::default()
+    .with_material(TerrainMaterial::Cutout)
+    .with_uv_shift(belt);
+draw.terrain_model(self.belt, options)?;
+```
+
+- Faces sample the animated block sprites, cull back faces and write colour and depth like
+  opaque terrain. Light is the draw's own, raised by each quad's emission.
+- `material`: `Model` keeps each quad's `render_type` (solid, `cutout`, `cutout_mipped`), and
+  a translucent quad refuses the draw. `Solid`, `Cutout` (alpha under 0.1 discarded, no
+  mipmaps) and `CutoutMipped` (under 0.5, mipmapped) choose one material for all quads.
+- `shade`: `Model` follows each quad's `shade` flag, `Off` turns directional shading off, and
+  `Entity` shades every quad by the level's entity light directions. Full-bright light never
+  turns shading off.
+- `uv_shift` draws faces of exactly one sprite with another, their UVs scaled then moved.
+  `uv_shrink_ratio` (`0.0..=1.0`, default `0.0`) pulls UVs towards each face's centre first,
+  for a model baked with an older `FaceBakery`'s atlas shrink. The engine never guesses it.
+- `tint` (`0xRRGGBB`) multiplies only quads with a tint index.
+- A stale handle is `TerrainModelError::Model`. If any quad can't be drawn, the result is
+  `TerrainModelError::Refused` and nothing is drawn. That covers a translucent quad under
+  `Model`, a missing sprite, a pose that flattens the model, a ratio out of range, and a shift
+  whose numbers aren't finite, whose sprites are unknown or whose source sprite no face uses.
+
 ## Persistent groups
 
 - `host.create_group(model, capacity)` reserves up to 16,384 copies of a solid model.
@@ -44,3 +76,29 @@ as does a destroyed group, a group after resource reload or world close, or a gr
 whose mod was disabled. Re-enabling starts without groups: recreate them from the
 newly published model handles. Slot reuse never revives an old handle. Native and
 wasm use the same ownership, budgets, lifetime and rendering implementation.
+
+## Still fluids in a block entity
+
+A block entity, mob or player submit hook draws a tank's contents with
+`draw.fluid_box(&stack, bounds, options)`, where `bounds` is
+`[x0, y0, z0, x1, y1, z1]` in blocks under the draw's current pose:
+
+```rust,ignore
+let options = FluidBoxOptions::new(false, 4.0 / 1024.0);
+draw.fluid_box(&tank.stack, [0.125, 0.0625, 0.125, 0.875, level, 0.875], options)?;
+```
+
+- The stack is `minecraft:water` or `minecraft:lava` with no components. Any other fluid,
+  an unresolved one or a component patch is `FluidBoxError::UnsupportedFluid`.
+- Each face tiles the fluid's animated still sprite once per block, cut at whole-block lines.
+  Each tile keeps its place in the sprite. The box is not inset. `uv_shrink_ratio` is the
+  sprite's `TextureAtlasSprite.uvShrinkRatio` (`0.0..=1.0`), and `render_bottom` adds the bottom face.
+- The colour is the stack's tint (plain water `0xFF3F76E4`, lava white), never the biome's
+  water colour. `with_argb` replaces it, alpha included. Faces have no directional shading.
+  Sky light is the draw's own, and block light rises to the fluid's (lava 15).
+- The faces use a material of their own: sorted far to near, alpha blended, culled from behind,
+  and depth-writing. They draw with the block entities, before the level's translucent terrain,
+  under shader packs too.
+- A stack of 0 draws nothing and returns `Ok` without checking `bounds`. Non-finite or reversed
+  bounds, a box of more than 65,536 tiled quads and a ratio out of range are
+  `FluidBoxError::InvalidBox`. A refusal draws nothing.

@@ -542,6 +542,10 @@ impl BlockEntityDraw {
     pub(super) fn vertices_mut(&mut self) -> &mut Vec<Vertex> {
         &mut self.vertices
     }
+    /// The light the helpers draw with (`native_draw_light`).
+    pub(super) fn light(&self) -> u32 {
+        self.light
+    }
     /// A quad of `corners` (blocks, under the pose) with unit UVs, shaded as
     /// vanilla's block entity models are (`Lighting`'s two lights).
     fn quad(&mut self, corners: [[f32; 3]; 4], uv: [[f32; 2]; 4], sprite: Rect, tint: u32) {
@@ -2336,13 +2340,15 @@ mod tests {
             };
             assert_eq!(drawn.text_width("A"), 6.0);
             assert_eq!(drawn.text_width("AÁ"), 12.0);
-            drawn.text(
-                &mod_api::Text::literal("AÁ"),
-                [0.0, 0.0],
-                0xFF0000,
-                false,
-                0,
-            );
+            drawn
+                .text(
+                    &mod_api::Text::literal("AÁ"),
+                    [0.0, 0.0],
+                    0xFF0000,
+                    false,
+                    0,
+                )
+                .unwrap();
             assert_eq!(surface.vertices.len(), 8, "a quad per glyph");
             // Vanilla's bitmap providers: A is 8x8 with ascent 7; Á is 9x12 with ascent 10.
             // GlyphBitmap places the top at 7 - ascent; BakedSheetGlyph adds the pen's position.

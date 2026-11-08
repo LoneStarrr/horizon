@@ -210,12 +210,8 @@ impl Game<'_> {
             spawning::villager_type(&facts)
         });
         self.mobs[ib].extra.age = 6000;
-        let Some(id) = self.spawn_mob(
-            "minecraft:villager",
-            [from.x, from.y, from.z],
-            true,
-            super::creatures::SpawnSite::Plain,
-        ) else {
+        let Some(id) = self.spawn_mob_raw("minecraft:villager", [from.x, from.y, from.z], true)
+        else {
             return;
         };
         if let Some(child) = self.mobs.iter_mut().find(|m| m.id == id) {
@@ -277,7 +273,7 @@ impl Game<'_> {
         let Some(ty) = horizon_client::particles::ParticleType::from_name(kind) else {
             return;
         };
-        let options = mod_api::particles::ParticleOptions::simple(ty);
+        let options = horizon_client::particles::ParticleOptions::simple(ty);
         let mut spawned = Vec::new();
         horizon_client::particles::around_self(
             self.particles.random(),

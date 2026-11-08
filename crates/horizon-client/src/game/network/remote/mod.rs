@@ -8,6 +8,7 @@
 //! everything else.
 use super::remote_chunks::{ChunkDecoder, ChunkFormat, Next};
 use super::{Dim, Game, Mining, Screen, level_sounds::LevelSound};
+use crate::game::api_values::TryIntoApi;
 use horizon_client::actions::Action;
 use horizon_client::first_person::{Hand, SwingAnimation};
 use horizon_client::{
@@ -542,13 +543,27 @@ pub(super) struct Remote {
     /// The item the player's use began with (`LivingEntity.useItem`).
     pub(super) use_item: Option<Arc<str>>,
     pub(super) dimension: DimensionType,
-    /// The environment attributes of `dimension` when the server's data for it
-    /// is not one of vanilla's three types (`None`: the type of that name).
-    pub(super) environment: Option<Arc<horizon_client::environment::Environment>>,
     /// The level's key (`minecraft:overworld`): where its far terrain is kept.
-    pub(super) level: String,
+    pub(in crate::game) level: String,
     /// `level`'s key, as mods' handles name the level.
     pub(super) level_key: mod_api::DimensionKey,
+    /// The level's facts from the dimension type this connection's server sent (`None` when it
+    /// sent none the game takes): owned by the connection, so entering a level touches no other
+    /// level's facts, the integrated server's included.
+    pub(in crate::game) level_facts: Option<&'static horizon_world::dimension_type::DimensionFacts>,
+    /// The facts made for each level of this connection, by level, with the type they came from:
+    /// a level entered again with the same type reuses them, so a reconnect-free session leaks
+    /// one set per distinct type.
+    /// The sky, fog and cloud attributes (and timelines) of the level from the server's type, for a
+    /// level of a mod or a pack (`None` for a built-in level, or when the type is refused).
+    pub(in crate::game) level_environment: Option<horizon_client::environment::Environment>,
+    facts_cache: HashMap<
+        String,
+        (
+            serde_json::Value,
+            &'static horizon_world::dimension_type::DimensionFacts,
+        ),
+    >,
     /// `ClientPlayerNetworkEvent.LoggingOut` was fired for this connection: every way out
     /// of a world reports it once.
     logged_out: bool,
@@ -600,19 +615,30 @@ pub(super) struct Remote {
     /// sequence its block updates only replace the remembered state; then the block
     /// takes it.
     predictions: HashMap<[i32; 3], Prediction>,
+    /// The entities the level held when its `LocalPlayer` was added
+    /// (`ClientLevel.addEntity` on login or respawn): `ClientLevel.tickEntities`
+    /// ticks in the order entities were added, so these tick before the
+    /// player and every later one after it.
+    ticked_before_player: std::collections::HashSet<u32>,
     /// Open container: (window id, menu name).
     pub(super) menu: ClientMenu,
     /// The crafting result slot of the open menu as the server last set it
     /// (`CraftingMenu.slotChangedCraftingGrid`): the client never computes it.
     pub(super) craft_result: Option<ItemStack>,
     /// The open menu's title as the server named it, with its styles.
-    pub(super) menu_title: Option<horizon_client::text::Text>,
+    menu_title: Option<horizon_client::text::Text>,
+    menu_title_snapshot: Option<Arc<mod_api::Text>>,
     state_id: i32,
     use_target: Option<[i32; 3]>,
     /// A mod menu's extra data, kept for the `OpenScreen` of its window that
     /// follows (`horizon:menu_extra`).
     menu_extra: Option<horizon_protocol::menu_extra::Message>,
     entities: HashMap<i32, Tracked>,
+    /// Per-tick remote entity scratch retained between frames.
+    tick_fluids: Vec<Option<horizon_client::mobs::living::Fluids>>,
+    tick_rain: Vec<bool>,
+    tick_standings: Vec<Option<String>>,
+    tick_water_fx: Vec<horizon_client::mobs::MobEvent>,
     /// Complete network riding graph, including invisible plugin seat entities.
     pub(super) passenger_vehicles: HashMap<u32, u32>,
     lerps: HashMap<i32, Lerp>,
@@ -997,9 +1023,14 @@ impl Game<'_> {
         );
         self.server_packs_connect(local.is_none().then_some(address), user);
         let session = match local {
-            Some(pipe) => {
-                Session::connect_local(pipe, name, info.clone(), lang.clone(), item_data.clone())
-            }
+            Some(pipe) => Session::connect_local(
+                pipe,
+                name,
+                auth.clone(),
+                info.clone(),
+                lang.clone(),
+                item_data.clone(),
+            ),
             None => {
                 self.extras_connecting(address, name, lan);
                 match cookies {
@@ -1138,9 +1169,11 @@ impl Game<'_> {
             camera: None,
             use_item: None,
             dimension: DimensionType::vanilla("minecraft:overworld"),
-            environment: None,
             level: "minecraft:overworld".into(),
             level_key: mod_api::DimensionKey::OVERWORLD,
+            level_facts: None,
+            level_environment: None,
+            facts_cache: Default::default(),
             hashed_seed: 0,
             chunk_format: Arc::new(ChunkFormat::new(
                 &DimensionType::vanilla("minecraft:overworld"),
@@ -1166,12 +1199,18 @@ impl Game<'_> {
             sent_info: info,
             predictions: HashMap::new(),
             menu: ClientMenu::default(),
+            ticked_before_player: std::collections::HashSet::new(),
             craft_result: None,
             menu_title: None,
+            menu_title_snapshot: None,
             state_id: 0,
             use_target: None,
             menu_extra: None,
             entities: HashMap::new(),
+            tick_fluids: Vec::new(),
+            tick_rain: Vec::new(),
+            tick_standings: Vec::new(),
+            tick_water_fx: Vec::new(),
             passenger_vehicles: HashMap::new(),
             lerps: HashMap::new(),
             cart_lerps: HashMap::new(),
@@ -1381,9 +1420,11 @@ impl Game<'_> {
             camera: None,
             use_item: None,
             dimension: DimensionType::vanilla("minecraft:overworld"),
-            environment: None,
             level: "minecraft:overworld".into(),
             level_key: mod_api::DimensionKey::OVERWORLD,
+            level_facts: None,
+            level_environment: None,
+            facts_cache: Default::default(),
             hashed_seed: 0,
             chunk_format: Arc::new(ChunkFormat::new(
                 &DimensionType::vanilla("minecraft:overworld"),
@@ -1409,12 +1450,18 @@ impl Game<'_> {
             sent_info: info,
             predictions: HashMap::new(),
             menu: ClientMenu::default(),
+            ticked_before_player: std::collections::HashSet::new(),
             craft_result: None,
             menu_title: None,
+            menu_title_snapshot: None,
             state_id: 0,
             use_target: None,
             menu_extra: None,
             entities: HashMap::new(),
+            tick_fluids: Vec::new(),
+            tick_rain: Vec::new(),
+            tick_standings: Vec::new(),
+            tick_water_fx: Vec::new(),
             passenger_vehicles: HashMap::new(),
             lerps: HashMap::new(),
             cart_lerps: HashMap::new(),
@@ -2515,6 +2562,29 @@ impl Game<'_> {
         }
     }
     fn set_registries(&mut self, registries: Arc<Dynamic>) {
+        let entries: Vec<(&str, serde_json::Value)> = registries
+            .registries
+            .get("minecraft:enchantment")
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, data)| {
+                Some((
+                    name.as_str(),
+                    horizon_client::scoreboard::tag_to_json(data.as_ref()?),
+                ))
+            })
+            .collect();
+        let enchantments = match self
+            .stations()
+            .enchantments
+            .with_entries(entries.iter().map(|(n, v)| (*n, v)))
+        {
+            Ok(table) => table.map(Arc::new),
+            Err(error) => {
+                log::warn!("Horizon: refused enchantment registry: {error}");
+                return;
+            }
+        };
         // The server's biomes the game lacks (a world data pack's) join the
         // game's table, from the data it sent: colours, meshing and the
         // chunk format all go through that table. The window's own server
@@ -2541,23 +2611,6 @@ impl Game<'_> {
                     .collect()
             })
             .unwrap_or_default();
-        let entries: Vec<(&str, serde_json::Value)> = registries
-            .registries
-            .get("minecraft:enchantment")
-            .into_iter()
-            .flatten()
-            .filter_map(|(name, data)| {
-                Some((
-                    name.as_str(),
-                    horizon_client::scoreboard::tag_to_json(data.as_ref()?),
-                ))
-            })
-            .collect();
-        let enchantments = self
-            .stations()
-            .enchantments
-            .with_entries(entries.iter().map(|(n, v)| (*n, v)))
-            .map(Arc::new);
         if let Some(r) = self.remote.as_mut() {
             r.enchantments = enchantments;
             let bits = ceil_log2(biomes.len());
@@ -2575,6 +2628,19 @@ impl Game<'_> {
         keep_world: bool,
         reason: horizon_client::level_loading::Reason,
     ) {
+        // Every level has the sea level its server says (`CommonPlayerSpawnInfo.seaLevel`): the
+        // table may still hold a local world's (a superflat Overworld's).
+        if let Ok(key) = horizon_core::LevelKey::parse(&spawn.dimension) {
+            horizon_world::level::register_sea_level(key, spawn.sea_level);
+            if !matches!(
+                key,
+                horizon_core::LevelKey::OVERWORLD
+                    | horizon_core::LevelKey::NETHER
+                    | horizon_core::LevelKey::END
+            ) {
+                Dim::add_extra(&spawn.dimension);
+            }
+        }
         // The replacement player starts with its inventory menu, even if the
         // server switched levels without closing the previous container.
         self.remote_close_local();
@@ -2585,6 +2651,12 @@ impl Game<'_> {
         // handleRespawn keeps the ClientLevel only for the same level key:
         // two levels sharing a dimension type are still two levels.
         let same = keep_world && r.heard_level.as_deref() == Some(spawn.dimension.as_str());
+        let transition_screen = horizon_client_render::dimension_transition::select(
+            mod_api::__private::dimension_key(&spawn.dimension),
+            r.heard_level
+                .as_deref()
+                .map(mod_api::__private::dimension_key),
+        );
         if !same {
             self.forget_all_remote_columns();
         }
@@ -2608,12 +2680,46 @@ impl Game<'_> {
                 .with_dimension(&dimension)
                 .in_column(shape.column()),
         );
-        r.environment = level_environment(
-            &self.pack.data_source,
-            &dimension.name,
-            r.registries
-                .data("minecraft:dimension_type", spawn.dimension_type),
-        );
+        // The server's dimension type gives the level's facts (what it does to fluids, mobs,
+        // beds and time), not only its shape: a level of a mod the server runs is no
+        // longer taken for the Overworld.
+        r.level_facts = None;
+        r.level_environment = None;
+        if let Some((name, json)) = r.registries.dimension_json(spawn.dimension_type) {
+            if !matches!(
+                spawn.dimension.as_str(),
+                "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+            ) {
+                r.level_environment = horizon_client::environment::Environment::with_type(
+                    self.res.environment(),
+                    &json,
+                );
+            }
+            let cached = r
+                .facts_cache
+                .get(&spawn.dimension)
+                .filter(|(old, _)| *old == json)
+                .map(|(_, facts)| *facts);
+            r.level_facts = cached.or_else(|| {
+                use horizon_world::dimension_type::DimensionFacts;
+                let base = DimensionFacts::base_for_type(&name);
+                let facts = DimensionFacts::patched(base, &name, &json)
+                    .map_err(|why| {
+                        log::warn!("the server's dimension type {name} is refused ({why})")
+                    })
+                    .ok()?;
+                if !sane_facts(&facts) {
+                    log::warn!(
+                        "the server's dimension type {name} is refused (a value out of range)"
+                    );
+                    return None;
+                }
+                let facts: &'static DimensionFacts = Box::leak(Box::new(facts));
+                r.facts_cache
+                    .insert(spawn.dimension.clone(), (json.clone(), facts));
+                Some(facts)
+            });
+        }
         r.dimension = dimension;
         r.resolve_clocks();
         self.world.day_time = r.clock_time(r.default_clock);
@@ -2631,6 +2737,7 @@ impl Game<'_> {
         // startWaitingForNewLevel: `LevelLoadTracker.startClientLoad` and the
         // `LevelLoadingScreen`.
         r.level_load.start_client_load(client_millis(), reason);
+        r.level_load.set_transition_screen(transition_screen);
         // A replacement LocalPlayer has a fresh ambient mood and sendPosition baseline.
         self.ambience.moodiness = 0.0;
         r.position_sender = Default::default();
@@ -2846,8 +2953,10 @@ impl Game<'_> {
         let block = self.world.block(pos[0], pos[1], pos[2]);
         if let Some(BlockEntity::Mod(m)) = self.world.block_entities.get_mut(&key) {
             if m.id() == name
-                && horizon_client::block_entity_types::type_for(&self.res.facts().get(block).name)
-                    == Some(name)
+                && horizon_client::block_entity_types::valid(
+                    &self.res.facts().get(block).name,
+                    name,
+                ) == Some(true)
             {
                 m.merge_update_tag(fields);
             }
@@ -3155,7 +3264,13 @@ impl Game<'_> {
         })
     }
 
-    fn spawn_entity(&mut self, id: i32, kind: &str, position: [f64; 3], rotation: [f32; 3]) {
+    pub(super) fn spawn_entity(
+        &mut self,
+        id: i32,
+        kind: &str,
+        position: [f64; 3],
+        rotation: [f32; 3],
+    ) {
         let [yaw, pitch, head] = rotation;
         let at = Vec3::new(position[0], position[1], position[2]);
         let mob_type = if kind == "minecraft:player" {
@@ -3184,6 +3299,7 @@ impl Game<'_> {
                 count: 1,
                 ticks: 0,
                 health: 5,
+                following: None,
             });
         }
         if let Some(t) = mob_type {
@@ -3474,6 +3590,16 @@ impl Game<'_> {
         self.turn_remote_projectile(id, rotation);
     }
     fn remove_entity(&mut self, id: i32) {
+        // A client-only camera selection has no server spectating state to reset it.
+        // Use the camera-packet path to restore control and the player's post effect.
+        if let Some(player) = self
+            .remote
+            .as_ref()
+            .filter(|r| r.camera == Some(id))
+            .map(|r| r.entity_id)
+        {
+            self.remote_set_camera(player);
+        }
         self.audio.remove_sound_entity(id as u32);
         // Entity.setRemoved detaches every passenger, even when no empty
         // SetPassengers packet preceded the vehicle's removal. Otherwise
@@ -3883,6 +4009,13 @@ impl Game<'_> {
                     r.sequence = 0;
                 }
                 self.enter_remote_dimension(&p.spawn, true, reason);
+                // handleRespawn adds the new LocalPlayer after what the kept
+                // level holds; a new level holds nothing yet.
+                let before: std::collections::HashSet<u32> =
+                    self.mobs.iter().map(|m| m.id).collect();
+                if let Some(r) = self.remote.as_mut() {
+                    r.ticked_before_player = before;
+                }
                 if dimension_changed {
                     // LevelExtractor.setLevel: a new level drops the highlights.
                     self.test_highlights.clear();
@@ -4043,6 +4176,9 @@ impl Game<'_> {
                 let rotation =
                     [p.yaw, p.pitch, p.head_yaw].map(horizon_protocol::buf::unpack_degrees);
                 if let Some(r) = self.remote.as_mut() {
+                    // ClientLevel.addEntity: an id it holds already is removed
+                    // and added again, after the player.
+                    r.ticked_before_player.remove(&(p.id as u32));
                     // A new entity looks its PlayerInfo up afresh.
                     r.level_player_textures.remove(&p.id);
                     if kind == "minecraft:player" {
@@ -5893,7 +6029,10 @@ impl Game<'_> {
 
     /// Resolve inline `object:player` profiles through the same skin cache as
     /// player heads on items. The next frame uses the uploaded atlas texture.
-    pub(super) fn resolve_inline_profiles(&mut self, profiles: &[serde_json::Value]) {
+    pub(super) fn resolve_inline_profiles(
+        &mut self,
+        profiles: &[std::sync::Arc<serde_json::Value>],
+    ) {
         use horizon_client::skins;
         for profile in profiles {
             let skin = skins::head_skin(
@@ -6733,6 +6872,10 @@ impl Game<'_> {
         // ClientLevel.tick: the End's sky flash, frozen or not.
         self.tick_end_flash();
         self.player_border();
+        // The entities added after the player tick after it: their pushes
+        // (from where they ended last tick, onto where the player ended)
+        // reach its next move, this one.
+        let pushed_after = self.remote_pushes(false);
         self.tick_remote_entities(running);
         self.tick_remote_arm_poses();
         self.tick_random_textures();
@@ -6780,7 +6923,8 @@ impl Game<'_> {
         self.tick_subtitles();
         self.tick_client_load();
         let entity_collisions = self.player_entity_collisions();
-        let pushed = self.remote_pushes();
+        // Those added before it tick before it: their pushes reach this move.
+        let pushed = pushed_after.add_vector(self.remote_pushes(true));
         let sprint_window = self.settings.sprint_window;
         let Some(player) = self.player.as_mut() else {
             return Ok(());
@@ -7184,8 +7328,10 @@ impl Game<'_> {
     /// `LivingEntity.pushEntities`, and of the boats' pushes: on a client
     /// `EntitySelector.pushableBy` lets entities push only the local player,
     /// so the server never sends these pushes. `doPush(player)` is
-    /// `player.push(entity)`.
-    fn remote_pushes(&self) -> Vec3 {
+    /// `player.push(entity)`. `before_player`: the mobs that tick before the
+    /// player (`ticked_before_player`) and the boats, else the mobs that tick
+    /// after it.
+    fn remote_pushes(&self, before_player: bool) -> Vec3 {
         let (Some(p), Some(r)) = (self.player.as_ref(), self.remote.as_ref()) else {
             return Vec3::ZERO;
         };
@@ -7210,7 +7356,8 @@ impl Game<'_> {
         let board = &self.score.board;
         let player_team = board.players_team(&r.profile_name);
         let mut push = Vec3::ZERO;
-        for m in &self.mobs {
+        let order = |id: u32| r.ticked_before_player.contains(&id) == before_player;
+        for m in self.mobs.iter().filter(|m| order(m.id)) {
             let listed = r
                 .level_players
                 .get(&(m.id as i32))
@@ -7252,7 +7399,14 @@ impl Game<'_> {
         // AbstractBoat.push(player) from the boat's own tick (its box grown
         // by 0.2 sideways) and from the player's pushEntities (its box).
         let area = Vec3::new(f64::from(0.2_f32), f64::from(-0.01_f32), f64::from(0.2_f32));
-        for b in self.boats.iter().filter(|b| self.riding != Some(b.id)) {
+        // The boats' pushes stay where they were measured: with the entities
+        // that tick before the player.
+        let boats = if before_player {
+            &self.boats[..]
+        } else {
+            &[][..]
+        };
+        for b in boats.iter().filter(|b| self.riding != Some(b.id)) {
             let bb = b.bounds();
             let times = usize::from(
                 bounds.intersects(bb.inflate(area))
@@ -7309,22 +7463,43 @@ impl Game<'_> {
             guardian::look_at(&mut self.mobs[i], look);
         }
     }
-    /// Each player model's held arm poses (`held_arm_poses`), once the tick has set its hands.
-    fn tick_remote_arm_poses(&mut self) {
+    /// Humanoid held arm poses, once the tick has set equipment and use state.
+    pub(in crate::game) fn tick_remote_arm_poses(&mut self) {
         for i in 0..self.mobs.len() {
             let m = &self.mobs[i];
-            if &*m.kind.id != "minecraft:player" {
+            if !horizon_client::mobs::anim::extracts_humanoid(m) {
                 continue;
             }
-            let poses = self.held_arm_poses(
-                m.id,
-                [
-                    horizon_items::equipment::MAINHAND,
-                    horizon_items::equipment::OFFHAND,
-                ]
-                .map(|slot| m.extra.slot_stack(slot)),
-            );
+            // Extraction also runs while the world is frozen: derive the use
+            // animation from the current equipment rather than last tick's state.
+            if &*m.kind.id != "minecraft:player" {
+                let slot = if m.extra.using_off_hand {
+                    horizon_items::equipment::OFFHAND
+                } else {
+                    horizon_items::equipment::MAINHAND
+                };
+                let animation = (m.extra.using_item > 0)
+                    .then(|| m.extra.slot_stack(slot))
+                    .flatten()
+                    .map_or_else(Default::default, |stack| self.item_use_animation(stack));
+                self.mobs[i].extra.use_animation = animation;
+            }
+            let m = &self.mobs[i];
+            let poses = self.held_arm_poses(m.id, m);
+            let charge_duration = (&*m.kind.id != "minecraft:player").then(|| {
+                let using_slot = if m.extra.using_off_hand {
+                    horizon_items::equipment::OFFHAND
+                } else {
+                    horizon_items::equipment::MAINHAND
+                };
+                m.extra
+                    .slot_stack(using_slot)
+                    .map_or(25, |stack| Self::charge_ticks(stack).max(1)) as i32
+            });
             self.mobs[i].extra.held_arm_pose = poses;
+            if let Some(duration) = charge_duration {
+                self.mobs[i].extra.ints[5] = duration;
+            }
         }
     }
     fn tick_remote_entities(&mut self, running: bool) {
@@ -7337,48 +7512,53 @@ impl Game<'_> {
         // tropical fish lie on their side without `in_water`, #1591).
         // A frozen level ticks only the players, as below.
         // Entity.isInRain for the wolves, which dry off by their own `Wolf.tick`.
-        let (fluids, rain, standings, thundering): (Vec<_>, Vec<_>, Vec<_>, bool) = {
+        let (mut fluids, mut rain, mut standings, mut water_fx) = {
+            let r = self
+                .remote
+                .as_mut()
+                .expect("remote entity tick without remote state");
+            (
+                std::mem::take(&mut r.tick_fluids),
+                std::mem::take(&mut r.tick_rain),
+                std::mem::take(&mut r.tick_standings),
+                std::mem::take(&mut r.tick_water_fx),
+            )
+        };
+        let thundering = {
             let w = self.mob_world_base(&[]);
             let players = self.remote.as_ref().map(|r| &r.level_players);
-            let fluids = self
-                .mobs
-                .iter()
-                .map(|m| {
-                    (running || players.is_some_and(|p| p.contains_key(&(m.id as i32))))
-                        .then(|| w.fluids(m.bounds(), m.eye_y()))
-                })
-                .collect();
-            let rain = self
-                .mobs
-                .iter()
-                .map(|m| {
-                    m.species() == horizon_client::mobs::Species::Wolf
-                        && horizon_client::mobs::tame::in_rain(m, &w)
-                })
-                .collect();
+            fluids.clear();
+            fluids.extend(self.mobs.iter().map(|m| {
+                (running || players.is_some_and(|p| p.contains_key(&(m.id as i32))))
+                    .then(|| w.fluids(m.bounds(), m.eye_y()))
+            }));
+            rain.clear();
+            rain.extend(self.mobs.iter().map(|m| {
+                m.species() == horizon_client::mobs::Species::Wolf
+                    && horizon_client::mobs::tame::in_rain(m, &w)
+            }));
             // The block under each mob the packs' random-model rules read (a grazing
             // cow), one hair below the feet like `Entity.getBlockStateOn`; nothing
             // without rules.
-            let standings = self
-                .mobs
-                .iter()
-                .map(|m| {
-                    horizon_client::mobs::cem::tracks_standing(&m.kind.id).then(|| {
-                        let (x, y, z) = (
-                            m.position.x.floor() as i32,
-                            (m.position.y - 0.0001).floor() as i32,
-                            m.position.z.floor() as i32,
-                        );
-                        w.block_name(x, y, z).to_owned()
-                    })
+            standings.clear();
+            standings.extend(self.mobs.iter().map(|m| {
+                horizon_client::mobs::cem::tracks_standing(&m.kind.id).then(|| {
+                    let (x, y, z) = (
+                        m.position.x.floor() as i32,
+                        (m.position.y - 0.0001).floor() as i32,
+                        m.position.z.floor() as i32,
+                    );
+                    w.block_name(x, y, z).to_owned()
                 })
-                .collect();
-            (fluids, rain, standings, w.thundering)
+            }));
+            w.thundering
         };
         // The window's own player already splashes from its motion tick.
         let own = self.remote.as_ref().map(|r| r.entity_id);
-        let mut water_fx = Vec::new();
-        for ((m, fluids), standing) in self.mobs.iter_mut().zip(fluids).zip(standings) {
+        for i in 0..self.mobs.len() {
+            let m = &mut self.mobs[i];
+            let fluids = fluids[i].take();
+            let standing = standings[i].take();
             if let Some(fluids) = fluids {
                 let was = m.fluids.in_water;
                 let first = m.first_tick;
@@ -7506,7 +7686,7 @@ impl Game<'_> {
         let mut mob_fx = water_fx;
         let tick_listened = mod_api::__private::listened(mod_api::HookId::PlayerTickPre)
             || mod_api::__private::listened(mod_api::HookId::PlayerTickPost);
-        for (i, rain) in rain.into_iter().enumerate() {
+        for (i, rain) in rain.iter().copied().enumerate() {
             let id = self.mobs[i].id;
             let player = self
                 .remote
@@ -7842,7 +8022,7 @@ impl Game<'_> {
             items.retain_mut(|item| {
                 // The server decides entity collisions. This copy predicts block movement.
                 let (_, discarded) =
-                    self.tick_item_with_block_contacts(item, false, &[], true, &mut |splash| {
+                    self.tick_item_with_block_contacts(item, None, &[], true, &mut |splash| {
                         entered.push(splash);
                     });
                 !discarded
@@ -7855,7 +8035,13 @@ impl Game<'_> {
         for splash in entered {
             self.apply_item_splash(splash);
         }
-        let _ = self.handle_mob_events(mob_fx);
+        let _ = self.handle_mob_events_reusable(&mut mob_fx);
+        if let Some(r) = self.remote.as_mut() {
+            r.tick_fluids = fluids;
+            r.tick_rain = rain;
+            r.tick_standings = standings;
+            r.tick_water_fx = mob_fx;
+        }
         for (item, ticks, at, eye, pitch, yaw) in using {
             self.remote_player_eating(&item, ticks, at, eye, pitch, yaw);
         }
@@ -10925,7 +11111,7 @@ impl Game<'_> {
         self.recipe_ui.reset_screen();
         if let Some(r) = self.remote.as_mut() {
             r.menu.set(None);
-            r.menu_title = None;
+            r.set_menu_title(None);
             r.craft_result = None;
         }
         self.mount_menu_reset();
@@ -10956,7 +11142,7 @@ impl Game<'_> {
         if let Some(r) = self.remote.as_mut() {
             r.menu
                 .set(Some((container, "minecraft:merchant".to_owned())));
-            r.menu_title = Some(text);
+            r.set_menu_title(Some(text));
         }
         let session = horizon_client::merchant::Session::new(Vec::new(), true);
         self.open_remote_merchant(session, (!title.is_empty()).then_some(title));
@@ -11039,6 +11225,7 @@ impl Game<'_> {
             // LecternScreen: the book and page come in the menu's content and data.
             if let Some(r) = self.remote.as_mut() {
                 r.menu.set(Some((p.container, menu)));
+                r.set_menu_title(None);
             }
             self.remote_open_lectern(target.unwrap_or_default());
             return;
@@ -11125,7 +11312,7 @@ impl Game<'_> {
         let title = menu_title(&p.title);
         if let Some(r) = self.remote.as_mut() {
             r.menu.set(Some((p.container, menu.clone())));
-            r.menu_title = Some(title);
+            r.set_menu_title(Some(title));
         }
         self.craft_size = if menu == "minecraft:crafting" { 3 } else { 2 };
         self.container = None;
@@ -11150,7 +11337,7 @@ impl Game<'_> {
                 self.container = None;
                 if let Some(r) = self.remote.as_mut() {
                     r.menu.set(None);
-                    r.menu_title = None;
+                    r.set_menu_title(None);
                 }
                 self.send(S::ContainerClose(play::ContainerClose {
                     container: p.container,
@@ -11172,7 +11359,7 @@ impl Game<'_> {
         if let Some(r) = self.remote.as_mut() {
             r.menu
                 .set(Some((p.container, format!("{MOUNT_MENU}{columns}"))));
-            r.menu_title = None;
+            r.set_menu_title(None);
         }
     }
     /// The type of the menu a server opened (`MenuType`'s id).
@@ -11267,6 +11454,13 @@ impl Game<'_> {
             horizon_client::widgets::begin_screen(|| {
                 super::screen_info::level_loading(progress, &super::screen_info::tr)
             });
+            if self.draw_dimension_transition_screen(
+                batch,
+                &r.level_load,
+                progress.map(|_| self.loading_progress),
+            ) {
+                return true;
+            }
             self.draw_level_loading_background(batch, r.level_load.reason);
             let atlas = &self.gui.atlas;
             match self.integrated.as_ref().map(|i| i.load_view()) {
@@ -12138,6 +12332,19 @@ impl ClientMenu {
 }
 
 impl Remote {
+    pub(super) fn set_menu_title(&mut self, title: Option<horizon_client::text::Text>) {
+        self.menu_title_snapshot = title.try_into_api().ok().flatten().map(Arc::new);
+        self.menu_title = title;
+    }
+
+    pub(super) fn menu_title_snapshot(&self) -> Option<&mod_api::Text> {
+        self.menu_title_snapshot.as_deref()
+    }
+
+    pub(super) fn shared_menu_title_snapshot(&self) -> Option<Arc<mod_api::Text>> {
+        self.menu_title_snapshot.clone()
+    }
+
     /// Resolve registry keys only when registries or the dimension change.
     fn resolve_clocks(&mut self) {
         self.overworld_clock = self
@@ -12432,6 +12639,137 @@ mod attachment_query_tests;
 mod tests {
     use super::super::api_values::TryIntoApi;
 
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn menu_title_snapshot_tracks_open_replacement_and_close() {
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            let (client, _server) = horizon_protocol::connection::Pipe::pair();
+            game.connect_local(client, "menu-title-test").unwrap();
+            let remote = game.remote.as_mut().unwrap();
+            for value in [Some("first"), Some("replacement"), None] {
+                remote.set_menu_title(value.map(horizon_client::text::Text::literal));
+                assert_eq!(
+                    remote.menu_title_snapshot(),
+                    remote.menu_title.try_into_api().unwrap().as_ref()
+                );
+            }
+        });
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn menu_title_snapshot_follows_packet_and_close_paths() {
+        use horizon_core::nbt::Tag;
+        use horizon_protocol::packets::play::{self, Clientbound as C};
+        use std::sync::Arc;
+
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            let (client, _server) = horizon_protocol::connection::Pipe::pair();
+            game.connect_local(client, "menu-title-paths").unwrap();
+            let menu_id = |game: &super::Game<'_>, name: &str| {
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .builtin
+                    .get("minecraft:menu")
+                    .unwrap()
+                    .id(name)
+                    .unwrap()
+            };
+            let chest = menu_id(game, "minecraft:generic_9x3");
+            let lectern = menu_id(game, "minecraft:lectern");
+            let open = |game: &mut super::Game<'_>, menu, title: &str| {
+                game.handle_packet(C::OpenScreen(play::OpenScreen {
+                    container: 7,
+                    menu,
+                    title: Tag::String(title.into()),
+                }))
+                .unwrap();
+            };
+            let snapshot = |game: &super::Game<'_>| {
+                let shared = game
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .unwrap();
+                let observed = game.test_observed_title().unwrap();
+                assert!(Arc::ptr_eq(&observed, &shared));
+                shared
+            };
+            open(game, chest, "first");
+            let first = snapshot(game);
+            open(game, chest, "replacement");
+            let replacement = snapshot(game);
+            assert!(!Arc::ptr_eq(&first, &replacement));
+            assert_ne!(first, replacement);
+            game.handle_packet(C::ContainerClose(play::ContainerClose { container: 7 }))
+                .unwrap();
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            assert!(game.test_observed_title().is_none());
+            open(game, chest, "again");
+            snapshot(game);
+            game.remote_close_container();
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            open(game, chest, "before reject");
+            game.remote_reject_container(7);
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            open(game, chest, "before dimension change");
+            spawn_menu_test(game);
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            open(game, chest, "before lectern");
+            snapshot(game);
+            open(game, lectern, "lectern");
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            game.remote_lectern_page(1);
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            game.handle_packet(C::ContainerClose(play::ContainerClose { container: 7 }))
+                .unwrap();
+            assert!(
+                game.remote
+                    .as_ref()
+                    .unwrap()
+                    .shared_menu_title_snapshot()
+                    .is_none()
+            );
+            assert!(game.test_observed_title().is_none());
+        });
+    }
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn stopping_a_retained_client_dig_aborts_only_once() {
@@ -12884,7 +13222,6 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn mods_replace_and_cancel_received_chat() {
         use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_client::text::Text;
         use horizon_core::nbt::Tag;
         use horizon_protocol::{
             connection::Pipe,
@@ -12899,12 +13236,14 @@ mod tests {
                 _: &mut dyn mod_api::ClientHost,
                 event: &mut mod_api::ClientChatReceivedEvent<'_>,
             ) -> mod_api::Flow {
-                let text = event.message.plain();
+                let mod_api::text::TextContent::Literal(text) = &event.message.content else {
+                    panic!("expected literal chat fixture");
+                };
                 if text.contains("drop") {
                     return mod_api::Flow::Cancel;
                 }
                 if event.system {
-                    *event.message = Text::literal(format!("[server] {text}"));
+                    *event.message = mod_api::Text::literal(format!("[server] {text}"));
                 }
                 mod_api::Flow::Continue
             }
@@ -13272,6 +13611,97 @@ mod tests {
             cfg::Serverbound::FinishConfiguration(_)
         ));
         (reader, writer)
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn dimension_transition_screen_is_selected_at_entry_drawn_and_dropped() {
+        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
+        use horizon_client::{hud::HudBatch, level_loading::Reason};
+        use mod_api::__private::game::RegistrationContextNew;
+        use mod_api::{DimensionTransition, DimensionTransitionScreen};
+
+        struct Arrival;
+        #[mod_api::__subscriptions]
+        impl mod_api::Hooks for Arrival {
+            fn register_dimension_transition_screen(
+                &self,
+                _: &mod_api::RegistrationContext,
+                event: &mut mod_api::RegisterDimensionTransitionScreenEvent<'_>,
+            ) {
+                event.screens.push(DimensionTransitionScreen {
+                    screen: "transition_test:arrival".into(),
+                    transition: DimensionTransition::Conditional {
+                        to: "transition_test:b".into(),
+                        from: "transition_test:a".into(),
+                    },
+                });
+            }
+            fn dimension_transition_screen_draw(
+                &self,
+                _: &dyn mod_api::ClientHost,
+                event: &mut mod_api::DimensionTransitionScreenDrawEvent<'_>,
+            ) {
+                assert_eq!(event.screen, "transition_test:arrival");
+                assert_eq!(event.reason, mod_api::DimensionTransitionReason::Other);
+                assert_eq!(event.progress, Some(0.25));
+                event.draw.fill([0.0, 0.0, 80.0, 10.0], 0xFF102030);
+            }
+        }
+        mod_api::testing::with_mods(
+            vec![mod_api::ModEntry::new("transition_test", Box::new(Arrival))].into(),
+            || {
+                let mut registrations = Vec::new();
+                super::Game::native_register_dimension_transition_screen(
+                    &mod_api::RegistrationContext::new(),
+                    &mut registrations,
+                );
+                horizon_client_render::dimension_transition::register(registrations);
+                with_game(|game| {
+                    game.options.execution_role = ExecutionRole::Client;
+                    let (client, _server) = horizon_protocol::connection::Pipe::pair();
+                    game.connect_local(client, "TransitionTest").unwrap();
+                    let mut spawn = horizon_protocol::packets::play::SpawnInfo {
+                        dimension_type: 0,
+                        dimension: "transition_test:a".into(),
+                        seed: 0,
+                        game_type: 0,
+                        previous_game_type: None,
+                        debug: false,
+                        flat: true,
+                        last_death: None,
+                        portal_cooldown: 0,
+                        sea_level: 63,
+                    };
+                    game.enter_remote_dimension(&spawn, false, Reason::Other);
+                    assert_eq!(
+                        game.remote.as_ref().unwrap().level_load.transition_screen(),
+                        None
+                    );
+                    spawn.dimension = "transition_test:b".into();
+                    game.enter_remote_dimension(&spawn, true, Reason::Other);
+                    let tracker = game.remote.as_ref().unwrap().level_load;
+                    assert!(tracker.transition_screen().is_some());
+                    let mut batch = HudBatch::scratch([320, 240]);
+                    assert!(game.draw_dimension_transition_screen(
+                        &mut batch,
+                        &tracker,
+                        Some(0.25)
+                    ));
+                    assert!(!batch.vertices.is_empty());
+                    game.remote.as_mut().unwrap().level_load.finish();
+                    let tracker = game.remote.as_ref().unwrap().level_load;
+                    assert!(!game.draw_dimension_transition_screen(&mut batch, &tracker, None));
+                    spawn.dimension = "transition_test:c".into();
+                    game.enter_remote_dimension(&spawn, true, Reason::Other);
+                    let tracker = game.remote.as_ref().unwrap().level_load;
+                    let mut vanilla = HudBatch::scratch([320, 240]);
+                    assert!(!game.draw_dimension_transition_screen(&mut vanilla, &tracker, None));
+                    game.draw_level_loading_background(&mut vanilla, tracker.reason);
+                    assert!(!vanilla.vertices.is_empty());
+                });
+            },
+        );
     }
 
     /// Spawns the connected client in the overworld as entity 7, profile 42.
@@ -13900,7 +14330,12 @@ mod tests {
             assert!(!level.is_loaded(game, [160, 64, 0]));
             game.handle_packet(C::BlockUpdate(play::BlockUpdate { pos: at, state: 1 }))
                 .unwrap();
-            assert_eq!(level.block(game, at).as_deref(), Some("minecraft:stone"));
+            assert_eq!(
+                level
+                    .block(game, at)
+                    .and_then(mod_api::__private::block_key_id),
+                Some("minecraft:stone")
+            );
             assert!(level.block_state(game, at).is_some());
             assert_eq!(level.block(game, [160, 64, 0]), None);
             assert_eq!(level.block_property(game, [160, 64, 0], "facing"), None);
@@ -14203,7 +14638,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn client_camera_entity_is_the_player_without_a_server_camera() {
+    fn client_camera_entity_returns_to_player_after_removal() {
         use super::super::{
             Game, native_entity_refs::tests::with_client_game, native_lifecycle::NativeLifecycle,
         };
@@ -14247,19 +14682,19 @@ mod tests {
             );
             assert_eq!(local.position(game), Some([0.0; 3]));
 
-            let pig = game
+            let creeper = game
                 .remote
                 .as_ref()
                 .unwrap()
                 .builtin
                 .get("minecraft:entity_type")
                 .unwrap()
-                .id("minecraft:pig")
+                .id("minecraft:creeper")
                 .unwrap();
             game.handle_packet(C::AddEntity(play::AddEntity {
                 id: 31,
                 uuid: 9,
-                kind: pig,
+                kind: creeper,
                 position: [10.0, 64.0, 12.0],
                 velocity: [0.0; 3],
                 pitch: 0,
@@ -14268,9 +14703,14 @@ mod tests {
                 data: 0,
             }))
             .unwrap();
-            game.handle_packet(C::SetCamera(play::SetCamera { camera_id: 31 }))
-                .unwrap();
+            game.remote_set_camera(31);
+            assert!(!game.controls_camera());
+            assert!(game.hides_as_camera(31));
+            assert!(game.spectated_post_effect.is_some());
             let attached = camera(game).unwrap();
+            game.handle_packet(C::RemoveEntities(play::RemoveEntities { ids: vec![99] }))
+                .unwrap();
+            assert_eq!(camera(game), Some(attached));
             assert_eq!(attached.id(), 31);
             assert_eq!(attached.position(game), Some([10.0, 64.0, 12.0]));
             game.handle_packet(C::SetCamera(play::SetCamera { camera_id: 99 }))
@@ -14282,11 +14722,13 @@ mod tests {
             );
             game.handle_packet(C::RemoveEntities(play::RemoveEntities { ids: vec![31] }))
                 .unwrap();
-            assert_eq!(
-                camera(game).unwrap().position(game),
-                None,
-                "a removed target cannot be read"
+            assert_eq!(camera(game), Some(local));
+            assert!(
+                game.controls_camera(),
+                "movement input and position packets are enabled"
             );
+            assert!(!game.hides_as_camera(31));
+            assert!(game.spectated_post_effect.is_none());
             game.handle_packet(C::SetCamera(play::SetCamera { camera_id: 7 }))
                 .unwrap();
             assert_eq!(camera(game), Some(local));
@@ -15317,6 +15759,86 @@ mod tests {
         assert!(!client_has_level(false, None), "joined, waiting for Login");
         assert!(client_has_level(true, None), "after Login");
         assert!(!client_has_level(true, Some(40)), "reconfiguring");
+    }
+
+    /// #12148: a proxy moves the player to its next server. The last server's
+    /// columns stay until the next Login, but Reconfigured already put in the
+    /// next server's biome table, shorter when only the last server had a
+    /// biome the game lacks: the columns hold an id past it ("the len is 67
+    /// but the index is 67"). Vanilla's clearClientLevel leaves no player, so
+    /// getSituationalMusic is MENU, and ServerReconfigScreen (no
+    /// LevelLoadingScreen) lets MusicManager.tick start it.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_reconfiguring_client_plays_menu_music_and_never_indexes_past_the_biomes() {
+        use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
+        use horizon_client::{chunk::Chunk, music::Music};
+        use horizon_core::geometry::Vec3;
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::Client,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.init_remote_for_replay().unwrap();
+        // The last server's column at the origin: its extra biome came after
+        // the built-in ones, one past the table the next server leaves.
+        let stale = world_biomes!(game).list.len() as u16;
+        let mut column = Chunk::empty(0, 0);
+        // Quart 16 above the column's bottom at -64: block y 0.
+        column.set_biome_cell(0, 16, 0, stale);
+        game.world
+            .chunks
+            .insert((0, 0), std::sync::Arc::new(column));
+        assert_eq!(game.biome_at([0.0; 3]), "minecraft:plains");
+        assert_eq!(
+            game.biome_name_at(Vec3::new(0.5, 0.5, 0.5)).as_deref(),
+            Some("minecraft:plains")
+        );
+
+        // StartConfiguration after a Login: no player, ServerReconfigScreen.
+        let ticks = game.ticks;
+        let r = game.remote.as_mut().unwrap();
+        r.logged_in = true;
+        r.reconfiguring = Some(ticks);
+        game.player = None;
+        assert_eq!(game.situational_music().0, Some(Music::menu()));
+        // A new manager waits its first 100 ticks, then starts the menu track.
+        let menu = (0..=100).any(|_| {
+            game.tick_music();
+            game.music.current(&game.audio.engine) == Some("minecraft:music.menu")
+        });
+        assert!(menu, "the menu music starts under ServerReconfigScreen");
+
+        // With a level again the camera probe reads that column: plains' music.
+        game.remote.as_mut().unwrap().reconfiguring = None;
+        let (music, _) = game.situational_music();
+        assert!(music.is_some_and(|m| m != Music::menu()));
     }
 
     /// The server's on-fire flag keeps the predicted countdown (which
@@ -16536,27 +17058,36 @@ mod player_tick_tests {
     }
 }
 
-/// The environment of a level whose dimension type the server sent as data:
-/// its `attributes`, with the Overworld's day cycle when its `timelines` have
-/// it. Vanilla's own types (sent as names) use the game's loaded environments.
-fn level_environment(
-    source: &horizon_assets::resource_source::ResourceSource,
-    type_name: &str,
-    data: Option<&horizon_core::nbt::Tag>,
-) -> Option<Arc<horizon_client::environment::Environment>> {
-    if matches!(
-        type_name,
-        "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
-    ) {
-        return None;
-    }
-    let json = horizon_client::scoreboard::tag_to_json(data?);
-    let day_cycle = horizon_client::environment::has_day_cycle(&json["timelines"]);
-    match horizon_client::environment::Environment::from_type(source, &json, day_cycle) {
-        Ok(environment) => Some(Arc::new(environment)),
-        Err(error) => {
-            log::warn!("Horizon: the sky of dimension type {type_name} is not readable: {error}");
-            None
+/// Whether a synchronized dimension type's values are inside the codec's ranges
+/// (`DimensionType.java`: a coordinate scale of `1.0E-5F` to `3.0E7`, a monster spawn block light
+/// limit of 0 to 15; the ambient light has no range), so a portal's ratio of two scales is finite.
+fn sane_facts(facts: &horizon_world::dimension_type::DimensionFacts) -> bool {
+    (f64::from(1.0e-5_f32)..=3.0e7).contains(&facts.coordinate_scale)
+        && (0..=15).contains(&facts.monster_spawn_block_light_limit)
+}
+
+#[cfg(test)]
+mod level_facts_tests {
+    use super::sane_facts;
+    use horizon_world::dimension_type::DimensionFacts;
+
+    /// A type outside the codec's ranges is not taken; the vanilla ones are.
+    #[test]
+    fn a_type_outside_the_codecs_ranges_is_refused() {
+        let mut facts = DimensionFacts::overworld().clone();
+        assert!(sane_facts(&facts));
+        assert!(sane_facts(DimensionFacts::of_builtin_level(
+            horizon_core::LevelKey::NETHER
+        )));
+        for scale in [0.0, f64::from_bits(1), -1.0, 3.1e7, f64::NAN] {
+            facts.coordinate_scale = scale;
+            assert!(!sane_facts(&facts), "{scale}");
         }
+        facts.coordinate_scale = 1.0;
+        // the codec sets no range on the ambient light
+        facts.ambient_light = 1.5;
+        assert!(sane_facts(&facts));
+        facts.monster_spawn_block_light_limit = 16;
+        assert!(!sane_facts(&facts));
     }
 }

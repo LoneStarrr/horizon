@@ -47,6 +47,9 @@ impl Victim {
 pub(super) struct Strike {
     /// The attacking guest, kept after their turn through `as_guest` ends.
     attacker: Option<u32>,
+    /// The attacker's creative mode: their hit passes the victim's
+    /// invulnerability (`DamageSource.isCreativePlayer`, #916).
+    creative: bool,
     amount: f32,
     scale: f32,
     crit: bool,
@@ -86,6 +89,7 @@ impl Strike {
     pub(super) fn test_blow(attacker: u32) -> Self {
         Self {
             attacker: Some(attacker),
+            creative: false,
             amount: 1.0,
             scale: 1.0,
             crit: false,
@@ -108,6 +112,9 @@ impl Strike {
 pub(super) struct Sweep {
     /// The attacking guest (none: the host).
     attacker: Option<u32>,
+    /// The attacker's creative mode: their hit passes the victim's
+    /// invulnerability (`DamageSource.isCreativePlayer`, #916).
+    creative: bool,
     from: [f64; 3],
     /// The damage after the enchantments and the attack strength.
     damage: f32,
@@ -188,6 +195,7 @@ impl Game<'_> {
         let ignite = self.weapon_ignite_seconds();
         Some(Strike {
             attacker: self.lan_acting,
+            creative: self.creative,
             amount,
             scale,
             crit,
@@ -257,6 +265,20 @@ impl Game<'_> {
         }
     }
 
+    /// `ServerPlayer.canHarmPlayer`: the `pvp` game rule is on, and the
+    /// victim's team lets the attacker's hurt it (`Player.canHarmPlayer`:
+    /// allies only with friendly fire on).
+    pub(in crate::game) fn player_may_harm(
+        &self,
+        victim: Option<&horizon_client_core::scoreboard::Team>,
+        attacker: Option<&horizon_client_core::scoreboard::Team>,
+    ) -> bool {
+        self.ui
+            .rules
+            .bool_at(horizon_client::gamerules::vanilla::PVP)
+            && horizon_client::scoreboard::teams_allow_damage(victim, attacker)
+    }
+
     /// A player's projectile on a player: the hit runs as the victim, whose
     /// hurt refuses it when the `pvp` game rule or their teams forbid it
     /// (`ServerPlayer.canHarmPlayer`; `AbstractArrow.onHitEntity` then turns
@@ -281,11 +303,7 @@ impl Game<'_> {
         let target = match victim {
             Victim::Guest(conn) => host.hub.guest(conn).and_then(|g| team_of(self, &g.name)),
         };
-        let refused = !(self
-            .ui
-            .rules
-            .bool_at(horizon_client::gamerules::vanilla::PVP)
-            && horizon_client::scoreboard::teams_allow_damage(target.as_ref(), attacker.as_ref()));
+        let refused = !self.player_may_harm(target.as_ref(), attacker.as_ref());
         let on_player = Hit::Entity {
             who: Who::Player,
             at,
@@ -320,15 +338,13 @@ impl Game<'_> {
         let Some(host) = self.lan.as_ref() else {
             return false;
         };
-        // ServerPlayer.canHarmPlayer: the pvp game rule, then the victim's
-        // team (Player.canHarmPlayer: allies only with friendly fire on).
         let team = match victim {
             Victim::Guest(conn) => host
                 .hub
                 .guest(conn)
                 .and_then(|g| self.score.board.players_team(&g.name)),
         };
-        let harm = horizon_client::scoreboard::teams_allow_damage(team, s.team.as_ref());
+        let harm = self.player_may_harm(team, s.team.as_ref());
         if s.knockback_attack {
             self.audio.play(
                 "minecraft:entity.player.attack.knockback",
@@ -361,7 +377,8 @@ impl Game<'_> {
                         s.item.clone(),
                     );
                 }
-                let hurt = g.mob_hits_player(s.amount, s.from, "minecraft:player_attack");
+                let hurt =
+                    g.mob_hits_player_from(s.amount, s.from, "minecraft:player_attack", s.creative);
                 g.combat.player_attacker = None;
                 let (strength, xd, zd) = s.knockback;
                 if hurt && strength > 0.0 {
@@ -384,12 +401,7 @@ impl Game<'_> {
                 (hurt, thorns)
             })
         };
-        let (hurt, thorns) = if self
-            .ui
-            .rules
-            .bool_at(horizon_client::gamerules::vanilla::PVP)
-            && harm
-        {
+        let (hurt, thorns) = if harm {
             match victim {
                 Victim::Guest(conn) => self.guest_struck_by(conn, land).unwrap_or_default(),
             }
@@ -519,6 +531,7 @@ impl Game<'_> {
         let damage = self.enchanted_damage("minecraft:player", base) * scale;
         Sweep {
             attacker: self.lan_acting,
+            creative: self.creative,
             from,
             damage,
             knockback: self.extra_knockback_direction(),
@@ -582,7 +595,12 @@ impl Game<'_> {
                 if let Some((id, name)) = &attacker {
                     g.note_named_attacker("minecraft:player_attack", *id, name.clone());
                 }
-                if g.mob_hits_player(sweep.damage, sweep.from, "minecraft:player_attack") {
+                if g.mob_hits_player_from(
+                    sweep.damage,
+                    sweep.from,
+                    "minecraft:player_attack",
+                    sweep.creative,
+                ) {
                     g.knock_back_player(0.4, xd, zd, PVP_SOURCE, &attack);
                     if sweep.ignite > 0.0
                         && let Some(p) = g.player.as_mut()

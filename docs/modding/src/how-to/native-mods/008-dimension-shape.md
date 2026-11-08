@@ -16,6 +16,17 @@ skylight and ceiling from its dimension shape. It accepts `&dyn Host`, including
 level is parked, and returns `None` for a stale or unavailable level or on a client. It does
 not load a level or allocate.
 
+### Dimension type
+
+`level.dimension_type(host)` reads a level's dimension type (`Level.dimensionType()` and its
+gameplay attributes) as a `LevelDimensionType`: the build range, `coordinate_scale`, `ambient_light`,
+`has_fixed_time`, `infiniburn`, the monster spawn light range, the sky and the gameplay switches. A
+level on a vanilla type returns that type's values, a registered dimension returns what its
+`DimensionSettings` set, and a data pack's dimension type counts the same way. It returns `None` for
+a stale handle, and on a client it reads the level that window shows; a client of another server
+reads the Overworld's values for a level that server's mods added (the game itself plays that level
+by the type the server sent).
+
 ### Registering a dimension
 
 `register_dimension` gives every world a level of the mod's own. Call it once, at startup, in
@@ -35,10 +46,38 @@ impl Hooks for MyMod {
 
 The level is `mymod:pocket`. `DimensionSettings` sets the build height, `has_skylight`,
 `has_ceiling`, the `generator` (`minecraft:noise` by default), its `noise_settings` and the level's
-one `biome`; the default is the Overworld's shape and terrain over plains, and the parts of a
-dimension type not named here are the Overworld's. The level opens, ticks, saves and closes as the
+one `biome`; the default is the Overworld's shape and terrain over plains. It also sets the rest of
+the dimension type the game reads: `has_fixed_time`, `has_ender_dragon_fight`, `coordinate_scale`,
+`ambient_light`, `infiniburn`, the monster spawn light range and block light limit, the `skybox`,
+the `cardinal_light` and the gameplay switches (`water_evaporates`, `fast_lava`,
+`respawn_anchor_works`, `nether_portal_spawns_piglin`, `piglins_zombify`, `snow_golem_melts`,
+`can_start_raid`, `sky_light_level`) and the bed rule (`bed_can_sleep`, `bed_can_set_spawn`,
+`bed_destroy_on_use`, `bed_destroy_on_leave`: `always`, `when_dark` or `never`, and whether a bed
+explodes or breaks; the same four with `straw_bed_` for the straw bed). A field left at its default is the Overworld's, and the game
+refuses a value out of range (a `coordinate_scale` outside 0.00001 to 30000000, an `ambient_light` that is not a number, an unknown
+`skybox`, a bed rule that is none of the three) at startup with a message naming the mod. The
+`coordinate_scale` is what `execute in mymod:pocket` scales a position by, and what a portal
+between two levels scales by (`DimensionType.getTeleportationScale`); a position given to a
+teleport call is taken as it is. The level opens, ticks, saves and closes as the
 Nether and the End do, in `dimensions/mymod/pocket/` of the world, and clients receive its
-dimension type when they join.
+dimension type when they join. A client of a server takes the whole type, not only the build
+range: the level's fluids, mobs, beds and time follow the type the server sent, as on the host,
+whether or not the client has the mod that registered the level.
+
+`sky_color`, `fog_color` (`#rrggbb`) and `cloud_height` set the sky overhead, the fog at the
+horizon and the clouds' height; left as None they are the Overworld's. A client of a server draws a
+level of a mod or a pack with the sky the server's type gives it, as the host does.
+
+`day_cycle` picks the timelines and the clock the dimension type names: `overworld` (the day and moon
+cycles, the villagers' schedule and the Overworld's clock, the default), `nether` (the schedule only,
+no clock), `end` or `none`. It sets how the level's sky and light change over the day in the host's
+world, whether monsters burn in daylight, and which clock `/time` reads there. `level.dimension_type(host)`
+gives the timelines and `default_clock` back. The day time itself is the world's one clock.
+
+The level's biomes are the one `biome` everywhere unless `biome_source` says otherwise:
+`BiomeSourceKind::Checkerboard` alternates the `biomes` in cells `2^biome_scale` chunks wide,
+`MultiNoise` uses the Overworld's or the Nether's biomes (`biome_preset`) and `End` the End's islands.
+Only `Fixed` suits a chunk generator of the mod's own, which writes terrain only.
 
 A dimension in another mod's namespace, an empty name, a name that is not a folder of the world
 (lowercase letters, digits and `_ . -` only, with `/` between segments that are not empty, `.` or
@@ -57,75 +96,96 @@ generator is code, and `register_chunk_generator` is native only.
 
 ### Sending a player to a dimension
 
-There is no portal to a registered level, and no travel call: a mod sends a player there with the
-command vanilla has for it, from a server hook.
+There is no portal to a registered level. A mod sends an entity there with
+`entity.teleport_to_level(host, dimension, pos, rotation)` from a server hook, the call vanilla has
+as `Entity.teleportTo(ServerLevel, ..)`. It works for a player, a mob, a boat and a minecart (a
+vehicle takes its passengers along).
 
 ```rust,ignore
 fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
     let CommandSource::Player { player, .. } = event.source else {
         return Flow::Continue;
     };
-    let Some(name) = player.name(&*host) else {
-        return Flow::Continue;
-    };
-    let line = format!("execute in mymod:pocket run tp {name} 8 100 8");
-    host.commands().run_command(&line);
+    let entity = player.entity();
+    entity.teleport_to_level(host, "mymod:pocket", [8.5, 100.0, 8.5], None);
     Flow::Cancel
 }
 ```
 
-The teleport happens at the next tick's start, and the level opens then if it isn't open. Name the
-player, as the line runs as the console. `run_command` answers whether the command
-ran, not whether the player arrived: a level that won't open, such as one naming a generator
-nobody registered, logs an error and leaves the player where they were. Nothing builds a platform
-at the destination, so look for the ground first, or place one.
+`pos` is in the destination's own coordinates: nothing scales it by the level's
+`coordinate_scale`. A level nobody has entered opens first, and a player arrives after the current
+tick, when `player_teleported` and `player_changed_dimension` report the move. The call
+answers whether the move was taken, not whether the player arrived: a level that won't open, such
+as one naming a generator nobody registered, logs an error and leaves the player where they were.
+It is false for an unregistered dimension and for an entity that cannot change level (an item, an
+orb, a projectile); a fake player stays where it is. Nothing builds a platform at the destination, so look for the
+ground first, or place one.
+
+### Sea level
+
+`level.sea_level(host)` reads `Level.getSeaLevel`: 63 in the Overworld, 32 in the Nether, 0 in the End. For a level of
+the noise generator it is the `sea_level` of its noise settings, a data pack's too when it replaces them. A level
+of a chunk generator the mod wrote has no noise settings to read: set `DimensionSettings::sea_level` to give it one
+(a level of the noise generator keeps its noise settings'), else it is 63 (-63 for a superflat generator). It is the sea
+level the game uses for the level: mob spawning and behaviour (drowned, turtles, phantoms), rain and snow, and maps.
+Terrain and aquifers are built with the generator's own sea level, which for a noise level is the noise settings' and
+which `DimensionSettings::sea_level` never changes: it only gives `level.sea_level(host)` a value for a generator that has
+none, so it does not move where the water is.
+
+### Day clocks
+
+Each level goes by its dimension type's `default_clock`: the Overworld by `minecraft:overworld`, the End by
+`minecraft:the_end`, a level without one (the Nether) by the Overworld's. Every clock the world has met runs at its
+own rate and keeps its own total, saved in `world_clocks.dat`, so a level with a clock of its own has its own day:
+its sky, its spawning and its beds follow that clock, and `/time` in the level sets it.
+`level.clock_time(host)` reads the level's own clock in ticks (None for a level without a default clock);
+`level.day_time(host)` stays the Overworld's, whichever level is asked.
+
+### Which level a hook is in
+
+The block-behaviour hooks (`neighbor_changed`, `random_tick`, `crop_grow`, `block_changed` and the rest) name their
+level with a `LevelDimension`: `Overworld`, `Nether`, `End`, or `Custom(key)` for any other level, a mod's or a data
+pack's. `LevelDimension::key()` gives the level's key (`key.id()` its `namespace:path`) and `LevelDimension::of_level`
+goes back. Match it with a final `Custom(_)` arm. The game's own rules read the level's own dimension type for these
+too (water that evaporates, fast lava, infiniburn, piglin portals), and `player_respawn_position` may send a player to
+a `Custom` level.
+
+### Saving a level
+
+`level.request_save(host)` asks the server to save a level, as the autosave and `/save-all` do, with its
+chunks on disk when it ends. The save runs at the start of the next server tick, not inside the call (a hook
+may be running in the tick that is saving), and a level asked for twice before then is saved once. The call
+answers whether the request was taken. `level_save` fires with the level's dimension once it was written; a
+save that fails fires nothing and is logged.
 
 ### Chunk generators
+
 
 A chunk generator is a mod's code for a level's terrain: vanilla's `ChunkGenerator`, and
 `build_terrain` its `buildTerrain`. Register it once, at startup, and name it from a dimension,
 or from a data pack's level stem as `"generator": {"type": "mymod:void"}`:
 
 ```rust,ignore
-struct Floor;
-
-impl ChunkGenerator for Floor {
-    fn build_terrain(&self, chunk: &mut dyn ChunkAccess) {
-        let stone = chunk.state("stone");
-        let [x, z] = [chunk.pos().x * 16, chunk.pos().z * 16];
-        for (dx, dz) in (0..16).flat_map(|dx| (0..16).map(move |dz| (dx, dz))) {
-            chunk.set_block([x + dx, chunk.min_y(), z + dz], stone);
-        }
-    }
-}
-
-#[mod_api::horizon_mod]
-impl Hooks for MyMod {
-    fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
-        r.register_chunk_generator("void", Floor);
-        r.register_dimension(
-            "void",
-            DimensionSettings { generator: "mymod:void".into(), ..Default::default() },
-        );
-    }
-}
+{{#include ../../../examples/src/worldgen.rs:terrain}}
 ```
 
 There is no `Host` in world generation: chunks fill on the worker threads, so a generator sees only
 the `ChunkAccess` of the chunk it fills, is `Send + Sync`, and keeps no mutable state, because two
 workers can fill neighbouring chunks at once. The same seed and chunk give the same blocks.
-`ChunkAccess` has the chunk's `pos`, the world's `seed`, the level's `min_y` and `height`, `state`
-and `state_with` to resolve a block by name into a `TerrainState` (the handle `set_block` takes),
-and `set_block`, which skips a position outside the chunk or the build height and answers whether
-it wrote. The chunk starts as air.
+`ChunkAccess` has the chunk's `pos`, the world's `seed`, the level's `min_y` and `height`, and
+borrowed immutable `metadata()`. Resolve `BlockKey`s at registration, then use `state` or
+`state_with` to construct API-owned `BlockState`s before the terrain-writing loop, never once per
+placed block. `set_block` skips a position outside the chunk or build height and answers whether
+it wrote. The chunk starts as air; invalid state ordinals are refused rather than written.
 
 The generator gives terrain only. The level has no surface, carvers or features, and every chunk
 has the stem's one biome. `noise_settings` means nothing to it.
 
 A generator in another mod's namespace, an empty name, a name that is not a folder of the world (as
 for a dimension), an id registered twice and `minecraft:noise` stop the game at startup with a
-message naming the mod. It is native only: a mod built to `mod.wasm` that calls
-`register_chunk_generator` fails when it registers, with a message saying why.
+message naming the mod. ChunkGenerator and ChunkAccess are not yet bound by the generated wasm worker interface; a wasm
+mod can register dimensions naming an already installed generator, but cannot register its own
+chunk generator. Structure types use the existing generated worker binding instead.
 
 A level stem naming a generator nobody registered, say after its mod was removed, is an error for
 whoever opens that level, not for the world: a teleport there fails and is logged, and a player

@@ -9,7 +9,7 @@ pub use jar::{
     JarConflict, JarInputsError, JarRef, JarRequirement, MissingJar, collect_jar_requirements,
     missing_jars,
 };
-pub use wasm::{MAX_WASM, Wasm, WasmError, export_prefix, sha512_of};
+pub use wasm::{MAX_WASM, Wasm, WasmError, sha512_of};
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -43,6 +43,21 @@ pub struct Manifest {
     pub description: String,
     #[serde(default)]
     pub authors: Vec<String>,
+    /// The Mods screen's `License:` line (a name such as `MIT`); empty shows it as not given.
+    #[serde(default)]
+    pub license: String,
+    /// Where the license text is: the screen makes its name a link.
+    #[serde(default)]
+    pub license_url: Option<String>,
+    /// The Mods screen's `Credits:` line.
+    #[serde(default)]
+    pub credits: String,
+    /// The mod's home page, the Mods screen's Homepage button.
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// Where to report problems, the Mods screen's Issues button.
+    #[serde(default)]
+    pub issues: Option<String>,
     /// The content API line: `0.2`.
     pub api: String,
     #[serde(default)]
@@ -246,12 +261,6 @@ impl Manifest {
         if m.native.is_some() && m.wasm.is_some() {
             return Err(format!("{MANIFEST}: a mod is [native] or [wasm], not both"));
         }
-        if m.wasm.is_some() && !wasm::exportable(&m.id) {
-            return Err(format!(
-                "{MANIFEST}: a wasm mod's id is words that each start with a letter (`{}`)",
-                m.id
-            ));
-        }
         inject::Inject::check_all(&m.inject, &m.id, m.native.is_some() || m.wasm.is_some())
             .map_err(|e| format!("{MANIFEST}: {e}"))?;
         if let Some(native) = &m.native {
@@ -300,6 +309,20 @@ impl Manifest {
             return Err(format!(
                 "{MANIFEST}: a content mod has capabilities = [\"registries\"]"
             ));
+        }
+        for (field, url) in [
+            ("license_url", &m.license_url),
+            ("homepage", &m.homepage),
+            ("issues", &m.issues),
+        ] {
+            if let Some(url) = url
+                && (url.len() > 2048
+                    || !(url.starts_with("https://") || url.starts_with("http://")))
+            {
+                return Err(format!(
+                    "{MANIFEST}: {field} is an http(s) link of at most 2048 characters"
+                ));
+            }
         }
         for (i, ns) in m.namespaces.iter().enumerate() {
             // Vanilla's namespace characters, at most as long as an id.
@@ -390,12 +413,17 @@ impl Package {
                 .take(MAX_WASM + 1)
                 .read_to_end(&mut bytes)
         } else {
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-            zip.by_name(WASM)
-                .map_err(|_| WasmError::Missing.to_string())?
-                .take(MAX_WASM + 1)
-                .read_to_end(&mut bytes)
+            #[cfg(target_arch = "wasm32")]
+            return Err("archive I/O is unavailable on wasm32".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+                zip.by_name(WASM)
+                    .map_err(|_| WasmError::Missing.to_string())?
+                    .take(MAX_WASM + 1)
+                    .read_to_end(&mut bytes)
+            }
         };
         read.map_err(|e| format!("{WASM}: {e}"))?;
         wasm.check(&bytes).map_err(|e| e.to_string())?;
@@ -470,9 +498,14 @@ impl Package {
                     path.display()
                 ));
             }
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-            return Self::read_zip(&mut zip);
+            #[cfg(target_arch = "wasm32")]
+            return Err("archive I/O is unavailable on wasm32".into());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+                return Self::read_zip(&mut zip);
+            }
         };
         let package = Self::from_parts(&toml, icon, has_cargo, has_source, has_wasm)?;
         if let Some(wasm) = &package.manifest.wasm {
@@ -483,6 +516,7 @@ impl Package {
     }
 
     /// Read and validate an archive, including all selected source and resource entries.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn read_zip<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Self, String> {
         let mut icon = None;
         let mut has_cargo = false;
@@ -627,10 +661,15 @@ impl Package {
         if path.is_dir() {
             return path.join(MANIFEST).is_file();
         }
-        std::fs::File::open(path)
-            .ok()
-            .and_then(|f| zip::ZipArchive::new(f).ok())
-            .is_some_and(|mut zip| zip.by_name(MANIFEST).is_ok())
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::fs::File::open(path)
+                .ok()
+                .and_then(|f| zip::ZipArchive::new(f).ok())
+                .is_some_and(|mut zip| zip.by_name(MANIFEST).is_ok())
+        }
+        #[cfg(target_arch = "wasm32")]
+        false
     }
     /// Select and validate a flat project's source and resource files deterministically.
     pub fn directory_files(
@@ -704,6 +743,7 @@ impl Package {
     }
 
     /// Pack a flat project, selecting its source and resource files deterministically.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn pack_directory(root: &Path) -> Result<Vec<u8>, String> {
         let package = Self::read(root)?;
         let mut files = package.directory_files(root)?;
@@ -717,6 +757,7 @@ impl Package {
     }
 
     /// The `.hmod` bytes for `manifest_text` and selected project files.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn write_files(manifest_text: &str, files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         use std::io::Write;
         let manifest = Manifest::parse(manifest_text)?;
@@ -912,6 +953,26 @@ capabilities = ["registries"]
         assert!(Manifest::parse(&text("distinct")).is_ok());
         let error = Manifest::parse(&text("shared")).unwrap_err();
         assert!(error.contains("duplicate module id"), "{error}");
+    }
+
+    #[test]
+    fn wasm_internals_declarations_parse_with_and_without_kind_and_need_a_wasm_or_native_mod() {
+        let wasm = format!(
+            "[wasm]\nsha512='{}'\ntoolchain='t'\nbuilt_with='t'\n",
+            "a".repeat(128)
+        );
+        let injection = "[[inject]]\nid='fell'\nat='Game::break_block'\nkind='head'\nwith='fell'\naccess='internals'\nhash='h'\n";
+        let text = |internals: &str, tail: &str| format!("{EXAMPLE}{internals}{tail}");
+        let ok = Manifest::parse(&text(
+            "internals=[{path='Game::world',kind='field',hash='1'},{path='Game::tick',hash='2'}]\n",
+            &format!("{wasm}{injection}"),
+        ))
+        .unwrap();
+        assert_eq!(ok.internals[0].kind.as_deref(), Some("field"));
+        assert_eq!(ok.internals[1].kind, None);
+        // A wasm internals listener with nothing declared, and declarations with no code mod.
+        assert!(Manifest::parse(&text("", &format!("{wasm}{injection}"))).is_err());
+        assert!(Manifest::parse(&text("internals=[{path='Game::world',hash='1'}]\n", "")).is_err());
     }
 
     #[test]
@@ -1258,8 +1319,38 @@ capabilities = ["registries"]
     }
 
     #[test]
+    fn the_mods_screen_fields_are_optional_and_links_must_be_http() {
+        let m = Manifest::parse(EXAMPLE).unwrap();
+        assert!(m.license.is_empty() && m.credits.is_empty());
+        assert!(m.license_url.is_none() && m.homepage.is_none() && m.issues.is_none());
+        let full = format!(
+            "{EXAMPLE}license = \"MIT\"
+credits = \"Alex\"
+homepage = \"https://example.org\"
+issues = \"http://example.org/issues\"
+"
+        );
+        let m = Manifest::parse(&full).unwrap();
+        assert_eq!((m.license.as_str(), m.credits.as_str()), ("MIT", "Alex"));
+        assert_eq!(m.homepage.as_deref(), Some("https://example.org"));
+        for field in ["license_url", "homepage", "issues"] {
+            let e = Manifest::parse(&format!(
+                "{EXAMPLE}{field} = \"file:///etc/passwd\"
+"
+            ))
+            .unwrap_err();
+            assert!(e.contains(field), "{e}");
+        }
+    }
+
+    #[test]
     fn a_wasm_mod_carries_exactly_its_declared_module() {
-        let module = b"\0asm\x01\0\0\0".to_vec();
+        // A minimal valid shared member: a `dylink.0` section and the three guest exports.
+        let module = wat::parse_str(
+            r#"(module (@custom "dylink.0" "\01\04\00\00\00\00")
+                (func (export "horizon_layout")) (func (export "horizon_in")) (func (export "horizon_hook")))"#,
+        )
+        .unwrap();
         let text = format!(
             "{}\n[wasm]\nsha512 = \"{}\"\ntoolchain = \"1.99.1\"\nbuilt_with = \"test\"\n",
             EXAMPLE.trim_end(),

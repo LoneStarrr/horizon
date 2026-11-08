@@ -9,19 +9,31 @@ impl Game<'_> {
             return false;
         };
         let g = &host.hub.guests[gi];
+        self.spawn_protection_for(host, g.uuid)
+            .is_some_and(|radius| self.spawn_protects(radius, &g.dimension, pos))
+    }
+
+    pub(super) fn spawn_protection_for(&self, host: &LanHost, uuid: u128) -> Option<i32> {
         let radius = host.hub.spawn_protection;
-        if self.options.dedicated.is_none() || radius <= 0 || g.dimension != "minecraft:overworld" {
-            return false;
-        }
+        (self.options.dedicated.is_some()
+            && radius > 0
+            && !host.hub.ops.is_empty()
+            && !host.hub.ops.contains_key(&uuid))
+        .then_some(radius)
+    }
+
+    pub(in crate::game) fn spawn_protects(
+        &self,
+        radius: i32,
+        dimension: &str,
+        pos: [i32; 3],
+    ) -> bool {
         let Some(spawn) = self.level.world_spawn else {
             return false;
         };
-        if host.hub.ops.is_empty() || host.hub.ops.contains_key(&g.uuid) {
-            return false;
-        }
         let dx = pos[0].abs_diff(spawn[0]);
         let dz = pos[2].abs_diff(spawn[2]);
-        dx.max(dz) <= radius as u32
+        dimension == "minecraft:overworld" && dx.max(dz) <= radius as u32
     }
 
     /// ServerPlayer.sendSpawnProtectionMessage.
@@ -1215,6 +1227,13 @@ impl Game<'_> {
             return;
         };
         if Dim::from_id(&host.hub.guests[gi].dimension) != dim {
+            if !self.server_player_travel_allowed(
+                own,
+                dim,
+                crate::game::server_travel::TravelCause::Teleport,
+            ) {
+                return;
+            }
             self.level_teleports
                 .push(crate::game::server_travel::LevelTeleport {
                     conn: own,

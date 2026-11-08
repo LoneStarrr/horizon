@@ -112,12 +112,8 @@ impl Game<'_> {
             if trap {
                 let at = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
                 // ServerLevel.tickChunk: a trap horse waits for a player.
-                if let Some(id) = self.spawn_mob(
-                    "minecraft:skeleton_horse",
-                    at,
-                    false,
-                    super::creatures::SpawnSite::Plain,
-                ) && let Some(h) = self.mobs.iter_mut().find(|m| m.id == id)
+                if let Some(id) = self.spawn_mob_raw("minecraft:skeleton_horse", at, false)
+                    && let Some(h) = self.mobs.iter_mut().find(|m| m.id == id)
                 {
                     h.extra.trap = true;
                     h.extra.age = 0;
