@@ -417,6 +417,7 @@ pub mod tests {
         install_parts(
             &[ModEntry::new("mymod", Box::new(All))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap();
         let parts = mod_api::__private::installed_tree_parts();
@@ -491,6 +492,7 @@ pub mod tests {
         install_parts(
             &[ModEntry::new("mymod", Box::new(All))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap();
         let parts = mod_api::__private::installed_tree_parts();
@@ -543,6 +545,7 @@ pub mod tests {
         let errors = install_parts(
             &[ModEntry::new("test", Box::new(Invalid))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap_err();
         assert_eq!(errors.len(), 5, "{errors:?}");
@@ -566,6 +569,7 @@ pub mod tests {
         let errors = install_parts(
             &[ModEntry::new("minecraft", Box::new(Own))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap_err();
         assert_eq!(errors.len(), 1);

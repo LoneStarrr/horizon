@@ -140,6 +140,7 @@ pub mod tests {
         let errors = install_parts(
             &[ModEntry::new("test", Box::new(Invalid))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap_err();
         assert_eq!(errors.len(), 4, "{errors:?}");
@@ -162,6 +163,7 @@ pub mod tests {
         let errors = install_parts(
             &[ModEntry::new("minecraft", Box::new(Own))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap_err();
         assert_eq!(errors.len(), 1);
@@ -238,6 +240,7 @@ pub mod tests {
         install_parts(
             &[ModEntry::new("test", Box::new(Registers))],
             &crate::parts::tests::rule_schema(),
+            |_| false,
         )
         .unwrap();
         let types = mod_api::__private::installed_feature_types();
