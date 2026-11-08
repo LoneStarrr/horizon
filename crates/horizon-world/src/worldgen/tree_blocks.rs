@@ -82,6 +82,29 @@ const DEFAULTS: [&str; 20] = [
     "minecraft:dirt",
     "minecraft:mud",
 ];
+/// The default state of every block the registry holds, by name. Mod tree parts look blocks up by
+/// name (`"arconia:red_arconium_vine"`), so mod blocks need an entry as much as vanilla's.
+fn default_states(registry: &BlockRegistry) -> BTreeMap<String, BlockStateId> {
+    let mut defaults: BTreeMap<String, BlockStateId> = DEFAULTS
+        .iter()
+        .filter_map(|name| {
+            registry
+                .default_state(name)
+                .map(|id| ((*name).to_owned(), id))
+        })
+        .collect();
+    for index in 0..registry.len() {
+        let Some(state) = registry.state(BlockStateId(index as u32)) else {
+            continue;
+        };
+        if !defaults.contains_key(&state.name)
+            && let Some(id) = registry.default_state(&state.name)
+        {
+            defaults.insert(state.name.clone(), id);
+        }
+    }
+    defaults
+}
 impl TreeBlocks {
     pub(crate) fn build(bindings: &FeatureBlockBindings<'_>) -> Result<Self, DecodeError> {
         let registry: &BlockRegistry = bindings.registry();
@@ -229,14 +252,7 @@ impl TreeBlocks {
                 *names.entry(name.clone()).or_insert(next)
             })
             .collect();
-        let defaults = DEFAULTS
-            .iter()
-            .filter_map(|name| {
-                registry
-                    .default_state(name)
-                    .map(|id| ((*name).to_owned(), id))
-            })
-            .collect();
+        let defaults = default_states(registry);
         Ok(Self {
             flags,
             distance,
@@ -438,7 +454,46 @@ pub(crate) fn shuffle<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_core::nbt::Tag;
     use horizon_core::random::{LegacyRandom, RandomSource};
+    #[test]
+    fn default_states_include_blocks_a_mod_registered() {
+        // A mod's vine sits after vanilla blocks in the registry.
+        let names = [
+            "minecraft:air",
+            "minecraft:oak_log",
+            "arconia:red_arconium_vine",
+        ];
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+            (
+                "states",
+                Tag::List(
+                    names
+                        .iter()
+                        .map(|name| Tag::compound([("id", Tag::String((*name).into()))]))
+                        .collect(),
+                ),
+            ),
+            (
+                "defaults",
+                Tag::compound([
+                    ("minecraft:air", Tag::Int(0)),
+                    ("minecraft:oak_log", Tag::Int(1)),
+                    ("arconia:red_arconium_vine", Tag::Int(2)),
+                ]),
+            ),
+        ]))
+        .unwrap();
+        let defaults = default_states(&registry);
+        assert_eq!(
+            defaults.get("arconia:red_arconium_vine"),
+            Some(&BlockStateId(2))
+        );
+        assert_eq!(defaults.get("minecraft:air"), Some(&BlockStateId(0)));
+        assert_eq!(defaults.get("minecraft:oak_log"), Some(&BlockStateId(1)));
+        assert_eq!(defaults.get("minecraft:stone"), None);
+    }
     #[test]
     fn pos_set_iterates_in_java_hash_bucket_order() {
         let mut set = PosSet::default();
