@@ -414,7 +414,11 @@ pub mod tests {
     /// and leaves.
     #[test]
     fn registered_tree_parts_place_a_tree_on_a_small_region() {
-        install_parts(&[ModEntry::new("mymod", Box::new(All))]).unwrap();
+        install_parts(
+            &[ModEntry::new("mymod", Box::new(All))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
         let parts = mod_api::__private::installed_tree_parts();
         let trunk = parts.trunk_placers["mymod:spiral_trunk_placer"]
             .decode(&serde_json::json!({
@@ -484,7 +488,11 @@ pub mod tests {
     /// A part's own decode error reaches the tree's load error, and an unknown config is refused.
     #[test]
     fn registered_tree_parts_refuse_their_invalid_configs() {
-        install_parts(&[ModEntry::new("mymod", Box::new(All))]).unwrap();
+        install_parts(
+            &[ModEntry::new("mymod", Box::new(All))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
         let parts = mod_api::__private::installed_tree_parts();
         assert_eq!(
             parts.trunk_placers["mymod:spiral_trunk_placer"]
@@ -532,7 +540,11 @@ pub mod tests {
                 r.register_tree_decorator("lantern", Lantern);
             }
         }
-        let errors = install_parts(&[ModEntry::new("test", Box::new(Invalid))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("test", Box::new(Invalid))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 5, "{errors:?}");
         assert!(errors[0].contains("test registered trunk placer test:spiral twice"));
         assert!(errors[1].contains("test registered foliage placer \"other:spiral\""));
@@ -551,7 +563,11 @@ pub mod tests {
                 r.register_trunk_placer("straight_trunk_placer", Spiral);
             }
         }
-        let errors = install_parts(&[ModEntry::new("minecraft", Box::new(Own))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("minecraft", Box::new(Own))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains(
             "minecraft registered trunk placer minecraft:straight_trunk_placer, in the game's own namespace"

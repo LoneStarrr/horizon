@@ -137,7 +137,11 @@ pub mod tests {
                 r.register_density_function("Bad Name", Wave);
             }
         }
-        let errors = install_parts(&[ModEntry::new("test", Box::new(Invalid))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("test", Box::new(Invalid))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors[0].contains("test registered density function test:wave twice"));
         assert!(errors[1].contains("test registered density function \"other:wave\""));
@@ -155,7 +159,11 @@ pub mod tests {
                 r.register_density_function("add", Wave);
             }
         }
-        let errors = install_parts(&[ModEntry::new("minecraft", Box::new(Own))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("minecraft", Box::new(Own))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("minecraft registered density function minecraft:add"));
     }
@@ -170,7 +178,11 @@ pub mod tests {
                 r.register_density_function("wave", Wave);
             }
         }
-        install_parts(&[ModEntry::new("test", Box::new(Registers))]).unwrap();
+        install_parts(
+            &[ModEntry::new("test", Box::new(Registers))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
         let types = mod_api::__private::installed_density_functions();
         let function = types["test:wave"]
             .decode(&serde_json::json!({"type": "test:wave", "scale": 0.5}))

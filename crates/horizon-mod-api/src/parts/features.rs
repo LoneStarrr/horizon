@@ -137,7 +137,11 @@ pub mod tests {
                 r.register_feature_type("Bad Name", Column);
             }
         }
-        let errors = install_parts(&[ModEntry::new("test", Box::new(Invalid))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("test", Box::new(Invalid))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors[0].contains("test registered feature type test:spikes twice"));
         assert!(errors[1].contains("test registered feature type \"other:spikes\""));
@@ -155,7 +159,11 @@ pub mod tests {
                 r.register_feature_type("ore", Column);
             }
         }
-        let errors = install_parts(&[ModEntry::new("minecraft", Box::new(Own))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("minecraft", Box::new(Own))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("minecraft registered feature type minecraft:ore"));
     }
@@ -227,7 +235,11 @@ pub mod tests {
                 false
             }
         }
-        install_parts(&[ModEntry::new("test", Box::new(Registers))]).unwrap();
+        install_parts(
+            &[ModEntry::new("test", Box::new(Registers))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
         let types = mod_api::__private::installed_feature_types();
         let feature = types["test:column"]
             .decode(&serde_json::json!({"type": "test:column", "height": 2}))

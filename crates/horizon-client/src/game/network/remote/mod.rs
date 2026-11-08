@@ -1377,6 +1377,7 @@ impl Game<'_> {
             camera: None,
             use_item: None,
             dimension: DimensionType::vanilla("minecraft:overworld"),
+            environment: None,
             level: "minecraft:overworld".into(),
             level_key: mod_api::DimensionKey::OVERWORLD,
             hashed_seed: 0,
