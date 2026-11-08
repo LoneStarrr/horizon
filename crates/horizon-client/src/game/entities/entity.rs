@@ -7,6 +7,7 @@
 //! `Game` end. The walk allocates nothing and dispatch is static: hot paths pay
 //! no vtable. A new kind is one line in `entity_lists!` and one `impl Entity`.
 
+use super::api_values::{TryIntoApi, TryIntoEngine};
 use super::commands::Target;
 use super::persist::ChunkKey;
 use super::{FallingBlock, Game};
@@ -27,6 +28,17 @@ use horizon_core::position::BlockPos;
 use horizon_world::{level::data::PushReaction, piston_push};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+
+/// Assign a stored owner's delayed id at its existing allocation point.
+/// Kinds without a lifetime slot pass None; a bound owner must keep its id.
+pub(super) fn assign_stored_id(
+    next: &mut u32,
+    id: &mut u32,
+    lifetime: Option<&horizon_mod_runtime::attachments::AttachmentLifetime>,
+) -> u32 {
+    debug_assert!(*id != 0 || lifetime.is_none_or(|slot| !slot.is_bound()));
+    super::lan_entities::assign_entity_id(next, id)
+}
 
 /// What `Entity.thunderHit` does to a kind: it sets the entity on fire and
 /// calls `hurtServer(lightning_bolt, 5)`, so a kind whose `hurtServer` does
@@ -279,6 +291,10 @@ pub(super) trait Entity: EntityRules {
         let position = self.position_mut();
         *position = position.add_vector(movement);
     }
+    /// `setOnGroundWithMovement` at the end of a piston's or shulker lid's
+    /// `Entity.move`, for the kinds that keep the flag: on a server it runs
+    /// for every push, sideways ones and those the collision turned away included.
+    fn set_piston_on_ground(&mut self, _on_ground: bool) {}
     /// `PistonMovingBlockEntity.causeBounce`: a slime block sets the velocity
     /// along the movement axis.
     fn piston_slime_bounce(&mut self, movement: Direction) {
@@ -616,18 +632,28 @@ impl Game<'_> {
             let state = self.world.block(pos.x, pos.y, pos.z);
             let position = item.position;
             let mut discarded = false;
-            self.native_item_after_vertical_collision(
-                mod_api::__private::ItemAfterVerticalCollisionCall {
-                    dimension: self.dim.id(),
-                    client,
-                    entity: item.id,
-                    state,
-                    block_pos: [pos.x, pos.y, pos.z],
-                    item_pos: [position.x, position.y, position.z],
-                    stack: &mut item.stack,
-                    discard: &mut discarded,
-                },
-            );
+            if mod_api::__private::has_part_hook(mod_api::HookId::ItemAfterVerticalCollision)
+                && let Ok(snapshot) = item.stack.try_into_api()
+            {
+                let mut stack = Some(snapshot);
+                self.native_item_after_vertical_collision(
+                    mod_api::__private::ItemAfterVerticalCollisionCall {
+                        dimension: self.dim.id(),
+                        client,
+                        entity: item.id,
+                        state,
+                        block_pos: [pos.x, pos.y, pos.z],
+                        item_pos: [position.x, position.y, position.z],
+                        stack: &mut stack,
+                        discard: &mut discarded,
+                    },
+                );
+                match stack.try_into_engine(self.items()) {
+                    Ok(Some(stack)) => item.stack = stack,
+                    Ok(None) => discarded = true,
+                    Err(_) => discarded = false,
+                }
+            }
             if discarded || item.stack.count == 0 {
                 return (false, true);
             }
@@ -724,7 +750,7 @@ macro_rules! define_entity_handles {
             /// cursor per list. Static dispatch and nothing allocated. Checked:
             /// a list out of join order, or an entity that never joined, stops
             /// the walk with the entity at fault.
-            #[allow(dead_code)] // read by the tick order slices that follow
+            #[allow(dead_code, reason = "the tick order work that reads this has not landed yet")]
             pub(super) fn walk_in_join_order(
                 self,
                 visit: impl FnMut(EntityHandle, JoinSeq),
@@ -757,14 +783,13 @@ macro_rules! define_entity_handles {
             /// Moves every list out; give it back with `restore_entities`.
             pub(super) fn take_entities(&mut self) -> TakenEntities {
                 TakenEntities {
-                    $($field: std::mem::take(&mut self$(.$list)+),)*
+                    $($field: self$(.$list)+.lift(),)*
                 }
             }
-            pub(super) fn restore_entities(&mut self, mut taken: TakenEntities) {
+            pub(super) fn restore_entities(&mut self, taken: TakenEntities) {
                 $({
                     let expected = self$(.$list)+.len() + taken.$field.len();
-                    std::mem::swap(&mut self$(.$list)+, &mut taken.$field);
-                    self$(.$list)+.append(&mut taken.$field);
+                    self$(.$list)+.restore(taken.$field, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
                     debug_assert_eq!(self$(.$list)+.len(), expected);
                 })*
             }
@@ -797,7 +822,10 @@ pub(crate) use define_entity_handles;
 
 /// Why [`EntityLists::walk_in_join_order`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // read by the tick order slices that follow
+#[allow(
+    dead_code,
+    reason = "the tick order work that reads this has not landed yet"
+)]
 pub(super) enum JoinOrderError {
     /// Never put in its list through the list's own `push`, so it has no
     /// join number.
@@ -811,7 +839,10 @@ pub(super) enum JoinOrderError {
 /// lengths, `seq(list, i)` the join number of entity `i` of a list, `handle`
 /// names it. Each step takes the lowest next number among the `N` cursors
 /// (a stack array; no allocation).
-#[allow(dead_code)] // read by the tick order slices that follow
+#[allow(
+    dead_code,
+    reason = "the tick order work that reads this has not landed yet"
+)]
 fn merge_in_join_order<const N: usize>(
     lens: [usize; N],
     seq: impl Fn(usize, usize) -> JoinSeq,
@@ -1053,6 +1084,9 @@ impl Game<'_> {
             .chain(self.crystals.iter().map(|e| e.id))
             .chain(self.dragon.iter().map(|e| e.id))
             .chain(self.ominous_spawners.iter().map(|e| e.id))
+            // Cast hooks live with their players, not in the saveable lists.
+            // Keep both their identities and attachment holders until they leave.
+            .chain(self.fishing_hooks_here().map(|(hook, _)| hook.id()))
     }
     /// The ids of every entity in the level that is not removed: one walk.
     pub(super) fn live_entity_ids(&self) -> HashSet<u32> {
@@ -1272,12 +1306,8 @@ impl Entity for ItemEntity {
     fn on_ground(&self) -> bool {
         self.on_ground
     }
-    fn move_by_piston(&mut self, movement: Vec3) {
-        self.position = self.position.add_vector(movement);
-        // Entity.move(MoverType.PISTON): onGround only if the push was down.
-        if movement.y != 0.0 {
-            self.on_ground = movement.y < 0.0;
-        }
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn piston_slime_bounce(&mut self, movement: Direction) {
         ItemEntity::piston_slime_bounce(self, movement);
@@ -1342,11 +1372,8 @@ impl Entity for ExperienceOrb {
     fn on_ground(&self) -> bool {
         self.on_ground
     }
-    fn move_by_piston(&mut self, movement: Vec3) {
-        self.position = self.position.add_vector(movement);
-        if movement.y != 0.0 {
-            self.on_ground = movement.y < 0.0;
-        }
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn piston_slime_bounce(&mut self, movement: Direction) {
         self.velocity = piston_push::bounce_velocity(movement, self.velocity);
@@ -1589,6 +1616,11 @@ impl Entity for ArmorStand {
     fn on_ground(&self) -> bool {
         self.on_ground
     }
+    /// A living entity's own flag too: keeping the old support flag would run
+    /// Frost Walker while the stand is moving over open water.
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn is_living(&self) -> bool {
         true
     }
@@ -1678,6 +1710,9 @@ impl Entity for PrimedTnt {
     }
     fn on_ground(&self) -> bool {
         self.on_ground
+    }
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn piston_slime_bounce(&mut self, movement: Direction) {
         self.velocity = piston_push::bounce_velocity(movement, self.velocity);
@@ -1775,7 +1810,7 @@ impl Entity for Projectile {
                 game.load_arrow(tag, uuid, player_uuid)
             }
             "minecraft:llama_spit" | "minecraft:shulker_bullet" => {
-                game.load_spit_or_bullet(tag, player_uuid)
+                game.load_spit_or_bullet(tag, uuid, player_uuid)
             }
             "minecraft:fireball"
             | "minecraft:small_fireball"
@@ -2195,7 +2230,7 @@ mod join_order_tests {
     #[test]
     fn an_entity_put_back_keeps_its_join_number() {
         let (mut lists, joined) = mixed();
-        let taken = std::mem::take(&mut lists.tridents);
+        let taken = lists.tridents.lift();
         let before: Vec<_> = taken
             .iter()
             .map(horizon_client::join_seq::Joined::join_seq)

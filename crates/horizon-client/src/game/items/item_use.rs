@@ -396,14 +396,15 @@ impl Game<'_> {
     /// `Player.canEat(canAlwaysEat)` for `stack`, food that is eaten only
     /// when hungry, then a mod's answer.
     pub(super) fn can_eat(&self, stack: &ItemStack, can_always_eat: bool) -> bool {
-        let mut can_eat = can_always_eat
+        let vanilla = can_always_eat
             || self.creative
             || self
                 .player
                 .as_ref()
                 .is_some_and(|p| p.health.food.food < 20);
-        self.native_can_eat(stack, &mut can_eat);
-        can_eat
+        let mut answer = None;
+        self.native_can_eat(stack, vanilla, &mut answer);
+        answer.unwrap_or(vanilla)
     }
 }
 
@@ -591,36 +592,37 @@ mod tests {
         impl ItemPart for Part {
             fn use_animation(&self, _: &dyn ClientHost, event: &mut UseAnimationEvent<'_>) {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                let expected = match &*event.stack.item {
+                let expected = match mod_api::__private::item_key_id(event.stack.item()).unwrap() {
                     "minecraft:bow" => UseAnimation::Bow,
                     "minecraft:crossbow" => UseAnimation::Crossbow,
                     "minecraft:trident" => UseAnimation::Trident,
                     "minecraft:brush" => UseAnimation::Brush,
                     "minecraft:wooden_spear"
-                        if event
-                            .stack
-                            .data()
-                            .is_none_or(|d| d.other("!minecraft:kinetic_weapon").is_none()) =>
+                        if event.stack.components().is_none_or(|d| {
+                            d.as_nbt()
+                                .get(&"!minecraft:kinetic_weapon".into())
+                                .is_none()
+                        }) =>
                     {
                         UseAnimation::Spear
                     }
                     "minecraft:stick"
-                        if event
-                            .stack
-                            .data()
-                            .is_some_and(|d| d.other("minecraft:kinetic_weapon").is_some()) =>
+                        if event.stack.components().is_some_and(|d| {
+                            d.as_nbt().get(&"minecraft:kinetic_weapon".into()).is_some()
+                        }) =>
                     {
                         UseAnimation::Spear
                     }
                     _ => UseAnimation::None,
                 };
                 assert_eq!(*event.animation, expected);
-                *event.animation = if &*event.stack.item == "minecraft:stick"
-                    || event
-                        .stack
-                        .data()
-                        .is_some_and(|d| d.other("!minecraft:kinetic_weapon").is_some())
-                {
+                *event.animation = if mod_api::__private::item_key_id(event.stack.item()).unwrap()
+                    == "minecraft:stick"
+                    || event.stack.components().is_some_and(|d| {
+                        d.as_nbt()
+                            .get(&"!minecraft:kinetic_weapon".into())
+                            .is_some()
+                    }) {
                     UseAnimation::Spear
                 } else {
                     UseAnimation::Drink
@@ -646,7 +648,7 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let mods: Mods = vec![ModEntry::new("animation", Box::new(Mod(calls.clone())))].into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_client_game(|game| {
                 for id in [
@@ -724,7 +726,7 @@ mod tests {
                 game.inventory[game.selected] =
                     Some(horizon_client::items::ItemStack::new("minecraft:bow", 1));
                 game.visible_hands[0].1 = game.inventory[game.selected].clone();
-                mod_api::__private::install_parts(&[]).unwrap();
+                crate::game::api_values::install_parts(&[]).unwrap();
                 game.resolve_parts().unwrap();
                 let (vanilla, _) = game.hand_geometry(0.0);
                 assert!(!overridden.is_empty());

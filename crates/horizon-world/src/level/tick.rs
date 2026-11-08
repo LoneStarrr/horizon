@@ -79,26 +79,25 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     }
                 }
                 Class::Coral => {
-                    if !self.coral_scan_for_water(pos) {
-                        if let Some(dead) = b.data(state).link {
-                            let next = b.default_of(dead);
-                            if self.level.allow_block_fade(pos, state, next) {
-                                self.set_block(pos, next, 2);
-                            }
+                    if !self.coral_scan_for_water(pos)
+                        && let Some(dead) = b.data(state).link
+                    {
+                        let next = b.default_of(dead);
+                        if self.level.allow_block_fade(pos, state, next) {
+                            self.set_block(pos, next, 2);
                         }
                     }
                 }
                 Class::CoralFan | Class::CoralPlant | Class::CoralWallFan => {
-                    if !self.coral_plant_scan_for_water(state, pos) {
-                        if let Some(dead) = b.data(state).link {
-                            let mut next =
-                                b.table.set_bool(b.default_of(dead), p.waterlogged, false);
-                            if class == Class::CoralWallFan {
-                                next = b.table.set_dir(next, p.facing, b.facing(state));
-                            }
-                            if self.level.allow_block_fade(pos, state, next) {
-                                self.set_block(pos, next, 2);
-                            }
+                    if !self.coral_plant_scan_for_water(state, pos)
+                        && let Some(dead) = b.data(state).link
+                    {
+                        let mut next = b.table.set_bool(b.default_of(dead), p.waterlogged, false);
+                        if class == Class::CoralWallFan {
+                            next = b.table.set_dir(next, p.facing, b.facing(state));
+                        }
+                        if self.level.allow_block_fade(pos, state, next) {
+                            self.set_block(pos, next, 2);
                         }
                     }
                 }
@@ -356,7 +355,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     if rules.spawn_mobs
                         && rules.spawn_monsters
                         && difficulty != 0
-                        && self.level.dimension() == horizon_core::dimension::Dimension::Overworld
+                        && self.level.dimension_type().nether_portal_spawns_piglin
                         && self.rand_int(2000) < difficulty
                     {
                         self.emit(LevelEvent::BlockEvent {
@@ -645,10 +644,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.remove_block(pos, false);
         }
         let below_state = self.below_state(pos);
-        let infiniburn = match self.level.dimension() {
-            horizon_core::dimension::Dimension::Overworld => &b.tags.infiniburn_overworld,
-            horizon_core::dimension::Dimension::Nether => &b.tags.infiniburn_nether,
-            horizon_core::dimension::Dimension::End => &b.tags.infiniburn_end,
+        let infiniburn = match self.level.dimension_type().infiniburn.as_str() {
+            "#minecraft:infiniburn_nether" => &b.tags.infiniburn_nether,
+            "#minecraft:infiniburn_end" => &b.tags.infiniburn_end,
+            _ => &b.tags.infiniburn_overworld,
         };
         let infini = b.in_set(below_state, infiniburn);
         let age = b.table.int(state, p.age);
@@ -787,7 +786,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             true
         };
         if self.rand_int(3) == 0 || fewer(self, pos, 4) {
-            let brightness = if self.level.dimension() == horizon_core::dimension::Dimension::End {
+            let brightness = if self.level.level_key() == super::LevelKey::END {
                 self.level.block_light(pos)
             } else {
                 self.max_local_raw_brightness(pos)
@@ -917,15 +916,14 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 .support_tag2
                 .as_ref()
                 .is_some_and(|tag| b.in_set(below_state, tag))
+            && let (Some(fruit), Some(stem)) = (data.link, data.link2)
         {
-            if let (Some(fruit), Some(stem)) = (data.link, data.link2) {
-                self.set_block_and_update(relative, b.default_of(fruit));
-                self.set_block_and_update(
-                    pos,
-                    b.table
-                        .set_dir(b.default_of(stem), b.props.facing, direction),
-                );
-            }
+            self.set_block_and_update(relative, b.default_of(fruit));
+            self.set_block_and_update(
+                pos,
+                b.table
+                    .set_dir(b.default_of(stem), b.props.facing, direction),
+            );
         }
     }
     /// `PitcherCropBlock.grow`.
@@ -1646,10 +1644,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         let chance = (older + 1) as f32 / (older + same + 1) as f32;
         let modifier = if own == 0 { 0.75 } else { 1.0 };
-        if self.random().next_float() < chance * chance * modifier {
-            if let Some(next) = self.copper_next(state) {
-                self.set_block_and_update(pos, next);
-            }
+        if self.random().next_float() < chance * chance * modifier
+            && let Some(next) = self.copper_next(state)
+        {
+            self.set_block_and_update(pos, next);
         }
     }
     /// `WeatheringCopper.getNext` by registry naming.
@@ -1810,7 +1808,7 @@ impl Behaviours {
         while let Ok(Some(tick)) = ticks.fluids.next_tick() {
             let mut sim = self.sim(level, ticks);
             let fluid = self.fluid(sim.state(tick.pos)).kind();
-            if TickTypeId(fluid as u32) == tick.kind {
+            if TickTypeId(fluid.tick_id()) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
         }
@@ -1859,7 +1857,7 @@ impl Behaviours {
             };
             let mut sim = self.sim(level, ticks);
             let fluid = self.fluid(sim.state(tick.pos)).kind();
-            if TickTypeId(fluid as u32) == tick.kind {
+            if TickTypeId(fluid.tick_id()) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
         } else {
@@ -1971,6 +1969,19 @@ impl Behaviours {
         struck: BlockPos,
     ) {
         self.sim(level, ticks).lightning_clear_copper(struck);
+    }
+    /// `ServerLevel.tickBlock` for the block at `pos` now, as a due tick from the queue runs it:
+    /// the level's say first (a mod block's part), else `BlockState.tick`. The queue is not
+    /// read or changed.
+    pub fn due_block_tick<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+        pos: BlockPos,
+    ) {
+        let mut sim = self.sim(level, ticks);
+        let state = sim.state(pos);
+        sim.tick_due_block(state, pos);
     }
     /// Run one scheduled block tick at `pos` immediately (no queue check).
     pub fn scheduled_block_tick<L: LevelAccess + ?Sized>(

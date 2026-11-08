@@ -12,9 +12,12 @@ use std::path::Path;
 
 /// The standalone models native mods asked for (`native_standalone_models`).
 static STANDALONE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-/// Test fixture shared with the resource-bake worker. Holders must request the same names.
+/// Test fixture shared with the resource-bake worker.
 static STANDALONE_FIXTURE: std::sync::Mutex<Option<(Vec<String>, usize)>> =
     std::sync::Mutex::new(None);
+
+#[cfg(feature = "test-support")]
+static FIXTURE_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn standalone_names(mut names: Vec<String>) -> Vec<String> {
     names.retain(|n| {
@@ -48,7 +51,7 @@ pub fn standalone() -> Vec<String> {
 }
 
 /// Installs standalone names until dropped, including on the bake worker, without sealing
-/// process registration. A second holder must request the same names.
+/// process registration. Other fixture holders wait until the active fixture finishes.
 #[cfg(feature = "test-support")]
 pub struct StandaloneFixture;
 
@@ -58,13 +61,12 @@ pub fn standalone_fixture(names: Vec<String>) -> StandaloneFixture {
     let mut fixture = STANDALONE_FIXTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match fixture.as_mut() {
-        Some((current, holders)) => {
-            assert_eq!(current, &names, "standalone fixture already set");
-            *holders += 1;
-        }
-        None => *fixture = Some((names, 1)),
+    while fixture.is_some() {
+        fixture = FIXTURE_CHANGED
+            .wait(fixture)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+    *fixture = Some((names, 1));
     StandaloneFixture
 }
 
@@ -78,6 +80,7 @@ impl Drop for StandaloneFixture {
             *holders -= 1;
             if *holders == 0 {
                 *fixture = None;
+                FIXTURE_CHANGED.notify_all();
             }
         }
     }

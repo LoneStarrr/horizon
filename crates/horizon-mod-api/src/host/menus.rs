@@ -15,7 +15,7 @@ pub trait MenusServerHost {
         rows: u8,
         title: Text,
         items: Vec<Option<ItemStack>>,
-    ) -> Option<i32>;
+    ) -> Result<Option<i32>, StackWriteError>;
     /// Side: server.
     /// Closes the player's native menu (a `native_menu_closed` follows).
     #[access(WorldOnly)]
@@ -75,6 +75,21 @@ pub trait MenusBackend {
     #[access(WorldOnly)]
     fn menu_slot_gives(&self, menu: MenuRef, slot: usize) -> Option<bool>;
 }
+/// The handles' client reads of the `menus` area, implemented by the game and reached through [`ClientBackend`].
+// hidden: a handle's backend, reached through `ClientBackend`; mods call the handle, never this trait
+#[doc(hidden)]
+#[horizon_mod_api_macros::host_area]
+pub trait MenusClientBackend {
+    /// Side: client.
+    /// The open inventory screen's slot boxes in menu slot order
+    /// (`AbstractContainerScreen.leftPos`/`topPos` plus each `Slot.x`/`Slot.y`, 16x16). A box
+    /// is `[x, y, width, height]` in GUI pixels, with `None` for a hidden slot.
+    /// Returns `None` for a stale menu, another screen, or an inventory covered
+    /// by the recipe book. The boxes follow the actual layout, including GUI
+    /// scale and the recipe book's horizontal offset.
+    #[access(WorldOnly)]
+    fn menu_slot_boxes(&self, menu: MenuRef) -> Option<Vec<Option<[f32; 4]>>>;
+}
 /// The handles' client writes of the `menus` area, implemented by the game and reached through [`ClientBackendMut`].
 // hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait
 #[doc(hidden)]
@@ -95,7 +110,7 @@ pub trait MenusClientBackendMut {
     /// (`AbstractContainerScreen.onClose`, `LocalPlayer.closeContainer`): the
     /// server is told (`ContainerClose`) and the screen goes. Refuses stale
     /// menus, non-client hosts and a menu whose screen is not open, such as
-    /// the inventory menu while playing.
+    /// the inventory menu while playing. A server closes a menu with `close_container`.
     #[access(WorldOnly)]
     fn menu_close(&mut self, menu: MenuRef) -> bool;
     /// Side: client.
@@ -109,4 +124,19 @@ pub trait MenusClientBackendMut {
     /// opened. True means sent, not that the menu took it.
     #[access(WorldOnly)]
     fn menu_click_button(&mut self, menu: MenuRef, button: i32) -> bool;
+}
+/// The handles' server writes of the `menus` area, implemented by the game and reached through [`Backend`].
+// hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait
+#[doc(hidden)]
+#[horizon_mod_api_macros::host_area]
+pub trait MenusBackendMut {
+    /// Side: server.
+    /// Close a player's open menu as `ServerPlayer.closeContainer` does, running the normal
+    /// lifecycle once: the container's lid, a vehicle's or a trade's stand-in, the crafting,
+    /// station and mount menus, the carried stack back to the inventory,
+    /// `player_container_close`, then the client's window closed (`ContainerClose`). Refuses
+    /// stale menus, clients, a player whose state is swapped in for a turn, and the player's own
+    /// inventory menu, which is never closed. A client closes its own screen with `close`.
+    #[access(WorldOnly)]
+    fn menu_close_container(&mut self, menu: MenuRef) -> bool;
 }

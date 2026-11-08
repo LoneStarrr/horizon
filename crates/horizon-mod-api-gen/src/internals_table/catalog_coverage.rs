@@ -255,6 +255,7 @@ fn prepare(stage: &Path, build: &Path) {
         .iter()
         .enumerate()
         .map(|(index, (entry, _))| internals_view::Injection {
+            id: format!("raw_{index}"),
             target: entry.path.clone(),
             at_return: false,
             listener: format!("raw_{index}"),
@@ -291,10 +292,12 @@ fn prepare(stage: &Path, build: &Path) {
             .replace("#![forbid(unsafe_code)]", "#![deny(unsafe_code)]"),
     )
     .unwrap();
-    let mut manifest = String::from("[native]\n");
+    let mut manifest = String::from(
+        "id='coverage'\nname='Coverage'\nversion='1.0.0'\napi='0.2'\nside='both'\ncapabilities=['registries']\n",
+    );
     for d in &declared {
         manifest.push_str(&format!(
-            "[[native.internals]]\npath = {:?}\nhash = {:?}\nkind = {:?}\n",
+            "[[internals]]\npath = {:?}\nhash = {:?}\nkind = {:?}\n",
             d.path,
             d.hash,
             d.kind.as_ref().unwrap()
@@ -302,10 +305,14 @@ fn prepare(stage: &Path, build: &Path) {
     }
     for injection in &raw {
         manifest.push_str(&format!(
-            "[[native.injection]]\ntarget = {:?}\nkind = \"HEAD\"\nraw = {:?}\n",
-            injection.target, injection.listener
+            "[[inject]]\nid = {:?}\nat = {:?}\nkind = \"head\"\naccess = \"internals\"\nhash = \"coverage\"\nwith = {:?}\n",
+            injection.id, injection.target, injection.listener
         ));
     }
+    manifest.push_str(&format!(
+        "[wasm]\nsha512='{:0<128}'\ntoolchain='1.99.1'\n",
+        ""
+    ));
     let manifest_path = build.join("coverage.toml");
     fs::write(&manifest_path, manifest).unwrap();
     let report = format!(

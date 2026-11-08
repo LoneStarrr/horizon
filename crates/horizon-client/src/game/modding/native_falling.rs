@@ -118,13 +118,45 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn falling_tick_preserves_its_owner_on_success_and_collision_error() {
         bound_falling_case(false, |game, _| {
+            assert!(game.spawn_remote_projectile(
+                72,
+                "minecraft:falling_block",
+                [4.5, 70.0, 0.5],
+                (0.0, 0.0),
+                [0.0; 3],
+                game.falling[0].state.0 as i32,
+            ));
+            let expected: Vec<_> = game.falling.iter().map(|f| (f.id, f.join)).collect();
             game.tick_one_falling(0, &[]).unwrap();
+            assert_eq!(
+                game.falling
+                    .iter()
+                    .map(|f| (f.id, f.join))
+                    .collect::<Vec<_>>(),
+                expected
+            );
             assert_eq!(game.falling[0].age, 1);
             assert!(game.falling[0].position.y < 70.0);
+            game.tick_one_falling(1, &[]).unwrap();
+            assert_eq!(
+                game.falling
+                    .iter()
+                    .map(|f| (f.id, f.join))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!([game.falling[0].age, game.falling[1].age], [1, 1]);
             // A corrupt resident palette makes the real collision lookup fail.
             Arc::make_mut(game.world.chunks.get_mut(&(0, 0)).unwrap()).set(0, 69, 0, 65_535);
             let position = game.falling[0].position;
             assert!(game.tick_one_falling(0, &[]).is_err());
+            assert_eq!(
+                game.falling
+                    .iter()
+                    .map(|f| (f.id, f.join))
+                    .collect::<Vec<_>>(),
+                expected
+            );
             assert_eq!(game.falling[0].position, position);
             assert_eq!(game.falling[0].age, 1);
         });

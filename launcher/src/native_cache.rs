@@ -1,6 +1,8 @@
 //! Disposable native compilation outputs only. Installed games and player data are never targets.
 //! Keep Cargo's profile directories and lock files in place: unlinking a locked inode would let
 //! another Cargo acquire a replacement lock while cleanup was still deleting its outputs.
+use cap_fs_ext::DirExt;
+use cap_std::fs::Dir;
 use std::fs::{self, File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 const PROFILES: [&str; 2] = ["fast", "release"];
 
 #[derive(Debug)]
-pub(crate) enum Error {
+pub enum Error {
     Busy,
     Unsafe(PathBuf),
     Io(io::Error),
@@ -22,13 +24,14 @@ impl From<io::Error> for Error {
 
 pub(crate) struct Cache {
     root: PathBuf,
+    directory: Dir,
     _lease: Locked,
 }
 
 /// A held lock that is released before its file closes. A child process spawned at that moment
 /// (Cargo, git) holds a copy of the descriptor until its exec, and closing ours alone would leave
 /// the lock taken through that copy: the next lease or cleanup would read Busy.
-struct Locked(File);
+pub(crate) struct Locked(File);
 
 impl Drop for Locked {
     fn drop(&mut self) {
@@ -36,7 +39,7 @@ impl Drop for Locked {
     }
 }
 
-fn linked(metadata: &Metadata) -> bool {
+pub(crate) fn linked(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -49,7 +52,7 @@ fn linked(metadata: &Metadata) -> bool {
     }
 }
 
-fn checked(path: &Path, directory: bool) -> Result<Option<Metadata>, Error> {
+pub(crate) fn checked(path: &Path, directory: bool) -> Result<Option<Metadata>, Error> {
     match fs::symlink_metadata(path) {
         Ok(meta)
             if linked(&meta)
@@ -75,6 +78,10 @@ fn lock(path: &Path) -> Result<Locked, Error> {
         .create(true)
         .truncate(false)
         .open(path)?;
+    locked(file)
+}
+
+pub(crate) fn locked(file: File) -> Result<Locked, Error> {
     file.try_lock().map_err(|error| match error {
         fs::TryLockError::WouldBlock => Error::Busy,
         fs::TryLockError::Error(error) => Error::Io(error),
@@ -109,12 +116,31 @@ impl Cache {
         let root = build_dir.canonicalize()?.join("native");
         checked(&root, true)?;
         fs::create_dir_all(&root)?;
-        let root = root.canonicalize()?;
+        let anchor = root.ancestors().last().expect("canonical root is absolute");
+        let mut directory = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
+        for component in root.strip_prefix(anchor).expect("root anchor").components() {
+            directory = directory.open_dir_nofollow(component.as_os_str())?;
+        }
         let lease = lock(&root.join(".build.lock"))?;
         Ok(Self {
             root,
+            directory,
             _lease: lease,
         })
+    }
+
+    /// Create and open cache subdirectories without following a redirected component.
+    pub(crate) fn directory(&self, parts: &[&str]) -> Result<Dir, Error> {
+        let mut directory = self.directory.try_clone()?;
+        for part in parts {
+            match directory.create_dir(part) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            directory = directory.open_dir_nofollow(part)?;
+        }
+        Ok(directory)
     }
 
     pub(crate) fn bytes(&self) -> Result<u64, Error> {

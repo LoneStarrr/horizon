@@ -1,7 +1,7 @@
 use super::identity::{CallIdentity, Refusal, Selection, select};
 use super::resolve::{Resolved, resolve};
 use super::*;
-use crate::{crossing::Rule, internals::Internal, points::file_points};
+use crate::{crossing::Rule, internals::Internal, points::file_functions};
 use quote::{ToTokens, format_ident, quote};
 use sha2::{Digest, Sha256};
 use syn::{FnArg, Type, spanned::Spanned};
@@ -88,10 +88,23 @@ pub fn rewrite(
     module: &str,
     entries: &[Internal],
     declarations: &[Declaration],
+    private: bool,
 ) -> Result<(String, Vec<Site>), Error> {
     let parsed = syn::parse_file(source)?;
     let mut functions = Vec::new();
-    file_points(module, &parsed.items, &|_| true, &mut functions);
+    file_functions(
+        module,
+        &parsed.items,
+        &|_| true,
+        &|attrs, sig| {
+            if private {
+                crate::points::source::eligible(attrs, sig)
+            } else {
+                point_shape::eligible(attrs, sig)
+            }
+        },
+        &mut functions,
+    );
     let rule = Rule::new(entries);
     let mut edits = BTreeMap::new();
     let mut claimed = BTreeMap::new();
@@ -101,28 +114,30 @@ pub fn rewrite(
         .collect();
     let offset = |at| crate::points::offset(source, &lines, at);
     for declaration in declarations {
+        let enclosing = match super::identity::enclosing(&declaration.target, entries, &rule) {
+            Ok(entry) => entry,
+            Err(Error {
+                cause: Cause::Missing(_),
+                ..
+            }) => continue,
+            Err(error) => return Err(error.at(declaration.origin.clone())),
+        };
         for found in functions
             .iter()
-            .filter(|f| plain_path(&f.target()) == declaration.target)
+            .filter(|f| plain_path(&f.target()) == plain_path(&enclosing.path))
         {
             let build = || -> Result<_, Error> {
                 let mut lexical = super::analysis::Scope::scan(found.sig, Some(found.body));
-                let enclosing = entries
-                    .iter()
-                    .find(|e| {
-                        plain_path(&e.path) == declaration.target
-                            && matches!(e.kind, "method" | "fn")
-                            && e.cfg.is_empty()
-                    })
-                    .ok_or(Cause::Missing(
-                        "enclosing function is not in the internals catalog",
-                    ))?;
                 let written = super::analysis::calls(found.body, &declaration.selector);
                 let paths = written
                     .iter()
                     .map(|expr| {
                         super::resolve::callee(expr, enclosing, found.sig, &lexical, entries, &rule)
-                            .map(|c| plain_path(&c.callee.path))
+                            .and_then(|c| {
+                                super::identity::nominal(c.callee, &rule).ok_or_else(|| {
+                                    Cause::Missing("unresolved nominal callee owner").into()
+                                })
+                            })
                     })
                     .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
                 if paths.len() > 1 {
@@ -136,7 +151,10 @@ pub fn rewrite(
                     .into_iter()
                     .filter(|expr| {
                         super::resolve::callee(expr, enclosing, found.sig, &lexical, entries, &rule)
-                            .is_ok_and(|c| plain_path(&c.callee.path) == path)
+                            .is_ok_and(|c| {
+                                super::identity::nominal(c.callee, &rule).as_deref()
+                                    == Some(path.as_str())
+                            })
                     })
                     .collect::<Vec<_>>();
                 if calls.is_empty() && declaration.ctx.is_empty() {
@@ -176,6 +194,11 @@ pub fn rewrite(
                         return Err(Cause::Identity(Refusal::Lost).into());
                     }
                 };
+                if private && declaration.selector != path {
+                    return Err(
+                        Cause::Signature("source requests require the canonical callee").into(),
+                    );
+                }
                 let expr = calls[index];
                 let Resolved {
                     callee,
@@ -207,7 +230,11 @@ pub fn rewrite(
                         call.args = arg_fields.into_iter().collect();
                     }
                     Expr::Call(call) => {
-                        call.args = arg_fields.into_iter().collect();
+                        call.args = receiver
+                            .map(|_| syn::parse_quote!(#recv))
+                            .into_iter()
+                            .chain(arg_fields)
+                            .collect();
                     }
                     _ => unreachable!(),
                 }
@@ -264,12 +291,12 @@ pub fn rewrite(
                     hash: digest(format!(
                         "{}|{}|{}|{}|{nth}|{same}|{}",
                         enclosing.signature,
-                        plain_path(&callee.path),
+                        path,
                         callee.signature,
                         expr.to_token_stream(),
                         call_context(found.body, expr)
                     )),
-                    call: plain_path(&callee.path),
+                    call: path,
                     ctx: contexts[index].clone(),
                     listener: format!("{}::{listener}", found.module),
                     record: format!("{}::{record}", found.module),

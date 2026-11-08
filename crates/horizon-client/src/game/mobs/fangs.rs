@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(super) struct Fangs {
+    pub(in crate::game) join: horizon_client::join_seq::JoinSeq,
     pub id: u32,
     pub pos: [f64; 3],
     pub yaw: f32,
@@ -19,6 +20,9 @@ pub(super) struct Fangs {
     /// `Entity.random`. The attack sound's pitch is its first draw.
     random: LegacyRandom,
 }
+
+horizon_client::impl_joined!(Fangs);
+
 /// `EvokerFangs.handleEntityEvent`: `nextFloat() * 0.2 + 0.85`.
 pub(super) fn fang_attack_pitch(random: &mut impl RandomSource) -> f32 {
     random.next_float() * 0.2 + 0.85
@@ -51,6 +55,7 @@ impl Game<'_> {
             self.fangs.model = self.entity_models.evoker_fangs.clone();
         }
         self.fangs.list.push(Fangs {
+            join: Default::default(),
             id,
             pos: at,
             yaw,
@@ -134,7 +139,7 @@ impl Game<'_> {
 
     /// `EvokerFangs.tick`.
     pub(super) fn tick_fangs(&mut self) {
-        let mut list = self.fangs.list.take();
+        let mut list = self.fangs.list.lift();
         #[cfg(test)]
         super::entity::taken_pass_tests::after_take(self);
         list.retain_mut(|f| {
@@ -159,7 +164,9 @@ impl Game<'_> {
             f.life -= 1;
             f.life >= 0
         });
-        self.fangs.list.restore(list);
+        self.fangs
+            .list
+            .restore(list, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
     }
     /// `dealDamageTo` everything alive in the fangs' box (0.5 x 0.8,
     /// inflated 0.2 sideways) but the evoker's allies.
@@ -255,7 +262,7 @@ impl Game<'_> {
         &self,
         camera: glam::DVec3,
         alpha: f64,
-        out: &mut Vec<mod_api::render::Vertex>,
+        out: &mut Vec<mod_render::render::Vertex>,
     ) {
         let Some(model) = self.fangs.model.as_ref() else {
             return;

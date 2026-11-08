@@ -92,6 +92,12 @@ impl ProtoSnapshot<'_> {
 pub trait ChunkGenerator: Send + Sync + 'static {
     type Worker: Send + 'static;
     fn worker(&self) -> Self::Worker;
+    /// The persistent wrapper supplies starts from their owning chunk, in every dimension.
+    fn set_saved_starts(
+        &self,
+        _source: Arc<horizon_world::worldgen::generator::SavedStructureStarts>,
+    ) {
+    }
     fn lod_sampler(self: Arc<Self>) -> Box<dyn LodSampler>
     where
         Self: Sized,
@@ -310,6 +316,7 @@ struct MeshSettings {
     blend_radius: i32,
     smooth_lighting: bool,
     cutout_leaves: bool,
+    opaque_ice: bool,
     translucent_layers: Arc<[bool]>,
     leaf_culling: LeafCullingMode,
 }
@@ -622,6 +629,8 @@ pub struct Streaming {
     /// The `ao` and `cutoutLeaves` options.
     pub smooth_lighting: bool,
     pub cutout_leaves: bool,
+    /// Draw regular ice opaque in the solid pass (`Mesher::opaque_ice`).
+    pub opaque_ice: bool,
     /// Sprite layers a shader pack draws in the translucent pass (`[[materials]]
     /// translucent`), by layer; empty without one.
     pub translucent_layers: Arc<[bool]>,
@@ -1089,6 +1098,7 @@ impl<G: ChunkGenerator> Jobs<G> {
                     blend_radius: settings.blend_radius,
                     smooth_lighting: settings.smooth_lighting,
                     cutout_leaves: settings.cutout_leaves,
+                    opaque_ice: settings.opaque_ice,
                     translucent_layers: &settings.translucent_layers,
                     leaf_culling: settings.leaf_culling,
                     hidden_states: &context.hidden_states,
@@ -1208,6 +1218,7 @@ impl Streaming {
             biome_blend: 2,
             smooth_lighting: true,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: Arc::from([]),
             leaf_culling: LeafCullingMode::Off,
             light_tables,
@@ -1229,18 +1240,29 @@ impl Streaming {
     pub fn lod_source(&self) -> Arc<dyn LodSource> {
         self.saves.clone()
     }
-    /// Resource packs reloaded (`LevelRenderer.allChanged`): mesh with the new
+    /// Resource packs reloaded (`LevelExtractor.allChanged`): mesh with the new
     /// models and sprites, and rebuild every loaded section. Meshes in flight
     /// were made with the old resources; their results are dropped.
     pub fn reload_resources(&mut self, world: &mut World, context: Arc<WorkerContext>) {
         *self.shared.context.write().unwrap() = context;
+        self.reload_sections(world);
+    }
+    /// `LevelExtractor.allChanged`: discard mesh work made before the reload and
+    /// rebuild every loaded, lit section.
+    pub fn reload_sections(&mut self, world: &mut World) {
         self.meshing.clear();
         self.compile_started.clear();
+        Self::mark_loaded_sections_dirty(world, &self.lit);
+    }
+    /// The resident sections `LevelExtractor.allChanged` queues again. An
+    /// unlit column will queue itself when its light job completes.
+    fn mark_loaded_sections_dirty(world: &mut World, lit: &FxHashSet<(i32, i32)>) {
         for &(x, z) in world.chunks.keys() {
-            if self.lit.contains(&(x, z)) {
-                for sy in 0..world.layout().sections() as i32 {
-                    world.dirty_sections.insert((x, sy, z));
-                }
+            if !lit.contains(&(x, z)) {
+                continue;
+            }
+            for sy in 0..world.layout().sections() as i32 {
+                world.dirty_sections.insert((x, sy, z));
             }
         }
     }
@@ -2281,6 +2303,7 @@ impl Streaming {
                             blend_radius: self.biome_blend,
                             smooth_lighting: self.smooth_lighting,
                             cutout_leaves: self.cutout_leaves,
+                            opaque_ice: self.opaque_ice,
                             translucent_layers: self.translucent_layers.clone(),
                             leaf_culling: self.leaf_culling,
                         },
@@ -5017,5 +5040,40 @@ mod cover_tests {
                 time(&ranges(Some(&cover))),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn reload_marks_every_section_of_loaded_lit_columns() {
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        world.chunks.insert((2, -3), Arc::new(Chunk::empty(2, -3)));
+        world.chunks.insert((4, 5), Arc::new(Chunk::empty(4, 5)));
+        let lit = FxHashSet::from_iter([(2, -3), (99, 99)]);
+
+        Streaming::mark_loaded_sections_dirty(&mut world, &lit);
+
+        let sections = world.layout().sections() as i32;
+        assert_eq!(world.dirty_sections.len(), sections as usize);
+        for sy in 0..sections {
+            assert!(world.dirty_sections.contains(&(2, sy, -3)));
+            assert!(!world.dirty_sections.contains(&(4, sy, 5)));
+        }
+    }
+
+    #[test]
+    fn reload_keeps_existing_work_and_ignores_unloaded_lit_columns() {
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        world.chunks.insert((4, 5), Arc::new(Chunk::empty(4, 5)));
+        world.dirty_sections.insert((4, 3, 5));
+        let lit = FxHashSet::from_iter([(99, 99)]);
+
+        Streaming::mark_loaded_sections_dirty(&mut world, &lit);
+
+        assert_eq!(world.dirty_sections.len(), 1);
+        assert!(world.dirty_sections.contains(&(4, 3, 5)));
     }
 }

@@ -24,8 +24,9 @@ struct Stick;
 #[mod_api::horizon_part]
 impl ItemPart for Stick {
     fn use_item(&self, host: &mut dyn ServerHost, event: &mut UseItemEvent<'_>) -> Flow {
+        let item = event.stack.item().id(host);
         host.messages()
-            .broadcast(Text::literal(format!("a {} was used", event.stack.item)));
+            .broadcast(Text::literal(format!("a {item} was used")));
         Flow::Continue
     }
 }
@@ -100,6 +101,13 @@ impl Hooks for Mod {
             ),
             Err(FluidStateError::Duplicate(1))
         );
+        let properties = service.type_properties(water).expect("water properties");
+        assert_eq!(properties.description_id, "block.minecraft.water");
+        assert_eq!(properties.light_level, 3);
+        assert_eq!(properties.fall_distance_modifier, 0.25);
+        assert!(properties.can_push_entity && properties.can_drown && properties.can_hydrate);
+        assert!(!properties.can_swim && !properties.can_extinguish && !properties.supports_boating);
+        assert_eq!(service.type_properties(chocolate), None);
         assert_eq!(
             service.definition(chocolate),
             Some(FluidDefinition::TankOnly)

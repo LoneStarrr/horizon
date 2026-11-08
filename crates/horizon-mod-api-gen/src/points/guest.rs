@@ -82,6 +82,7 @@ mod tests {
             returns: "none",
             at_return: true,
             raw: false,
+            raw_shape: None,
             listener: None,
             return_listener: None,
             record_item: String::new(),

@@ -349,8 +349,6 @@ pub struct Hub {
     /// The active world session rule definitions.
     pub rule_registry: Arc<crate::gamerules::RuleRegistry>,
     pub ticks: u64,
-    /// The next `Guest.vehicle_order`: a rider that boards later sits behind.
-    pub seat_order: u64,
     /// `Level.soundSeedGenerator`: a fresh `nextLong` per `playSound`.
     pub(super) sound_seeds: Mutex<LegacyRandom>,
     pub(super) sound_order: Mutex<super::sound_order::SoundOrder>,
@@ -386,6 +384,9 @@ pub struct Hub {
     /// (`native_set_nickname`), by UUID. Their real name stays everywhere
     /// else: the log, commands, the hover of the shown name.
     pub nicknames: std::collections::HashMap<u128, String>,
+    /// The name the server's user cache knew a joining player by, by UUID, looked up before the
+    /// cache learns the new one (PlayerList.placeNewPlayer's `oldName`); taken by the join line.
+    pub former_names: std::collections::HashMap<u128, String>,
     last_clock: i64,
     last_rate: f32,
     ticking: (f32, bool),
@@ -585,6 +586,26 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// PlayerList.placeNewPlayer's join line: `multiplayer.player.joined`, or
+    /// `multiplayer.player.joined.renamed` with the cached old name when the
+    /// player's name changed (ignoring case) since the user cache last saw it.
+    fn joined_line(&mut self, uuid: u128, name: &str) -> Tag {
+        let display = self.player_display_name(uuid, name);
+        match self
+            .former_names
+            .remove(&uuid)
+            .filter(|old| !old.eq_ignore_ascii_case(name))
+        {
+            Some(old) => yellow_names(
+                "multiplayer.player.joined.renamed",
+                vec![display, string(&old)],
+            ),
+            None => yellow_names("multiplayer.player.joined", vec![display]),
+        }
+    }
+}
+
 /// A yellow translation of player names (`multiplayer.player.joined`).
 fn yellow_names(key: &str, names: Vec<Tag>) -> Tag {
     Tag::compound([
@@ -738,8 +759,7 @@ impl Hub {
             sync,
             rule_registry: crate::gamerules::rule_registry(),
             ticks: 0,
-            seat_order: 0,
-            sound_seeds: Mutex::new(LegacyRandom::new(crate::sound_engine::unique_seed())),
+            sound_seeds: Mutex::new(crate::random_source::create()),
             sound_order: Mutex::default(),
             immediate_respawn: false,
             reduced_debug_info: false,
@@ -789,6 +809,7 @@ impl Hub {
             hidden: Default::default(),
             teams: Vec::new(),
             nicknames: std::collections::HashMap::new(),
+            former_names: std::collections::HashMap::new(),
         }
     }
 
@@ -1083,7 +1104,8 @@ impl Hub {
         }));
     }
     /// ListPlayersCommand's reply: the players in join order (the host of a
-    /// LAN world first), as display names or names with ids, joined by
+    /// LAN world first), as display names (Player.getDisplayName, with the
+    /// team's colour and affixes) or names with ids, joined by
     /// gray commas (ComponentUtils.formatList).
     pub fn list_reply(&self, uuids: bool) -> Tag {
         let players: Vec<(u128, &str)> = self
@@ -1103,7 +1125,7 @@ impl Hub {
                     ),
                 ])
             } else {
-                display_name(&self.loop_context, uuid, name)
+                self.player_display_name(uuid, name)
             }
         };
         let names = match players.len() {
@@ -1516,10 +1538,7 @@ impl Hub {
         // not placed.
         if !held {
             let joined = C::SystemChat(play::SystemChat {
-                content: yellow_names(
-                    "multiplayer.player.joined",
-                    vec![self.player_display_name(self.guests[i].uuid, &name)],
-                ),
+                content: self.joined_line(uuid, &name),
                 overlay: false,
             })
             .encode();
@@ -1706,10 +1725,7 @@ impl Hub {
         };
         if announce {
             let joined = C::SystemChat(play::SystemChat {
-                content: yellow_names(
-                    "multiplayer.player.joined",
-                    vec![self.player_display_name(uuid, &name)],
-                ),
+                content: self.joined_line(uuid, &name),
                 overlay: false,
             })
             .encode();
@@ -2022,7 +2038,7 @@ impl Hub {
                     permission,
                     dedicated,
                     &self.sync.builtin,
-                    &self.mod_commands.0,
+                    &super::commands::with_session_tools(&self.mod_commands.0),
                     &self.sync.features,
                     &self.rule_registry,
                 )
@@ -2309,6 +2325,7 @@ impl Hub {
                 NetEvent::Packet(conn, packet, bytes) => {
                     let exceeded =
                         self.update_guest(conn, |g| {
+                            g.sender.undrained.taken(bytes);
                             // A kicked player's packets wait for nothing.
                             if !g.left_reason.is_empty() {
                                 return false;
@@ -2931,7 +2948,10 @@ impl Hub {
     /// PlayerChunkSender.sendNextChunks' choice: ready chunks, closest first,
     /// as many as the batch quota the client's acknowledgements pace allows,
     /// with their places in the queue. What the view leaves of the quota goes
-    /// to the far ring, as far as its brake lets it reach.
+    /// to the far ring, as far as its brake lets it reach. A memory connection
+    /// that has not loaded yet sends every ready view column in that one
+    /// batch; the quota recorded for it covers them, so the tick after
+    /// `PlayerLoaded` is capped again.
     fn next_batch<'w>(
         &mut self,
         i: usize,
@@ -2949,6 +2969,10 @@ impl Hub {
             Some(g.batch_quota.floor() as usize)
         })?;
         let g = &self.guests[i];
+        // The integrated server's own player, still on the loading screen.
+        // LAN guests and a client that has loaded keep the quota above.
+        let burst = g.address == super::conn::MEMORY_ADDRESS && !g.loaded;
+        let near_take = if burst { g.chunk_queue.len() } else { budget };
         // ChunkStatus.LIGHT needs its neighbours at INITIALIZE_LIGHT: a
         // column whose light layers would leave one out waits for it.
         let ready = |c: &Chunk| {
@@ -2969,11 +2993,12 @@ impl Hub {
             .enumerate()
             .filter_map(|(idx, key)| Some((idx, &**world.chunks.get(key)?)))
             .filter(|(_, c)| ready(c))
-            .take(budget)
+            .take(near_take)
             .collect();
         let mut far = Vec::new();
         if let (Some(ring), Some((cx, cz))) = (self.far.as_mut(), g.center) {
-            let mut left = budget - near.len();
+            // What the view left of the vanilla quota. A first-view burst can take more than that.
+            let mut left = budget.saturating_sub(near.len());
             for (idx, &(x, z)) in g.far_queue.iter().enumerate().take(super::far::LOOKS) {
                 if left == 0 {
                     break;
@@ -2993,6 +3018,13 @@ impl Hub {
                 left -= usize::from(column.is_some());
                 far.push((idx, column));
             }
+        }
+        // `update_chunks` subtracts the batch. Covering the near columns keeps that from going
+        // negative, so the next tick's `.min(chunks_per_tick)` cap holds again.
+        if burst {
+            self.guests.update(i, |g| {
+                g.batch_quota = g.batch_quota.max(near.len() as f32);
+            });
         }
         (!near.is_empty() || !far.is_empty()).then_some(Batch { near, far })
     }
@@ -3150,8 +3182,14 @@ impl Hub {
             return;
         };
         if !bulk.is_empty() {
-            // (what changed in them one at a time went with them)
-            log.retain(|p| bulk.binary_search(&(p.0 >> 4, p.2 >> 4)).is_err());
+            // (what changed in them one at a time went with them, but for one-shot fields: a chunk has none)
+            log.retain(|p| {
+                bulk.binary_search(&(p.0 >> 4, p.2 >> 4)).is_err()
+                    || matches!(
+                        world.block_entities.get(p),
+                        Some(crate::containers::BlockEntity::Mod(m)) if m.has_client_update_fields()
+                    )
+            });
         }
         if log.is_empty() {
             return;
@@ -3235,7 +3273,7 @@ impl Hub {
                 }
                 // A decorated pot is no block entity: its tag is the chunk's saved one.
                 let tag = match world.block_entities.get(&(x, y, z)) {
-                    Some(entity) => self.encoder.update_tag((x, y, z), entity),
+                    Some(entity) => self.encoder.change_tag((x, y, z), entity),
                     None => world
                         .chunks
                         .get(&(x >> 4, z >> 4))
@@ -3461,6 +3499,8 @@ impl Hub {
             vertical_collision: false,
             horizontal_collision: false,
             needs_sync: false,
+            sync_position: false,
+            stepped: false,
             idle: false,
             bare: false,
             minecart_steps: None,
@@ -4504,10 +4544,15 @@ impl Hub {
                 // bow's arrow, a trident, a spear) and a stab use the player's
                 // position and known movement now (#8423): shot after the move, an
                 // arrow left the position of the tick after the release, a tick
-                // ahead of the camera's instead of a tick behind it.
+                // ahead of the camera's instead of a tick behind it. A STAB (8) does
+                // not hold the move: held a tick, the jump the move carries
+                // (handlePlayerPositionChange's jumpFromGround) ran a tick after the
+                // Lunge's impulse, and the server took two moves in the next tick
+                // (lunge_motion, every jump phase).
                 S::PlayerAction(p) => {
+                    let stab = p.action == 8;
                     events.push(HostEvent::Packet(conn, Box::new(S::PlayerAction(p))));
-                    held = self.move_queued(i);
+                    held = !stab && self.move_queued(i);
                 }
                 // handleUseItem uses the player's position and known movement now:
                 // a later move must not overtake a throw before the game runs it.
@@ -5366,10 +5411,10 @@ fn wrap_degrees(degrees: f32) -> f32 {
 const PACKETS_PER_TICK: usize = 400;
 /// The packets a player may have waiting (a second of its budget) before it is
 /// disconnected, as vanilla's rate-limit does: no real client gets near it.
-const INBOX_LIMIT: usize = 20 * PACKETS_PER_TICK;
+pub(crate) const INBOX_LIMIT: usize = 20 * PACKETS_PER_TICK;
 /// The same in bytes on the wire: 8000 full books would hold gigabytes. A
 /// real client's largest packets (a 100-page book) are a few hundred kB.
-const INBOX_BYTES: usize = 16 << 20;
+pub(crate) const INBOX_BYTES: usize = 16 << 20;
 
 /// The `minecraft:gravity` attribute of a player.
 const PLAYER_GRAVITY: f64 = 0.08;
@@ -5501,6 +5546,119 @@ mod tests {
     use super::*;
     use crate::fast_hash::FxHashSet;
 
+    /// Queued one-shot fields wait out a change nobody sees, go in one built tag to
+    /// every viewer, and are not sent again; a column sent whole doesn't lose them.
+    #[test]
+    fn client_update_fields_reach_every_viewer_once_and_wait_without_viewers() {
+        use crate::block_entity_types::BlockEntityTypes;
+        use crate::containers::{BlockEntity, ModBlockEntity, ModBlockEntityFields};
+        use horizon_core::nbt::{Compound, JavaString};
+        use std::sync::atomic::AtomicUsize;
+        static BUILT: AtomicUsize = AtomicUsize::new(0);
+        let (mut hub, first) = hub_with_a_guest();
+        let builtin = horizon_protocol::registry::Builtin::parse(
+            r#"{"minecraft:block_entity_type":{"entries":{"test:machine":{"protocol_id":49}}}}"#,
+        )
+        .unwrap();
+        let types = BlockEntityTypes::new(
+            [("test:machine".into(), "test:machine".into())].into(),
+            builtin
+                .get("minecraft:block_entity_type")
+                .unwrap()
+                .names
+                .clone(),
+        );
+        let states = ["minecraft:air", "test:machine"].map(|n| (Arc::<str>::from(n), false, None));
+        hub.encoder = ChunkEncoder::with_types(states, &builtin, &[], &[], Some(&types));
+        hub.encoder.mod_update_tag = Some(|_, entity| {
+            BUILT.fetch_add(1, Ordering::Relaxed);
+            Some(entity.nbt.clone())
+        });
+        let pos = (1, 64, 3);
+        let progress = (JavaString::from("progress"), Tag::Int(7));
+        let effect = (JavaString::from("effect"), Tag::Int(23));
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.set(pos.0, pos.1, pos.2, 1);
+        world.chunks.insert((0, 0), Arc::new(chunk));
+        let machine = ModBlockEntity::new(
+            "test:machine".into(),
+            ModBlockEntityFields {
+                nbt: Compound::from([progress.clone()]),
+                ..Default::default()
+            },
+        );
+        let revision = machine.revision();
+        machine.set_client_update_fields(Compound::from([effect.clone()]));
+        world
+            .block_entities
+            .insert(pos, BlockEntity::Mod(Box::new(machine)));
+        world.block_log = Some(vec![pos]);
+        // Nobody has the chunk yet: no tag is built, and the fields wait.
+        hub.broadcast_block_changes(&mut world);
+        assert_eq!(BUILT.load(Ordering::Relaxed), 0);
+        assert!(first.try_recv().is_err());
+        hub.guests.update(0, |g| _ = g.sent_chunks.insert((0, 0)));
+        let (tx, second) = std::sync::mpsc::channel();
+        let mut other = Guest::new(
+            crate::lan::Joined {
+                conn: 2,
+                uuid: 2,
+                name: "Ada".into(),
+                properties: Vec::new(),
+                info: horizon_protocol::packets::configuration::ClientInformation::new(8),
+                brand: "vanilla".into(),
+                sender: crate::lan::PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                address: "127.0.0.1:25566".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 64.0, 0.5],
+            8,
+        );
+        other.placed = true;
+        other.dimension = "minecraft:overworld".into();
+        other.sent_chunks.insert((0, 0));
+        hub.guests.push(other);
+        let tags = |rx: &std::sync::mpsc::Receiver<crate::lan::Out>| {
+            let mut tags = Vec::new();
+            while let Ok(out) = rx.try_recv() {
+                let crate::lan::Out::Packet(body) = out else {
+                    continue;
+                };
+                let mut r = horizon_protocol::buf::Reader::new(&body);
+                let id = r.varint().unwrap();
+                if let Ok(C::BlockEntityData(packet)) = C::decode(id, r.rest()) {
+                    assert_eq!(packet.pos, [pos.0, pos.1, pos.2]);
+                    tags.push(packet.tag);
+                }
+            }
+            tags
+        };
+        // The column goes whole in the same broadcast: the change is kept for the fields.
+        world.bulk_log.insert((0, 0));
+        world.block_log.as_mut().unwrap().extend([pos, pos]);
+        hub.broadcast_block_changes(&mut world);
+        let once = Tag::Compound(Compound::from([progress.clone(), effect]));
+        for viewer in [&first, &second] {
+            assert_eq!(tags(viewer), std::slice::from_ref(&once));
+        }
+        let built = BUILT.load(Ordering::Relaxed);
+        world.block_log.as_mut().unwrap().push(pos);
+        hub.broadcast_block_changes(&mut world);
+        let plain = Tag::Compound(Compound::from([progress.clone()]));
+        for viewer in [&first, &second] {
+            assert_eq!(tags(viewer), std::slice::from_ref(&plain));
+        }
+        assert_eq!(BUILT.load(Ordering::Relaxed), built + 1);
+        let BlockEntity::Mod(machine) = &world.block_entities[&pos] else {
+            unreachable!();
+        };
+        assert_eq!(machine.revision(), revision);
+        assert_eq!(machine.nbt, Compound::from([progress]));
+    }
+
     /// A hub with one placed guest, the speed effect registered, and what the
     /// guest is sent.
     fn hub_with_a_guest() -> (Hub, std::sync::mpsc::Receiver<crate::lan::Out>) {
@@ -5510,6 +5668,64 @@ mod tests {
             horizon_protocol::registry::Ids::from_names(vec!["minecraft:speed".to_string()]),
         );
         hub_with_sync(sync)
+    }
+
+    #[test]
+    fn modprofile_guest_tree_survives_refresh_with_permissions() {
+        for level in 0..=4 {
+            let mut sync = SyncData::empty();
+            sync.commands = Some(crate::lan::commands::CommandTree {
+                root: serde_json::json!({"type":"root","children":{}}),
+            });
+            let (mut hub, rx) = hub_with_sync(sync);
+            hub.guests.update(0, |guest| guest.permission = level);
+            for refresh in [false, true] {
+                if refresh {
+                    hub.set_mod_commands(7, serde_json::json!({"children":{"plugin":{"type":"literal","executable":true}}}));
+                } else {
+                    hub.send_commands(0);
+                }
+                let crate::lan::Out::Packet(body) = rx.try_recv().unwrap() else {
+                    panic!("packet");
+                };
+                let mut reader = horizon_protocol::buf::Reader::new(&body);
+                let id = reader.varint().unwrap();
+                let play::Clientbound::Commands(packet) =
+                    play::Clientbound::decode(id, &body[reader.position()..]).unwrap()
+                else {
+                    panic!("commands");
+                };
+                let root = &packet.nodes[packet.root as usize];
+                let profile = root
+                    .children
+                    .iter()
+                    .map(|&i| &packet.nodes[i as usize])
+                    .find(|n| n.name == "modprofile");
+                if level < 3 {
+                    assert!(profile.is_none());
+                } else {
+                    let profile = profile.expect("admins receive modprofile on join and refresh");
+                    assert!(profile.restricted && !profile.executable);
+                    let actions: Vec<_> = profile
+                        .children
+                        .iter()
+                        .map(|&i| {
+                            let node = &packet.nodes[i as usize];
+                            assert!(node.executable);
+                            node.name.as_str()
+                        })
+                        .collect();
+                    assert_eq!(actions, ["report", "start", "stop"]);
+                }
+                if refresh {
+                    assert!(
+                        root.children
+                            .iter()
+                            .any(|&i| packet.nodes[i as usize].name == "plugin")
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6848,11 +7064,10 @@ mod tests {
         );
     }
 
-    /// #8423: a RELEASE_USE_ITEM shoots from the player's position and known
-    /// movement of the last move the server handled; the move the client sent
-    /// after it waits for the next tick, as vanilla handles the two in order.
-    #[test]
-    fn a_release_shoots_before_the_move_behind_it() {
+    /// Drains guest 0's inbox holding a player action (`action`) and the move
+    /// its client sent after it in the same client tick: the packets handed to
+    /// the game, and the guest's position and known movement before.
+    fn drain_action_then_move(action: i32) -> (Hub, Vec<S>, ([f64; 3], [f64; 3])) {
         let (mut hub, _rx) = hub_with_a_guest();
         let before = (hub.guests[0].position, hub.guests[0].known_movement);
         hub.guests.update(0, |guest| {
@@ -6860,7 +7075,7 @@ mod tests {
             let inbox = &mut guest.inbox;
             inbox.push_back((
                 S::PlayerAction(play::PlayerAction {
-                    action: 6,
+                    action,
                     pos: [0; 3],
                     direction: 0,
                     sequence: 0,
@@ -6895,14 +7110,23 @@ mod tests {
             border: &border,
             streaming: None,
         };
-        let events = hub.drain_packets(&mut ctx);
-        let handled: Vec<&S> = events
-            .iter()
+        let handled = hub
+            .drain_packets(&mut ctx)
+            .into_iter()
             .filter_map(|e| match e {
-                HostEvent::Packet(_, p) => Some(&**p),
+                HostEvent::Packet(_, p) => Some(*p),
                 _ => None,
             })
             .collect();
+        (hub, handled, before)
+    }
+
+    /// #8423: a RELEASE_USE_ITEM shoots from the player's position and known
+    /// movement of the last move the server handled; the move the client sent
+    /// after it waits for the next tick, as vanilla handles the two in order.
+    #[test]
+    fn a_release_shoots_before_the_move_behind_it() {
+        let (hub, handled, before) = drain_action_then_move(6);
         assert!(
             matches!(handled[..], [S::PlayerAction(_)]),
             "the game was handed {handled:?}"
@@ -6920,6 +7144,20 @@ mod tests {
             before,
             "the shot's position"
         );
+    }
+
+    /// A STAB's move runs in the same tick: held for the next one, the jump it
+    /// carries came a tick after the Lunge's impulse (lunge_motion).
+    #[test]
+    fn a_stab_keeps_the_move_behind_it_in_its_tick() {
+        let (hub, handled, before) = drain_action_then_move(8);
+        assert!(
+            matches!(handled[..], [S::PlayerAction(_)]),
+            "the game was handed {handled:?}"
+        );
+        let g = &hub.guests[0];
+        assert!(g.inbox.is_empty(), "the move waited for the next tick");
+        assert_eq!(g.position[0], before.0[0] + 0.3, "the move was not handled");
     }
 
     /// The owner's own shoulder parrots are sent when a slot changes.
@@ -7329,5 +7567,143 @@ mod tests {
             let _ = hub.remove_guest(0, "bye");
             assert_eq!(watches(&mut hub), run(Unwatch, "minecraft:the_nether"));
         });
+    }
+
+    /// A single-player memory connection sends every ready view column before
+    /// `PlayerLoaded`. After that, on a respawn, and for a socket guest, the
+    /// batch is `chunks_per_tick` again (64). An unlit column stays out, and
+    /// the gates that send nothing still do.
+    #[test]
+    fn memory_connection_first_view_sends_every_ready_column() {
+        let (mut hub, _rx) = hub_with_a_guest();
+        hub.ticks = 3;
+        {
+            hub.guests.update(0, |g| {
+                g.chunks_per_tick = 64.0;
+                g.batch_quota = 0.0;
+                g.address = crate::lan::conn::MEMORY_ADDRESS;
+                g.loaded = false;
+            });
+        }
+        // The unlit column first, then 80 lit ones (`floor_at`'s empty column, lit).
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut dark = crate::chunk::Chunk::empty(100, 100);
+        dark.lit = false;
+        world.chunks.insert((100, 100), std::sync::Arc::new(dark));
+        hub.guests.update(0, |g| {
+            g.chunk_queue.push((100, 100));
+        });
+        for i in 0..80 {
+            let (x, z) = (i % 16, i / 16);
+            let mut chunk = crate::chunk::Chunk::empty(x, z);
+            chunk.lit = true;
+            world.chunks.insert((x, z), std::sync::Arc::new(chunk));
+            hub.guests.update(0, |g| {
+                g.chunk_queue.push((x, z));
+            });
+        }
+
+        let batch = hub
+            .next_batch(0, &world, None)
+            .expect("the first view sends");
+        assert_eq!(
+            batch.near.len(),
+            80,
+            "every ready column leaves in one batch"
+        );
+        assert!(
+            batch.near.iter().all(|(_, c)| c.lit),
+            "an unlit column is not ready"
+        );
+        assert!(batch.far.is_empty());
+        assert!(hub.guests[0].batch_quota >= 80.0);
+
+        hub.guests.update(0, |g| {
+            g.loaded = true;
+        });
+        let loaded = hub
+            .next_batch(0, &world, None)
+            .expect("a loaded client still receives chunks");
+        assert_eq!(loaded.near.len(), 64, "PlayerLoaded puts the cap back");
+
+        hub.guests.update(0, |g| {
+            g.address = "127.0.0.1:25565".parse().unwrap();
+        });
+        hub.guests.update(0, |g| {
+            g.loaded = false;
+        });
+        hub.guests.update(0, |g| {
+            g.batch_quota = 0.0;
+        });
+        let socket = hub
+            .next_batch(0, &world, None)
+            .expect("a socket guest still receives chunks");
+        assert_eq!(socket.near.len(), 64, "a socket guest keeps the quota");
+
+        hub.guests.update(0, |g| {
+            g.address = crate::lan::conn::MEMORY_ADDRESS;
+        });
+        hub.guests.update(0, |g| {
+            g.loaded = true;
+        });
+        hub.guests.update(0, |g| {
+            g.loading = true;
+        });
+        hub.guests.update(0, |g| {
+            g.batch_quota = 0.0;
+        });
+        let respawn = hub
+            .next_batch(0, &world, None)
+            .expect("a respawned player still receives chunks");
+        assert_eq!(
+            respawn.near.len(),
+            64,
+            "a respawn stays on the vanilla pace"
+        );
+
+        // Seventy lit columns, the unlit one still queued: all seventy, in one batch.
+        hub.guests.update(0, |g| {
+            g.loaded = false;
+        });
+        hub.guests.update(0, |g| {
+            g.batch_quota = 0.0;
+        });
+        hub.guests.update(0, |g| {
+            g.chunk_queue.truncate(71);
+        });
+        let seventy = hub
+            .next_batch(0, &world, None)
+            .expect("seventy ready columns send");
+        assert_eq!(seventy.near.len(), 70);
+        assert!(seventy.near.iter().all(|(_, c)| c.lit));
+
+        hub.guests.update(0, |g| {
+            g.unacknowledged = g.max_unacknowledged;
+        });
+        assert!(
+            hub.next_batch(0, &world, None).is_none(),
+            "too many batches still waiting sends nothing"
+        );
+
+        hub.guests.update(0, |g| {
+            g.unacknowledged = 0;
+        });
+        hub.ticks = hub.guests[0].placed_at + 1;
+        assert!(
+            hub.next_batch(0, &world, None).is_none(),
+            "the tick after placement still waits"
+        );
+
+        hub.ticks = 3;
+        hub.guests.update(0, |g| {
+            g.chunk_queue.clear();
+        });
+        hub.guests.update(0, |g| {
+            g.far_queue.clear();
+        });
+        assert!(
+            hub.next_batch(0, &world, None).is_none(),
+            "an empty queue sends nothing"
+        );
     }
 }

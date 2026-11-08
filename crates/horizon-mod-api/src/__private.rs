@@ -3,6 +3,10 @@
 //! (`game`). None of it is part of the API a mod is written against.
 use crate::*;
 
+/// The game's profiler control and reports, not a mod-facing API contract.
+#[path = "profiler.rs"]
+pub mod profiler;
+
 /// Switch an installed mod's dispatches on or off, returning whether it was found.
 pub fn set_mod_enabled(id: &str, on: bool) -> bool {
     crate::set_mod_enabled(id, on)
@@ -85,6 +89,10 @@ pub mod built {
         env!("OUT_DIR"),
         "/mod_api_exports_private_built.rs"
     ));
+    /// Wrap a slot in the persistent instance group store.
+    pub fn instance_group_ref(generation: u64, slot: u32) -> crate::InstanceGroupRef {
+        crate::InstanceGroupRef::from_parts(generation, slot).expect("published group generation")
+    }
     /// Wrap a slot in the model store's published generation.
     pub fn model_ref(generation: u64, slot: u32) -> crate::ModelRef {
         crate::ModelRef(generation, slot)
@@ -103,24 +111,6 @@ pub mod game {
         where
             Self: 'a;
         fn fields(&self) -> Self::Fields<'_>;
-    }
-
-    /// `Ingredient::test` with the loop context the game's own matching holds.
-    pub trait IngredientTest {
-        fn test_in(
-            &self,
-            context: &horizon_world::native_load_context::LoopContext,
-            stack: &ItemStack,
-        ) -> bool;
-    }
-    impl IngredientTest for Ingredient {
-        fn test_in(
-            &self,
-            context: &horizon_world::native_load_context::LoopContext,
-            stack: &ItemStack,
-        ) -> bool {
-            Ingredient::test_in(self, context, stack)
-        }
     }
 
     /// A block entity handle the game names.

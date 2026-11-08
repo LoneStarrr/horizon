@@ -2,14 +2,12 @@
 use horizon_mod_package::{
     Manifest,
     index::native,
-    internals::{self, ListedInternal},
+    internals::{self, ListedInternal, cache_catalogs},
     manifest::MANIFEST,
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use toml_edit::{DocumentMut, Item, Value};
@@ -17,8 +15,6 @@ use toml_edit::{DocumentMut, Item, Value};
 const USAGE: &str =
     "usage: cargo horizon-mod internals sync [--repo <path>] | add <path>… [--kind <kind>]";
 const CATALOG: &str = "internals.json";
-const CATALOG_LIMIT: u64 = 64 << 20;
-const ARCHIVE_LIMIT: u64 = 4 << 30;
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let Some((command, args)) = args.split_first() else {
@@ -59,10 +55,10 @@ fn add(dir: &Path, paths: &[&str], kind: Option<&str>) -> Result<(), String> {
     let path = dir.join(MANIFEST);
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let manifest = Manifest::parse(&text)?;
-    let (declared, catalog) = if let Some(wasm) = &manifest.wasm {
-        (wasm.internals(), internals::read(&wasm_catalog(dir)?)?)
+    let catalog = if manifest.wasm.is_some() {
+        internals::read(&wasm_catalog(dir)?)?
     } else if let Some(native) = &manifest.native {
-        (native.internals.as_slice(), load(dir, &native.horizon)?)
+        load(dir, &native.horizon)?
     } else {
         return Err("internals add needs a [native] or [wasm] mod".into());
     };
@@ -76,14 +72,14 @@ fn add(dir: &Path, paths: &[&str], kind: Option<&str>) -> Result<(), String> {
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    upsert(&mut doc, declared, &entries)?;
+    upsert(&mut doc, &manifest.internals, &entries)?;
     for entry in entries {
         println!("Added internal {}", entry.path);
     }
     fs::write(&path, doc.to_string()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Adds or refreshes `entries` in `[native].internals`, which also holds a `[wasm]` mod's.
+/// Adds or refreshes `entries` in `internals`, shared by both code targets.
 fn upsert(
     doc: &mut DocumentMut,
     declared: &[horizon_mod_package::manifest::Internal],
@@ -107,11 +103,11 @@ fn upsert(
             }
             listed.insert(key, index);
         } else {
-            let item = &mut doc["native"]["internals"];
+            let item = &mut doc["internals"];
             if item.is_none() {
                 *item = toml_edit::value(toml_edit::Array::new());
             }
-            // The manifest accepts both inline arrays and [[native.internals]] tables.
+            // The manifest accepts both inline arrays and [[internals]] tables.
             if let Some(array) = item.as_array_mut() {
                 let mut internal = toml_edit::InlineTable::new();
                 internal.insert("path", entry.path.as_str().into());
@@ -126,7 +122,7 @@ fn upsert(
                 internal["kind"] = toml_edit::value(&entry.kind);
                 array.push(internal);
             } else {
-                return Err(format!("{MANIFEST}: native.internals must be an array"));
+                return Err(format!("{MANIFEST}: internals must be an array"));
             }
             listed.insert(key, listed.len());
         }
@@ -139,7 +135,7 @@ fn sync(dir: &Path, repo: Option<&Path>) -> Result<(), String> {
     let path = dir.join(MANIFEST);
     let original = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let manifest = Manifest::parse(&original)?;
-    if let Some(wasm) = &manifest.wasm {
+    if manifest.wasm.is_some() {
         let repo = match repo {
             Some(repo) => repo.to_path_buf(),
             None => dir
@@ -158,14 +154,18 @@ fn sync(dir: &Path, repo: Option<&Path>) -> Result<(), String> {
             return Err(format!("{}: not a Horizon workspace", repo.display()));
         }
         let output = directory.join(format!("{}.txt", manifest.id));
-        let paths: BTreeSet<&str> = wasm
-            .internals()
+        let paths: BTreeSet<&str> = manifest
+            .internals
             .iter()
             .map(|entry| entry.path.as_str())
             .chain(
-                wasm.raw_injections()
+                manifest
+                    .inject
                     .iter()
-                    .map(|entry| entry.target.as_str()),
+                    .filter(|i| {
+                        i.access == horizon_mod_package::manifest::inject::Access::Internals
+                    })
+                    .map(|entry| entry.at.as_str()),
             )
             .collect();
         let mut contents = format!(
@@ -220,9 +220,18 @@ fn sync(dir: &Path, repo: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, contents: String) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, contents: String) -> Result<(), String> {
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     let temporary = path.with_extension("toml.sync");
     fs::write(&temporary, contents)
+        .and_then(|()| match permissions {
+            Some(permissions) => fs::set_permissions(&temporary, permissions),
+            None => Ok(()),
+        })
         .and_then(|()| fs::rename(&temporary, path))
         .map_err(|e| {
             let _ = fs::remove_file(&temporary);
@@ -232,7 +241,7 @@ fn atomic_write(path: &Path, contents: String) -> Result<(), String> {
 
 fn replace(text: &str, entries: &[ListedInternal]) -> Result<(String, String), String> {
     let manifest = Manifest::parse(text)?;
-    let native = manifest
+    manifest
         .native
         .as_ref()
         .ok_or("internals sync needs a [native] mod")?;
@@ -243,9 +252,9 @@ fn replace(text: &str, entries: &[ListedInternal]) -> Result<(String, String), S
         .iter()
         .map(|entry| (entry.path.as_str(), entry.kind.as_str()))
         .collect();
-    let mut keep = vec![false; native.internals.len()];
+    let mut keep = vec![false; manifest.internals.len()];
     for typed in [true, false] {
-        for (index, old) in native.internals.iter().enumerate() {
+        for (index, old) in manifest.internals.iter().enumerate() {
             if old.kind.is_some() != typed {
                 continue;
             }
@@ -262,9 +271,9 @@ fn replace(text: &str, entries: &[ListedInternal]) -> Result<(String, String), S
         }
     }
     let mut report = String::new();
-    for (index, old) in native.internals.iter().enumerate().rev() {
+    for (index, old) in manifest.internals.iter().enumerate().rev() {
         if !keep[index] {
-            let item = &mut doc["native"]["internals"];
+            let item = &mut doc["internals"];
             if let Some(array) = item.as_array_mut() {
                 // TOML stores a trailing comment after the previous comma as this
                 // value's prefix. Keep it when dropping the declaration that follows it.
@@ -297,11 +306,7 @@ fn replace(text: &str, entries: &[ListedInternal]) -> Result<(String, String), S
         report.push_str(&format!("added: {path} ({kind})\n"));
     }
     let entries: Vec<_> = entries.iter().collect();
-    upsert(
-        &mut doc,
-        &retained.native.as_ref().expect("native manifest").internals,
-        &entries,
-    )?;
+    upsert(&mut doc, &retained.internals, &entries)?;
     Ok((doc.to_string(), report))
 }
 
@@ -313,12 +318,12 @@ pub fn refresh(
     old: &[ListedInternal],
     new: &[ListedInternal],
 ) -> Result<String, String> {
-    let native = manifest
+    manifest
         .native
         .as_ref()
         .ok_or("update needs a [native] mod")?;
     let mut report = String::new();
-    for (index, declared) in native.internals.iter().enumerate() {
+    for (index, declared) in manifest.internals.iter().enumerate() {
         let path = &declared.path;
         let entry = match internals::resolve(new, &manifest.id, path, declared.kind.as_deref()) {
             Ok(entry) => entry,
@@ -351,7 +356,7 @@ fn set_fingerprint(
     hash: &str,
     kind: Option<&str>,
 ) -> Result<(), String> {
-    let item = &mut doc["native"]["internals"];
+    let item = &mut doc["internals"];
     let value = if let Some(array) = item.as_array_mut() {
         array
             .get_mut(index)
@@ -445,97 +450,16 @@ pub fn load(dir: &Path, revision: &str) -> Result<Vec<ListedInternal>, String> {
         })
         .ok_or_else(|| format!("{release}/SHA256SUMS: no checksum for {name}"))?;
     println!("Reading internals from the prebuilt game at {revision}");
-    cache_catalog(&cache, &name, get(&name)?.into_reader(), expected)
-}
-
-/// Verify the whole archive before trusting any catalog bytes; never unpack its other files.
-fn cache_catalog(
-    cache: &Path,
-    name: &str,
-    body: impl Read,
-    expected: &str,
-) -> Result<Vec<ListedInternal>, String> {
-    fs::create_dir_all(cache).map_err(|e| format!("{}: {e}", cache.display()))?;
-    let path = cache.join(CATALOG);
-    let archive = cache.join(format!("{name}.{}.partial", std::process::id()));
-    let result = (|| {
-        let mut body = body.take(ARCHIVE_LIMIT + 1);
-        let mut file = fs::File::create(&archive).map_err(|e| e.to_string())?;
-        let mut hash = Sha256::new();
-        let mut size = 0;
-        let mut buffer = [0; 65536];
-        loop {
-            let read = body.read(&mut buffer).map_err(|e| e.to_string())?;
-            if read == 0 {
-                break;
-            }
-            size += read as u64;
-            if size > ARCHIVE_LIMIT {
-                return Err(format!("{name}: prebuilt archive exceeds 4 GiB"));
-            }
-            hash.update(&buffer[..read]);
-            file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
-        }
-        drop(file);
-        if format!("{:x}", hash.finalize()) != expected {
-            return Err(format!(
-                "The prebuilt game {name} doesn't match its release's checksum. Try again."
-            ));
-        }
-        let file = fs::File::open(&archive).map_err(|e| e.to_string())?;
-        let text = catalog_from_archive(file)?;
-        let entries = serde_json::from_str(&text).map_err(|e| format!("{CATALOG}: {e}"))?;
-        let partial = path.with_extension(format!("json.{}.partial", std::process::id()));
-        fs::write(&partial, text).map_err(|e| format!("{}: {e}", partial.display()))?;
-        fs::rename(&partial, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(entries)
-    })();
-    let _ = fs::remove_file(&archive);
-    result
-}
-
-fn catalog_from_archive(reader: impl Read) -> Result<String, String> {
-    let reader = flate2::read::GzDecoder::new(reader).take(8 << 30);
-    let mut archive = tar::Archive::new(reader);
-    for entry in archive.entries().map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path().map_err(|e| e.to_string())?;
-        if path != Path::new(CATALOG) && path != Path::new("./internals.json") {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            return Err(format!("{CATALOG}: not a file in the prebuilt archive"));
-        }
-        let mut text = String::new();
-        entry
-            .take(CATALOG_LIMIT + 1)
-            .read_to_string(&mut text)
-            .map_err(|e| e.to_string())?;
-        if text.len() as u64 > CATALOG_LIMIT {
-            return Err(format!("{CATALOG}: catalog exceeds 64 MiB"));
-        }
-        return Ok(text);
-    }
-    Err(format!("prebuilt archive has no {CATALOG}"))
+    fs::create_dir_all(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
+    let directory = cap_std::fs::Dir::open_ambient_dir(&cache, cap_std::ambient_authority())
+        .map_err(|e| format!("{}: {e}", cache.display()))?;
+    cache_catalogs(&directory, &name, get(&name)?.into_reader(), expected)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn archive(path: &str, kind: tar::EntryType, contents: &str) -> Vec<u8> {
-        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        let mut archive = tar::Builder::new(gzip);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
-        header.set_entry_type(kind);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, path, contents.as_bytes())
-            .unwrap();
-        archive.into_inner().unwrap().finish().unwrap()
-    }
 
     #[test]
     fn sync_replaces_declarations_and_preserves_retained_formatting_for_both_array_forms() {
@@ -544,18 +468,21 @@ mod tests {
             "a".repeat(40),
             "b".repeat(40)
         );
+        let (metadata, pins) = header.split_once("[native]").unwrap();
         let entries: Vec<ListedInternal> = serde_json::from_str(r#"[{"path":"Used","kind":"struct","signature":"struct Used","hash":"new"},{"path":"New","kind":"fn","signature":"fn new()","hash":"added"}]"#).unwrap();
         for body in [
             "internals = [\n  { path = 'Used', hash = 'old' }, # keep\n  { path = 'Unused', hash = 'gone' },\n]\n",
-            "[[native.internals]] # keep\npath = 'Used'\nhash = 'old' # hash\n[[native.internals]]\npath = 'Unused'\nhash = 'gone'\n",
+            "[[internals]] # keep\npath = 'Used'\nhash = 'old' # hash\n[[internals]]\npath = 'Unused'\nhash = 'gone'\n",
         ] {
-            let (candidate, report) = replace(&(header.clone() + body), &entries).unwrap();
-            let native = Manifest::parse(&candidate).unwrap().native.unwrap();
-            assert_eq!(native.internals.len(), 2);
-            assert_eq!(native.internals[0].hash, "new");
-            assert_eq!(native.internals[0].kind.as_deref(), Some("struct"));
+            let (candidate, report) =
+                replace(&format!("{metadata}{body}[native]{pins}"), &entries).unwrap();
+            let manifest = Manifest::parse(&candidate).unwrap();
+            assert_eq!(manifest.internals.len(), 2);
+            assert_eq!(manifest.internals[0].hash, "new");
+            assert_eq!(manifest.internals[0].kind.as_deref(), Some("struct"));
             assert!(candidate.contains("# keep"));
-            assert!(candidate.starts_with(&header));
+            assert!(candidate.starts_with(metadata));
+            assert!(candidate.contains(&format!("[native]{pins}")));
             assert!(report.contains("removed: Unused"));
             assert!(report.contains("added: New (fn)"));
             assert!(!report.contains("added: Used"));
@@ -563,66 +490,17 @@ mod tests {
             assert_eq!(unchanged, candidate);
             assert!(report.is_empty());
             let (empty, report) = replace(&candidate, &[]).unwrap();
-            assert!(
-                Manifest::parse(&empty)
-                    .unwrap()
-                    .native
-                    .unwrap()
-                    .internals
-                    .is_empty()
-            );
+            assert!(Manifest::parse(&empty).unwrap().internals.is_empty());
             assert!(report.contains("removed: Used"));
         }
         // An untyped and a typed row for one access leave one current declaration.
         let body = "internals = [{ path = 'Used', hash = 'stale' }, { path = 'Used', kind = 'struct', hash = 'stale' }]\n";
-        let (candidate, _) = replace(&(header.clone() + body), &entries[..1]).unwrap();
-        let native = Manifest::parse(&candidate).unwrap().native.unwrap();
-        assert_eq!(native.internals.len(), 1);
-        assert_eq!(native.internals[0].hash, "new");
-        assert_eq!(native.internals[0].kind.as_deref(), Some("struct"));
-    }
-
-    #[test]
-    fn reads_only_the_root_catalog_from_the_prebuilt_archive() {
-        let catalog = include_str!("../tests/fixtures/internals-old.json");
-        let bytes = archive("./internals.json", tar::EntryType::Regular, catalog);
-        assert_eq!(catalog_from_archive(bytes.as_slice()).unwrap(), catalog);
-        let bytes = archive("deps/internals.json", tar::EntryType::Regular, catalog);
-        assert_eq!(
-            catalog_from_archive(bytes.as_slice()).unwrap_err(),
-            "prebuilt archive has no internals.json"
-        );
-        let bytes = archive("internals.json", tar::EntryType::Symlink, "");
-        assert!(
-            catalog_from_archive(bytes.as_slice())
-                .unwrap_err()
-                .contains("not a file")
-        );
-    }
-
-    #[test]
-    fn downloaded_catalog_is_cached_only_after_checksum_and_json_checks() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/i3-d/tests")
-            .join(format!("archive-cache-{}", std::process::id()));
-        let catalog = include_str!("../tests/fixtures/internals-old.json");
-        let bytes = archive("./internals.json", tar::EntryType::Regular, catalog);
-        let error = cache_catalog(&dir, "game.tar.gz", bytes.as_slice(), "wrong").unwrap_err();
-        assert!(error.contains("doesn't match its release's checksum"));
-        assert!(!dir.join(CATALOG).exists());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-
-        let invalid = archive("./internals.json", tar::EntryType::Regular, "not JSON");
-        let hash = format!("{:x}", Sha256::digest(&invalid));
-        assert!(cache_catalog(&dir, "game.tar.gz", invalid.as_slice(), &hash).is_err());
-        assert!(!dir.join(CATALOG).exists());
-
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        let entries = cache_catalog(&dir, "game.tar.gz", bytes.as_slice(), &hash).unwrap();
-        assert_eq!(entries[0].path, "horizon_client::game::Game");
-        assert_eq!(fs::read_to_string(dir.join(CATALOG)).unwrap(), catalog);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
+        let (candidate, _) =
+            replace(&format!("{metadata}{body}[native]{pins}"), &entries[..1]).unwrap();
+        let manifest = Manifest::parse(&candidate).unwrap();
+        assert_eq!(manifest.internals.len(), 1);
+        assert_eq!(manifest.internals[0].hash, "new");
+        assert_eq!(manifest.internals[0].kind.as_deref(), Some("struct"));
     }
 
     #[test]

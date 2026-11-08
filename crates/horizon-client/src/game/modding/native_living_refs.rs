@@ -803,6 +803,20 @@ impl Game<'_> {
         slot: EquipmentSlot,
         stack: Option<ItemStack>,
     ) -> bool {
+        self.write_living_equipment(living, slot, stack, false)
+    }
+    /// The write `native_living_set_equipment` makes (#932): with `defer`,
+    /// its equip sound and game event wait for the root commit of the open
+    /// transaction — an abort stays quiet — while the equipment and the
+    /// attribute map change at once, as later steps of the same transaction
+    /// read them.
+    pub(super) fn write_living_equipment(
+        &mut self,
+        living: LivingRef,
+        slot: EquipmentSlot,
+        stack: Option<ItemStack>,
+        defer: bool,
+    ) -> bool {
         // A client's copy changes only when the server says so.
         if self.remote.is_some() {
             return false;
@@ -838,8 +852,17 @@ impl Game<'_> {
                         })
                         .flatten()
                 });
-                let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
-                self.equip_item_effects([at.x, at.y, at.z], sound, equippable.is_some(), ctx);
+                if defer {
+                    self.after_commit(super::transactions::After::Equip {
+                        at: [at.x, at.y, at.z],
+                        sound,
+                        equips: equippable.is_some(),
+                        who: id,
+                    });
+                } else {
+                    let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
+                    self.equip_item_effects([at.x, at.y, at.z], sound, equippable.is_some(), ctx);
+                }
             }
             // The stack's attribute modifiers go on the live map at once, so
             // the next read — a hit's armor, a `LivingRef`'s — sees them (#941).
@@ -872,7 +895,9 @@ impl Game<'_> {
             .slots_named(&Owner::Entity(t), slot_name(slot))
             .as_slice()
         {
-            [s] => self.slot_set(s, stack.clone()),
+            // This path owns onEquipItem below, including immediate writes.
+            // The generic stand slot writer must not emit it a second time.
+            [s] => self.slot_set_with_effects(s, stack.clone(), false),
             _ => false,
         };
         if let (true, Some(at), false) = (written, at, first_tick) {
@@ -888,9 +913,18 @@ impl Game<'_> {
                 let (Target::Stand(id) | Target::Dragon(id)) = t else {
                     unreachable!("only a stand or the dragon gets here")
                 };
-                let ctx_who = Some(horizon_client::mobs::Who::Mob(id));
-                let ctx = self.who_context(ctx_who, None);
-                self.equip_item_effects([at.x, at.y, at.z], sound, equippable.is_some(), ctx);
+                if defer {
+                    self.after_commit(super::transactions::After::Equip {
+                        at: [at.x, at.y, at.z],
+                        sound,
+                        equips: equippable.is_some(),
+                        who: id,
+                    });
+                } else {
+                    let ctx_who = Some(horizon_client::mobs::Who::Mob(id));
+                    let ctx = self.who_context(ctx_who, None);
+                    self.equip_item_effects([at.x, at.y, at.z], sound, equippable.is_some(), ctx);
+                }
             }
         }
         written
@@ -922,7 +956,7 @@ impl Game<'_> {
     /// side, not a spectator, not the first tick, another item): the equip
     /// sound when there is one, and the `equip` (the stack is equippable) or
     /// `unequip` game event.
-    fn equip_item_effects(
+    pub(in crate::game) fn equip_item_effects(
         &mut self,
         at: [f64; 3],
         sound: Option<String>,
@@ -1043,6 +1077,7 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::api_values::TryIntoApi;
     use super::*;
     use horizon_core::geometry::Vec3;
 
@@ -1118,7 +1153,7 @@ mod tests {
             let broken = living
                 .hurt_and_break(game, EquipmentSlot::MainHand, 1)
                 .unwrap();
-            assert_eq!(broken.damage, max);
+            assert_eq!(broken.damage(), max);
             assert!(game.inventory[game.selected].is_none());
 
             let kind = game
@@ -1131,11 +1166,18 @@ mod tests {
             let mob = game.living(game.entity(21).unwrap()).unwrap();
             let mut sword = ItemStack::new("minecraft:diamond_sword", 1);
             sword.damage = max - 1;
-            assert!(mob.set_equipment(game, EquipmentSlot::MainHand, Some(sword)));
+            assert!(
+                mob.set_equipment(
+                    game,
+                    EquipmentSlot::MainHand,
+                    Some(sword.try_into_api().unwrap())
+                )
+                .unwrap()
+            );
             let broken = mob
                 .hurt_and_break(game, EquipmentSlot::MainHand, 1)
                 .unwrap();
-            assert_eq!(broken.damage, max);
+            assert_eq!(broken.damage(), max);
             assert!(mob.equipment(game, EquipmentSlot::MainHand).is_none());
         });
     }
@@ -1176,25 +1218,27 @@ mod tests {
                 game.audio.heard.clear();
                 game.guest_equipment_breaks.clear();
                 let random = game.world.random.clone();
-                // Pre-migration: decide all losses before mutating any slot.
-                let losses: [Option<(u32, u32)>; 4] = std::array::from_fn(|i| {
-                    let stack = game.armor[i].clone()?;
-                    let max = game.items().get(&stack.item)?.max_damage;
-                    let loss = game.wear(&stack, 1);
-                    (loss > 0).then_some((loss, max))
-                });
+                // Player.hurtArmor supplies FEET, LEGS, CHEST, HEAD;
+                // LivingEntity.doHurtEquipment finishes hurtAndBreak (including
+                // its effects/RNG) before the next slot's durability draw.
                 let mut broken = Vec::new();
-                for (index, (cell, loss)) in game.armor.iter_mut().zip(losses).enumerate() {
-                    if let (Some(stack), Some((loss, max))) = (cell.as_mut(), loss) {
-                        stack.damage = stack.damage.saturating_add(loss).min(max);
-                        if stack.damage >= max {
-                            broken.push((stack.clone(), index));
-                            *cell = None;
-                        }
+                for index in [3, 2, 1, 0] {
+                    let Some(mut stack) = game.armor[index].clone() else {
+                        continue;
+                    };
+                    let max = game.items().get(&stack.item).unwrap().max_damage;
+                    let loss = game.wear(&stack, 1);
+                    if loss == 0 {
+                        continue;
                     }
-                }
-                for (stack, index) in &broken {
-                    game.player_equipment_broke(super::super::armor_slot(*index), stack);
+                    stack.damage = stack.damage.saturating_add(loss).min(max);
+                    if stack.damage >= max {
+                        game.armor[index] = None;
+                        game.player_equipment_broke(super::super::armor_slot(index), &stack);
+                        broken.push(index);
+                    } else {
+                        game.armor[index] = Some(stack);
+                    }
                 }
                 let expected_armor = game.armor.clone();
                 let expected_events = game.guest_equipment_breaks.clone();
@@ -1207,15 +1251,15 @@ mod tests {
                     .map(|event| event.identifier.clone())
                     .collect();
                 let expected_random = game.world.random.next_float();
-                assert_eq!(broken.len(), 2);
+                assert_eq!(broken, [1, 0]);
                 if guest {
-                    assert_eq!(expected_events, [49, 50]);
+                    assert_eq!(expected_events, [50, 49]);
                 } else {
                     assert_eq!(expected_sounds.get("minecraft:entity.item.break"), Some(&1));
                     assert_eq!(expected_sounds.get("minecraft:block.anvil.break"), Some(&1));
                     assert_eq!(
                         expected_sound_order,
-                        ["minecraft:entity.item.break", "minecraft:block.anvil.break"]
+                        ["minecraft:block.anvil.break", "minecraft:entity.item.break"]
                     );
                 }
                 game.armor = armor.clone();
@@ -1749,13 +1793,27 @@ mod tests {
             let sword = ItemStack::new("minecraft:iron_sword", 1);
             let shield = ItemStack::new("minecraft:shield", 1);
             let host: &mut dyn ServerHost = game;
-            assert!(player.set_hand_item(host, Hand::Main, Some(sword.clone())));
-            assert!(player.set_hand_item(host, Hand::Off, Some(shield.clone())));
+            assert!(
+                player
+                    .set_hand_item(host, Hand::Main, Some(sword.try_into_api().unwrap()))
+                    .unwrap()
+            );
+            assert!(
+                player
+                    .set_hand_item(host, Hand::Off, Some(shield.try_into_api().unwrap()))
+                    .unwrap()
+            );
             assert_eq!(game.inventory[3], Some(sword.clone()));
             assert_eq!(game.offhand, Some(shield.clone()));
-            assert_eq!(player.hand_item(game, Hand::Main), Some(sword.clone()));
-            assert_eq!(player.hand_item(game, Hand::Off), Some(shield));
-            assert!(player.set_hand_item(game, Hand::Off, None));
+            assert_eq!(
+                player.hand_item(game, Hand::Main),
+                Some(sword.try_into_api().unwrap())
+            );
+            assert_eq!(
+                player.hand_item(game, Hand::Off),
+                Some(shield.try_into_api().unwrap())
+            );
+            assert!(player.set_hand_item(game, Hand::Off, None).unwrap());
             assert_eq!(game.offhand, None);
             assert_eq!(game.inventory[3], Some(sword.clone()));
 
@@ -1767,13 +1825,21 @@ mod tests {
                 .clone();
             game.mobs.push(Mob::new(12, kind, Vec3::ZERO, 0.0));
             let zombie = game.living(game.entity(12).unwrap()).unwrap();
-            assert!(zombie.set_hand_item(game, Hand::Off, Some(sword.clone())));
+            assert!(
+                zombie
+                    .set_hand_item(game, Hand::Off, Some(sword.try_into_api().unwrap()))
+                    .unwrap()
+            );
             let stacks = game.mobs[0].equipment_stacks();
             assert_eq!(stacks[EquipmentSlot::OffHand as usize], Some(sword.clone()));
             assert_eq!(stacks[EquipmentSlot::MainHand as usize], None);
 
             game.mobs.clear();
-            assert!(!zombie.set_hand_item(game, Hand::Main, Some(sword)));
+            assert!(
+                !zombie
+                    .set_hand_item(game, Hand::Main, Some(sword.try_into_api().unwrap()))
+                    .unwrap()
+            );
         });
     }
 
@@ -1908,10 +1974,18 @@ mod tests {
             let mut helmet = ItemStack::new("minecraft:iron_helmet", 2);
             helmet.damage = 7;
             helmet.data_mut().enchantments = vec![("minecraft:protection".into(), 3)];
-            assert!(zombie.set_equipment(game, EquipmentSlot::Head, Some(helmet.clone())));
+            assert_eq!(
+                zombie.set_equipment(
+                    game,
+                    EquipmentSlot::Head,
+                    Some(helmet.try_into_api().unwrap())
+                ),
+                Err(mod_api::StackWriteError::CountExceeded { maximum: 1 })
+            );
+            assert!(game.living_set_equipment(zombie, EquipmentSlot::Head, Some(helmet.clone())));
             assert_eq!(
                 zombie.equipment(game, EquipmentSlot::Head),
-                Some(helmet.clone())
+                Some(helmet.try_into_api().unwrap())
             );
             assert_eq!(
                 game.mobs[0]
@@ -2089,11 +2163,19 @@ mod tests {
                 if event.entity == 18 && event.slot == "mainhand" {
                     let entity = host.entity(event.entity).unwrap();
                     let living = host.living(entity).unwrap();
-                    assert!(living.set_equipment(
-                        host,
-                        EquipmentSlot::Head,
-                        Some(ItemStack::new("minecraft:iron_helmet", 1)),
-                    ));
+                    assert!(
+                        living
+                            .set_equipment(
+                                host,
+                                EquipmentSlot::Head,
+                                Some(
+                                    ItemStack::new("minecraft:iron_helmet", 1)
+                                        .try_into_api()
+                                        .unwrap()
+                                ),
+                            )
+                            .unwrap()
+                    );
                 }
             }
         }

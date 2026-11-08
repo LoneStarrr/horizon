@@ -48,6 +48,8 @@ fn singleton_dragon_load_keeps_state_and_reserves_nine_ids() {
         assert_eq!(dragon.id, before + 1);
         assert_eq!(dragon.position, saved.position);
         assert_eq!(dragon.health, 73.0);
+        assert!(dragon.join.is_joined());
+        assert_eq!(game.dragon.locate(dragon.join), Some(0));
         assert_eq!(game.next_entity, before + 9);
         assert_eq!(game.persist.uuids.get(&dragon.id), Some(&uuid));
         game.load_dragon(tag, Some(uuid));

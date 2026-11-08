@@ -10,8 +10,9 @@
 //! answering more than it was asked is a mod bug, named once, and the write aborts.
 use super::HostTransaction;
 use super::{
-    Capability, Direction, ENTITY_ITEMS, Hand, ITEMS, ItemResource, ItemStack, LevelRef, MenuRef,
-    MenuSlotBacking, ResourceHandler, ServerHost, Transaction, backend_mut_of, backend_of,
+    Capability, Direction, ENTITY_ITEMS, EquipmentSlot, Hand, ITEMS, ItemResource, ItemStack,
+    LevelRef, MenuRef, MenuSlotBacking, ResourceHandler, ServerHost, Transaction, backend_mut_of,
+    backend_of,
 };
 use std::{collections::HashSet, fmt::Debug, marker::PhantomData, sync::Mutex};
 
@@ -66,6 +67,17 @@ pub enum ItemPlace {
         entity: u32,
         /// The slot's index in the entity's inventory.
         slot: usize,
+    },
+    /// Slot `slot` of living entity `entity`'s equipment (NeoForge's
+    /// `LivingEntityEquipmentWrapper` through `Capabilities.Item.ENTITY`), reached through
+    /// [`ENTITY_ITEMS`](super::ENTITY_ITEMS). Its write is the equipment write
+    /// `LivingRef::set_equipment` makes, so the equip and unequip game event, sound and
+    /// attribute updates are the same, and a transaction that aborts puts it back.
+    Equipment {
+        /// The entity's network id.
+        entity: u32,
+        /// The equipment slot.
+        slot: EquipmentSlot,
     },
     /// Slot `slot` of the item at `parent`, through its [`ITEM_ITEMS`] handler: a backpack in a
     /// backpack.
@@ -198,12 +210,12 @@ impl ResourceHandler<ItemResource> for GameItemItems {
         Some(ItemResource::of(&self.slot(host, index)?))
     }
     fn amount(&self, host: &mut dyn ServerHost, index: usize) -> u32 {
-        self.slot(host, index).map_or(0, |stack| stack.count)
+        self.slot(host, index).map_or(0, |stack| stack.count())
     }
     fn capacity(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> u32 {
         self.0.stack(host).map_or(0, |held| {
             backend_of(&*host).map_or(0, |backend| {
-                backend.item_container_capacity(&held, index, &resource.to_stack(1))
+                backend.item_container_capacity(&held, index, resource.as_stack())
             })
         })
     }
@@ -215,7 +227,9 @@ impl ResourceHandler<ItemResource> for GameItemItems {
         resource: &ItemResource,
         amount: u32,
     ) -> u32 {
-        let offer = resource.to_stack(amount);
+        let Some(offer) = resource.to_stack(amount) else {
+            return 0;
+        };
         let Some((went, changed)) = self.0.stack(host).and_then(|held| {
             backend_of(&*host)
                 .and_then(|backend| backend.item_container_insert_slot(&held, index, &offer))
@@ -247,7 +261,7 @@ impl ResourceHandler<ItemResource> for GameItemItems {
         }) else {
             return 0;
         };
-        self.rewrite(host, tx, &changed, out.count.min(amount))
+        self.rewrite(host, tx, &changed, out.count().min(amount))
     }
 }
 
@@ -284,12 +298,12 @@ impl ItemPlace {
             } => {
                 let handler = level.capability(host, &ITEMS, *pos, *side)?;
                 let resource = handler.resource(host, *slot)?;
-                Some(resource.to_stack(handler.amount(host, *slot)))
+                resource.to_stack(handler.amount(host, *slot))
             }
             ItemPlace::Nested { parent, slot } => {
                 let handler = parent.capability(host, &ITEM_ITEMS)?;
                 let resource = handler.resource(host, *slot)?;
-                Some(resource.to_stack(handler.amount(host, *slot)))
+                resource.to_stack(handler.amount(host, *slot))
             }
             ItemPlace::Mod { provider, key } => {
                 let (provider, _) = host.capability_providers().place_provider(provider)?;
@@ -298,7 +312,6 @@ impl ItemPlace {
             ItemPlace::MenuSlot { menu, slot } => menu.slot(host, *slot)?,
             _ => backend_mut_of(host).and_then(|backend| backend.game_stack(self)),
         }
-        .filter(|stack| stack.count > 0)
     }
 
     /// What is here, without its count (`ItemAccess.getResource`).
@@ -308,7 +321,7 @@ impl ItemPlace {
 
     /// How many are here (`ItemAccess.getAmount`).
     pub fn amount(&self, host: &mut dyn ServerHost) -> u32 {
-        self.stack(host).map_or(0, |stack| stack.count)
+        self.stack(host).map_or(0, |stack| stack.count())
     }
 
     /// Puts up to `amount` of `resource` here, in transaction `tx`: how much went
@@ -382,7 +395,7 @@ impl ItemPlace {
         // `getMaxStackSize` for what goes in, `Slot.mayPickup` for what comes out.
         let amount = match self {
             ItemPlace::MenuSlot { menu, slot } if insert => {
-                let holds = menu.slot_holds(host, *slot, &resource.to_stack(1));
+                let holds = menu.slot_holds(host, *slot, resource.as_stack());
                 let room = holds.unwrap_or(0).saturating_sub(self.amount(host));
                 amount.min(room)
             }
@@ -452,10 +465,12 @@ impl ItemPlace {
                     _ => {
                         return Ok(match insert {
                             true => backend_mut_of(host).map_or(0, |backend| {
-                                backend.game_insert(self, resource.to_stack(amount), tx)
+                                backend.game_insert(self, resource, amount, tx).unwrap_or(0)
                             }),
                             false => backend_mut_of(host).map_or(0, |backend| {
-                                backend.game_extract(self, resource.to_stack(amount), tx)
+                                backend
+                                    .game_extract(self, resource, amount, tx)
+                                    .unwrap_or(0)
                             }),
                         });
                     }
@@ -479,10 +494,12 @@ impl ItemPlace {
             }
             _ => Ok(match insert {
                 true => backend_mut_of(host).map_or(0, |backend| {
-                    backend.game_insert(self, resource.to_stack(amount), tx)
+                    backend.game_insert(self, resource, amount, tx).unwrap_or(0)
                 }),
                 false => backend_mut_of(host).map_or(0, |backend| {
-                    backend.game_extract(self, resource.to_stack(amount), tx)
+                    backend
+                        .game_extract(self, resource, amount, tx)
+                        .unwrap_or(0)
                 }),
             }),
         });
@@ -517,7 +534,7 @@ fn one_of(
     f: impl FnOnce(&mut dyn ServerHost, &Transaction) -> Result<u32, ()>,
 ) -> Result<u32, ()> {
     let held = parent.stack(host).ok_or(())?;
-    let others = held.count - 1;
+    let others = held.count() - 1;
     if others == 0 {
         return f(host, tx);
     }
@@ -555,7 +572,7 @@ impl ItemPlace {
                 host,
                 |index| {
                     provided
-                        .then(|| table.item_provider(key.name, &stack.item, index))
+                        .then(|| table.item_provider(key.name, stack.item(), index))
                         .flatten()
                 },
                 super::ItemProviderOf::get::<T>,

@@ -8,7 +8,12 @@ import sys
 
 PRIVATE_ROOTS = {".local", "decompiled", "minecraft", "assets", "run", "logs"}
 PRIVATE_EXTENSIONS = {".jar", ".class", ".jfr", ".hprof", ".java"}
-ORIGINAL_JDK_TOOLS = {"tools/JfrSummary.java", "tests/java/JfrFixture.java"}
+ORIGINAL_JDK_TOOLS = {
+    "tools/JfrSummary.java",
+    "tests/java/JfrFixture.java",
+    # Our own comparison driver; it calls the player's pinned vanilla jars at run time and carries none of their code.
+    "tools/refactors/api-pr3/JsonNbtOracle.java",
+}
 # The prepared folder's files in one file (crates/horizon-core/src/prepared_files.rs): Mojang's data.
 PRIVATE_NAMES = {"horizon-data.bin"}
 
@@ -56,12 +61,14 @@ def pushed_revisions(stream):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--history", action="store_true", help="Inspect paths in all local Git history")
+    mode.add_argument("--history", action="store_true", help="Inspect paths in the history reachable from HEAD")
     mode.add_argument("--pre-push", action="store_true", help="Inspect history reachable from Git's ref updates on stdin")
     # CI's pull requests: only the commits a merge would add, not every ref's whole history.
     mode.add_argument("--range", metavar="BASE..HEAD", help="Inspect the commits of a revision range")
     args = parser.parse_args()
-    revisions = pushed_revisions(sys.stdin) if args.pre_push else [args.range] if args.range else None
+    # CI checks out every branch, so `--all` would fail main on any other branch's file: scan HEAD's ancestry.
+    revisions = (pushed_revisions(sys.stdin) if args.pre_push else [args.range] if args.range
+                 else ["HEAD"] if args.history else None)
     history = args.history or args.pre_push or bool(args.range)
     rejected = sorted({path for path in paths_in_repository(history, revisions)
                        if path and prohibited(path)})

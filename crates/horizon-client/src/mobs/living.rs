@@ -119,6 +119,10 @@ impl CurrentTarget for Pushed<'_> {
         Ok(())
     }
 }
+/// Dimensions as `EntityDimensions` holds them: the floats `Mob::dims` widened, back.
+pub fn dims_array((w, h, e): (f64, f64, f64)) -> [f32; 3] {
+    [w as f32, h as f32, e as f32]
+}
 pub fn wrap(a: f32) -> f32 {
     let mut a = a % 360.0;
     if a >= 180.0 {
@@ -191,7 +195,8 @@ impl MobWorld<'_> {
                                 out.lava = out.lava.max(depth);
                                 out.in_lava = true;
                             }
-                            Fluid::None => {}
+                            // A mod's fluid is in neither tag: no entity swims in it.
+                            Fluid::None | Fluid::Modded => {}
                         }
                     }
                 }
@@ -238,7 +243,8 @@ impl MobWorld<'_> {
                     let p = BlockPos::new(x, y, z);
                     let state = self.fluid_tables.fluid(self.world.block(x, y, z));
                     let current = match state.kind() {
-                        FluidKind::Empty => continue,
+                        // A mod's fluid is in neither tag, so it pushes no entity.
+                        FluidKind::Empty | FluidKind::Mod(_) | FluidKind::ModFlowing(_) => continue,
                         FluidKind::Water | FluidKind::FlowingWater => &mut water,
                         FluidKind::Lava | FluidKind::FlowingLava => &mut lava,
                     };
@@ -460,8 +466,23 @@ impl Mob {
     /// Entity dimensions: the type's, a class's BABY_DIMENSIONS, or the
     /// slime size scaling, in the mob's current pose.
     /// `EntityDimensions` (float width, height and eye height) widened to double.
+    /// An `entity_size` answer (`EntityEvent.Size`) replaces them while the mob is still in
+    /// the pose and vanilla size it was asked for.
     pub fn dims(&self) -> (f64, f64, f64) {
-        self.dims_in_pose(self.pose())
+        let pose = self.pose();
+        let vanilla = self.dims_in_pose(pose);
+        match self
+            .size_answer
+            .and_then(|answer| answer.holds(pose, dims_array(vanilla)))
+        {
+            Some([w, h, e]) => (f64::from(w), f64::from(h), f64::from(e)),
+            None => vanilla,
+        }
+    }
+    /// `dims` as vanilla computes them, without an `entity_size` answer: the `newSize`
+    /// `EntityEvent.Size` starts from.
+    pub fn vanilla_dims(&self) -> [f32; 3] {
+        dims_array(self.dims_in_pose(self.pose()))
     }
     /// The pose this mob is in (`Entity.getPose`): the stance its species
     /// keeps in its own fields — a villager's bed, a camel's sit flag, an
@@ -902,7 +923,7 @@ impl Mob {
         // EntityFluidInteraction.applyCurrentTo: the flow pushes the mob.
         if (self.fluids.in_water || self.fluids.in_lava) && self.pushed_by_fluid() {
             let (water, lava) = w.fluid_currents(self.bounds());
-            let lava_scale = if w.nether {
+            let lava_scale = if w.dimension_type.fast_lava {
                 0.007
             } else {
                 0.0023333333333333335
@@ -2096,9 +2117,11 @@ impl RestitutionWorld for MobRestitution<'_, '_, '_> {
     fn bounce_event(&mut self) -> Result<(), ()> {
         Ok(())
     }
-    /// Nothing to mark: the bounce is already the velocity of this tick, and
-    /// the mob tracker sends the position and velocity it reads.
-    fn mark_position_for_sync(&mut self) {}
+    /// `Entity.syncPosition`: the tracker keeps where the mob bounced as a
+    /// step of its next move (`SteppedInterpolationTracker.updateTracking`).
+    fn mark_position_for_sync(&mut self) {
+        self.mob.sync_position = true;
+    }
     fn set_velocity(&mut self, velocity: Vec3) -> Result<(), ()> {
         self.mob.velocity = velocity;
         Ok(())
@@ -2413,6 +2436,7 @@ mod tests {
                 others: &[],
                 dragon: None,
                 leash_boats: &[],
+                who_lookup: None,
                 others_grid: None,
                 others_index: None,
                 others_villagers: None,
@@ -2423,7 +2447,7 @@ mod tests {
                 day_time: 18000,
                 raining: false,
                 thundering: false,
-                nether: false,
+                level: horizon_core::LevelKey::OVERWORLD,
                 block_tags: &items.block_tags,
                 landing: &motion.landing,
                 biomes: &biomes,
@@ -2432,7 +2456,7 @@ mod tests {
                 mob_drops: true,
                 max_entity_cramming: 24,
                 difficulty: super::super::spawning::LocalDifficulty::new(2, 18000, 0, 0.0),
-                end: false,
+                dimension_type: horizon_world::dimension_type::DimensionFacts::overworld(),
                 world_seed: 0,
                 sea_level: 63,
                 items: Some(&items),
@@ -2549,6 +2573,7 @@ mod tests {
             others: &[],
             dragon: None,
             leash_boats: &[],
+            who_lookup: None,
             others_grid: None,
             others_index: None,
             others_villagers: None,
@@ -2559,7 +2584,7 @@ mod tests {
             day_time: 18000,
             raining: false,
             thundering: false,
-            nether: false,
+            level: horizon_core::LevelKey::OVERWORLD,
             block_tags: &items.block_tags,
             landing: &motion.landing,
             biomes: &biomes,
@@ -2568,7 +2593,7 @@ mod tests {
             mob_drops: true,
             max_entity_cramming: 24,
             difficulty: super::super::spawning::LocalDifficulty::new(2, 18000, 0, 0.0),
-            end: false,
+            dimension_type: horizon_world::dimension_type::DimensionFacts::overworld(),
             world_seed: 0,
             sea_level: 63,
             items: Some(&items),
@@ -2691,6 +2716,7 @@ mod tests {
                 controlling_player_movement: None,
                 nearest_player: None,
                 others: &others,
+                who_lookup: None,
                 dragon: None,
                 leash_boats: &[],
                 others_grid: None,
@@ -2703,7 +2729,7 @@ mod tests {
                 day_time: 6000,
                 raining: false,
                 thundering: false,
-                nether: false,
+                level: horizon_core::LevelKey::OVERWORLD,
                 block_tags: &items.block_tags,
                 landing: &motion.landing,
                 biomes: &biomes,
@@ -2712,7 +2738,7 @@ mod tests {
                 mob_drops: true,
                 max_entity_cramming: 24,
                 difficulty: super::super::spawning::LocalDifficulty::new(2, 6000, 0, 0.0),
-                end: false,
+                dimension_type: horizon_world::dimension_type::DimensionFacts::overworld(),
                 world_seed: 0,
                 sea_level: 63,
                 items: Some(&items),
@@ -3426,5 +3452,42 @@ mod tests {
             );
         });
         assert!(ran, "built test world ran");
+    }
+}
+
+#[cfg(test)]
+mod size_answer_tests {
+    use super::*;
+    use crate::pose::SizeAnswer;
+
+    /// `EntityEvent.Size`: an `entity_size` answer replaces the mob's dimensions while its
+    /// pose and vanilla size hold; a change to either goes back to vanilla's.
+    #[test]
+    fn a_size_answer_holds_until_the_pose_or_vanilla_size_changes() {
+        let mut cow = Mob::new(1, crate::mobs::sensor_scan_tests::kind(), Vec3::ZERO, 0.0);
+        let vanilla = cow.vanilla_dims();
+        assert_eq!(dims_array(cow.dims()), vanilla);
+        cow.size_answer = Some(SizeAnswer {
+            pose: cow.pose(),
+            vanilla,
+            size: Some([2.0, 3.0, 2.5]),
+        });
+        assert_eq!(cow.dims(), (2.0, 3.0, 2.5));
+        assert_eq!(
+            (cow.width(), cow.height(), cow.eye_height()),
+            (2.0, 3.0, 2.5)
+        );
+        assert_eq!(cow.vanilla_dims(), vanilla);
+        // A baby's vanilla size is another one: the answer no longer holds.
+        crate::mobs::finalize::set_baby(&mut cow, true);
+        assert_ne!(cow.vanilla_dims(), vanilla);
+        assert_eq!(dims_array(cow.dims()), cow.vanilla_dims());
+        // An answer that left vanilla's size changes nothing.
+        cow.size_answer = Some(SizeAnswer {
+            pose: cow.pose(),
+            vanilla: cow.vanilla_dims(),
+            size: None,
+        });
+        assert_eq!(dims_array(cow.dims()), cow.vanilla_dims());
     }
 }

@@ -1,3 +1,6 @@
+use crate::game::api_values::{TryIntoApi, TryIntoEngine};
+use horizon_client::containers::ModBlockEntity as EngineBlockEntity;
+
 struct ContentsChangedGuard<'a, 'game> {
     game: &'a mut Game<'game>,
 }
@@ -352,7 +355,7 @@ impl Game<'_> {
     /// show, so a mod's `Cancel` or its own screen doesn't keep it shut (a
     /// mod's screen can't open over the title).
     pub(super) fn show_title(&mut self, mut title: horizon_client::title::Title) {
-        title.set_rule_registry(Arc::new(mod_api::__private::game_rule_registry()));
+        title.set_rule_registry(Arc::new(crate::game::api_values::game_rule_registry()));
         self.show_title_with_registry(title);
     }
     pub(super) fn show_title_with_registry(&mut self, mut title: horizon_client::title::Title) {
@@ -783,14 +786,17 @@ fn screen_text_hooked(text: &str, mut canceled: impl FnMut(char) -> bool) -> Opt
     Some(left)
 }
 
-/// What a key press's characters leave for a text box after the
-/// `ScreenEvent.CharacterTyped.Pre` hook: the characters no mod cancelled,
-/// control ones gone (the key's own handling takes those, and vanilla fires
-/// no `charTyped` for them). `None` when nothing is left to type.
-fn chars_to_type(text: &str, canceled: impl FnMut(char) -> bool) -> Option<String> {
-    let left = screen_text_hooked(text, canceled)?;
-    let text: String = left.chars().filter(|c| !c.is_control()).collect();
-    (!text.is_empty()).then_some(text)
+/// What of a key press's text is characters for the
+/// `ScreenEvent.CharacterTyped.Pre` hook: control ones are gone (the key's own
+/// handling takes those, and vanilla fires no `charTyped` for them).
+/// With the edit modifier held the key is a shortcut and its characters are
+/// not text (`types_text`): no hook hears them, as vanilla's `textInput`
+/// gets none for Ctrl+A.
+fn chars_to_type(text: &str, types_text: bool) -> String {
+    if !types_text {
+        return String::new();
+    }
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// The hook points. Each does nothing in Horizon.
@@ -1154,21 +1160,45 @@ impl Game<'_> {
         );
         canceled
     }
+    /// `native_screen_char_typed_pre` for one character, with the focused
+    /// box's edit: what the listeners leave of `field` goes back to the box
+    /// before the character does. Whether they cancelled the character.
+    fn screen_char_canceled(&mut self, c: char) -> bool {
+        if !mod_api::__private::listened(mod_api::HookId::ScreenCharTypedPre)
+            || !self.screen_hooks_open()
+        {
+            return false;
+        }
+        let modifiers = super::glfw_modifiers(self.modifiers);
+        self.with_focused_text_edit(|game, field| {
+            let Some(screen) = game.screen_view_now() else {
+                return false;
+            };
+            let mut canceled = false;
+            game.native_screen_char_typed_pre(&screen, c, modifiers, field, &mut canceled);
+            canceled
+        })
+    }
     /// Text on its way to a text box after the open screen's character hooks
     /// (`native_screen_char_typed_pre` per printable character): the cancelled
     /// characters are gone and every other one stays, control characters
     /// included (a text box reads Backspace, Delete and the like as keys).
-    /// `None` when none of them is left to type.
-    pub(super) fn screen_text_typed(&self, text: &str) -> Option<String> {
-        let Some(screen) = self.screen_view_now() else {
-            return Some(text.to_owned());
-        };
-        let modifiers = super::glfw_modifiers(self.modifiers);
-        screen_text_hooked(text, |c| {
-            let mut canceled = false;
-            self.native_screen_char_typed_pre(&screen, c, modifiers, &mut canceled);
-            canceled
-        })
+    /// `None` when none of them is left to type. For a key's text that stays
+    /// on the key, which no box with a `field` takes.
+    pub(super) fn screen_text_typed(&mut self, text: &str) -> Option<String> {
+        screen_text_hooked(text, |c| self.screen_char_canceled(c))
+    }
+    /// Text into a text box a character at a time (`Screen.charTyped`): each
+    /// printable one is offered to `native_screen_char_typed_pre`, and `take`
+    /// gets it unless cancelled, before the next is offered. A control
+    /// character goes straight to `take`: a text box reads it as a key.
+    pub(super) fn screen_text_each(&mut self, text: &str, mut take: impl FnMut(&mut Self, &str)) {
+        let mut encoded = [0; 4];
+        for c in text.chars() {
+            if c.is_control() || !self.screen_char_canceled(c) {
+                take(self, c.encode_utf8(&mut encoded));
+            }
+        }
     }
     /// A key press's characters (`ScreenEvent.CharacterTyped.Pre`, vanilla's
     /// `KeyboardHandler.charTyped`), dispatched once the screen has acted on
@@ -1182,22 +1212,17 @@ impl Game<'_> {
         let Some(text) = text else {
             return;
         };
-        let Some(screen) = self.screen_view_now() else {
+        if !self.screen_hooks_open() {
             return;
-        };
-        let modifiers = super::glfw_modifiers(self.modifiers);
-        let Some(text) = chars_to_type(text, |c| {
-            let mut canceled = false;
-            self.native_screen_char_typed_pre(&screen, c, modifiers, &mut canceled);
-            canceled
-        }) else {
-            return;
-        };
-        // A held edit modifier makes a shortcut of the key, not text.
-        // `Err` only says no text box of the screen takes the characters.
-        if !self.types_text() || self.type_chars_into_screen(&text).is_err() {
-            self.screen_chars_post(&text);
         }
+        // A held edit modifier makes a shortcut of the key, not text.
+        let text = chars_to_type(text, self.types_text());
+        self.screen_text_each(&text, |game, c| {
+            // `Err` only says no text box of the screen takes the character.
+            if game.type_chars_into_screen(c).is_err() {
+                game.screen_chars_post(c);
+            }
+        });
     }
     pub(super) fn observe_client_packet(
         &mut self,
@@ -1339,12 +1364,15 @@ pub(super) fn incoming_damage(
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
     let mut canceled = false;
     let attack = level.attack();
+    let Ok(weapon) = attack.weapon_of(source.direct).try_into_api() else {
+        return false;
+    };
     HitLevel(level).native_living_incoming_damage(mod_api::__private::LivingIncomingDamageCall {
         entity,
         kind,
         source: &source,
         victim: &victim,
-        weapon: attack.weapon_of(source.direct),
+        weapon: weapon.as_ref(),
         container,
         canceled: &mut canceled,
     });
@@ -1442,6 +1470,7 @@ impl Game<'_> {
             attacker,
             held,
             projectile: None,
+            direct: None,
             player_uuid,
         }
     }
@@ -1486,6 +1515,9 @@ pub(super) fn knockback(level: DamageLevel<'_>, pushed: Hurting<'_>, knock: &mut
     let (entity, kind, source) = hurt_server_args(pushed, level.attack());
     let mut canceled = false;
     let [main, off] = &attack.held;
+    let (Ok(main), Ok(off)) = (main.try_into_api(), off.try_into_api()) else {
+        return false;
+    };
     HitLevel(level).native_living_knockback(mod_api::__private::LivingKnockbackCall {
         entity,
         kind,
@@ -1591,7 +1623,9 @@ fn mob_source(damage: &Damage, attack: &Attack) -> HurtSource<'static> {
     HurtSource {
         damage_type,
         causing,
-        direct: if melee {
+        direct: if let Some(direct) = attack.direct {
+            direct
+        } else if melee {
             causing
         } else {
             attack.projectile_direct(damage_type)
@@ -1802,9 +1836,20 @@ impl GameLevel<'_> {
     pub(super) fn new_block_entity(&self, name: &str) -> Option<BlockEntity> {
         let mut nbt = None;
         if horizon_client::block_entity_types::type_for(name).is_some() {
-            self.native_block_entity(name, &mut nbt);
+            self.native_block_entity(name, self.registry.default_state(name)?, &mut nbt);
         }
         block_entity_for_block(self.registry, self.facts, name, nbt.unwrap_or_default())
+    }
+    /// Creates a declared state-aware block entity from its actual state. No answer
+    /// means no entity; the registered declaration owns its type identity.
+    pub(super) fn new_block_entity_for_state(&self, state: BlockStateId) -> Option<BlockEntity> {
+        let name = &self.registry.state(state)?.name;
+        if self.world.block_entities.stateful_entity(state.0) {
+            let mut nbt = None;
+            self.native_block_entity(name, state, &mut nbt);
+            return block_entity_for_block(self.registry, self.facts, name, nbt?);
+        }
+        self.new_block_entity(name)
     }
     /// Replaces the block at `pos` with `state` through `Level.setBlock`, as
     /// `Game::native_set_block` does for the Host, from a hook that gets the
@@ -1833,8 +1878,9 @@ impl GameLevel<'_> {
         let b = self.behaviours;
         let changed = b.set_block(self, ticks, at, state, flags);
         let landed = self.world.block(pos[0], pos[1], pos[2]);
-        if let Some(name) = block_entity_to_create(self.facts, changed, previous, state, landed)
-            && let Some(entity) = self.new_block_entity(&name)
+        if !self.world.block_entities.stateful_entity(landed.0)
+            && block_entity_to_create(self.facts, changed, previous, state, landed).is_some()
+            && let Some(entity) = self.new_block_entity_for_state(landed)
         {
             put_block_entity(self.world, pos, entity);
         }
@@ -1929,7 +1975,7 @@ fn block_entity_for_block(
     initial: Compound,
 ) -> Option<BlockEntity> {
     if let Some(kind) = horizon_client::block_entity_types::type_for(name) {
-        return Some(BlockEntity::Mod(Box::new(ModBlockEntity::new(
+        return Some(BlockEntity::Mod(Box::new(EngineBlockEntity::new(
             kind.to_owned(),
             ModBlockEntityFields {
                 nbt: initial,
@@ -2076,7 +2122,7 @@ impl Game<'_> {
     pub(super) fn native_with_mod_block_entity<R>(
         &mut self,
         pos: [i32; 3],
-        change: impl FnOnce(&mut ModBlockEntity) -> R,
+        change: impl FnOnce(&mut EngineBlockEntity) -> R,
     ) -> Option<R> {
         let key = (pos[0], pos[1], pos[2]);
         let Some(BlockEntity::Mod(m)) = self.world.block_entities.get_mut(&key) else {
@@ -2121,20 +2167,55 @@ impl Game<'_> {
             self.clear_client_particles();
         }
     }
-    /// Draws one vanilla HUD layer between the mods' hooks: `native_gui_layer_pre`
-    /// (which may hide it), the layer, then `native_gui_layer_post`. `None` when
-    /// a mod hid the layer.
+    /// Draws one vanilla HUD layer between the mods' hooks: first the mods' layers
+    /// placed below it (`draw_mod_gui_layers`), then `native_gui_layer_pre` (which
+    /// may hide it), the layer, then `native_gui_layer_post`. `None` when a mod hid
+    /// the layer.
     pub(super) fn gui_layer<R>(
         &mut self,
         layer: &str,
         batch: &mut HudBatch,
         draw: impl FnOnce(&mut Self, &mut HudBatch) -> R,
     ) -> Option<R> {
+        self.draw_mod_gui_layers(Some(layer), batch);
         let mut canceled = false;
         self.native_gui_layer_pre(layer, batch, &mut canceled);
         let drawn = (!canceled).then(|| draw(self, batch));
         self.native_gui_layer_post(layer, batch);
         drawn
+    }
+    /// `GuiLayerManager.renderInner` for the mods' layers (`native_register_gui_layers`) not
+    /// drawn yet this frame and placed below vanilla layer `until`, or for all that are left
+    /// with `None`, at the HUD's end. Each fires `native_gui_layer_pre` (which may hide it),
+    /// `native_gui_layer_draw`, then `native_gui_layer_post`, as a vanilla layer does. So a
+    /// vanilla layer that is not drawn this frame keeps its place: the mods' layers around it
+    /// draw at the next layer that is. Nothing while the HUD is hidden, and nothing to look up
+    /// when no mod registered a layer.
+    pub(super) fn draw_mod_gui_layers(&mut self, until: Option<&str>, batch: &mut HudBatch) {
+        let order = horizon_client::gui_layers::order();
+        let Some(next) = self.hud_layer_next.filter(|_| order.has_mod_layers()) else {
+            return;
+        };
+        let end = match until {
+            Some(layer) => match order.position(layer) {
+                Some(at) => at,
+                None => return,
+            },
+            None => order.len(),
+        };
+        for at in next..end {
+            let Some(layer) = order.mod_layer(at) else {
+                continue;
+            };
+            let mut canceled = false;
+            self.native_gui_layer_pre(layer, batch, &mut canceled);
+            if !canceled {
+                self.native_gui_layer_draw(layer, batch);
+            }
+            self.native_gui_layer_post(layer, batch);
+        }
+        // Past `until` itself: it is drawn next, by `gui_layer`.
+        self.hud_layer_next = Some(next.max(end + usize::from(until.is_some())));
     }
     /// Whether a box in `corner` shows: F3's debug screen takes both top
     /// corners (its left and right columns), and a bottom corner while one
@@ -2368,6 +2449,13 @@ impl Game<'_> {
             (None, None)
         };
         let (mut successful, mut canceled) = (false, false);
+        let Ok(snapshot) = stack.try_into_api() else {
+            return BonemealAsk {
+                crop: None,
+                check: Some(check),
+            };
+        };
+        let mut snapshot = Some(snapshot);
         self.native_bonemeal(mod_api::__private::BonemealCall {
             dimension: self.dim.level(),
             player,
@@ -2375,11 +2463,21 @@ impl Game<'_> {
             pos,
             state,
             source: BonemealSource::Interaction,
-            stack,
+            stack: &mut snapshot,
             valid_bonemeal_target: valid,
             successful: &mut successful,
             canceled: &mut canceled,
         });
+        match snapshot.try_into_engine(self.items()) {
+            Ok(Some(next)) => *stack = next,
+            Ok(None) => stack.count = 0,
+            Err(_) => {
+                return BonemealAsk {
+                    crop: None,
+                    check: Some(check),
+                };
+            }
+        }
         BonemealAsk {
             crop: canceled.then_some(successful),
             check: Some(check),
@@ -2492,7 +2590,13 @@ impl Game<'_> {
                 use_item,
             };
         }
-        let click = self.block_click(hit, hand, stack);
+        let Ok(snapshot) = stack.try_into_api() else {
+            return BlockClickAnswer::Go {
+                use_block,
+                use_item,
+            };
+        };
+        let click = self.block_click(hit, hand, snapshot.as_ref());
         let (mut result, mut canceled) = (NativeInteractionResult::Pass, false);
         self.native_right_click_block(
             &click,
@@ -2521,7 +2625,8 @@ impl Game<'_> {
         if !mod_api::__private::listened(mod_api::HookId::UseItemOnBlock) {
             return None;
         }
-        let click = self.block_click(hit, hand, stack);
+        let snapshot = stack.try_into_api().ok()?;
+        let click = self.block_click(hit, hand, snapshot.as_ref());
         let (mut result, mut canceled) = (NativeInteractionResult::TryWithEmptyHand, false);
         self.native_use_item_on_block(&click, phase, &mut result, &mut canceled);
         if !canceled {
@@ -2557,9 +2662,10 @@ impl Game<'_> {
         if !mod_api::__private::has_part_hook(mod_api::HookId::OnItemUseFirst) {
             return None;
         }
-        let click = self.block_click(hit, hand, Some(stack));
+        let snapshot = stack.try_into_api().ok()?;
+        let click = self.block_click(hit, hand, Some(&snapshot));
         let mut answer = None;
-        self.native_on_item_use_first(stack, &click, &mut answer);
+        self.native_on_item_use_first(&snapshot, &click, &mut answer);
         answer.filter(|answer| *answer != NativeInteractionResult::Pass)
     }
     /// Air use only: a passing block or entity keeps its target, rather than
@@ -2582,6 +2688,7 @@ impl Game<'_> {
             .target_position(super::commands::Target::Player)?
             .map(|v| v.floor() as i32);
         let (player, player_entity_id) = self.native_clicker();
+        let snapshot = stack.try_into_api().ok()?;
         let click = NativeItemClick::from(mod_api::__private::built::NativeItemClick {
             side: if self.remote.is_some() {
                 LogicalSide::Client
@@ -2591,7 +2698,7 @@ impl Game<'_> {
             dimension: self.dim.level(),
             pos,
             hand,
-            stack,
+            stack: &snapshot,
             player,
             player_entity_id,
         });
@@ -2602,29 +2709,6 @@ impl Game<'_> {
             self.with_hand(hand, |game| game.apply_after_use_components(stack));
         }
         canceled.then_some(result)
-    }
-    /// The shared context for a block's behaviour and the click event.
-    pub(super) fn block_click<'a>(
-        &mut self,
-        hit: &super::Hit,
-        hand: Hand,
-        stack: Option<&'a ItemStack>,
-    ) -> NativeBlockClick<'a> {
-        let (player, player_entity_id) = self.native_clicker();
-        NativeBlockClick::from(mod_api::__private::built::NativeBlockClick {
-            side: if self.remote.is_some() {
-                LogicalSide::Client
-            } else {
-                LogicalSide::Server
-            },
-            dimension: self.dim.level(),
-            pos: hit.pos,
-            hit: hit.native(),
-            hand,
-            stack,
-            player,
-            player_entity_id,
-        })
     }
     /// `GameRuleChangedEvent` once the server set the rule `name` to `value`
     /// (`GameRules.set` with a server).
@@ -2692,6 +2776,12 @@ impl Game<'_> {
         explosion: Option<f32>,
         drops: &mut Vec<ItemStack>,
     ) {
+        if !mod_api::__private::listened(mod_api::HookId::LootDrops) {
+            return;
+        }
+        let Ok(snapshot) = tool.try_into_api() else {
+            return;
+        };
         let items = match &self.world_tables {
             Some(tables) => &tables.items,
             None => self.res.items(),
@@ -2704,7 +2794,7 @@ impl Game<'_> {
             block: Some((pos, state)),
             entity: None,
             player,
-            tool,
+            tool: snapshot.as_ref(),
             explosion,
             used: false,
         });
@@ -2724,6 +2814,12 @@ impl Game<'_> {
         tool: Option<&ItemStack>,
         drops: &mut Vec<ItemStack>,
     ) {
+        if !mod_api::__private::listened(mod_api::HookId::LootDrops) {
+            return;
+        }
+        let Ok(snapshot) = tool.try_into_api() else {
+            return;
+        };
         let context = NativeLootDrops::from(mod_api::__private::built::NativeLootDrops {
             table,
             dimension: self.dim.id(),
@@ -2731,7 +2827,7 @@ impl Game<'_> {
             block,
             entity,
             player,
-            tool,
+            tool: snapshot.as_ref(),
             explosion: None,
             used: true,
         });
@@ -2793,6 +2889,7 @@ impl Game<'_> {
     }
     /// The mobs from index `from` on are new in the world.
     pub(super) fn native_mobs_joined(&mut self, from: usize, natural: bool) {
+        self.join_spawn_tags(from);
         // A mod can keep a mob out; it is then taken out and not told of.
         self.native_joins_flush(false, 0);
         for i in from..self.mobs.len() {
@@ -2829,10 +2926,13 @@ impl Game<'_> {
         self.native_slot_tick(-106, false);
     }
     fn native_slot_tick(&mut self, slot: i32, selected: bool) {
-        if self.native_carried_slot(slot).is_none_or(|s| s.is_none()) {
+        if !mod_api::__private::has_part_hook(mod_api::HookId::InventoryTick) {
             return;
         }
-        self.native_inventory_tick(slot, selected);
+        let Some(stack) = self.native_carried_slot(slot).and_then(|s| s.clone()) else {
+            return;
+        };
+        self.native_inventory_tick(&stack, slot, selected);
         if let Some(stack) = self.native_carried_slot(slot)
             && stack.as_ref().is_some_and(|s| s.count == 0)
         {
@@ -2853,6 +2953,7 @@ impl Game<'_> {
     /// native mod's, made as a write of the level creates it
     /// (`GameLevel::new_block_entity`). Only a declared mod type builds the
     /// level.
+    #[cfg(test)]
     pub(super) fn new_block_entity(&mut self, name: &str) -> Option<BlockEntity> {
         if horizon_client::block_entity_types::type_for(name).is_none() {
             return block_entity_for_block(
@@ -2863,6 +2964,37 @@ impl Game<'_> {
             );
         }
         self.with_level(|_, level, _| level.new_block_entity(name))
+    }
+    /// Compile static state-factory ownership once per level, including on clients.
+    pub(super) fn ensure_stateful_entity_table(&mut self) {
+        if self.world.block_entities.has_stateful_entity_table() {
+            return;
+        }
+        let registry = self.pack.assets.registry;
+        let mut blocks = FxHashMap::default();
+        let states = (0..registry.len() as u32)
+            .map(|id| {
+                let Some(state) = registry.state(BlockStateId(id)) else {
+                    return false;
+                };
+                if state.name.starts_with("minecraft:") {
+                    return false;
+                }
+                *blocks.entry(state.name.as_str()).or_insert_with(|| {
+                    let mut stateful = false;
+                    self.native_stateful_block_entity(&state.name, &mut stateful);
+                    stateful
+                })
+            })
+            .collect();
+        self.world.block_entities.set_stateful_entities(states);
+    }
+    /// Create a block entity from an actual state using the level's creation hook.
+    pub(super) fn new_block_entity_for_state(
+        &mut self,
+        state: BlockStateId,
+    ) -> Option<BlockEntity> {
+        self.with_level(|_, level, _| level.new_block_entity_for_state(state))
     }
     /// The containers of the mod blocks' block entities, by block state
     /// (`native_block_entity_container`), checked.
@@ -3243,7 +3375,7 @@ impl Game<'_> {
             let items = horizon_client::save::encode_items(&std::mem::take(&mut taken.items));
             taken.nbt.insert("Items".into(), items);
         }
-        self.native_block_entity_tick([pos.0, pos.1, pos.2], &mut taken);
+        self.api_block_entity_tick([pos.0, pos.1, pos.2], &mut taken);
         self.put_back_mod_block_entity(pos, taken, &items);
     }
     /// Puts back a mod block entity taken out for a call, unless the call
@@ -3251,7 +3383,7 @@ impl Game<'_> {
     pub(super) fn put_back_mod_block_entity(
         &mut self,
         pos: Pos,
-        mut taken: ModBlockEntity,
+        mut taken: EngineBlockEntity,
         items: &[Option<ItemStack>],
     ) {
         if let Some(BlockEntity::Mod(m)) = self.world.block_entities.get_mut(&pos)
@@ -3297,7 +3429,7 @@ impl Game<'_> {
         }
         let mut taken = std::mem::take(&mut **m);
         let items = taken.items.clone();
-        self.native_menu_button(&context, &mut taken, carried);
+        self.api_menu_button(&context, &mut taken, carried);
         self.put_back_mod_block_entity(pos, taken, &items);
     }
     /// The cursor from the open mod screen's top left, with its block and
@@ -3431,9 +3563,20 @@ impl Game<'_> {
     /// `ClientHooks.onClickInput`: tells `native_interaction_key_mapping_triggered` that
     /// `key` is about to act with `hand`. `None` when the action goes on; when a mod
     /// cancelled it, `Some` of whether the hand swings.
-    pub(super) fn native_interaction(&mut self, key: InteractionKey, hand: Hand) -> Option<bool> {
+    pub(super) fn native_interaction(
+        &mut self,
+        key: InteractionKey,
+        hand: Hand,
+        attempt: InteractionAttempt,
+    ) -> Option<bool> {
         let (mut swing_hand, mut canceled) = (true, false);
-        self.native_interaction_key_mapping_triggered(key, hand, &mut swing_hand, &mut canceled);
+        self.native_interaction_key_mapping_triggered(
+            key,
+            hand,
+            attempt,
+            &mut swing_hand,
+            &mut canceled,
+        );
         canceled.then_some(swing_hand)
     }
     /// A client mod's command (the `command` hook); a server never asks.
@@ -3730,8 +3873,6 @@ fn packet_view(
 
 #[cfg(test)]
 mod tests {
-    use mod_api::__private::game::*;
-
     #[test]
     fn client_packet_view_exposes_the_type_and_custom_payload_only() {
         use horizon_protocol::packets::{
@@ -3983,7 +4124,7 @@ mod tests {
             ),
         ]);
         mod_api::__private::install(mods.clone());
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         let base = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let root = super::super::mods::content_root(&base, &Default::default());
         if invalid {
@@ -4163,7 +4304,6 @@ mod tests {
         use horizon_client::chunk::Chunk;
         use horizon_client::containers::{BlockEntity, ModBlockEntity, ModBlockEntityFields};
         use horizon_client::save::{decode_block_entity, encode_block_entity};
-        use mod_api;
         use std::sync::Arc;
 
         with_game(|game| {
@@ -4178,15 +4318,11 @@ mod tests {
                 .insert(pos, BlockEntity::Mod(Box::new(machine)));
             assert_eq!(
                 game.native_with_mod_block_entity([1, 64, 1], |entity| {
-                    let mut event = mod_api::BlockEntityTickEvent {
-                        pos: [1, 64, 1],
-                        entity: mod_api::ModBlockEntityView::new(entity),
-                    };
-                    *event.entity = ModBlockEntityFields {
+                    **entity = ModBlockEntityFields {
                         data: vec![7],
                         ..Default::default()
                     };
-                    assert_eq!(event.entity.id(), "test:machine");
+                    assert_eq!(entity.id(), "test:machine");
                 }),
                 Some(())
             );
@@ -4602,25 +4738,16 @@ mod tests {
         );
     }
 
-    /// The window's key path: a key whose press a mod cancelled still types
-    /// the characters no mod cancelled (vanilla's separate `charTyped`), while
-    /// the key characters never reach the text box.
+    /// The window's key path: only a key's printable characters go on to the
+    /// hook and the text box.
     #[test]
-    fn a_cancelled_key_still_types_the_characters_left() {
-        // `axb` with 'x' cancelled: the key went no further, `ab` still types.
-        assert_eq!(
-            super::chars_to_type("axb", |c| c == 'x').as_deref(),
-            Some("ab")
-        );
+    fn a_key_offers_only_its_printable_characters() {
         // Backspace, Escape and the like are keys, not text.
-        assert_eq!(
-            super::chars_to_type("a\u{7f}\u{1b}b", |_| false).as_deref(),
-            Some("ab")
-        );
-        // Every character cancelled: the box takes none of them.
-        assert_eq!(super::chars_to_type("ab", |_| true), None);
+        assert_eq!(super::chars_to_type("a\u{7f}\u{1b}b", true), "ab");
         // Nothing typed: nothing to hand over.
-        assert_eq!(super::chars_to_type("", |_| false), None);
+        assert_eq!(super::chars_to_type("", true), "");
+        // Ctrl+A is a shortcut: its `a` reaches no hook and no box.
+        assert_eq!(super::chars_to_type("a", false), "");
     }
 
     /// A mod's camera replaces vanilla's value by value; one that isn't finite keeps vanilla's.
@@ -4960,6 +5087,7 @@ mod tests {
                 &Attack {
                     attacker: 7,
                     projectile: None,
+                    direct: None,
                     player_uuid: None,
                     held: Default::default(),
                 },
@@ -4967,6 +5095,10 @@ mod tests {
             (s.damage_type, s.causing, s.direct)
         };
         let zombie = Some(Who::Mob(3));
+        // A registered type of a datapack reaches the hook under its own id.
+        let scorch = K::Named(horizon_client::mobs::NamedDamage::new("demo:scorch", 0));
+        assert_eq!(source(scorch, None), ("demo:scorch", 0, 0));
+        assert_eq!(source(scorch, zombie), ("demo:scorch", 3, 0));
         assert_eq!(source(K::MobAttack, zombie), ("minecraft:mob_attack", 3, 3));
         assert_eq!(source(K::Thorns, zombie), ("minecraft:thorns", 3, 3));
         assert_eq!(source(K::Arrow, zombie), ("minecraft:arrow", 3, 0));
@@ -4981,6 +5113,7 @@ mod tests {
                 &Attack {
                     attacker: 7,
                     projectile: Some(912),
+                    direct: None,
                     player_uuid: None,
                     held: Default::default(),
                 },
@@ -5118,7 +5251,7 @@ mod item_fall_on_tests {
     fn a_dropped_item_lands_on_a_fall_on_part() {
         let heard = Lands::default();
         let mods: mod_api::Mods = vec![ModEntry::new("lands", Box::new(Mod(heard.clone())))].into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         let _ = horizon_client::block_contact::HOOKS.set(BLOCK_CONTACT_HOOKS);
         with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
@@ -5295,7 +5428,7 @@ pub(super) mod particle_count_tests {
                 );
                 game.native_render_gui_pre(&mut false);
                 assert_eq!(mod_api::prelude::EffectsClientHost::particle_count(game), 0);
-                let (mut after, _, _, _) = game.entity_geometry(camera, 0.0, Vec::new());
+                let (mut after, _, _, _) = game.entity_geometry(camera, 0.0, None, Vec::new());
                 game.client_particle_geometry(camera, 0.0, 70.0, &mut after);
                 assert!(
                     after.is_empty(),
@@ -5360,7 +5493,7 @@ pub(super) mod particle_count_tests {
                     );
                 let at = game.particles.camera;
                 game.spawn_item(
-                    mod_api::ItemStack::new("minecraft:stick", 1),
+                    horizon_client::items::ItemStack::new("minecraft:stick", 1),
                     at,
                     [0.0; 3],
                     0,
@@ -5460,65 +5593,73 @@ pub(super) mod particle_count_tests {
         .into();
         mod_api::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_client_game(|game| {
-                let mut builder = winit::event_loop::EventLoop::builder();
-                #[cfg(target_os = "linux")]
-                {
-                    use winit::platform::x11::EventLoopBuilderExtX11;
-                    builder.with_x11().with_any_thread(true);
-                }
-                let event_loop = builder.build().unwrap();
-                #[allow(deprecated)]
-                let window = std::sync::Arc::new(
-                    event_loop
-                        .create_window(
-                            winit::window::Window::default_attributes()
-                                .with_visible(false)
-                                .with_inner_size(winit::dpi::PhysicalSize::new(320, 240)),
-                        )
-                        .unwrap(),
-                );
-                game.options.offscreen = true;
-                game.renderer = Some(game.new_renderer(window).unwrap());
-                game.title = None;
-                game.settings.extras.dynamic_lights = true;
-                game.settings.horizon.particle_culling =
-                    horizon_client::graphics::ParticleCullingMode::Off;
-                let mut chunk = horizon_client::chunk::Chunk::empty(0, 0);
-                chunk.lit = true;
-                game.world.chunks.insert((0, 0), std::sync::Arc::new(chunk));
-                let mut player =
-                    horizon_client::motion::PlayerMotion::new(game.motion, Vec3::ZERO).unwrap();
-                player.position = Vec3::new(0.5, 64.0, 0.5);
-                game.previous_position = player.position;
-                game.player = Some(player);
-                game.particles.camera = [0.5, 65.5, 1.5];
-                // Ordinary (non-particle) entity geometry and an unrelated item light.
-                game.spawn_item(
-                    mod_api::ItemStack::new("minecraft:torch", 1),
-                    [0.5, 65.0, 4.5],
-                    [0.0; 3],
-                    0,
-                );
-                // Only the picked-up stick resolves this custom property. The torch's
-                // ordinary model must survive the clear unchanged.
-                std::sync::Arc::get_mut(&mut game.pack.item_renderer)
-                    .unwrap()
-                    .models
-                    .definitions
-                    .insert(
-                        "minecraft:stick".into(),
-                        horizon_assets::item_model::ClientItem::from_json(
-                            r#"{"model":{
-                        "type":"minecraft:condition", "property":"test:clear",
-                        "on_true":{"type":"minecraft:model","model":"minecraft:item/stick"},
-                        "on_false":{"type":"minecraft:model","model":"minecraft:item/stick"}
-                    }}"#,
-                        )
-                        .unwrap(),
-                    );
+                let _event_loop = frame_scene(game);
                 test(game, &at, &calls);
             });
         });
+    }
+
+    /// A real offscreen renderer and a world for it to draw; the event loop that returns
+    /// holds the window.
+    pub(in crate::game) fn frame_scene(
+        game: &mut super::Game<'_>,
+    ) -> winit::event_loop::EventLoop<()> {
+        let mut builder = winit::event_loop::EventLoop::builder();
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11().with_any_thread(true);
+        }
+        let event_loop = builder.build().unwrap();
+        #[allow(deprecated)]
+        let window = std::sync::Arc::new(
+            event_loop
+                .create_window(
+                    winit::window::Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(320, 240)),
+                )
+                .unwrap(),
+        );
+        game.options.offscreen = true;
+        game.renderer = Some(game.new_renderer(window).unwrap());
+        game.title = None;
+        game.settings.extras.dynamic_lights = true;
+        game.settings.horizon.particle_culling = horizon_client::graphics::ParticleCullingMode::Off;
+        let mut chunk = horizon_client::chunk::Chunk::empty(0, 0);
+        chunk.lit = true;
+        game.world.chunks.insert((0, 0), std::sync::Arc::new(chunk));
+        let mut player =
+            horizon_client::motion::PlayerMotion::new(game.motion, Vec3::ZERO).unwrap();
+        player.position = Vec3::new(0.5, 64.0, 0.5);
+        game.previous_position = player.position;
+        game.player = Some(player);
+        game.particles.camera = [0.5, 65.5, 1.5];
+        // Ordinary (non-particle) entity geometry and an unrelated item light.
+        game.spawn_item(
+            horizon_client::items::ItemStack::new("minecraft:torch", 1),
+            [0.5, 65.0, 4.5],
+            [0.0; 3],
+            0,
+        );
+        // Only the picked-up stick resolves this custom property. The torch's
+        // ordinary model must survive the clear unchanged.
+        std::sync::Arc::get_mut(&mut game.pack.item_renderer)
+            .unwrap()
+            .models
+            .definitions
+            .insert(
+                "minecraft:stick".into(),
+                horizon_assets::item_model::ClientItem::from_json(
+                    r#"{"model":{
+                "type":"minecraft:condition", "property":"test:clear",
+                "on_true":{"type":"minecraft:model","model":"minecraft:item/stick"},
+                "on_false":{"type":"minecraft:model","model":"minecraft:item/stick"}
+            }}"#,
+                )
+                .unwrap(),
+            );
+        event_loop
     }
 
     fn add_frame_particles(game: &mut super::Game<'_>) {
@@ -5531,7 +5672,7 @@ pub(super) mod particle_count_tests {
             );
         }
         game.spawn_item(
-            mod_api::ItemStack::new("minecraft:stick", 1),
+            horizon_client::items::ItemStack::new("minecraft:stick", 1),
             game.particles.camera,
             [0.0; 3],
             0,
@@ -5551,8 +5692,8 @@ pub(super) mod particle_count_tests {
         glowing: Vec<u8>,
         gpu: (usize, usize, u32),
         motion: Vec<(u32, u64)>,
-        spans: Vec<mod_api::render::EntitySpan>,
-        gpu_spans: Vec<mod_api::render::EntitySpan>,
+        spans: Vec<mod_render::render::EntitySpan>,
+        gpu_spans: Vec<mod_render::render::EntitySpan>,
         outlines: (usize, u32),
     }
     fn frame_geometry(frame: &super::super::Frame<'_>) -> FrameGeometry {

@@ -27,8 +27,8 @@ toolchain = "1.99.1 <commit>"     # every mod linked together needs the same one
 my_library = "…"
 ```
 
-A mod carries native code or wasm code, not both. A wasm mod may keep declarations under
-`[native]` (`internals` and `injection`), but never native sources or build pins there.
+A mod carries native code or wasm code, not both. A wasm mod keeps `internals` and
+`[[inject]]` declarations at the manifest root, with no `[native]` table.
 A wasm mod's id is words that each start with a
 letter (`hello_wasm`, not `mod_2`).
 
@@ -82,9 +82,9 @@ back when it returns. Internals use the view below. Source mixins require a nati
 
 For internals that the typed API does not yet cover, add `horizon-mod-internals` (library name
 `mod_internals`) to the mod's Cargo dependencies. Declare each internal with
-`cargo horizon-mod internals add <path>` and use `raw = "<function>"` for its internals declaration.
-Its raw-only schema accepts `id`, `target`, `kind` (`HEAD` or `RETURN`) and `raw`; API functions
-are declared only through `[[inject]]`. `cargo horizon-mod build --wasm` fetches the newest prebuilt game's
+`cargo horizon-mod internals add <path>` at the manifest root. Declare each listener with
+`[[inject]]`, `at`, `kind = "head"` or `"return"`, `access = "internals"`, its function `hash`
+and a crate-root `with` callback. `cargo horizon-mod build --wasm` fetches the newest prebuilt game's
 `internals.json` and generates `mod_internals::view` for exactly those declarations and the
 types they reach. The generated code stays in Cargo's build directory. Opaque types and
 functions that cannot cross the sandbox are refused at build, naming the declaration.
@@ -94,8 +94,7 @@ are opaque, except these `winit` key and mouse types, which cross by copy: `keyb
 `event::ElementState` and `MouseButton`. `KeyCode` is `#[non_exhaustive]`, so it, `PhysicalKey`
 and anything holding them are read-only.
 
-Call `mod_internals::raw_listeners!(first, second, ...)` once, listing the functions in the
-manifest's raw-injection order. Each takes its generated raw record and an optional receiver:
+Call `mod_internals::raw_listeners!()` once; the manifest generates the listener list and order. Each takes its generated raw record and an optional receiver:
 `fn(view::HandleChatInputRaw, Option<view::Game>)`, for example. A free function has no receiver
 and takes `Option<()>` instead. This compiled test mod shows the complete pattern:
 

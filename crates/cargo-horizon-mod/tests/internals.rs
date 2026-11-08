@@ -20,7 +20,7 @@ impl Project {
             .join("../../target/i3-d/tests")
             .join(format!("internals-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(MANIFEST), format!("# A modder's description\nid = 'example'\nname = 'Example'\nversion = '0.1.0'\napi = '0.2'\ncapabilities = ['registries']\n\n[native] # native settings\ngame = '26.3'\nhorizon = '{OLD}' # pinned game\nmixins = '{}'\n{declarations}", "a".repeat(40))).unwrap();
+        fs::write(dir.join(MANIFEST), format!("# A modder's description\nid = 'example'\nname = 'Example'\nversion = '0.1.0'\napi = '0.2'\ncapabilities = ['registries']\n{declarations}\n[native] # native settings\ngame = '26.3'\nhorizon = '{OLD}' # pinned game\nmixins = '{}'\n", "a".repeat(40))).unwrap();
         fs::write(dir.join("Cargo.toml"), format!("# Keep this comment\n[package]\nname = 'example'\nversion = '0.1.0'\n[dependencies]\nhorizon-mod-api = {{ git = 'https://example.invalid/horizon', rev = '{OLD}' }} # API pin\nhorizon-internals = {{ git = 'https://example.invalid/horizon', rev = '{OLD}' }} # facade pin\n")).unwrap();
         let project = Self { dir };
         project.catalog(OLD, OLD_CATALOG);
@@ -73,11 +73,11 @@ fn internals_add_writes_pinned_hashes_and_preserves_the_rest_of_the_manifest() {
         "horizon_client::game::Game",
     ]);
     success(&output);
-    let native = project.manifest().native.unwrap();
-    assert_eq!(native.internals.len(), 2);
-    assert_eq!(native.internals[0].hash, "1111");
+    let manifest = project.manifest();
+    assert_eq!(manifest.internals.len(), 2);
+    assert_eq!(manifest.internals[0].hash, "1111");
     // A guarded alternative before the unconditional entry must not shadow it.
-    assert_eq!(native.internals[1].hash, "7777");
+    assert_eq!(manifest.internals[1].hash, "7777");
     assert!(
         project
             .text()
@@ -125,7 +125,7 @@ fn internals_add_for_wasm_uses_the_shared_catalog_without_native_pins() {
     success(&run(&catalog));
     let manifest = project.manifest();
     assert!(manifest.native.is_none());
-    assert_eq!(manifest.wasm.unwrap().internals()[0].hash, "1111");
+    assert_eq!(manifest.internals[0].hash, "1111");
     assert!(project.text().contains("# A pinless mod"));
     let before = project.text();
     success(&run(&catalog));
@@ -210,7 +210,7 @@ fn update_diffs_signatures_refreshes_present_hashes_and_keeps_missing_declaratio
     let native = manifest.native.unwrap();
     assert_eq!(native.horizon, NEW);
     assert_eq!(
-        native
+        manifest
             .internals
             .iter()
             .map(|i| i.hash.as_str())
@@ -241,7 +241,7 @@ fn update_diffs_signatures_refreshes_present_hashes_and_keeps_missing_declaratio
 fn table_declarations_keep_their_format_when_adding_and_refreshing() {
     let project = Project::new(
         "tables",
-        "\n[[native.internals]] # the game\npath = 'horizon_client::game::Game'\nhash = 'stale' # fingerprint\n",
+        "\n[[internals]] # the game\npath = 'horizon_client::game::Game'\nhash = 'stale' # fingerprint\n",
     );
     success(&project.run(&[
         "internals",
@@ -249,12 +249,12 @@ fn table_declarations_keep_their_format_when_adding_and_refreshing() {
         "horizon_client::game::Game",
         "horizon_client::game::Game::creative",
     ]));
-    assert_eq!(project.manifest().native.unwrap().internals[0].hash, "1111");
-    assert!(project.text().contains("[[native.internals]] # the game"));
+    assert_eq!(project.manifest().internals[0].hash, "1111");
+    assert!(project.text().contains("[[internals]] # the game"));
     assert!(project.text().contains("# fingerprint"));
     let report = success(&project.run(&["update", "--horizon", NEW]));
     assert!(report.contains("unchanged: horizon_client::game::Game"));
-    assert_eq!(project.manifest().native.unwrap().internals.len(), 2);
+    assert_eq!(project.manifest().internals.len(), 2);
     assert!(project.text().contains("# fingerprint"));
 }
 
@@ -270,7 +270,7 @@ fn internals_add_requires_kind_for_ambiguous_paths_and_update_keeps_it() {
             ),
             (
                 "tables",
-                format!("\n[[native.internals]]\npath='{path}'\nhash='stale'\n"),
+                format!("\n[[internals]]\npath='{path}'\nhash='stale'\n"),
             ),
         ] {
             let project = Project::new(&format!("ambiguous-{kind}-{form}"), &declarations);
@@ -292,7 +292,7 @@ fn internals_add_requires_kind_for_ambiguous_paths_and_update_keeps_it() {
             assert!(error.contains(&format!("field, {kind}")), "{error}");
             assert_eq!(project.text(), before);
             success(&project.run(&["internals", "add", path, "--kind", kind]));
-            let declaration = &project.manifest().native.unwrap().internals[0];
+            let declaration = &project.manifest().internals[0];
             assert_eq!(declaration.kind.as_deref(), Some(kind));
             assert_eq!(declaration.hash, "function");
             success(&project.run(&["internals", "add", path, "--kind", "field"]));
@@ -304,12 +304,12 @@ fn internals_add_requires_kind_for_ambiguous_paths_and_update_keeps_it() {
                 report.contains("fn listening(&self) -> bool → fn listening(&mut self) -> bool"),
                 "{report}"
             );
-            let native = project.manifest().native.unwrap();
-            assert_eq!(native.internals.len(), 2);
-            assert_eq!(native.internals[0].kind.as_deref(), Some(kind));
-            assert_eq!(native.internals[0].hash, "new-function");
-            assert_eq!(native.internals[1].kind.as_deref(), Some("field"));
-            assert_eq!(native.internals[1].hash, "field");
+            let manifest = project.manifest();
+            assert_eq!(manifest.internals.len(), 2);
+            assert_eq!(manifest.internals[0].kind.as_deref(), Some(kind));
+            assert_eq!(manifest.internals[0].hash, "new-function");
+            assert_eq!(manifest.internals[1].kind.as_deref(), Some("field"));
+            assert_eq!(manifest.internals[1].hash, "field");
         }
     }
 }
@@ -362,9 +362,9 @@ printf '%s\n' '[{"path":"Used","kind":"struct","signature":"struct Used","hash":
     let report = success(&invoke());
     assert!(report.contains("added: Used (struct)"));
     assert!(report.contains("removed: Unused"));
-    let native = project.manifest().native.unwrap();
-    assert_eq!(native.internals.len(), 1);
-    assert_eq!(native.internals[0].hash, "compiler");
+    let manifest = project.manifest();
+    assert_eq!(manifest.internals.len(), 1);
+    assert_eq!(manifest.internals[0].hash, "compiler");
     assert!(project.text().contains("# native settings"));
     let before = project.text();
     fs::write(&launcher, "#!/bin/sh\nprintf 'not JSON'\n").unwrap();
@@ -378,7 +378,7 @@ fn wasm_sync_project(name: &str) -> (Project, PathBuf) {
     fs::create_dir_all(repo.join("crates/horizon-mod-api-gen/wasm-internals")).unwrap();
     fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
     let manifest = format!(
-        "id='example'\nname='Example'\nversion='0.1.0'\napi='0.2'\ncapabilities=['registries']\n[wasm]\nsha512='{}'\ntoolchain='nightly'\n[native]\ninternals=[{{path='z::last',hash='a'}},{{path='a::first',hash='b'}}]\n[[native.injection]]\nid='fell'\ntarget='a::first'\nkind='HEAD'\nraw='fell'\n",
+        "id='example'\nname='Example'\nversion='0.1.0'\napi='0.2'\ncapabilities=['registries']\ninternals=[{{path='z::last',hash='a'}},{{path='a::first',hash='b'}}]\n[wasm]\nsha512='{}'\ntoolchain='nightly'\n[[inject]]\nid='fell'\nat='a::first'\nkind='head'\naccess='internals'\nwith='fell'\nhash='b'\n[[inject]]\nid='only'\nat='m::only_injection'\nkind='head'\naccess='internals'\nwith='only'\nhash='c'\n",
         "a".repeat(128)
     );
     fs::write(project.dir.join(MANIFEST), manifest).unwrap();
@@ -405,7 +405,7 @@ fn wasm_sync_sorts_and_deduplicates() {
     assert_eq!(
         fs::read_to_string(repo.join("crates/horizon-mod-api-gen/wasm-internals/example.txt"))
             .unwrap(),
-        "# example: written by cargo horizon-mod internals sync from horizon-mod.toml\na::first\nz::last\n"
+        "# example: written by cargo horizon-mod internals sync from horizon-mod.toml\na::first\nm::only_injection\nz::last\n"
     );
 }
 

@@ -14,7 +14,7 @@ fn fixture() -> (Manifest, Catalog) {
         }])).unwrap(),
         sites: serde_json::from_value(serde_json::json!([{
             "name":"Sone", "target":"game::run", "selector":"self.step", "ordinal":0,
-            "hash":"context", "listener":"game::__SoneListener", "record":"game::__SoneArgs", "output":"()"
+            "call":"game::step", "ctx":"context", "hash":"place", "listener":"game::__SoneListener", "record":"game::__SoneArgs", "output":"()"
         }])).unwrap(),
         discovery: false,
     };
@@ -58,11 +58,12 @@ fn every_native_kind_and_access_registers_or_refuses_by_name() {
                 access,
                 priority: 7,
                 hash: "signature".into(),
-                call: call.then(|| "self.step".into()),
+                call: call.then(|| "game::step".into()),
                 nth: call.then_some(0),
                 ctx: call.then(|| "context".into()),
             });
             let pending = match (kind, access) {
+                (Kind::ModifyCallArg, _) => Some(NoSlotReason::SourcePending),
                 (Kind::ModifyLocal, _) => Some(NoSlotReason::LocalSlotsPending),
                 (Kind::Field, _) => Some(NoSlotReason::ExtensionSlotsPending),
                 (Kind::Expression, _) => Some(NoSlotReason::SourcePending),
@@ -109,13 +110,13 @@ fn every_native_kind_and_access_registers_or_refuses_by_name() {
                 "{main}"
             );
             assert!(facade.source.contains(if call {
-                "pub const fn sone"
+                "pub const fn s"
             } else if kind == Kind::Return {
                 "pub const fn run_return"
             } else {
                 "pub const fn run"
             }));
-            let reports = report(&manifest).collect::<Vec<_>>();
+            let reports = report(&catalog, &manifest).collect::<Vec<_>>();
             assert_eq!(reports.len(), 1);
             assert!(reports[0].contains("example:test: game::run -> slot"));
         }
@@ -123,7 +124,7 @@ fn every_native_kind_and_access_registers_or_refuses_by_name() {
 }
 
 #[test]
-fn unified_route_refuses_changed_missing_unlisted_and_invalid_condition() {
+fn unified_route_checks_freshness_and_selects_native_function_source() {
     let (mut manifest, mut catalog) = fixture();
     manifest.inject.push(Inject {
         id: "test".into(),
@@ -133,7 +134,7 @@ fn unified_route_refuses_changed_missing_unlisted_and_invalid_condition() {
         access: Access::Internals,
         priority: 0,
         hash: "signature".into(),
-        call: Some("self.step".into()),
+        call: Some("game::step".into()),
         nth: Some(0),
         ctx: Some("context".into()),
     });
@@ -151,6 +152,12 @@ fn unified_route_refuses_changed_missing_unlisted_and_invalid_condition() {
     manifest.inject[0].call = None;
     manifest.inject[0].kind = Kind::Head;
     catalog.points.clear();
+    check(&catalog, &manifest).unwrap();
+    assert!(report(&catalog, &manifest)
+        .next()
+        .unwrap()
+        .contains("source (private slot"));
+    manifest.inject[0].kind = Kind::ModifyArg;
     assert!(matches!(
         check(&catalog, &manifest),
         Err(InjectError::NoSlot {
@@ -158,9 +165,37 @@ fn unified_route_refuses_changed_missing_unlisted_and_invalid_condition() {
             ..
         })
     ));
+    manifest.inject[0].kind = Kind::Head;
     catalog.internals.clear();
     assert!(matches!(
         check(&catalog, &manifest),
         Err(InjectError::Missing { .. })
+    ));
+}
+
+#[test]
+fn unstaged_source_value_before_listed_wrap_if_does_not_panic() {
+    let (mut manifest, catalog) = fixture();
+    let mut entry = Inject {
+        id: "value".into(),
+        at: "game::run".into(),
+        kind: Kind::ModifyValue,
+        with: "listen".into(),
+        access: Access::Internals,
+        priority: 7,
+        hash: "signature".into(),
+        call: Some("game::other".into()),
+        nth: Some(0),
+        ctx: Some("other-statement".into()),
+    };
+    manifest.inject.push(entry.clone());
+    entry.id = "condition".into();
+    entry.kind = Kind::WrapIf;
+    entry.call = Some("game::step".into());
+    entry.ctx = Some("context".into());
+    manifest.inject.push(entry);
+    assert!(matches!(
+        routes(&catalog, &manifest).unwrap().as_slice(),
+        [Route::Source(_), Route::Slot(SlotKind::Site)]
     ));
 }

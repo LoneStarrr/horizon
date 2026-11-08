@@ -9,17 +9,18 @@ use horizon_client::{
     Result,
     collisions::SceneCollisions,
     containers::BlockEntity,
-    items::ItemStack,
+    items::{ItemStack, Items},
     mobs::{Mob, Species, sulfur_cube},
     particles::{ParticleOptions, ParticleType},
     projectiles::{Projectile, ProjectileKind},
+    random_source,
 };
 use mod_api::SoundSource;
 // Its old home, for mixin code that names it here.
 use horizon_core::{
     geometry::{Aabb, Direction, Vec3},
     position::BlockPos,
-    random::{LegacyRandom, RandomSource},
+    random::RandomSource,
 };
 use horizon_world::{
     fluid::FluidKind,
@@ -104,8 +105,9 @@ fn shrink(mut stack: ItemStack) -> Option<ItemStack> {
 type Dispensed = (Option<ItemStack>, i32);
 
 /// None keeps vanilla's behaviour; an explicit empty remainder consumes the stack.
-fn mod_dispensed(answer: Option<NativeDispensed>) -> Option<Dispensed> {
-    answer.map(|(left, event)| (left.filter(|stack| stack.count > 0), event))
+fn mod_dispensed(answer: Option<NativeDispensed>, items: &Items) -> Option<Dispensed> {
+    use super::api_values::TryIntoEngine;
+    answer.and_then(|answer| answer.try_into_engine(items).ok())
 }
 
 thread_local! {
@@ -136,31 +138,9 @@ enum Target {
     Stand(usize),
 }
 
-/// `RandomSource.create()`: the unseeded random an entity owns
-/// (`RandomSupport.generateUniqueSeed`). Draws of an entity's own random never
-/// touch the level's stream.
-pub(super) fn entity_random() -> LegacyRandom {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static UNIQUIFIER: AtomicI64 = AtomicI64::new(8_682_522_807_148_012);
-    const STEP: i64 = 1_181_783_497_276_652_981;
-    // seedUniquifier.updateAndGet(s -> s * STEP)
-    let mut current = UNIQUIFIER.load(Ordering::Relaxed);
-    let seed = loop {
-        let next = current.wrapping_mul(STEP);
-        match UNIQUIFIER.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => break next,
-            Err(actual) => current = actual,
-        }
-    };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64);
-    LegacyRandom::new(seed ^ nanos)
-}
 /// `new ItemEntity(level, x, y, z, stack)`'s motion, from the item's own random.
 pub(super) fn new_item_motion() -> [f64; 3] {
-    let mut r = entity_random();
+    let mut r = random_source::entity();
     let x = r.next_double() * 0.2 - 0.1;
     let z = r.next_double() * 0.2 - 0.1;
     [x, 0.2, z]
@@ -610,7 +590,7 @@ impl Game<'_> {
                 &mut answer,
             );
         }
-        if let Some((left, event)) = mod_dispensed(answer) {
+        if let Some((left, event)) = mod_dispensed(answer, self.items()) {
             if event == FAIL {
                 self.native_block_failed_dispense(
                     self.dim.id(),
@@ -666,6 +646,9 @@ impl Game<'_> {
             "minecraft:honeycomb" => self.dispense_honeycomb(pos, facing, stack)?,
             "minecraft:potion" => self.dispense_potion(pos, facing, stack)?,
             _ if item.ends_with("shulker_box") => self.dispense_shulker_box(pos, facing, stack)?,
+            _ if horizon_world::fluid::mod_fluid_of_bucket(&item).is_some() => {
+                self.dispense_filled_bucket(pos, facing, stack)?
+            }
             _ if super::boats::any_boat_wood(&item).is_some() => {
                 self.dispense_boat(pos, facing, stack)
             }
@@ -981,13 +964,13 @@ impl Game<'_> {
         let Some(i) = self.mobs.iter().position(|m| m.id == id) else {
             return Ok(());
         };
-        let mut m = self.mobs.remove(i);
+        let mut m = self.mobs.extract(self.mobs[i].join).unwrap();
         let mut events = Vec::new();
         {
             let w = self.mob_world_base(&[]);
             horizon_client::mobs::ai::ambient_sound(&mut m, &w, &mut events);
         }
-        self.mobs.insert(i, m);
+        self.mobs.put_back(i, m);
         self.handle_mob_events(events)
     }
     /// A mob a bucket emptied: `setFromBucket` keeps it, then it calls out.
@@ -1096,7 +1079,7 @@ impl Game<'_> {
             ..stack.clone()
         };
         // Projectile.shoot spreads the shot with the projectile's own random.
-        let mut own = entity_random();
+        let mut own = random_source::entity();
         match item.as_str() {
             "minecraft:experience_bottle"
             | "minecraft:splash_potion"
@@ -1322,7 +1305,7 @@ impl Game<'_> {
         if emptied.is_none() {
             return Ok((self.dispense_default_in_level(pos, facing, stack), CLICK));
         }
-        if self.dim == super::Dim::Nether
+        if self.dimension_type().water_evaporates
             && matches!(
                 content,
                 BucketContent::Fluid(FluidKind::Water) | BucketContent::MobWater
@@ -1685,9 +1668,12 @@ impl Game<'_> {
         };
         let target = (placed.x, placed.y, placed.z);
         let state = self.apply_item_block_state([target.0, target.1, target.2], state, &stack)?;
-        let name = self.res.facts().get(state).name.clone();
-        if let Some(entity) = self.new_block_entity(&name) {
+        if !self.world.block_entities.stateful_entity(state.0)
+            && let Some(entity) = self.new_block_entity_for_state(state)
+        {
             self.world.block_entities.insert(target, entity);
+        }
+        if self.world.block_entities.get(&target).is_some() {
             self.apply_placed_item([target.0, target.1, target.2], &stack, false);
         }
         self.process_level_events()?;
@@ -2412,21 +2398,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn mod_dispenser_answers_preserve_fallback_and_own_consumption() {
-        assert!(
-            mod_dispensed(None).is_none(),
-            "no registered behaviour keeps vanilla"
-        );
-        assert_eq!(mod_dispensed(Some((None, CLICK))), Some((None, CLICK)));
-        let stack = ItemStack::new("minecraft:stone", 7);
-        let Some((Some(left), event)) = mod_dispensed(Some((Some(stack.clone()), FAIL))) else {
-            panic!("handled stack")
-        };
-        assert_eq!(left, stack, "the returned remainder is not consumed again");
-        assert_eq!(event, FAIL, "the answer chooses its sound");
-        assert_eq!(
-            mod_dispensed(Some((Some(ItemStack { count: 0, ..stack }), 0))),
-            Some((None, 0))
-        );
+        use super::super::api_values::{StackReadError, TryIntoApi};
+        super::super::native_entity_refs::tests::with_game(|game| {
+            assert!(
+                mod_dispensed(None, game.items()).is_none(),
+                "no registered behaviour keeps vanilla"
+            );
+            assert_eq!(
+                mod_dispensed(Some((None, CLICK)), game.items()),
+                Some((None, CLICK))
+            );
+            let stack = ItemStack::new("minecraft:stone", 7);
+            let Some((Some(left), event)) = mod_dispensed(
+                Some((Some(stack.try_into_api().unwrap()), FAIL)),
+                game.items(),
+            ) else {
+                panic!("handled stack")
+            };
+            assert_eq!(left, stack, "the returned remainder is not consumed again");
+            assert_eq!(event, FAIL, "the answer chooses its sound");
+            // An empty engine value is refused before a mod answer can be constructed.
+            assert_eq!(
+                ItemStack { count: 0, ..stack }.try_into_api(),
+                Err(StackReadError::Empty)
+            );
+            assert_eq!(
+                mod_dispensed(Some((None, 0)), game.items()),
+                Some((None, 0))
+            );
+        });
     }
 }

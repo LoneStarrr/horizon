@@ -45,11 +45,14 @@ impl ItemPart for Probe {
         event: &mut ItemInteractMobEvent<'_>,
     ) -> Option<bool> {
         let stack = event.stack;
-        assert!(stack.count > 0);
-        self.calls
-            .lock()
-            .unwrap()
-            .push((event.entity, event.kind.into(), stack.item.to_string()));
+        assert!(stack.count() > 0);
+        self.calls.lock().unwrap().push((
+            event.entity,
+            event.kind.into(),
+            mod_api::__private::item_key_id(stack.item())
+                .unwrap()
+                .to_string(),
+        ));
         let answer = self.answer.load(Ordering::Relaxed);
         if answer != 0 && self.discard.load(Ordering::Relaxed) {
             let entity = host.entity(event.entity as u32).unwrap();
@@ -112,7 +115,7 @@ fn actual_item_interact_mob_fallback_priority_and_filters() {
     let probe = Probe::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("item", Box::new(probe.clone()))].into();
     mod_api::testing::with_mods(mods.clone(), || {
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::__private::mark_game_thread();
         let mut game = Game::new(
             &loaded.resources,

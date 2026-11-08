@@ -52,6 +52,7 @@ pub(super) fn inventory_slot(i: usize) -> (f32, f32) {
 /// `ExplorationMapFunction` in the game world: the nearest structure of the
 /// tag through the generator's `/locate`, a new map centred on it with its
 /// target decoration.
+#[derive(Clone)]
 pub(super) struct GameMaps<'a> {
     pub(super) terrain: Option<std::sync::Arc<horizon_client::vanillagen::VanillaTerrain>>,
     /// Structure tag -> its structures.
@@ -61,6 +62,15 @@ pub(super) struct GameMaps<'a> {
     pub(super) next_id: std::cell::Cell<i32>,
 }
 impl merchant::MapMaker for GameMaps<'_> {
+    fn with_staged(&self, edit: &mut dyn FnMut(&dyn merchant::MapMaker) -> bool) -> bool {
+        let staged = self.clone();
+        if !edit(&staged) {
+            return false;
+        }
+        self.next_id.set(staged.next_id.get());
+        self.made.replace(staged.made.into_inner());
+        true
+    }
     fn exploration_map(
         &self,
         stack: ItemStack,
@@ -330,7 +340,6 @@ impl Game<'_> {
         for (id, r) in std::mem::take(&mut session.sequences) {
             self.rand_sequences.give_back(id, r);
         }
-        let traded = std::mem::take(&mut session.last_traded);
         let Some(id) = state.mob else { return };
         let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) else {
             return;
@@ -347,9 +356,6 @@ impl Game<'_> {
         let trade = m.extra.trade.get_or_insert_default();
         trade.xp = session.xp;
         trade.offers = session.offers.clone();
-        if traded && session.villager {
-            self.villager_traded(id);
-        }
     }
     /// Opens a merchant menu without a mob (horizon-ctl `trade`).
     pub(super) fn open_merchant(&mut self, profession: &str, variant: &str, level: i32) {
@@ -499,6 +505,11 @@ impl Game<'_> {
         offers: &mut [MerchantOffer],
         traded: &[usize],
     ) {
+        if !traded.is_empty()
+            && let Some(id) = mob
+        {
+            self.villager_trade_pending(id);
+        }
         for index in traded {
             let Some(offer) = offers.get_mut(*index) else {
                 continue;

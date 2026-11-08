@@ -105,7 +105,21 @@ fn component(engine: &wasmtime::Engine) -> Component {
             let name = self.names.get(&self.next).map(String::as_str).unwrap_or("");
             self.next += 1;
             let mut f = wasm_encoder::Function::new([]);
-            if name.ends_with("|run") {
+            if name.contains("fixture-block-entity-part")
+                && name.ends_with("|block-entity-update-tag")
+            {
+                // Some(empty NBT bytes), then Some([1, 2, 3]) for the event position.
+                for (offset, value) in [1, 0, 0, 1, 1, 2, 3].into_iter().enumerate() {
+                    f.instruction(&I::I32Const(4096 + offset as i32 * 4))
+                        .instruction(&I::I32Const(value))
+                        .instruction(&I::I32Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                }
+                f.instruction(&I::I32Const(4096));
+            } else if name.ends_with("|run") {
                 f.instruction(&I::LocalGet(0))
                     .instruction(&I::Call(self.invoke));
             } else if name.ends_with("|trigger") {
@@ -327,6 +341,27 @@ fn fixture_with_budget(fuel: bool) -> (Arc<Running>, TypedFunc<(u32,), (u32,)>) 
         released: Mutex::default(),
     });
     (module, run)
+}
+
+#[test]
+fn malformed_method_return_does_not_apply_a_valid_out_event() {
+    let (module, _) = fixture();
+    let handler = WasmHandler {
+        module,
+        index: 0,
+        subscribed: &[],
+        erased: false,
+    };
+    let entity = crate::ModBlockEntity::new("test:counter".into(), Default::default());
+    let revision = entity.revision();
+    let mut event = crate::BlockEntityUpdateTagEvent {
+        pos: [0; 3],
+        entity: &entity,
+    };
+    assert!(crate::BlockEntityPart::block_entity_update_tag(&handler, &mut event).is_none());
+    assert_eq!(event.pos, [0; 3]);
+    assert!(entity.data.is_empty());
+    assert_eq!(entity.revision(), revision);
 }
 
 fn run(module: &Arc<Running>, function: TypedFunc<(u32,), (u32,)>, index: u32) -> Option<u32> {

@@ -73,6 +73,37 @@ pub enum DrawError {
     CapacityExceeded,
 }
 
+/// Where in the world's frame a stage's geometry is drawn: NeoForge 26.3's
+/// `RenderLevelStageEvent` stages Horizon draws, in the order the frame reaches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderLevelStage {
+    /// After the sky, sun, moon and stars, before any terrain (`AfterSky`): behind
+    /// everything else the world draws, for backdrops and atmosphere.
+    AfterSky,
+    /// After solid and cutout terrain, before entities and block entities
+    /// (`AfterOpaqueBlocks`).
+    AfterOpaqueBlocks,
+    /// After translucent terrain such as water and stained glass, before translucent
+    /// particles (`AfterTranslucentBlocks`).
+    AfterTranslucentBlocks,
+    /// After rain and snow, before the world border (`AfterWeather`).
+    AfterWeather,
+    /// After the rest of the world, before the first-person hand (`AfterLevel`): where
+    /// `submit_custom_geometry` and the debug renderers draw.
+    AfterLevel,
+}
+impl RenderLevelStage {
+    /// Every stage, in the order the frame reaches them.
+    pub const ALL: [Self; 5] = [
+        Self::AfterSky,
+        Self::AfterOpaqueBlocks,
+        Self::AfterTranslucentBlocks,
+        Self::AfterWeather,
+        Self::AfterLevel,
+    ];
+}
+
 /// Immutable, minimal extracted state for custom world geometry submission.
 /// This initial view does not expose NeoForge's full level state or visible sections.
 #[derive(Clone, Copy, Debug, PartialEq)]

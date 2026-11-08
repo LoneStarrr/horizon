@@ -145,7 +145,9 @@ impl Game<'_> {
         else {
             return;
         };
-        let mut mobs = std::mem::take(&mut self.mobs);
+        let mut mobs = self.mobs.lift();
+        #[cfg(test)]
+        super::entity::taken_pass_tests::after_take(self);
         let w = self.mob_world_base(&[]);
         for m in &mut mobs {
             if m.species() == Species::Panda
@@ -163,7 +165,8 @@ impl Game<'_> {
                 }
             }
         }
-        self.mobs = mobs;
+        self.mobs
+            .restore(mobs, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
     }
     /// What a window draws of its pandas: the crumbs of a bite
     /// (`addEatingParticles`) and the sneeze's particle.
@@ -194,5 +197,29 @@ impl Game<'_> {
         for (at, velocity) in sneezes {
             self.particles.add(&options, at, velocity);
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_spawn_tests {
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn lifted_mob_callback_keeps_nested_spawns_until_the_next_pass() {
+        crate::game::entity::taken_pass_tests::in_both_dimensions(|game, balance| {
+            let kind = game.res.mob_types().get("minecraft:panda").unwrap().clone();
+            game.mobs.push(horizon_client::mobs::Mob::new(
+                99,
+                kind,
+                horizon_core::geometry::Vec3::new(0.5, 80.0, 0.5),
+                0.0,
+            ));
+            crate::game::entity::taken_pass_tests::assert_mob_spawn_survives(
+                game,
+                balance,
+                |game| {
+                    game.panda_sneezed(99);
+                },
+            );
+        });
     }
 }

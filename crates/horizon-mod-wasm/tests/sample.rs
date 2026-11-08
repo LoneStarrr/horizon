@@ -64,6 +64,25 @@ impl mod_api::prelude::BlockStatesBackend for Server {
             )],
         })
     }
+    fn fluid_type_properties(
+        &self,
+        key: mod_api::FluidKey,
+    ) -> Option<mod_api::FluidTypeProperties> {
+        // Distinct canned fields exercise real guest lifting of the record.
+        (mod_api::__private::fluid_id(key)? == "minecraft:water").then(|| {
+            mod_api::FluidTypeProperties {
+                description_id: "block.minecraft.water".into(),
+                light_level: 3,
+                fall_distance_modifier: 0.25,
+                can_push_entity: true,
+                can_swim: false,
+                can_drown: true,
+                can_extinguish: false,
+                can_hydrate: true,
+                supports_boating: false,
+            }
+        })
+    }
     fn fluid_state_validate(
         &self,
         key: mod_api::FluidKey,
@@ -176,7 +195,8 @@ fn the_sample_mod_loads_subscribes_and_registers_its_part() {
         "the sample listens to server_chat"
     );
     // Its `register` runs in the mod and attaches a part to sticks, which listens to use_item.
-    mod_api::__private::install_parts(&loaded.mods).unwrap();
+    mod_api::__private::install_parts(&loaded.mods, &mod_api::__private::part_tests::rule_schema())
+        .unwrap();
     mod_api::__private::resolve_effects(
         horizon_client_core::potions::all_effects()
             .map(|def| horizon_client_core::potions::namespaced(def.id)),

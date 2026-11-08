@@ -6,7 +6,6 @@ api = "0.2"
 side = "both"
 capabilities = ["registries"]
 
-[native]
 internals = [
   { path = "horizon_client::game::Game::left", kind = "field", hash = "71b38399f108e572a5ef928b5cfdf52872f61b4615115d91f588221900ab97e0" },
   { path = "horizon_client::game::Game::right", kind = "field", hash = "7b6f34593a32100b46a93d4562b17b8adeb9c7e5645fe9f8efbccc519aadfcc2" },
@@ -14,8 +13,14 @@ internals = [
   { path = "horizon_client::mutate_copies", kind = "fn", hash = "mutate-copies-hash" },
  ]
 
-[[native.injection]]
+[[inject]]
 id = "counter"
-target = "horizon_client::game::chat::Game<'_>::handle_chat_input"
-kind = "HEAD"
-raw = "call"
+at = "horizon_client::game::chat::Game<'_>::handle_chat_input"
+kind = "head"
+access = "internals"
+hash = "fixture-signature"
+with = "call"
+
+[wasm]
+sha512 = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+toolchain = "1.99.1"

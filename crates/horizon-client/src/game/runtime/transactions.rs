@@ -41,6 +41,9 @@ pub(super) struct Level {
     players: HashMap<u128, KeptPlayer>,
     /// Each entity's inventory (`entity_slots`) before this transaction first wrote it.
     entities: HashMap<u32, Vec<Option<ItemStack>>>,
+    /// Each mob's or armor stand's equipment before this transaction first
+    /// wrote it (#932), told apart for the way back.
+    equipment: HashMap<u32, KeptEquipment>,
     /// Each chested mob's item list's length before `entity_slots` first grew it to its slots
     /// in this transaction.
     mob_lengths: HashMap<u32, usize>,
@@ -67,7 +70,7 @@ struct Kept {
     attachments: Option<Attachments>,
     hopper: Option<HopperState>,
     /// The custom name Horizon keeps beside the model (`World::block_names`).
-    name: Option<String>,
+    name: Option<horizon_core::nbt::Tag>,
     /// The container lock and loot table roll kept beside the model.
     extras: BlockEntityExtras,
 }
@@ -98,6 +101,14 @@ struct KeptPlayer {
     carried: Option<ItemStack>,
 }
 
+/// A mob's or an armor stand's equipment as a transaction first wrote it
+/// (#932): the same eight slots, restored their own way.
+#[derive(Clone)]
+enum KeptEquipment {
+    Mob(Vec<Option<ItemStack>>),
+    Stand(Vec<Option<ItemStack>>),
+}
+
 #[derive(Clone)]
 struct KeptMenus {
     ender_items: Vec<Option<ItemStack>>,
@@ -123,6 +134,15 @@ pub(super) enum After {
     Spawn([f64; 3], ItemStack),
     /// The item entity with this id was emptied: removed, unless it holds items again.
     Emptied(u32),
+    /// `LivingEntity.onEquipItem`'s sound and equip/unequip game event, at the entity `who`
+    /// is: what an equipment write through a transaction tells the world only at the root
+    /// commit, so an abort stays quiet (#932).
+    Equip {
+        at: [f64; 3],
+        sound: Option<String>,
+        equips: bool,
+        who: u32,
+    },
 }
 
 /// Effects shared by transactional interaction contexts.
@@ -191,6 +211,9 @@ impl Game<'_> {
                 }
                 for (id, kept) in level.entities {
                     outer.entities.entry(id).or_insert(kept);
+                }
+                for (id, kept) in level.equipment {
+                    outer.equipment.entry(id).or_insert(kept);
                 }
                 for (id, kept) in level.item_entities {
                     outer.item_entities.entry(id).or_insert(kept);
@@ -310,6 +333,24 @@ impl Game<'_> {
             level.entities.entry(id).or_insert(slots);
         }
     }
+    /// Keeps mob `id`'s equipment as it is, if a transaction is open and hasn't yet (#932):
+    /// an abort puts every slot back and makes the attribute map over again.
+    pub(super) fn journal_equipment(&mut self, id: u32) {
+        let Some(level) = self.transactions.last_mut() else {
+            return;
+        };
+        if level.equipment.contains_key(&id) {
+            return;
+        }
+        let kept = if let Some(mob) = self.mobs.iter().find(|m| m.id == id && !m.removed) {
+            KeptEquipment::Mob(mob.equipment_stacks().iter().cloned().collect())
+        } else if let Some(stand) = self.armor_stands.iter().find(|a| a.id == id) {
+            KeptEquipment::Stand(stand.equipment.iter().cloned().collect())
+        } else {
+            return;
+        };
+        level.equipment.insert(id, kept);
+    }
     /// Sets item entity `id`'s stack, keeping it as it was if a transaction is open and hasn't
     /// yet. Emptied in one, it stays, empty, until the root commit removes it, so an abort can
     /// put its stack back. False where no such item entity is.
@@ -405,6 +446,17 @@ impl Game<'_> {
                     self.remove_dropped(i);
                 }
             }
+            After::Equip {
+                at,
+                sound,
+                equips,
+                who,
+            } => {
+                // `equip_item_effects` rebuilt from the entity it names: the
+                // sculk context reads the mob as it is at the root commit.
+                let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(who)), None);
+                self.equip_item_effects(at, sound, equips, ctx);
+            }
         }
     }
     fn root_commit(&mut self, level: Level) {
@@ -458,7 +510,34 @@ impl Game<'_> {
             }
         }
     }
-    fn roll_back(&mut self, level: Level) {
+    fn roll_back(&mut self, mut level: Level) {
+        // Each mob's equipment goes back as it was, and the attribute map is
+        // made over it again (#932).
+        let equipment = std::mem::take(&mut level.equipment);
+        for (id, kept) in equipment {
+            match kept {
+                KeptEquipment::Mob(stacks) => {
+                    let Some(mob) = self.mobs.iter_mut().find(|m| m.id == id && !m.removed) else {
+                        continue;
+                    };
+                    for (slot, stack) in stacks.into_iter().enumerate() {
+                        mob.set_equipment_stack(slot, stack);
+                    }
+                    self.collect_mob_equipment_attributes(id);
+                }
+                // An armor stand keeps no live attribute map of its gear; the
+                // plain write puts its slots back as they were.
+                KeptEquipment::Stand(stacks) => {
+                    let Some(stand) = self.armor_stands.iter_mut().find(|a| a.id == id) else {
+                        continue;
+                    };
+                    for (slot, stack) in stacks.into_iter().enumerate() {
+                        stand.equipment.set(slot, stack);
+                    }
+                }
+            }
+        }
+
         for (pos, kept) in level.block_entities {
             if let (Some(entity), Some(now)) =
                 (kept.entity, self.world.block_entities.get_mut(&pos))
@@ -542,6 +621,7 @@ mod player_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::super::api_values::TryIntoApi;
     use super::super::{Audio, BlockEntity, Game, Options, Progress, Settings, load_resources};
     use horizon_client::{chunk::Chunk, items::ItemStack};
     use mod_api::HostTransaction;
@@ -588,7 +668,11 @@ mod tests {
                 };
                 self.seen.lock().unwrap().push((
                     level.block_state(host, [2, 64, 2]),
-                    hand.stack(host).map(|s| s.item.to_string()),
+                    hand.stack(host).map(|s| {
+                        mod_api::__private::item_key_id(s.item())
+                            .unwrap()
+                            .to_string()
+                    }),
                 ));
                 Flow::Cancel
             }
@@ -806,7 +890,10 @@ mod tests {
             game.journal_menus(player);
             *game.native_menu_storage(menu, 1).unwrap() = Some(stone.clone());
             assert!(game.transactions.is_empty());
-            assert_eq!(menu.slot(game, 1), Some(Some(stone)));
+            assert_eq!(
+                menu.slot(game, 1),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
         });
     }
 
@@ -819,19 +906,22 @@ mod tests {
             let stone = ItemStack::new("minecraft:stone", 4);
             *game.native_menu_storage(menu, 1).unwrap() = Some(stone.clone());
             let place = mod_api::ItemPlace::MenuSlot { menu, slot: 1 };
-            let resource = ItemResource::of(&stone);
+            let resource = ItemResource::of(&stone.try_into_api().unwrap());
             let aborted: Result<(), ()> = game.transaction(|game, tx| {
                 assert_eq!(place.insert(game, tx, &resource, 2), 2);
                 assert_eq!(place.insert(game, tx, &resource, 3), 3);
                 let journal = &game.transactions.last().unwrap().menus;
                 assert_eq!(journal.len(), 1);
                 assert_eq!(journal[&12].craft_grid[0], Some(stone.clone()));
-                assert_eq!(menu.slot(game, 1).unwrap().unwrap().count, 9);
+                assert_eq!(menu.slot(game, 1).unwrap().unwrap().count(), 9);
                 Err(())
             });
             assert_eq!(aborted, Err(()));
             assert!(game.transactions.is_empty());
-            assert_eq!(menu.slot(game, 1), Some(Some(stone)));
+            assert_eq!(
+                menu.slot(game, 1),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
         });
     }
 
@@ -846,7 +936,13 @@ mod tests {
             .level
             .capability(host, &ITEMS, at.pos, at.side)
             .expect("item capability");
-        let inserted = handler.insert(host, tx, slot, &ItemResource::of(&stack), stack.count);
+        let inserted = handler.insert(
+            host,
+            tx,
+            slot,
+            &ItemResource::of(&stack.try_into_api().unwrap()),
+            stack.count,
+        );
         (inserted < stack.count).then(|| ItemStack {
             count: stack.count - inserted,
             ..stack
@@ -859,14 +955,14 @@ mod tests {
         slot: usize,
         amount: u32,
         tx: &Transaction,
-    ) -> Option<ItemStack> {
+    ) -> Option<mod_api::ItemStack> {
         let handler = at
             .level
             .capability(host, &ITEMS, at.pos, at.side)
             .expect("item capability");
         let resource = handler.resource(host, slot)?;
         let taken = handler.extract(host, tx, slot, &resource, amount);
-        (taken > 0).then(|| resource.to_stack(taken))
+        resource.to_stack(taken)
     }
 
     fn extract_fluid(
@@ -956,8 +1052,12 @@ mod tests {
         assert!(game.level_set_block(level, [2, 64, 0], full, flags));
         assert!(game.level_set_block(level, [4, 64, 0], jukebox, flags));
         let sticks = |count| ItemStack::new("minecraft:stick", count);
-        let stick = ItemResource::of(&sticks(1));
-        let rod = ItemResource::of(&ItemStack::new("minecraft:blaze_rod", 1));
+        let stick = ItemResource::of(&sticks(1).try_into_api().unwrap());
+        let rod = ItemResource::of(
+            &ItemStack::new("minecraft:blaze_rod", 1)
+                .try_into_api()
+                .unwrap(),
+        );
         let on = |pos, side| BlockSide { level, pos, side };
         let host: &mut dyn ServerHost = &mut game;
 
@@ -967,7 +1067,7 @@ mod tests {
             assert!(insert(host, on([0, 64, 0], None), 0, sticks(5), tx).is_none());
             let taken = host
                 .transaction(|host, tx| Ok::<_, ()>(extract(host, on([0, 64, 0], None), 0, 2, tx)));
-            assert_eq!(taken, Ok(Some(sticks(2))));
+            assert_eq!(taken, Ok(Some(sticks(2).try_into_api().unwrap())));
             let _ = host.transaction(|host, tx| {
                 insert(host, on([0, 64, 0], None), 1, sticks(3), tx);
                 Err::<(), ()>(())
@@ -1121,7 +1221,7 @@ mod tests {
             player: me,
             hand: mod_api::first_person::Hand::Main,
         };
-        let water = ItemResource::of(&bucket("minecraft:water_bucket", 1));
+        let water = ItemResource::of(&bucket("minecraft:water_bucket", 1).try_into_api().unwrap());
         let host: &mut dyn ServerHost = &mut game;
         let _ = host.transaction(|host, tx| {
             assert_eq!(hand.exchange(host, tx, &water, 1), 1);
@@ -1238,13 +1338,23 @@ mod tests {
                 Err::<(), ()>(())
             });
             let host: &mut dyn ServerHost = &mut game;
-            assert_eq!(place(0).stack(host), Some(sticks(5)), "{kind}");
+            assert_eq!(
+                place(0).stack(host),
+                Some(sticks(5).try_into_api().unwrap()),
+                "{kind}"
+            );
             assert_eq!(place(1).stack(host), None, "{kind}");
             let _ = host.transaction(|host, tx| Ok::<_, ()>(place(0).exchange(host, tx, &rod, 1)));
             let host: &mut dyn ServerHost = &mut game;
-            assert_eq!(place(0).stack(host), Some(sticks(4)), "{kind}");
-            let rod = place(1).stack(host).map(|s| s.item);
-            assert_eq!(rod.as_deref(), Some("minecraft:blaze_rod"), "{kind}");
+            assert_eq!(
+                place(0).stack(host),
+                Some(sticks(4).try_into_api().unwrap()),
+                "{kind}"
+            );
+            let rod = place(1)
+                .stack(host)
+                .map(|s| mod_api::__private::item_key_id(s.item()).unwrap());
+            assert_eq!(rod, Some("minecraft:blaze_rod"), "{kind}");
         }
 
         // An item entity: emptied in an aborted transaction, it's back whole; one of four
@@ -1262,10 +1372,10 @@ mod tests {
             Err::<(), ()>(())
         });
         let host: &mut dyn ServerHost = &mut game;
-        assert_eq!(entity.stack(host), Some(sticks(4)));
+        assert_eq!(entity.stack(host), Some(sticks(4).try_into_api().unwrap()));
         let _ = host.transaction(|host, tx| Ok::<_, ()>(entity.exchange(host, tx, &rod, 1)));
         let host: &mut dyn ServerHost = &mut game;
-        assert_eq!(entity.stack(host), Some(sticks(3)));
+        assert_eq!(entity.stack(host), Some(sticks(3).try_into_api().unwrap()));
         assert_eq!(count(&game), items + 1);
         let host: &mut dyn ServerHost = &mut game;
         let _ = host.transaction(|host, tx| Ok::<_, ()>(entity.extract(host, tx, &stick, 3)));

@@ -108,6 +108,9 @@ impl Selection {
                     return;
                 }
                 let named = rule.named(path).expect("listed");
+                if named.guarded {
+                    return;
+                }
                 for field in rule.fields(path) {
                     self.reach(&rule.shape(&named.module, Some(path), field.ty), rule);
                 }
@@ -283,7 +286,9 @@ fn buildable(shape: &Shape, rule: &Rule) -> bool {
 /// The fields of the listed type at `path` a node steps into: none for flags, which are read
 /// whole (their bits are no field of theirs).
 pub(crate) fn node_fields<'r>(rule: &'r Rule, path: &str) -> Vec<crate::crossing::Field<'r>> {
-    if crate::crossing::foreign(path) == Some(Foreign::Bits) {
+    if crate::crossing::foreign(path) == Some(Foreign::Bits)
+        || rule.named(path).is_some_and(|named| named.guarded)
+    {
         Vec::new()
     } else {
         rule.fields(path)
@@ -823,7 +828,7 @@ impl<'r> Gen<'r> {
                     ));
                 }
                 let case = match &named.item {
-                    syn::Item::Enum(item) => {
+                    syn::Item::Enum(item) if !named.guarded => {
                         let cases = item.variants.iter().enumerate().map(|(i, v)| {
                             let ident = &v.ident;
                             let i = i as u64;
@@ -1069,8 +1074,9 @@ impl<'r> Gen<'r> {
         let variant = shape.variant();
         let target = &point.target;
         let hash = &point.wire_shape;
+        let signature_hash = &internal.hash;
         let mut places = vec![
-            quote!(I::Place { place: ::mod_points::PointId::#variant as usize, target: #target, hash: #hash, receiver: #receiver, receiver_writable: #writable, record: #id },),
+            quote!(I::Place { place: ::mod_points::PointId::#variant as usize, target: #target, hash: #hash, signature_hash: #signature_hash, receiver: #receiver, receiver_writable: #writable, record: #id },),
         ];
         // A RETURN borrows the returned value directly, not the head's Option<R> slot.
         let returned = match &sig.output {
@@ -1108,7 +1114,7 @@ impl<'r> Gen<'r> {
                 receiver
             };
             let variant = shape.return_variant();
-            places.push(quote!(I::Place { place: ::mod_points::PointId::#variant as usize, target: #target, hash: #hash, receiver: #receiver, receiver_writable: #writable, record: #id },));
+            places.push(quote!(I::Place { place: ::mod_points::PointId::#variant as usize, target: #target, hash: #hash, signature_hash: #signature_hash, receiver: #receiver, receiver_writable: #writable, record: #id },));
         }
         Some(places)
     }
@@ -1570,17 +1576,19 @@ pub(crate) fn select<'a>(
     let fields: HashMap<_, _> = rule
         .paths()
         .flat_map(|owner| {
-            node_fields(rule, owner)
-                .into_iter()
-                .enumerate()
-                .map(move |(index, field)| {
-                    let member = field.member.to_token_stream().to_string();
-                    let path = match field.case {
-                        Some((_, case)) => format!("{owner}::{case}::{member}"),
-                        None => format!("{owner}::{member}"),
-                    };
-                    (path, (owner, index, field))
-                })
+            let fields = if rule.named(owner).is_some_and(|named| named.guarded) {
+                rule.fields(owner)
+            } else {
+                node_fields(rule, owner)
+            };
+            fields.into_iter().enumerate().map(move |(index, field)| {
+                let member = field.member.to_token_stream().to_string();
+                let path = match field.case {
+                    Some((_, case)) => format!("{owner}::{case}::{member}"),
+                    None => format!("{owner}::{member}"),
+                };
+                (path, (owner, index, field))
+            })
         })
         .collect();
     let mut functions = Vec::new();
@@ -1639,7 +1647,9 @@ pub(crate) fn select<'a>(
                         let named = rule.named(owner).expect("listed");
                         let shape = rule.shape(&named.module, Some(owner), field.ty);
                         let owner_shape = Shape::Named(owner.into(), named.lifetimes);
-                        if rule.crossing_of(&owner_shape) == Crossing::Opaque {
+                        if named.guarded {
+                            "conditional field or variant"
+                        } else if rule.crossing_of(&owner_shape) == Crossing::Opaque {
                             named.opaque_reason.unwrap_or("opaque owner")
                         } else if rule.crossing_of(&shape) == Crossing::Opaque {
                             "field type cannot cross"
@@ -1882,6 +1892,29 @@ pub(crate) mod tests {
                 .success()
         );
         std::fs::remove_dir_all(build).unwrap();
+    }
+
+    #[test]
+    fn guarded_enum_handle_does_not_name_conditional_variants() {
+        let entries = [
+            internal(
+                "horizon_client::Guarded",
+                "enum",
+                "enum Guarded { Present([u64; 32]), #[cfg(feature = \"x\")] Absent }",
+            ),
+            internal(
+                "horizon_client::Guarded::read",
+                "method",
+                "fn read(&self) -> u64",
+            ),
+        ];
+        let (code, counts) = all_table(&entries);
+        assert_eq!(counts.thunks, 1);
+        run_fixture(
+            &code,
+            "pub enum Guarded { Present([u64; 32]) } impl Guarded { fn read(&self) -> u64 { match self { Self::Present(data) => data[0] } } }",
+            "let _ = (std::mem::size_of::<Op>(), std::mem::size_of::<Reply>(), std::mem::size_of::<Value>());",
+        );
     }
 
     #[test]
@@ -2759,7 +2792,7 @@ pub(crate) mod tests {
             ),
         ]);
         assert_eq!(counts.types, 1, "{code}");
-        assert_eq!(counts.skipped_types["conditional field or variant"], 2);
+        assert_eq!(counts.skipped_types["opaque type"], 2);
         assert_eq!(counts.skipped_types["lower-crate layout not widened"], 2);
         assert_eq!(counts.skipped_types["generic type"], 1);
     }

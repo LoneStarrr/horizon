@@ -4,6 +4,27 @@ use crate::*;
 /// The client host's methods of the `client_render` area, implemented by the game and reached through [`crate::ClientHost`].
 #[horizon_mod_api_macros::host_area]
 pub trait ClientRenderClientHost {
+    /// Atomically overwrite retained model copies; use [`InstanceGroupRef::write`].
+    #[access(PublishedResources)]
+    fn instance_group_write(
+        &self,
+        group: InstanceGroupRef,
+        first: u32,
+        instances: &[ModelInstance],
+    ) -> Result<(), GroupError>;
+    /// Set the drawn length; use [`InstanceGroupRef::set_len`].
+    #[access(PublishedResources)]
+    fn instance_group_set_len(&self, group: InstanceGroupRef, len: u32) -> Result<(), GroupError>;
+    /// Replace the group pose; use [`InstanceGroupRef::set_group_transform`].
+    #[access(PublishedResources)]
+    fn instance_group_set_transform(
+        &self,
+        group: InstanceGroupRef,
+        transform: [f32; 12],
+    ) -> Result<(), GroupError>;
+    /// Retire retained model copies; use [`InstanceGroupRef::destroy`].
+    #[access(PublishedResources)]
+    fn instance_group_destroy(&self, group: InstanceGroupRef) -> Result<(), GroupError>;
     /// Side: client.
     /// Asks `native_block_render_visibility` again for every state and, when the answers differ
     /// from those in use, remeshes every loaded section with them. Call it when your answer changes (a toggle key, a scan

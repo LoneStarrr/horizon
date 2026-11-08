@@ -15,7 +15,7 @@ the `doc` field is in [Hook notes](hook-notes.md) until it moves into the fragme
 
 The bindings generator reads the Rust type declaration; codecs are not maintained separately for native and
 wasm mods. A type with a separate public form declares `#[horizon_mod_api_macros::wasm(via = Form)]` on the
-type or its re-export, with `From<&Type> for Form` and `TryFrom<Form> for Type` beside the type.
+type or its re-export, with `TryFrom<&Type> for Form` and `TryFrom<Form> for Type` beside the type.
 
 An owned tuple struct whose fields need load-owned validation declares
 `#[horizon_mod_api_macros::wasm(host_constructor = from_slot)]`. The named associated constructor takes the

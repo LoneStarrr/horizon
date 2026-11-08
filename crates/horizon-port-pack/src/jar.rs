@@ -30,6 +30,12 @@ pub struct Census {
     pub sounds: usize,
     pub classes: usize,
     pub mixin_configs: usize,
+    /// Files under `data/<namespace>/`, of any kind.
+    #[serde(default)]
+    pub data_files: usize,
+    /// A `pack.mcmeta` at the top: the jar is also a data or resource pack.
+    #[serde(default)]
+    pub pack_mcmeta: bool,
 }
 
 const NOT_MODS: [&str; 5] = ["minecraft", "neoforge", "forge", "fabricloader", "java"];
@@ -175,10 +181,10 @@ fn manifest_value(manifest: &str, key: &str) -> Option<String> {
             }
         } else if value.is_some() {
             break;
-        } else if let Some((name, contents)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case(key) {
-                value = Some(contents.strip_prefix(' ').unwrap_or(contents).to_owned());
-            }
+        } else if let Some((name, contents)) = line.split_once(':')
+            && name.eq_ignore_ascii_case(key)
+        {
+            value = Some(contents.strip_prefix(' ').unwrap_or(contents).to_owned());
         }
     }
     value.filter(|value| !value.is_empty())
@@ -359,6 +365,10 @@ pub fn census(names: &[String]) -> Census {
             c.classes += 1;
         } else if n.ends_with(".mixins.json") || (parts.len() == 1 && n.contains("mixins")) {
             c.mixin_configs += 1;
+        }
+        c.pack_mcmeta |= n == "pack.mcmeta";
+        if parts.len() > 2 && parts[0] == "data" && !n.ends_with('/') {
+            c.data_files += 1;
         }
         // assets/<ns>/<kind>/... and data/<ns>/<kind>/...
         let (Some(root), Some(kind)) = (parts.first(), parts.get(2)) else {

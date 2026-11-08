@@ -80,6 +80,7 @@ pub struct Parts {
     pub(crate) block_entity_kinds: HashMap<Box<str>, Vec<Attached<dyn BlockEntityPart>>>,
     pub(crate) items: HashMap<Box<str>, Vec<Attached<dyn ItemPart>>>,
     pub(crate) menus: HashMap<Box<str>, Vec<Attached<dyn MenuPart>>>,
+    pub(crate) fluids: HashMap<Box<str>, Vec<Attached<dyn FluidPart>>>,
     /// Entity parts by entity type id (`minecraft:zombie`), for the goal
     /// registration at every `Mob` construction (#1077). They carry no scoped
     /// hook, so they never enter `hooks`.
@@ -111,6 +112,7 @@ pub struct HookParts {
     pub(crate) block_entity_kinds: HashMap<Box<str>, Vec<Attached<dyn BlockEntityPart>>>,
     pub(crate) items: HashMap<Box<str>, Vec<Attached<dyn ItemPart>>>,
     pub(crate) menus: HashMap<Box<str>, Vec<Attached<dyn MenuPart>>>,
+    pub(crate) fluids: HashMap<Box<str>, Vec<Attached<dyn FluidPart>>>,
 }
 
 /// Which things a capability's providers are registered by.
@@ -135,16 +137,20 @@ pub(crate) struct TagParts {
 #[derive(Default)]
 pub(crate) struct Installed {
     pub(crate) game_rule_categories: Vec<String>,
-    pub(crate) game_rules: Vec<horizon_client_core::gamerules::Rule>,
+    pub(crate) game_rules: Vec<crate::GameRuleDecl>,
     pub(crate) game_rule_slots: Vec<u32>,
     pub(crate) keys: Parts,
     pub(crate) tags: TagParts,
-    pub(crate) block_entity_types: Vec<BlockEntityType>,
+    pub(crate) block_entity_types: Vec<BlockEntityTypeDecl>,
     pub(crate) entity_attributes: Vec<EntityAttributeDeclaration>,
+    pub(crate) world_fluids: Vec<horizon_mod_package::content::FluidLook>,
+    pub(crate) entity_attribute_modifications: Vec<EntityAttributeModification>,
     pub(crate) registry_keys: horizon_mod_runtime::registry_keys::Requests,
     pub(crate) effects: OnceLock<horizon_mod_runtime::registry_keys::Effects>,
     pub(crate) resolved_block_entity_types: OnceLock<horizon_mod_runtime::registry_keys::Names>,
     pub(crate) fluids: OnceLock<horizon_mod_runtime::registry_keys::Names>,
+    pub(crate) resolved_items: OnceLock<horizon_mod_runtime::registry_keys::Names>,
+    pub(crate) resolved_blocks: OnceLock<horizon_mod_runtime::registry_keys::Names>,
     /// The ticket controllers the mods registered; a [`TicketController`]'s slot indexes it.
     pub(crate) controllers: Vec<ControllerInfo>,
     pub(crate) tree_parts: crate::tree_parts::TreePartTable,
@@ -482,6 +488,7 @@ impl Parts {
         index!(block_entity_kinds, block_entity_subscribed);
         index!(items, item_subscribed);
         index!(menus, menu_subscribed);
+        index!(fluids, fluid_subscribed);
     }
 }
 
@@ -514,15 +521,17 @@ pub(crate) fn attached<'a, 'k, P: ?Sized>(
 // exhaustive: its fields are private, so mods cannot build or destructure it
 pub struct PartRegistrar {
     pub(crate) game_rule_categories: Vec<String>,
-    pub(crate) game_rules: Vec<horizon_client_core::gamerules::Rule>,
+    pub(crate) game_rules: Vec<crate::GameRuleDecl>,
     pub(crate) mod_id: &'static str,
     pub(crate) mod_index: usize,
     /// Parts registered so far, by every mod: the next part's `order`.
     pub(crate) registered: usize,
     pub(crate) parts: Parts,
     pub(crate) tags: TagParts,
-    pub(crate) block_entity_types: Vec<BlockEntityType>,
+    pub(crate) block_entity_types: Vec<BlockEntityTypeDecl>,
     pub(crate) entity_attributes: Vec<EntityAttributeDeclaration>,
+    pub(crate) world_fluids: Vec<horizon_mod_package::content::FluidLook>,
+    pub(crate) entity_attribute_modifications: Vec<EntityAttributeModification>,
     pub(crate) registry_keys: Rc<RefCell<horizon_mod_runtime::registry_keys::Requests>>,
     pub(crate) effects: OnceLock<horizon_mod_runtime::registry_keys::Effects>,
     pub(crate) controllers: Vec<ControllerInfo>,
@@ -547,6 +556,8 @@ impl PartRegistrar {
             tags: TagParts::default(),
             block_entity_types: Vec::new(),
             entity_attributes: Vec::new(),
+            world_fluids: Vec::new(),
+            entity_attribute_modifications: Vec::new(),
             registry_keys: Default::default(),
             effects: OnceLock::new(),
             controllers: Vec::new(),
@@ -654,43 +665,25 @@ pub(crate) fn register_all(mods: &[ModEntry]) -> PartRegistrar {
 
 /// Builds the parts from every mod's [`Hooks::register`](crate::Hooks::register), in dispatch order. Once, at startup;
 /// the error lists every part refused, naming its mods.
-pub fn install_parts(mods: &[ModEntry]) -> Result<(), Vec<String>> {
-    install_registrar(register_all(mods))
+pub fn install_parts(
+    mods: &[ModEntry],
+    schema: &crate::declarations::RuleSchema<'_>,
+) -> Result<(), Vec<String>> {
+    install_registrar(register_all(mods), schema)
 }
 
-pub(crate) fn install_registrar(mut registrar: PartRegistrar) -> Result<(), Vec<String>> {
-    let registry = horizon_client_core::gamerules::RuleRegistry::with_bool_rules(
-        &registrar.game_rule_categories,
-        &registrar.game_rules,
-    )
-    .map_err(|errors| {
-        registrar.refused.extend(
-            errors
-                .into_iter()
-                .map(|error| {
-                    let owner = match &error {
-                        horizon_client_core::gamerules::RuleRegistryError::UnknownCategory {
-                            rule,
-                            ..
-                        }
-                        | horizon_client_core::gamerules::RuleRegistryError::Duplicate(rule) => {
-                            rule.split_once(':').map_or("unknown", |(owner, _)| owner)
-                        }
-                    };
-                    format!("mod {owner}: {error:?}")
-                })
-                .collect::<Vec<_>>(),
-        );
-        registrar.refused.clone()
-    })?;
+pub(crate) fn install_registrar(
+    mut registrar: PartRegistrar,
+    schema: &crate::declarations::RuleSchema<'_>,
+) -> Result<(), Vec<String>> {
+    let slots = schema.validate(&registrar.game_rule_categories, &registrar.game_rules);
+    if let Err(errors) = &slots {
+        registrar.refused.extend(errors.iter().cloned());
+    }
     if !registrar.refused.is_empty() {
         return Err(registrar.refused);
     }
-    let game_rule_slots = registrar
-        .game_rules
-        .iter()
-        .map(|rule| registry.position(&rule.name).unwrap())
-        .collect();
+    let game_rule_slots = slots.expect("every schema refusal was collected");
     let mut installed = Installed {
         game_rule_slots,
         game_rules: registrar.game_rules,
@@ -699,12 +692,16 @@ pub(crate) fn install_registrar(mut registrar: PartRegistrar) -> Result<(), Vec<
         tags: registrar.tags,
         block_entity_types: registrar.block_entity_types,
         entity_attributes: registrar.entity_attributes,
+        world_fluids: registrar.world_fluids,
+        entity_attribute_modifications: registrar.entity_attribute_modifications,
         resolved_block_entity_types: OnceLock::new(),
         registry_keys: Rc::try_unwrap(registrar.registry_keys)
             .unwrap_or_else(|_| unreachable!("registration scope has ended"))
             .into_inner(),
         effects: registrar.effects,
         fluids: OnceLock::new(),
+        resolved_items: OnceLock::new(),
+        resolved_blocks: OnceLock::new(),
         controllers: registrar.controllers,
         tree_parts: registrar.tree_parts,
         structure_types: registrar.structure_types,
@@ -748,16 +745,32 @@ pub mod tests {
 
     use std::sync::Arc;
 
+    /// Install fixture parts with the test rule schema.
+    pub fn install_parts_fixture(mods: &[ModEntry]) -> Result<(), Vec<String>> {
+        install_parts(mods, &rule_schema())
+    }
+    /// A small independent vanilla-schema fixture for tests without a game.
+    pub fn rule_schema() -> crate::__private::RuleSchema<'static> {
+        crate::__private::RuleSchema {
+            category: &|id| matches!(id, "minecraft:drops" | "minecraft:misc"),
+            position: &|_| None,
+            rule_count: 0,
+        }
+    }
+
     /// Register the game fixture's final block registry through the actual registrar, retaining
     /// its installed test mods and Parts. Production mods request only the entries they use.
-    pub fn register_game_keys(ids: impl IntoIterator<Item = String>) {
+    pub fn register_game_keys(
+        ids: impl IntoIterator<Item = String>,
+        schema: &crate::declarations::RuleSchema<'_>,
+    ) {
         let mut registrar = super::register_all(crate::mods());
         registrar.mod_id = "horizon";
         registrar.declare_fluid("definition_test");
         for id in ids {
             registrar.block_key(&id);
         }
-        super::install_registrar(registrar).unwrap();
+        super::install_registrar(registrar, schema).unwrap();
         crate::registry_keys::resolve_effects(
             horizon_client_core::potions::all_effects()
                 .map(|def| horizon_client_core::potions::namespaced(def.id)),
@@ -837,7 +850,11 @@ pub mod tests {
                 r.effect_key("absent:effect");
             }
         }
-        install_parts(&[ModEntry::new("lookup", Box::new(Unknown))]).unwrap();
+        install_parts(
+            &[ModEntry::new("lookup", Box::new(Unknown))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
         assert_eq!(
             crate::registry_keys::resolve_blocks(|_| None).unwrap_err(),
             ["mod lookup requested unknown block absent:block"]
@@ -864,7 +881,11 @@ pub mod tests {
                 }
             }
         }
-        let errors = install_parts(&[ModEntry::new("lookup", Box::new(Invalid))]).unwrap_err();
+        let errors = install_parts(
+            &[ModEntry::new("lookup", Box::new(Invalid))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap_err();
         assert_eq!(errors.len(), 3);
         assert!(
             errors
@@ -1011,30 +1032,6 @@ pub mod tests {
     }
 
     #[cfg(test)]
-    /// A test host's whole state, kept on each transaction it opens and put back on an abort, as
-    /// the game's journal keeps its storages.
-    pub(crate) trait Journal: Clone {
-        fn kept(&mut self) -> &mut Vec<Self>;
-    }
-    #[cfg(test)]
-    pub(crate) fn open<J: Journal>(host: &mut J) {
-        let mut now = host.clone();
-        now.kept().clear();
-        host.kept().push(now);
-    }
-    #[cfg(test)]
-    pub(crate) fn close<J: Journal>(host: &mut J, commit: bool) {
-        let Some(was) = host.kept().pop() else {
-            return;
-        };
-        if !commit {
-            let kept = std::mem::take(host.kept());
-            *host = was;
-            *host.kept() = kept;
-        }
-    }
-
-    #[cfg(test)]
     /// State 1 is a `test:gauge`, state 2 a `test:other`.
     pub(crate) struct Level;
     #[cfg(test)]
@@ -1086,7 +1083,7 @@ pub mod tests {
         ]
         .into();
         crate::install(mods.clone());
-        install_parts(&mods).unwrap();
+        install_parts(&mods, &crate::parts::tests::rule_schema()).unwrap();
         crate::registry_keys::resolve_fluids(&[
             "minecraft:water",
             "minecraft:lava",
@@ -1098,34 +1095,6 @@ pub mod tests {
         mark_game_thread();
         mods
     }
-
-    #[cfg(test)]
-    /// Block entities of one type, or vanilla ones (none).
-    pub(crate) struct TypeOf(pub(crate) Option<&'static str>);
-    #[cfg(test)]
-    impl mod_api::prelude::BlockEntitiesBackend for TypeOf {
-        fn block_entity_kind(&self, _: BlockEntityRef) -> Option<BlockEntityTypeKey> {
-            self.0.map(type_key)
-        }
-    }
-    #[cfg(test)]
-    impl Backend for TypeOf {}
-    #[cfg(test)]
-    mod_api::impl_backend_areas!(TypeOf, except(block_entities));
-    #[cfg(test)]
-    impl mod_api::prelude::BlockEntitiesHost for TypeOf {
-        fn block_entity(&self, level: LevelRef, position: [i32; 3]) -> Option<BlockEntityRef> {
-            Some(crate::__private::game::block_entity_ref(level, position, 1))
-        }
-    }
-    #[cfg(test)]
-    impl Host for TypeOf {
-        fn backend(&self) -> Option<BackendRef<'_>> {
-            Some(BackendRef::of(self))
-        }
-    }
-    #[cfg(test)]
-    mod_api::impl_host_areas!(TypeOf, except(block_entities));
 
     /// How a mod tank misanswers: an extract takes and answers 100 mB more than asked
     /// (`GivesMore`), or an insert answers 100 mB more than went in (`TakesMore`).

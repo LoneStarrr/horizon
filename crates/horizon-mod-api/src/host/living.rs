@@ -24,19 +24,22 @@ pub trait LivingBackend {
     /// namespaced as the registry has it, the ticks left (-1 infinite), the
     /// amplifier and the flags. The effect is a registration-slot key resolved at load.
     /// None when it has the effect not, before effect resolution, or for an armor
-    /// stand, the dragon, a stale handle or a client.
+    /// stand, the dragon or a stale handle; on a client, for any entity but the
+    /// local player, whose copy of what the server sent it is read.
     #[access(WorldOnly)]
     fn living_effect(&self, living: LivingRef, effect: EffectKey) -> Option<NativeActiveEffect>;
     /// Side: both.
     /// The entity's active effects (`LivingEntity.getActiveEffects`), in the
     /// order their store keeps them, in `Some` even when it has none. None
-    /// for an armor stand, the dragon, a stale handle or a client.
+    /// for an armor stand, the dragon or a stale handle; on a client, for any
+    /// entity but the local player (its copy of what the server sent it).
     #[access(WorldOnly)]
     fn living_effects(&self, living: LivingRef) -> Option<Vec<NativeActiveEffect>>;
-    /// Side: server.
+    /// Side: both.
     /// Whether the entity has `effect` (`LivingEntity.hasEffect`), using its resolved key.
-    /// False before effect resolution, for an armor stand, the dragon,
-    /// a stale handle or a client.
+    /// False before effect resolution, for an armor stand, the dragon or a stale handle;
+    /// on a client, for any entity but the local player, whose copy of what the server
+    /// sent it is read.
     #[access(WorldOnly)]
     fn living_potion_affected(&self, living: LivingRef, effect: EffectKey) -> bool;
     /// Side: both.
@@ -258,7 +261,7 @@ pub trait LivingBackendMut {
         living: LivingRef,
         stack: &ItemStack,
         index: usize,
-    ) -> Option<bool>;
+    ) -> Result<Option<bool>, StackWriteError>;
     /// Side: server.
     /// `LivingEntity.addEffect(instance)`: gives the living entity the
     /// effect by the game's own path. A player's or a guest's goes through
@@ -443,7 +446,7 @@ pub trait LivingBackendMut {
         living: LivingRef,
         slot: EquipmentSlot,
         stack: Option<ItemStack>,
-    ) -> bool;
+    ) -> Result<bool, StackWriteError>;
     /// Side: server.
     /// Puts `stack` in hand `hand` (`LivingEntity.setItemInHand`): the main
     /// hand's slot or the off hand's, written as `set_equipment`
@@ -455,7 +458,7 @@ pub trait LivingBackendMut {
         living: LivingRef,
         hand: Hand,
         stack: Option<ItemStack>,
-    ) -> bool;
+    ) -> Result<bool, StackWriteError>;
     /// Side: server.
     /// Damage an equipped stack without an equip/unequip notification.
     #[access(WorldOnly)]
@@ -480,7 +483,7 @@ pub trait LivingBackendMut {
         stack: ItemStack,
         throw_randomly: bool,
         include_thrower_name: bool,
-    ) -> Option<EntityRef>;
+    ) -> Result<Option<EntityRef>, StackWriteError>;
     /// Side: server.
     /// `LivingEntity.swing(hand, DEFAULT, sendToSwingingEntity)`: starts the
     /// arm swing (shortened by haste, lengthened by mining fatigue) unless

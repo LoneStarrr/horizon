@@ -38,6 +38,9 @@ pub struct GamePoint {
     pub at_return: bool,
     /// Whether it has a raw form: listeners with the receiver and every parameter by its own type.
     pub raw: bool,
+    /// Full raw listener contract, including engine-typed parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_shape: Option<point_shape::RawShape>,
     /// Its raw listeners' function type, by path: a mod's raw listener has this type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listener: Option<String>,
@@ -91,7 +94,7 @@ type Pending = (String, PathBuf, PathBuf, Vec<String>);
 /// declarations (and `#[path]`s, and inline modules that declare files). With `every_build`, a
 /// module behind a `cfg` is left out with everything under it (the points: functions every build
 /// compiles); without, it is kept with its conditions (the internals, listed with the builds they
-/// exist in). Test-only modules are always left out.
+/// exist in). Test-only modules are always left out, including files gated by inner attributes.
 pub(crate) fn module_files(
     module: String,
     path: PathBuf,
@@ -103,6 +106,13 @@ pub(crate) fn module_files(
     while let Some((module, path, dir, cfg)) = pending.pop() {
         let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let file = crate::game_modules::parse(&path, &source)?;
+        if test_only(&file.attrs) || (every_build && gated(&file.attrs)) {
+            continue;
+        }
+        let cfg = cfg
+            .into_iter()
+            .chain(conditions(&file.attrs))
+            .collect::<Vec<_>>();
         let here = path
             .parent()
             .expect("a source file has a folder")
@@ -453,7 +463,7 @@ pub(crate) fn file_points<'a>(
     file_functions(module, items, keep, &point_shape::eligible, out);
 }
 
-fn file_functions<'a>(
+pub(crate) fn file_functions<'a>(
     module: &str,
     items: &'a [Item],
     keep: &dyn Fn(&Found<'_>) -> bool,
@@ -655,6 +665,9 @@ pub fn game_points(root: &Path) -> Result<Vec<GamePoint>, String> {
             wire_shape: shape.wire_shape(),
             at_return: shape.has_return(),
             raw: shape.raw,
+            raw_shape: shape
+                .raw
+                .then(|| point_shape::raw_shape(&shape, found.sig, found.owner.map(|(ty, _)| ty))),
             listener: shape
                 .raw
                 .then(|| format!("{}::{}", found.module, shape.raw_listener())),
@@ -983,6 +996,152 @@ pub(crate) fn records(points: &[GamePoint], sources: &[source::Point]) -> String
 mod tests {
     use super::*;
 
+    #[test]
+    fn record_mutability_catalog_proof() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let points = game_points(&root).unwrap();
+        let sources = source::read(&root).unwrap();
+        let full = serde_json::to_vec_pretty(&points).unwrap();
+        if let Ok(path) = std::env::var("RETURN_MUTABILITY_FULL") {
+            fs::write(path, &full).unwrap();
+        }
+        let serialized: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        assert_eq!(serialized, serde_json::to_value(&points).unwrap());
+        for point in serialized.as_array().unwrap() {
+            if let Some(raw) = point.get("raw_shape") {
+                assert!(raw["return_record_mutable"].is_boolean());
+                if raw["return_ty"] != "()" {
+                    assert_eq!(raw["return_record_mutable"], true);
+                }
+            }
+        }
+        let text = std::str::from_utf8(&full).unwrap();
+        for raw in text.split("\"raw_shape\":").skip(1) {
+            assert!(
+                raw.find("\"return_record_mutable\"").unwrap() < raw.find("\"return_ty\"").unwrap()
+            );
+            assert!(raw.find("\"return_ty\"").unwrap() < raw.find("\"return_class\"").unwrap());
+        }
+        let mut existing = serde_json::to_value(&points).unwrap();
+        let mut added = 0;
+        for point in existing.as_array_mut().unwrap() {
+            if let Some(raw) = point.get_mut("raw_shape") {
+                assert!(raw.get("return_record_mutable").is_some());
+                raw.as_object_mut().unwrap().remove("return_record_mutable");
+                for arg in raw["args"].as_array_mut().unwrap() {
+                    assert_eq!(arg["record_mutable"].as_bool(), Some(true));
+                    added += usize::from(
+                        arg.as_object_mut()
+                            .unwrap()
+                            .remove("record_mutable")
+                            .is_some(),
+                    );
+                }
+                assert_eq!(
+                    raw.get("outcome_record_mutable"),
+                    (raw["outcome"] != "none").then_some(&serde_json::Value::Bool(true)),
+                );
+                added += usize::from(
+                    raw.as_object_mut()
+                        .unwrap()
+                        .remove("outcome_record_mutable")
+                        .is_some(),
+                );
+            }
+        }
+        let existing = serde_json::to_vec_pretty(&existing).unwrap();
+        let proof = serde_json::to_vec_pretty(&serde_json::json!({
+            "existing_fields": String::from_utf8(existing.clone()).unwrap(),
+            "records_and_shapes": records(&points, &sources),
+        }))
+        .unwrap();
+        if let Ok(path) = std::env::var("RECORD_MUTABILITY_BASELINE") {
+            assert_eq!(
+                proof,
+                fs::read(path).unwrap(),
+                "existing points fields or records/SHAPES changed"
+            );
+        }
+        if let Ok(path) = std::env::var("RECORD_MUTABILITY_PROOF") {
+            fs::write(path, proof).unwrap();
+        }
+        println!(
+            "points={} raw={} added_flags={added} bytes={} existing_bytes={} growth={}",
+            points.len(),
+            points.iter().filter(|p| p.raw).count(),
+            full.len(),
+            existing.len(),
+            full.len() - existing.len()
+        );
+    }
+
+    #[test]
+    fn raw_shape_catalog_proof() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut points = game_points(&root).unwrap();
+        let mut existing = serde_json::to_value(&points).unwrap();
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for (point, json) in points.iter().zip(existing.as_array_mut().unwrap()) {
+            if point.raw {
+                assert!(json.get("raw_shape").is_some(), "{}", point.target);
+                if let Some(raw) = json.get("raw_shape") {
+                    assert!(raw["args"].is_array());
+                    for class in ["plain", "callback", "unclassified"] {
+                        if raw["args"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|arg| arg["class"] == class)
+                        {
+                            *counts.entry(class.into()).or_default() += 1;
+                            if class == "callback" {
+                                println!("callback {}: {}", point.target, raw["args"]);
+                            }
+                        }
+                    }
+                    if raw["return_class"] == "borrowed_return" {
+                        *counts.entry("borrowed_return".into()).or_default() += 1;
+                    }
+                }
+            } else {
+                assert!(json.get("raw_shape").is_none());
+            }
+            json.as_object_mut().unwrap().remove("raw_shape");
+        }
+        let sources = source::read(&root).unwrap();
+        let proof = serde_json::json!({
+            "existing_fields": existing,
+            "records": records(&points, &sources),
+            "wire_shapes": points.iter().map(|p| &p.wire_shape).collect::<Vec<_>>(),
+        });
+        let before_records = records(&points, &sources);
+        let before_json = serde_json::to_vec(&existing).unwrap();
+        for point in &mut points {
+            point.raw_shape = None;
+        }
+        let mut after = serde_json::to_value(&points).unwrap();
+        for json in after.as_array_mut().unwrap() {
+            json.as_object_mut().unwrap().remove("raw_shape");
+        }
+        assert_eq!(serde_json::to_vec(&after).unwrap(), before_json);
+        assert_eq!(records(&points, &sources), before_records);
+        if let Ok(path) = std::env::var("RAW_SHAPE_BASELINE") {
+            let baseline = fs::read(path).unwrap();
+            assert!(
+                serde_json::to_vec_pretty(&proof).unwrap() == baseline,
+                "existing fields or generated records/SHAPES changed"
+            );
+        }
+        if let Ok(path) = std::env::var("RAW_SHAPE_PROOF") {
+            fs::write(path, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
+        }
+        println!(
+            "points={} raw={} classes={counts:?}",
+            points.len(),
+            points.iter().filter(|p| p.raw).count()
+        );
+    }
+
     fn point(attribute: &str, method: &str) -> Result<point_shape::Shape, String> {
         let method: syn::ImplItemFn = syn::parse_str(method).map_err(|e| e.to_string())?;
         point_shape::shape(attribute.parse().unwrap(), &method.sig).map_err(|e| e.to_string())
@@ -1068,6 +1227,7 @@ mod tests {
                 returns: "result",
                 at_return: true,
                 raw: true,
+                raw_shape: Some(point_shape::raw_shape(&shape, &sig, None)),
                 listener: Some("horizon_client::__ChangeListener".into()),
                 return_listener: None,
                 record_item: String::new(),

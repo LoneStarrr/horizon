@@ -21,6 +21,10 @@ const LLD_ENV: &str = "HORIZON_MOD_LLD";
 /// The library mods' crate names, comma-separated, that a member leaves out.
 const PROVIDED_ENV: &str = "HORIZON_MOD_PROVIDED";
 const PROFILE: &str = "horizon-wasm";
+
+#[cfg(test)]
+#[path = "wasm/tests.rs"]
+mod tests;
 /// The crates of std, linked whole into the std member and left out of every other member.
 const STD_CRATES: &[&str] = &[
     "std",
@@ -147,16 +151,8 @@ fn toolchain() -> Result<Toolchain, String> {
     })
 }
 
-/// Builds the crate at `root` as a group member and gives its module.
-fn cargo_member(
-    root: &Path,
-    target_dir: &Path,
-    toolchain: &Toolchain,
-    role: &str,
-    provided: &[String],
-    features: &[String],
-) -> Result<Vec<u8>, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+/// Select the member's own view inputs, never inherited inputs from another mod or std.
+fn member_command(root: &Path, role: &str) -> Result<Command, String> {
     let mut command = pinned("cargo");
     command
         .env_remove("HORIZON_MOD_INTERNALS_MANIFEST")
@@ -165,14 +161,10 @@ fn cargo_member(
         let text = std::fs::read_to_string(root.join(MANIFEST)).map_err(|e| e.to_string())?;
         let manifest: toml_edit::DocumentMut =
             text.parse().map_err(|e| format!("{MANIFEST}: {e}"))?;
-        if manifest
-            .get("native")
-            .and_then(|n| n.get("internals"))
-            .is_some_and(|i| {
-                i.as_array().is_some_and(|a| !a.is_empty())
-                    || i.as_array_of_tables().is_some_and(|a| !a.is_empty())
-            })
-        {
+        if manifest.get("internals").is_some_and(|i| {
+            i.as_array().is_some_and(|a| !a.is_empty())
+                || i.as_array_of_tables().is_some_and(|a| !a.is_empty())
+        }) {
             command.env(
                 "HORIZON_MOD_INTERNALS_MANIFEST",
                 std::path::absolute(root.join(MANIFEST)).map_err(|e| e.to_string())?,
@@ -184,6 +176,20 @@ fn cargo_member(
             );
         }
     }
+    Ok(command)
+}
+
+/// Builds the crate at `root` as a group member and gives its module.
+fn cargo_member(
+    root: &Path,
+    target_dir: &Path,
+    toolchain: &Toolchain,
+    role: &str,
+    provided: &[String],
+    features: &[String],
+) -> Result<Vec<u8>, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = member_command(root, role)?;
     command.args(["rustc", "--lib", "--crate-type", "cdylib"]);
     if !features.is_empty() {
         command.args(["--features", &features.join(",")]);
@@ -361,16 +367,7 @@ pub fn build(root: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{MANIFEST}: {e}"))?;
     let mut manifest: toml_edit::DocumentMut =
         text.parse().map_err(|e| format!("{MANIFEST}: {e}"))?;
-    // A wasm mod's `[native]` holds only declarations, never native code or build pins.
-    if manifest
-        .get("native")
-        .and_then(toml_edit::Item::as_table_like)
-        .is_some_and(|native| {
-            native
-                .iter()
-                .any(|(key, _)| !matches!(key, "injection" | "internals"))
-        })
-    {
+    if manifest.contains_key("native") {
         return Err(format!(
             "{MANIFEST}: a [native] mod builds through the launcher, not --wasm"
         ));

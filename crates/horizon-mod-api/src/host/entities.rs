@@ -154,6 +154,35 @@ pub trait EntitiesBackend {
     /// one. Mobs and players.
     #[access(WorldOnly)]
     fn entity_damage_cooldown_time(&self, entity: EntityRef) -> Option<i32>;
+    /// Side: server.
+    /// `Entity.isInvulnerableTo` for a source of `damage_type`: #842's own
+    /// decision, the guard every mob damage hook runs after — dead or
+    /// removed, fire immunity, or the `Invulnerable` flag nothing but
+    /// `#bypasses_invulnerability` gets past. None for a stale handle or a
+    /// kind with no such decision (the player's paths answer their refusals
+    /// at hurt time). #924.
+    #[access(WorldOnly)]
+    fn entity_invulnerable_to_damage(&self, entity: EntityRef, damage_type: &str) -> Option<bool>;
+    /// Side: server.
+    /// Whether `source`'s damage may hit `entity` through their teams
+    /// (`Player.canHarmPlayer`, `Team.allowFriendlyFire`,
+    /// `DamageSource.doTeamsAllowDamage`): allies without friendly fire
+    /// cannot. Entities without a team always can. None for a stale handle.
+    /// #924.
+    #[access(WorldOnly)]
+    fn entity_entities_team_damage_allowed(
+        &self,
+        entity: EntityRef,
+        source: EntityRef,
+    ) -> Option<bool>;
+    /// Side: server.
+    /// `Entity.isInvulnerableToPiercingWeapon` (`isInvulnerable`): the
+    /// `Invulnerable` flag; the temporary window `Entity.invulnerableTime`
+    /// opens does not exist yet (#916), so no hit answers through it. None
+    /// for a stale handle or a kind without the flag. #924.
+    #[access(WorldOnly)]
+    fn entity_invulnerable_to_piercing_weapon(&self, entity: EntityRef) -> Option<bool>;
+
     /// Side: both.
     /// The entity's velocity in blocks a tick (`Entity.getDeltaMovement`). A
     /// player's is the move its client last reported (`getKnownMovement`); an
@@ -233,14 +262,59 @@ pub trait EntitiesBackend {
     #[access(WorldOnly)]
     fn entity_root_vehicle(&self, entity: EntityRef) -> Option<EntityRef>;
     /// Side: server.
-    /// The entities riding this one (`Entity.getPassengers`): its players
-    /// in the order they got in, then its mobs.
+    /// The entities riding this one (`Entity.getPassengers`), in `addPassenger`'s order: each
+    /// behind those aboard, except that a player goes first when the first is no player.
     #[access(WorldOnly)]
     fn entity_passengers(&self, entity: EntityRef) -> Option<Vec<EntityRef>>;
     /// Side: server.
     /// Whether anything rides the entity (`Entity.isVehicle`).
     #[access(WorldOnly)]
     fn entity_is_vehicle(&self, entity: EntityRef) -> Option<bool>;
+    /// Side: server.
+    /// Every entity riding this one, at any depth (`Entity.getIndirectPassengers`): each
+    /// passenger in `passengers` order, followed by those riding it.
+    #[access(WorldOnly)]
+    fn entity_indirect_passengers(&self, entity: EntityRef) -> Option<Vec<EntityRef>>;
+    /// Side: server.
+    /// The first passenger, when it steers the entity (`Entity.getControllingPassenger`): a
+    /// player in a boat, a player on a mount that is ready for one, or a mob on a mob with AI
+    /// unless `#non_controlling_rider` names it. `None` when nothing steers it, or for a stale
+    /// handle.
+    #[access(WorldOnly)]
+    fn entity_controlling_passenger(&self, entity: EntityRef) -> Option<LivingRef>;
+    /// Side: server.
+    /// Whether both entities share a root vehicle (`Entity.isPassengerOfSameVehicle`): true for
+    /// an entity and itself, false for two entities riding nothing. `None` for a stale handle.
+    #[access(WorldOnly)]
+    fn entity_is_passenger_of_same_vehicle(
+        &self,
+        entity: EntityRef,
+        other: EntityRef,
+    ) -> Option<bool>;
+    /// Side: server.
+    /// Where getting off this vehicle puts `passenger` as it stands now, riding it or not. This
+    /// is the game's own placement, from the code `stop_riding` runs, so it can differ from
+    /// `Entity.getDismountLocationForPassenger`. A player leaves a boat ahead of them or on top
+    /// of it, a cart beside or on top of it, a strider by vanilla's search, a happy ghast on
+    /// top, and any other mob beside or on top of it. A mob leaves a boat as a player does, a
+    /// cart by vanilla's search, a horse, camel or llama at its side or feet, and any other mob
+    /// on top: vanilla's searches for `Animal` and the strider don't reach mobs yet, and those
+    /// for horses, `Animal` and the cart don't reach players. Nothing rides anything else, so
+    /// there it is the top of the box. Reads only: no `mob_ride` or dismount veto is asked and
+    /// the passenger's pose stays. `None` for a stale handle, a passenger other than a player
+    /// or a mob, a player with no motion state, or a vehicle whose box Horizon does not keep.
+    #[access(WorldOnly)]
+    fn entity_dismount_location(
+        &self,
+        vehicle: EntityRef,
+        passenger: LivingRef,
+    ) -> Option<[f64; 3]>;
+    /// Side: server.
+    /// The live holder of a mob's or boat's lead (`Leashable.getLeashHolder`), or `Unleashed`
+    /// when no lead exists. `None` means an entity that takes no lead, or that the entity,
+    /// holder or saved holder is unavailable, stale or in a parked level. Does not load a level.
+    #[access(WorldOnly)]
+    fn entity_leash_holder(&self, entity: EntityRef) -> Option<LeashHolder>;
     /// Side: server.
     /// `Entity.getSoundSource`: the group an entity's sounds play under.
     /// Players are `Players`; `Monster`s, the dragon, hoglins, ghasts,
@@ -409,6 +483,27 @@ pub trait EntitiesBackendMut {
     #[access(WorldOnly)]
     fn entity_set_damage_cooldown_time(&mut self, entity: EntityRef, ticks: i32) -> bool;
     /// Side: server.
+    /// `Entity.hurtServer(level, source, amount)` of `amount` from a source
+    /// of `damage_type` (`minecraft:generic`'s shape), `direct` the entity
+    /// that dealt it (a shot arrow) and `causing` the one responsible for it
+    /// (its shooter): the engine's own hurt paths take it — the damage type,
+    /// the attacker, armor, the damage cooldown and every existing hurt hook
+    /// kept, the damage event the hit already broadcasts is the broadcast —
+    /// by kind: the player's and mobs' for the living, the item, vehicle,
+    /// dragon and crystal branches for the damageable rest. True when the
+    /// damage was taken. None for a stale handle, false for a kind that
+    /// cannot be hurt or an unregistered damage type. Stale direct/causing
+    /// handles are treated as absent sources. #924.
+    #[access(WorldOnly)]
+    fn entity_hurt(
+        &mut self,
+        entity: EntityRef,
+        damage_type: &str,
+        amount: f32,
+        direct: Option<EntityRef>,
+        causing: Option<EntityRef>,
+    ) -> Option<bool>;
+    /// Side: server.
     /// Sets the entity's velocity (`Entity.setDeltaMovement`); clients see it
     /// as they see the entity move. False for a player (its client moves
     /// it), an entity Horizon doesn't simulate, a value that isn't finite,
@@ -475,16 +570,18 @@ pub trait EntitiesBackendMut {
         entity: EntityRef,
         stack: ItemStack,
         y_offset: f32,
-    ) -> Option<EntityRef>;
+    ) -> Result<Option<EntityRef>, StackWriteError>;
     /// Side: server.
     /// Attempts to board a vehicle through the shared server mount path.
     ///
-    /// Players and mobs can ride a mob, boat or minecart. Returns false for
+    /// Players and mobs can ride a mob, boat, minecart or generic seat entity
+    /// (an armor stand, display, marker or interaction). Returns false for
     /// unsupported entity pairs, stale or held-out handles, a full stored
     /// vehicle, a cycle, or a canceled mount or dismount. Mob vehicle capacity
     /// follows its species; minecarts store one passenger and boats store one
-    /// mob and up to two passengers in total. `force` bypasses normal
-    /// admission checks, not these storage limits. Player boarding cooldown and the strider's
+    /// mob and up to two passengers in total. Generic seats admit one passenger unless forced.
+    /// `force` bypasses normal admission checks, not these storage limits.
+    /// Player boarding cooldown and the strider's
     /// eye-in-lava admission check are not yet represented by the game.
     #[access(WorldOnly)]
     fn entity_start_riding(&mut self, entity: EntityRef, vehicle: EntityRef, force: bool) -> bool;
@@ -500,6 +597,27 @@ pub trait EntitiesBackendMut {
     /// order. False when nothing rode it, or for a stale handle.
     #[access(WorldOnly)]
     fn entity_eject_passengers(&mut self, entity: EntityRef) -> bool;
+    /// Side: server.
+    /// Gives the holder the mob's or boat's lead (`Leashable.setLeashedTo`): the entity lets go
+    /// of any other holder and gets off its vehicle, where a mod's `mob_ride` lets it. As
+    /// there, neither `canBeLeashed` nor the distance is asked: a holder too far away snaps
+    /// the lead on the next tick. False for a stale handle, the entity itself, a holder other
+    /// than a player, mob or boat, or an entity that takes no lead.
+    #[access(WorldOnly)]
+    fn entity_leash_to(&mut self, entity: EntityRef, holder: EntityRef) -> bool;
+    /// Side: server.
+    /// Ties the mob's or boat's lead to the fence at `pos`, as `entity_leash_to` does to
+    /// an entity; the knot is there while a lead hangs on it. False for a stale handle, an
+    /// entity that takes no lead, or no fence at `pos`.
+    #[access(WorldOnly)]
+    fn entity_leash_to_knot(&mut self, entity: EntityRef, pos: [i32; 3]) -> bool;
+    /// Side: server.
+    /// Takes the lead off a mob or boat: the lead falls as an item with `drop_lead`
+    /// (`Leashable.dropLeash`), and is gone without it (`removeLeash`). A mob's removal is heard
+    /// by `entity_unleash`. False when no holder has the lead, for a stale handle, or for an
+    /// entity that takes no lead. A holder still unresolved from a save is left alone.
+    #[access(WorldOnly)]
+    fn entity_detach_leash(&mut self, entity: EntityRef, drop_lead: bool) -> bool;
     /// Side: server.
     /// `Entity.playSound(sound, volume, pitch)`: plays sound event `sound` at
     /// the entity under its sound source, for the players within range. A

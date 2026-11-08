@@ -471,16 +471,6 @@ impl Game<'_> {
         else {
             return false;
         };
-        let uuid = self
-            .lan
-            .as_ref()
-            .and_then(|host| host.hub.guests.iter().find(|g| g.conn == conn))
-            .map(|g| uuid_words(g.uuid));
-        if std::mem::take(&mut gm.merchant.session.last_traded)
-            && let (Some(id), Some(uuid)) = (gm.merchant.mob, uuid)
-        {
-            self.villager_traded_by(id, uuid);
-        }
         self.merchant_closed(&mut gm.merchant);
         true
     }
@@ -498,8 +488,7 @@ impl Game<'_> {
                 && guest_within_entity_range(g, &m.bounds(), 4.0)
         })
     }
-    /// `Villager.customServerAiStep` for the guests' trading villagers: the
-    /// TRADE reputation event, then the prices follow.
+    /// `AbstractVillager.stillValid`: close invalid guest merchant screens.
     pub(super) fn lan_merchant_tick(&mut self) {
         // `AbstractVillager.stillValid`: the trade screen closes once the trader
         // is gone or dead, or the guest is more than 4 blocks past its reach.
@@ -532,6 +521,9 @@ impl Game<'_> {
                 );
             }
         }
+    }
+    /// Refresh open guest prices after the actual villager reputation event.
+    pub(super) fn lan_merchant_reputation(&mut self, id: u32) {
         let conns: Vec<u32> = self
             .lan
             .as_ref()
@@ -540,7 +532,7 @@ impl Game<'_> {
                     .iter()
                     .filter(|(_, p)| {
                         p.merchant.as_ref().is_some_and(|m| {
-                            m.merchant.session.villager && m.merchant.session.last_traded
+                            m.merchant.session.villager && m.merchant.mob == Some(id)
                         })
                     })
                     .map(|(c, _)| *c)
@@ -561,19 +553,6 @@ impl Game<'_> {
             else {
                 continue;
             };
-            let Some(id) = self
-                .lan
-                .as_mut()
-                .and_then(|host| host.play.get_mut(&conn))
-                .and_then(|p| p.merchant.as_mut())
-                .and_then(|gm| {
-                    gm.merchant.session.last_traded = false;
-                    gm.merchant.mob
-                })
-            else {
-                continue;
-            };
-            self.villager_traded_by(id, uuid);
             let reputation = self.villager_reputation_of(id, uuid);
             self.lan_merchant_op(conn, None, |menu, env| {
                 if let Some(s) = menu.merchant.as_mut() {
@@ -694,6 +673,7 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::api_values::TryIntoApi;
     use super::super::native_entity_refs::tests::with_game;
     use super::super::native_merchant_refs::tests::{offer, spawn};
     use super::*;
@@ -1027,16 +1007,28 @@ mod tests {
             let player = villager.trading_player(game).unwrap();
             assert_eq!(player.uuid(), 12);
             let second = offer("minecraft:coal", "minecraft:diamond");
-            assert!(villager.add_offer(game, second.clone()));
+            assert!(
+                villager
+                    .add_offer(game, second.try_into_api().unwrap())
+                    .unwrap()
+            );
             assert_eq!(sent_offers(), 1);
             let mut changed = first.clone();
             changed.uses = 9;
-            assert!(villager.set_offer(game, 0, changed.clone()));
+            assert!(
+                villager
+                    .set_offer(game, 0, changed.try_into_api().unwrap())
+                    .unwrap()
+            );
             assert!(villager.set_xp(game, 40));
             assert!(villager.set_level(game, 3));
             // The profession cannot change under an open screen.
             assert!(!villager.set_profession(game, "minecraft:cleric"));
-            assert!(!villager.set_offer(game, 7, changed.clone()));
+            assert!(
+                !villager
+                    .set_offer(game, 7, changed.try_into_api().unwrap())
+                    .unwrap()
+            );
             assert_eq!(sent_offers(), 3);
             // The mob still has the old offers; the screen has the new ones.
             assert_eq!(
@@ -1044,7 +1036,7 @@ mod tests {
                 vec![first]
             );
             let live = vec![changed.clone(), second.clone()];
-            assert_eq!(villager.offers(game), Some(live.clone()));
+            assert_eq!(villager.offers(game), Some(live.try_into_api().unwrap()));
             assert_eq!(villager.xp(game), Some(40));
             assert_eq!(villager.level(game), Some(3));
             {
@@ -1168,7 +1160,13 @@ mod tests {
                     .and_then(|id| host.entity(id))
                     .and_then(|entity| host.merchant(entity));
                 let wrote = merchant.is_some_and(|m| {
-                    m.add_offer(host, offer("minecraft:wheat", "minecraft:emerald"))
+                    m.add_offer(
+                        host,
+                        offer("minecraft:wheat", "minecraft:emerald")
+                            .try_into_api()
+                            .unwrap(),
+                    )
+                    .unwrap()
                 });
                 let player = merchant.is_some_and(|m| m.trading_player(host).is_some());
                 self.0
@@ -1187,7 +1185,11 @@ mod tests {
             with_game(|game| {
                 let (villager, _rx, first) = open_trade(game, 1);
                 let second = offer("minecraft:coal", "minecraft:diamond");
-                assert!(villager.add_offer(game, second.clone()));
+                assert!(
+                    villager
+                        .add_offer(game, second.try_into_api().unwrap())
+                        .unwrap()
+                );
                 game.lan_select_trade(12, 1);
                 // The selected menu is restored before the hook, so its live
                 // session and trading player are readable and writable there.
@@ -1196,11 +1198,11 @@ mod tests {
                 assert_eq!(seen[0], (Some(40), 1, true, true));
                 assert_eq!(
                     villager.offers(game),
-                    Some(vec![
-                        first,
-                        second,
-                        offer("minecraft:wheat", "minecraft:emerald")
-                    ])
+                    Some(
+                        vec![first, second, offer("minecraft:wheat", "minecraft:emerald")]
+                            .try_into_api()
+                            .unwrap()
+                    )
                 );
             });
         });

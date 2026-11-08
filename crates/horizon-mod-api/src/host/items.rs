@@ -9,7 +9,17 @@ pub trait ItemsHost {
     /// or `None` for an unknown item: for a mod's container that fills or
     /// merges stacks itself.
     #[access(Metadata)]
-    fn max_stack_size(&self, item: &str) -> Option<u32>;
+    fn max_stack_size(&self, item: ItemKey) -> Option<u32>;
+    /// Side: both.
+    /// Default durability of the resolved item, or none if its metadata is unavailable.
+    /// Stack-specific component overrides are checked at the game's write boundary.
+    #[access(Metadata)]
+    fn max_damage(&self, item: ItemKey) -> Option<u32>;
+    /// Side: both.
+    /// Resolve an item once at load, including vanilla items, to its process-local identity.
+    /// None if the completed registry does not contain the identifier.
+    #[access(Metadata)]
+    fn item_key(&self, id: &Identifier) -> Option<ItemKey>;
     /// Side: both.
     /// Item `item`'s default value of component `component`, in its prototype
     /// (`Item.components().get`): `minecraft:max_damage` on an iron sword is `250`, data
@@ -17,7 +27,7 @@ pub trait ItemsHost {
     /// number is an `Int`, `Long` or `Double` and a boolean a `Byte`. None where the item
     /// hasn't the component, and for an unknown item.
     #[access(Metadata)]
-    fn item_default_component(&self, item: &str, component: &str) -> Option<Tag>;
+    fn item_default_component(&self, item: ItemKey, component: &str) -> Option<Tag>;
     /// Side: both.
     /// Item `item`'s cooking-fuel burn time in ticks (`FuelValues.burnDuration` of its `cooking_fuel`
     /// component, the data pack's context int provider resolved), None where it is no fuel. API
@@ -55,7 +65,7 @@ pub trait ItemsServerHost {
         pos: [i32; 3],
         facing: Direction,
         stack: ItemStack,
-    ) -> Option<ItemStack>;
+    ) -> Result<Option<ItemStack>, StackWriteError>;
 }
 /// The client host's methods of the `items` area, implemented by the game and reached through [`crate::ClientHost`].
 #[horizon_mod_api_macros::host_area]
@@ -91,6 +101,14 @@ pub trait ItemsBackend {
     /// Side: both. The effective vanilla bar, before client drawing hooks.
     #[access(WorldOnly)]
     fn item_resource_bar(&self, stack: &ItemStack) -> Option<ItemBar>;
+    /// Side: client. The item's standard tooltip lines before mod callbacks or drawing.
+    #[access(WorldOnly)]
+    fn item_resource_tooltip(
+        &self,
+        stack: &ItemStack,
+        advanced: bool,
+        creative: bool,
+    ) -> Option<Vec<TooltipElement>>;
     /// Side: server.
     /// How many slots of the block entity at `at` its side reaches (none: every slot), by its
     /// `WorldlyContainer` rules: a furnace's top reaches its input only. None where no block
@@ -182,14 +200,31 @@ pub trait ItemsBackend {
     /// chested mount is not one): none for any other entity, and on a client.
     #[access(WorldOnly)]
     fn entity_automation_size(&self, entity: u32) -> Option<usize>;
+    /// Side: server.
+    /// How many equipment slots living entity `entity`'s [`ENTITY_ITEMS`](crate::ENTITY_ITEMS)
+    /// answers (#932, NeoForge's `LivingEntityEquipmentWrapper`): a mob's or an armor stand's
+    /// seven (main hand, off hand, feet, legs, chest, head and body, by `EquipmentSlot`'s
+    /// ordinal; the saddle is not automation's to move), none for any other entity, and on a
+    /// client.
+    #[access(WorldOnly)]
+    fn entity_equipment_size(&self, entity: u32) -> Option<usize>;
 }
 /// The handles' writes of the `items` area, implemented by the game and reached through [`BackendMut`].
 // hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait
 #[doc(hidden)]
 #[horizon_mod_api_macros::host_area]
 pub trait ItemsBackendMut {
+    /// Side: server. Roll an enchantment result with the named level's random source.
+    #[access(WorldOnly)]
+    fn item_resource_enchant_randomly(
+        &mut self,
+        stack: &ItemStack,
+        level: LevelRef,
+        power: i32,
+        pool: &Identifier,
+    ) -> Result<Option<ItemStack>, StackWriteError>;
     /// Side: server.
-    /// Puts as much of `stack` as slot `slot` of those `at`'s side reaches takes, as a hopper
+    /// Puts up to `amount` of `resource` into slot `slot` of those `at`'s side reaches, as a hopper
     /// would (`canPlaceItem`, the slot's limit, the same item and components), in transaction
     /// `tx`; what didn't fit.
     #[access(WorldOnly)]
@@ -197,9 +232,10 @@ pub trait ItemsBackendMut {
         &mut self,
         at: BlockSide,
         slot: usize,
-        stack: ItemStack,
+        resource: &ItemResource,
+        amount: u32,
         tx: &Transaction,
-    ) -> Option<ItemStack>;
+    ) -> Result<Option<ItemStack>, StackWriteError>;
     /// Side: server.
     /// Takes up to `max` out of slot `slot` of those `at`'s side reaches, in transaction `tx`;
     /// through a side, only what that side may take (`canTakeItemThroughFace`). What came out.
@@ -219,7 +255,7 @@ pub trait ItemsBackendMut {
     fn game_stack(&mut self, place: &ItemPlace) -> Option<ItemStack>;
     /// Side: server.
     /// `ItemAccess.insert` at a player's place, an item entity's or an entity's slot: up to
-    /// `stack.count` of `stack`, into the place where it's empty or holds the same item and
+    /// `amount` of `resource`, into the place where it's empty or holds the same item and
     /// components, up to the item's stack size. The rest goes where vanilla puts an item split
     /// off it: a player's into their inventory, else dropped as `Player.drop(stack, false)` at
     /// the root commit (a creative player's hand takes anything, and gives them one if they have
@@ -228,16 +264,27 @@ pub trait ItemsBackendMut {
     /// went: 0 where `native_game_stack` reads nothing for want of the place. In transaction
     /// `tx`, which keeps each place as it was. The player's screen follows with the tick's sync.
     #[access(WorldOnly)]
-    fn game_insert(&mut self, place: &ItemPlace, stack: ItemStack, tx: &Transaction) -> u32;
+    fn game_insert(
+        &mut self,
+        place: &ItemPlace,
+        resource: &ItemResource,
+        amount: u32,
+        tx: &Transaction,
+    ) -> Result<u32, StackWriteError>;
     /// Side: server.
-    /// `ItemAccess.extract` at those places: up to `stack.count` of the item and components of
-    /// `stack`, how many came out. An item entity emptied stays, empty, until the root commit
+    /// `ItemAccess.extract` at those places: up to `amount` of `resource`, how many came out. An item entity emptied stays, empty, until the root commit
     /// removes it. A creative player's hand gives without losing any (`forInfiniteMaterials`).
     #[access(WorldOnly)]
-    fn game_extract(&mut self, place: &ItemPlace, stack: ItemStack, tx: &Transaction) -> u32;
+    fn game_extract(
+        &mut self,
+        place: &ItemPlace,
+        resource: &ItemResource,
+        amount: u32,
+        tx: &Transaction,
+    ) -> Result<u32, StackWriteError>;
     /// Side: server.
     /// Drops `stack` at the middle of the block at `pos`, as a block entity's handler gives up
     /// what it can't put back.
     #[access(WorldOnly)]
-    fn drop_at(&mut self, pos: [i32; 3], stack: ItemStack);
+    fn drop_at(&mut self, pos: [i32; 3], stack: ItemStack) -> Result<(), StackWriteError>;
 }

@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 import importlib.util
 import io
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -73,6 +74,7 @@ assert!(!dependencies.contains_key("horizon-mods"));
         self.assertEqual(rename.rewrite("launcher/src/native_mods/api.rs", source), expected)
         self.assertEqual(rename.rewrite("launcher/src/export.rs", source), source)
 
+    @unittest.skipUnless(shutil.which("rustfmt"), "requires rustfmt")
     def test_verify_rejects_an_unchanged_file_that_still_needs_the_mapping(self):
         with TemporaryDirectory() as directory, patch.object(rename, "ROOT", Path(directory)):
             crate = rename.ROOT / rename.OLD_PATH

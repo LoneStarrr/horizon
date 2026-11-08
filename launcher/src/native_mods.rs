@@ -16,7 +16,6 @@ use crate::i18n::{tr, trf};
 use crate::instances::{self, Instance};
 use crate::rust_toolchain::{self, Toolchain};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +26,8 @@ use std::sync::Arc;
 use horizon_mod_package::dependencies;
 
 mod api;
+mod planning;
+pub use planning::routes;
 mod crates;
 mod diagnostics;
 mod inject;
@@ -35,27 +36,33 @@ mod internals;
 mod internals_sync;
 mod isolate;
 mod package;
+mod picker;
 mod prebuilt;
 mod sites;
 mod slots;
-#[cfg(test)]
 mod source;
 #[cfg(all(test, target_os = "linux"))]
 mod source_server;
 mod wasm_internals;
 
 pub use isolate::LeftOut;
+pub use picker::{needs_picker, Route, Routes};
+pub use prebuilt::{prebuilt_availability, SourceReason};
+
+// Settings and logs are shared by native-build and diagnostics tests.
+#[cfg(test)]
+pub(crate) static TEST_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const PREFIX: &str = "native-";
 // A staging change invalidates both installed builds and patched-source snapshots.
-const STAGING: &str = "embedded-inventory-packages-v1";
+const STAGING: &str = "area-aware-mixins-input-v1";
 /// horizon-mixins, for bundles that don't name the revision they were tested with.
 const MIXINS_GIT: &str = "https://github.com/horizon-rust/horizon-mixins";
 pub const MIXINS_REV: &str = horizon_mod_package::index::native::MIXINS_REV;
 
-/// What a native build is compiled for, as the player picks it on the Mods page. `Optimized`, the
-/// default, is the release profile the daily prebuilt game is built with (thin LTO, one codegen
-/// unit): mods that need nothing but the mod API compile against that download in seconds, and
+/// Native build modes: a visible picker starts at Balanced and remembers the instance's choice.
+/// Optimized is the daily prebuilt game's release profile (thin LTO, one codegen
+/// unit): mods that need nothing but the mod API compile against that download, and
 /// any other set builds the whole game from source with the same profile. `Balanced` is the
 /// workspace's `fast` (16 codegen units, incremental, thin-local LTO only), built on this computer:
 /// quicker to rebuild after a change, a game a little slower. `Developer`, for writing a mod, is
@@ -63,17 +70,27 @@ pub const MIXINS_REV: &str = horizon_mod_package::index::native::MIXINS_REV;
 /// about twice as slow. `Balanced` and `Developer` share `native/target/fast/`: every other crate
 /// is built alike, so switching between them recompiles only `horizon-client`, and Cargo keeps
 /// both builds of it. Each profile has its own key, so their builds never mix.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Profile {
-    #[default]
     Optimized,
+    #[default]
     Balanced,
     Developer,
 }
 
 impl Profile {
-    /// The player's choices (the Mods page, `settings native-profile`).
+    /// The player's build-mode choices.
     pub const ALL: [Self; 3] = [Self::Optimized, Self::Balanced, Self::Developer];
 
     pub fn name(self) -> &'static str {
@@ -82,16 +99,6 @@ impl Profile {
             Self::Balanced => "balanced",
             Self::Developer => "developer",
         }
-    }
-
-    /// The profile named `text`.
-    pub fn parse(text: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.name() == text.trim())
-    }
-
-    /// The settings' profile, or the default when unset.
-    pub fn chosen(settings: &crate::backend::Settings) -> Self {
-        settings.native_profile.unwrap_or_default()
     }
 
     /// The Cargo profile it compiles with (its folder in `native/target/`), and what it sets over
@@ -274,12 +281,12 @@ impl Plan {
                 "Incremental rebuild: {changes}",
                 &[("changes", &changes.join("; "))],
             ),
-            Self::First => tr("First build: the whole game (several minutes)").into(),
-            Self::Prebuilt => tr("Prebuilt game: only the mods compile (seconds)").into(),
+            Self::First => tr("First build: the whole game").into(),
+            Self::Prebuilt => tr("Prebuilt game: only the mods compile").into(),
         }
     }
 
-    /// The word in "Built in 42 s (balanced, incremental)".
+    /// The plan's short name in a completed build's status.
     fn kind(&self) -> &'static str {
         match self {
             Self::UpToDate => "up to date",
@@ -462,15 +469,6 @@ fn log_text(line: &str) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
-/// "1 min 5 s" style time, for the build's status.
-pub fn duration_label(secs: u64) -> String {
-    if secs >= 60 {
-        format!("{} min {} s", secs / 60, secs % 60)
-    } else {
-        format!("{secs} s")
-    }
-}
-
 /// Whether an installed version is a native-mods build.
 pub fn is_native(version: &str) -> bool {
     version.starts_with(PREFIX)
@@ -505,22 +503,24 @@ pub fn append_log(message: &str) -> Result<(), String> {
 }
 
 /// Records the whole attempt, including selection or export after compilation.
-fn logged<T>(build: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn logged<T>(
+    build: impl FnOnce(Result<&crate::native_cache::Cache, &str>) -> Result<T, String>,
+) -> Result<T, String> {
     // Another build or a cleanup holds the lease on the same target/: refuse. Any other
-    // failure (a filesystem without file locks, a `native` folder linked to another drive)
-    // only stops the cleanup: the build goes ahead without the lease, as it did before.
-    let (cache, unavailable) = match crate::native_cache::Cache::acquire(&backend::build_dir()) {
-        Ok(cache) => (Some(cache), None),
+    // failure only stops cleanup for explicit builds. Automatic selection requires a held
+    // cache for its catalog and can refuse instead of accessing an unsafe tree.
+    let cache = match crate::native_cache::Cache::acquire(&backend::build_dir()) {
+        Ok(cache) => Ok(cache),
         Err(crate::native_cache::Error::Busy) => {
             return Err(cache_error(crate::native_cache::Error::Busy));
         }
-        Err(error) => (None, Some(cache_error(error))),
+        Err(error) => Err(cache_error(error)),
     };
     clear_log()?;
-    if let Some(warning) = &unavailable {
+    if let Err(warning) = &cache {
         log_warning(warning);
     }
-    let result = build();
+    let result = build(cache.as_ref().map_err(String::as_str));
     match &result {
         Ok(_) => {
             let _ = append_log("Build completed.");
@@ -531,7 +531,7 @@ fn logged<T>(build: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     }
     // The installed binary and post-build programs have left target/ before trimming. Keep
     // this lease through installation/export, including failed builds, and never wait on Cargo.
-    let Some(cache) = cache else {
+    let Ok(cache) = cache else {
         return result;
     };
     let limit = backend::Settings::load()
@@ -558,13 +558,14 @@ pub fn internals_rustc_wrapper() -> Option<i32> {
 /// Discover used internals without installing a game or changing an instance.
 pub fn sync_internals(
     folder: &Path,
-) -> Result<Vec<horizon_mod_package::internals::ListedInternal>, String> {
-    internals_sync::check(folder).map_err(|error| error.to_string())
+) -> Result<Vec<horizon_mod_package::internals::ListedInternal>, Failed> {
+    require_consent()?;
+    internals_sync::check(folder).map_err(|error| Failed::Other(error.to_string()))
 }
 
 pub const DEFAULT_CACHE_GIB: u64 = 30;
 
-fn cache_error(error: crate::native_cache::Error) -> String {
+pub fn cache_error(error: crate::storage::Error) -> String {
     match error {
         crate::native_cache::Error::Busy => {
             tr("A native build or cache cleanup is running. Try again when it finishes.").into()
@@ -580,34 +581,6 @@ fn cache_error(error: crate::native_cache::Error) -> String {
     }
 }
 
-#[derive(serde::Serialize)]
-pub struct CacheInfo {
-    pub path: PathBuf,
-    pub bytes: u64,
-    pub cleared_bytes: u64,
-    pub limit_gib: u64,
-}
-
-/// Inspect or clear only Cargo's native fast/release outputs, while no build is using them.
-/// This does not remove installed versions, instances, mods, saves, toolchains or downloads.
-pub fn cache_info(clear: bool) -> Result<CacheInfo, String> {
-    let cache = crate::native_cache::Cache::acquire(&backend::build_dir()).map_err(cache_error)?;
-    let bytes = cache.bytes().map_err(cache_error)?;
-    let cleared_bytes = if clear {
-        cache.clear().map_err(cache_error)?
-    } else {
-        0
-    };
-    Ok(CacheInfo {
-        path: root().join("target"),
-        bytes,
-        cleared_bytes,
-        limit_gib: backend::Settings::load()
-            .native_cache_gib
-            .unwrap_or(DEFAULT_CACHE_GIB),
-    })
-}
-
 const MANIFEST: &str = "horizon-mixin.toml";
 /// A registry download's `horizon-mod.toml` at the `.hmod` package root.
 const NATIVE_MANIFEST: &str = horizon_mod_package::manifest::MANIFEST;
@@ -618,11 +591,16 @@ pub const INSTALLED: &str = horizon_mod_package::mod_list::NATIVE_DIR;
 /// The native mods turned on in the game folder `home`, unpacked into a folder [`build`] takes.
 /// Each flat `.hmod` passes the registry's shared package boundary; no code is run.
 pub fn installed_mods(home: &Path) -> Result<PathBuf, String> {
-    stage_installed(home, root().join("installed.incoming"))
+    stage_installed(home, root().join("installed.incoming"))?.ok_or_else(|| {
+        format!(
+            "No native mod is turned on in {}: install one from the Mods page first.",
+            home.join(INSTALLED).display()
+        )
+    })
 }
 
 /// [`installed_mods`] into `out`, which it empties first.
-fn stage_installed(home: &Path, out: PathBuf) -> Result<PathBuf, String> {
+fn stage_installed(home: &Path, out: PathBuf) -> Result<Option<PathBuf>, String> {
     let _ = fs::remove_dir_all(&out);
     let mut paths: Vec<PathBuf> = fs::read_dir(home.join(INSTALLED))
         .map(|dir| dir.flatten().map(|e| e.path()).collect())
@@ -644,63 +622,11 @@ fn stage_installed(home: &Path, out: PathBuf) -> Result<PathBuf, String> {
         }
         count += 1;
     }
-    if count == 0 && wasm_internals::installed(Some(home))?.is_empty() {
-        return Err(format!(
-            "No native mod is turned on in {}: install one from the Mods page first.",
-            home.join(INSTALLED).display()
-        ));
+    if count == 0 && wasm_internals::installed(home)?.is_empty() {
+        return Ok(None);
     }
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
-/// How one native mod reaches the game under a build mode.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Route {
-    /// It compiles on its own against the prebuilt game.
-    Prebuilt,
-    /// The whole game builds from source on this computer, for this reason.
-    Game { reason: String },
-}
-
-/// Each mod id with its route.
-pub type Routes = Vec<(String, Route)>;
-
-/// Each turned-on native mod's route under `profile`, by mod id. Read from the files in
-/// `home`; empty when they can't be read (the build says why).
-pub fn routes(home: &Path, profile: Profile) -> Routes {
-    let Ok(folder) = stage_installed(home, root().join("installed.routes")) else {
-        return Vec::new();
-    };
-    let Ok(found) = bundles(&folder) else {
-        return Vec::new();
-    };
-    found
-        .iter()
-        .map(|bundle| {
-            let refusal = if profile != Profile::Optimized {
-                Some(prebuilt::SourceReason::Profile {
-                    profile: profile.name(),
-                })
-            } else {
-                match api::Project::read(bundle) {
-                    Ok(project) => prebuilt::project_refusal(&project),
-                    Err(e) => {
-                        return (
-                            bundle.manifest.id.clone(),
-                            Route::Game {
-                                reason: e.to_string(),
-                            },
-                        )
-                    }
-                }
-            };
-            let route = refusal.map_or(Route::Prebuilt, |reason| Route::Game {
-                reason: reason.to_string(),
-            });
-            (bundle.manifest.id.clone(), route)
-        })
-        .collect()
+    Ok(Some(out))
 }
 
 /// A validated flat mod project. The package manifest owns identity and build pins.
@@ -708,8 +634,6 @@ pub fn routes(home: &Path, profile: Profile) -> Routes {
 pub struct Bundle {
     pub manifest: horizon_mod_package::manifest::Manifest,
     pub dir: PathBuf,
-    /// The typed injection sites projected for conflict warnings.
-    pub injections: Vec<Injection>,
 }
 
 impl Bundle {
@@ -720,85 +644,10 @@ impl Bundle {
             .expect("validated code package")
     }
 
-    /// Whether horizon-mixins changes the game's source for it: a helper injection or a module.
-    /// A raw injection listens at a point instead ([`inject`]).
+    /// Whether horizon-mixins adds supporting modules to the game's source.
+    /// Unified injects are routed separately by the launcher.
     fn needs_mixins(&self) -> bool {
         !self.native().module.is_empty()
-            || self
-                .native()
-                .injection
-                .iter()
-                .any(|injection| injection.helper.is_some())
-    }
-}
-
-/// One `[[injection]]` of a bundle's manifest, read for the build's
-/// warnings: where it sits and whether it can cancel.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Injection {
-    pub id: String,
-    /// Where it injects: a native hook point by name, or a raw function path.
-    pub site: InjectionSite,
-    /// Its `kind` (`HEAD`, `RETURN`, …) as written.
-    pub kind: Option<String>,
-    /// Its `selector` and `ordinal`, which with the kind tell two interior
-    /// sites of one function apart.
-    pub selector: Option<String>,
-    pub ordinal: Option<usize>,
-    /// The injection priority, defaulting to horizon-mixins' 0.
-    pub priority: i32,
-    /// `cancellable = true` (a `HEAD`, `BEFORE_CALL`, `AFTER_CALL` or
-    /// `AFTER_ASSIGN` may carry it): a `Break` skips the later injections
-    /// at the site.
-    pub cancellable: bool,
-}
-
-/// An injection's site: `hook = "render_frame_pre"` names a native hook point from the
-/// catalog, `target = "game::tick"` a raw function path.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum InjectionSite {
-    Hook(String),
-    Target(String),
-}
-
-impl InjectionSite {
-    fn as_text(&self) -> String {
-        match self {
-            Self::Hook(name) => format!("hook `{name}`"),
-            Self::Target(path) => format!("`{path}`"),
-        }
-    }
-}
-
-impl Injection {
-    /// The place it sits at, as the manifest tells it: the function, the
-    /// kind, and the selector and ordinal of interior hooks. horizon-mixins
-    /// resolves the same place against the source (`plan.rs` sorts by file,
-    /// node, call site, constant site, then priority descending, mod id
-    /// ascending, injection id ascending): same manifest place, and its
-    /// tie-break tail is the run order.
-    fn place(&self) -> (&InjectionSite, Option<&str>, Option<&str>, Option<usize>) {
-        (
-            &self.site,
-            self.kind.as_deref(),
-            self.selector.as_deref(),
-            self.ordinal,
-        )
-    }
-    /// The place as a message names it.
-    fn place_as_text(&self) -> String {
-        let mut text = self.site.as_text();
-        if let Some(kind) = &self.kind {
-            text.push(' ');
-            text.push_str(kind);
-        }
-        if let Some(selector) = &self.selector {
-            text.push_str(&format!(" selector `{selector}`"));
-        }
-        if let Some(ordinal) = self.ordinal {
-            text.push_str(&format!(" ordinal {ordinal}"));
-        }
-        text
     }
 }
 
@@ -841,150 +690,6 @@ pub(crate) fn bundle_in(dir: &Path) -> Result<Option<Bundle>, String> {
 
 fn is_revision(text: &str) -> bool {
     text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// The build's warnings about the mods' injections (#6490): two mods on one
-/// place, mods wrapping one function at its head and its return, and a
-/// cancelling injection on a native hook point. Neither stops the build —
-/// they say what the player and the author could not otherwise see. The
-/// places are the manifest's: whether two selectors pick the same call, or
-/// a raw `target` names a hook point's function, only horizon-mixins
-/// resolves, so the warnings stay to what the manifest says for sure.
-fn warn_conflicts(mods: &[Bundle]) -> Vec<String> {
-    let mut out = Vec::new();
-    // One place (the function, the kind, the selector, the ordinal), the
-    // injections of at least two mods on it, ordered as horizon-mixins runs
-    // same-place injections: priority descending, mod id ascending,
-    // injection id ascending — the tail of its own sort, which the place
-    // prefixes already fixed.
-    let mut places: BTreeMap<_, Vec<(&str, &Injection)>> = BTreeMap::new();
-    for b in mods {
-        for i in &b.injections {
-            places
-                .entry(i.place())
-                .or_default()
-                .push((&b.manifest.id, i));
-        }
-    }
-    for (_, list) in places {
-        let mut list = list;
-        list.sort_by_key(|(mod_id, i)| {
-            (
-                std::cmp::Reverse(i.priority),
-                (*mod_id).to_owned(),
-                i.id.clone(),
-            )
-        });
-        let mut names: Vec<&str> = Vec::new();
-        for (mod_id, _) in &list {
-            if !names.contains(mod_id) {
-                names.push(mod_id);
-            }
-        }
-        if names.len() < 2 {
-            continue;
-        }
-        let first = list[0].1;
-        let both = if names.len() == 2 { "both" } else { "all" };
-        out.push(format!(
-            "mods {} {both} inject at {}; {} runs first (priority descending, mod id ascending).",
-            names.join(", "),
-            first.place_as_text(),
-            names[0]
-        ));
-    }
-    // A function's head and its return: two mods wrapping the whole
-    // function, which run in that order whatever their priorities. Said
-    // without a "runs first".
-    let mut functions: BTreeMap<&InjectionSite, Vec<(&str, &Injection)>> = BTreeMap::new();
-    for b in mods {
-        for i in &b.injections {
-            if i.kind.as_deref() == Some("HEAD") || i.kind.as_deref() == Some("RETURN") {
-                functions
-                    .entry(&i.site)
-                    .or_default()
-                    .push((&b.manifest.id, i));
-            }
-        }
-    }
-    for (site, list) in functions {
-        let kinds: std::collections::BTreeSet<&str> =
-            list.iter().filter_map(|(_, i)| i.kind.as_deref()).collect();
-        let mut names: Vec<&str> = Vec::new();
-        for (mod_id, _) in &list {
-            if !names.contains(mod_id) {
-                names.push(mod_id);
-            }
-        }
-        // Both sides, and more than one mod on the function: a single mod
-        // wrapping its own function at both ends is no one's conflict.
-        if kinds.len() < 2 || names.len() < 2 {
-            continue;
-        }
-        let sides: Vec<String> = list
-            .iter()
-            .map(|(mod_id, i)| format!("{mod_id} ({})", i.kind.as_deref().unwrap_or("")))
-            .collect();
-        out.push(format!(
-            "mods {} inject into {}: HEAD runs on entry, RETURN on return, whatever their priorities.",
-            sides.join(", "),
-            site.as_text()
-        ));
-    }
-    // A cancelling `HEAD` on a hook point: a `Break` skips the later
-    // injections at the place and the function's body. A `hook` name is one
-    // by definition; a raw `target` is one only through the catalog, so
-    // `hook_hints` says it once the source is at hand. Only `HEAD` is said:
-    // the interior kinds' cancellation skips less than the body.
-    for b in mods {
-        for i in &b.injections {
-            if i.cancellable
-                && i.kind.as_deref() == Some("HEAD")
-                && matches!(i.site, InjectionSite::Hook(_))
-            {
-                out.push(format!(
-                    "{}'s `{}` can cancel at {}: a Break skips the later injections and the function's body.",
-                    b.manifest.id,
-                    i.id,
-                    i.place_as_text()
-                ));
-            }
-        }
-    }
-    out
-}
-
-/// A raw `target` that is a catalog hook point's function: the same place by name, which a
-/// game update can move without breaking the mod, and a `mod_api` contract that needs no
-/// injection at all. Said once the game's source, which holds the catalog, is at hand.
-fn hook_hints(mods: &[Bundle], points: &[horizon_mod_api_gen::HookPoint]) -> Vec<String> {
-    let mut out = Vec::new();
-    for b in mods {
-        for i in &b.injections {
-            let InjectionSite::Target(target) = &i.site else {
-                continue;
-            };
-            let Some(point) = points.iter().find(|p| &p.target == target) else {
-                continue;
-            };
-            let instead = if point.scoped {
-                format!("the `{}` Part method", point.name)
-            } else {
-                format!("`Hooks::{}`", point.name)
-            };
-            if i.cancellable && i.kind.as_deref() == Some("HEAD") {
-                out.push(format!(
-                    "{}'s `{}` can cancel at hook `{}` HEAD: a Break skips the later injections and the function's body.",
-                    b.manifest.id, i.id, point.name
-                ));
-            }
-            out.push(format!(
-                "{}'s `{}` targets hook point `{}`: use `hook = \"{}\"`, `hook_version = {}`, or implement {instead} with no injection.",
-                b.manifest.id, i.id, point.name, point.name, point.version
-            ));
-        }
-    }
-    out
 }
 
 /// Appends `text` to the build log, the way a compiler warning reads.
@@ -1133,6 +838,14 @@ fn mismatch(mods: &[Bundle], revision: &str) -> Option<String> {
     })
 }
 
+fn build_revision(base: &str, built_on: Option<&About>) -> Result<String, String> {
+    built_on.map_or_else(|| revision_of(base), |about| Ok(about.horizon.clone()))
+}
+
+fn mismatch_error(list: &str) -> String {
+    format!("{MISMATCH}{list}; rebuild against this game.")
+}
+
 /// The Horizon commit `version` (an installed release or Nightly) was built from, from GitHub.
 pub fn revision_of(version: &str) -> Result<String, String> {
     let reference = match version.strip_prefix("nightly-") {
@@ -1167,10 +880,17 @@ pub struct About {
 
 /// What installed native build `version` was made from; None for any other version.
 pub fn about(version: &str) -> Option<About> {
+    checked_about(version).ok().flatten()
+}
+
+fn checked_about(version: &str) -> Result<Option<About>, String> {
     if !is_native(version) {
-        return None;
+        return Ok(None);
     }
-    about_in(&backend::version_dir(version))
+    about_in(&backend::version_dir(version)).map(Some).ok_or_else(|| trf(
+        "Native build {version} has a missing or invalid native-mods.json record. Rebuild it from an installed Horizon version.",
+        &[("version", version)],
+    ))
 }
 
 /// The build record (`native-mods.json`) in version folder `dir`, if it parses.
@@ -1293,6 +1013,7 @@ pub fn version_for(
         hash.update(target.name().as_bytes());
         hash.update([0]);
     }
+    // Private rows derive from the pinned SDK and inject declarations, all salted/hashed here.
     // bundles() reads folders in path order, which with their manifests decides trait dispatch
     // order: hashed in that order, a different order is another build.
     for b in bundles {
@@ -1474,17 +1195,9 @@ impl Step {
             },
             Self::Install => tr("Installing the build").into(),
             Self::LeftOut(left) => left.label(),
-            Self::Done {
-                secs,
-                profile,
-                plan,
-            } => trf(
-                "Built in {duration} ({profile}, {plan})",
-                &[
-                    ("duration", &duration_label(*secs)),
-                    ("profile", profile.name()),
-                    ("plan", tr(plan.kind())),
-                ],
+            Self::Done { profile, plan, .. } => trf(
+                "Built ({profile}, {plan})",
+                &[("profile", profile.name()), ("plan", tr(plan.kind()))],
             ),
         }
     }
@@ -1741,6 +1454,22 @@ fn tool(rust: &Toolchain, rev: &str, progress: &impl Fn(Step)) -> Result<PathBuf
     Ok(bin)
 }
 
+/// External mixins traverse ordinary module declarations, not generated OUT_DIR includes.
+/// Prepare their input separately so neither the downloaded source nor a cached snapshot changes.
+fn prepare_mixins_source(source: &Path, prepared: &Path) -> Result<(), String> {
+    // sync removes old files, not their directories. A leftover area directory without its
+    // marker would make module discovery refuse the next revision after an interrupted build.
+    if prepared.exists() {
+        fs::remove_dir_all(prepared).map_err(|e| format!("{}: {e}", prepared.display()))?;
+    }
+    let result = sync(source, prepared)
+        .and_then(|()| horizon_mod_api_gen::materialize_game_modules(prepared));
+    if result.is_err() {
+        let _ = fs::remove_dir_all(prepared);
+    }
+    result
+}
+
 /// `horizon-mixins apply`: the mods in `mods` applied to `source`, into `out`. It runs
 /// `cargo metadata`, so it gets the launcher's toolchain like a build does: on a computer with no
 /// Rust of its own, a plain command found no cargo (E_METADATA).
@@ -1930,7 +1659,7 @@ fn copy_bundle(bundle: &Bundle, to: &Path) -> Result<(), String> {
     package::copy(bundle, to)
 }
 
-/// Stage only manifests horizon-mixins can apply, after trait injections are prepared.
+/// Stage supporting modules for horizon-mixins, after unified injects are prepared.
 fn stage_mixins(mods: &[Bundle], to: &Path) -> Result<Vec<Bundle>, String> {
     if to.exists() {
         fs::remove_dir_all(to).map_err(|e| e.to_string())?;
@@ -1964,8 +1693,11 @@ struct Built {
     left_out: Vec<LeftOut>,
 }
 
-/// Why [`pipeline`] stopped.
-enum Failed {
+/// Why a native build or internals check stopped.
+#[derive(Debug)]
+pub enum Failed {
+    /// No native-code permission has been recorded for this install.
+    NoConsent,
     /// These mods stopped it (`error` says how), while `compiling` or before: it can run again
     /// without them.
     Mods {
@@ -1984,12 +1716,28 @@ impl From<String> for Failed {
     }
 }
 
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mods { error, .. } | Self::Other(error) => f.write_str(error),
+            Self::Nothing => Ok(()),
+            Self::NoConsent => f.write_str(tr("Native mods are native code that runs inside your game with your rights. Allow native mods in Settings, Storage, or pass --trust-native-code.")),
+        }
+    }
+}
+impl std::error::Error for Failed {}
 impl From<Failed> for String {
     fn from(failed: Failed) -> Self {
-        match failed {
-            Failed::Mods { error, .. } | Failed::Other(error) => error,
-            Failed::Nothing => String::new(),
-        }
+        failed.to_string()
+    }
+}
+
+/// Refuse before staging, fetching a prebuilt game or downloading a compiler.
+pub fn require_consent() -> Result<(), Failed> {
+    if backend::Settings::load().native_mods_allowed_at.is_some() {
+        Ok(())
+    } else {
+        Err(Failed::NoConsent)
     }
 }
 
@@ -1999,14 +1747,14 @@ struct BuildOptions<'a> {
     allow_jar_downloads: bool,
     skip: &'a [LeftOut],
     isolate: bool,
-    /// The instance whose installed wasm mods choose the game's internals table; none leaves the
-    /// committed empty table.
+    /// The instance whose enabled wasm mods choose the table; server exports instead use
+    /// packages directly in the explicit mod folder.
     home: Option<&'a Path>,
 }
 
 /// Whether an instance needs a source table even without any native code mods.
 pub fn has_wasm_internals(home: &Path) -> bool {
-    wasm_internals::installed(Some(home)).is_ok_and(|declared| !declared.is_empty())
+    wasm_internals::installed(home).is_ok_and(|declared| !declared.is_empty())
 }
 
 /// Resolve the two inputs to the source pipeline before preparing or building the game.
@@ -2015,7 +1763,10 @@ fn build_inputs(
     home: Option<&Path>,
 ) -> Result<(Vec<Bundle>, wasm_internals::Declarations), Failed> {
     let mods = scan_bundles(folder)?;
-    let declared = wasm_internals::installed(home)?;
+    let declared = match home {
+        Some(home) => wasm_internals::installed(home)?,
+        None => wasm_internals::from_directory(folder, None)?,
+    };
     if mods.is_empty() && declared.is_empty() {
         return Err(Failed::Nothing);
     }
@@ -2043,13 +1794,7 @@ fn pipeline(
     progress: &impl Fn(Step),
 ) -> Result<Built, Failed> {
     let started = std::time::Instant::now();
-    let built_on = about(base);
-    if is_native(base) && built_on.is_none() {
-        return Err(trf(
-            "Native build {version} has a missing or invalid native-mods.json record. Rebuild it from an installed Horizon version.",
-            &[("version", base)],
-        ).into());
-    }
+    let built_on = checked_about(base)?;
     backend::need_prepared(base)?;
     let platform = platform_for_game(base)?;
     fs::create_dir_all(root()).map_err(|e| e.to_string())?;
@@ -2058,11 +1803,6 @@ fn pipeline(
     let incoming = root().join("mods.incoming");
     let _ = fs::remove_dir_all(&incoming);
     let (found, wasm_internals) = build_inputs(folder, options.home)?;
-    // #6490: said before anything runs, so a build that fails later still
-    // shows them.
-    for warning in warn_conflicts(&found) {
-        log_warning(&warning);
-    }
     // A native build starts from the release or Nightly it was made from, on its own revision.
     let origin = built_on.as_ref().map_or(base, |a| a.base.as_str());
     let mut ids = std::collections::HashSet::new();
@@ -2122,9 +1862,9 @@ fn pipeline(
         .collect::<Result<_, _>>()
         .map_err(|error| error.to_string())?;
     for bundle in &ordered {
-        let native = bundle.native();
-        if !native.internals.is_empty() {
-            let paths = native
+        if !bundle.manifest.internals.is_empty() {
+            let paths = bundle
+                .manifest
                 .internals
                 .iter()
                 .map(|internal| internal.path.as_str())
@@ -2134,19 +1874,16 @@ fn pipeline(
                 "{mod} uses {count} game internals: {paths}",
                 &[
                     ("mod", &bundle.manifest.id),
-                    ("count", &native.internals.len().to_string()),
+                    ("count", &bundle.manifest.internals.len().to_string()),
                     ("paths", &paths),
                 ],
             ))?;
         }
     }
-    let revision = match &built_on {
-        Some(about) => about.horizon.clone(),
-        None => revision_of(base)?,
-    };
+    let revision = build_revision(base, built_on.as_ref())?;
     let other = mismatch(&mods, &revision);
     if let Some(list) = &other {
-        return Err(format!("{MISMATCH}{list}; rebuild against this game.").into());
+        return Err(mismatch_error(list).into());
     }
     if target == Target::Server {
         let jars = horizon_mod_package::manifest::collect_jar_requirements(
@@ -2199,19 +1936,22 @@ fn pipeline(
     };
     let exists = target.directory(&version).join(".installed").is_file();
     // The route, chosen before anything compiles: the prebuilt game when it serves these mods.
-    let prebuilt = if exists || !wasm_internals.is_empty() {
+    let prebuilt = if exists || !wasm_internals.is_empty() || profile != Profile::Optimized {
         None
     } else {
-        let game = match prebuilt::refusal(&projects, profile) {
+        let game = match prebuilt::refusal(&projects) {
             Some(reason) => Err(reason),
             None => match prebuilt::fetch(&revision, target, || {
                 progress(Step::PrebuiltGame(revision.clone()))
             })? {
-                Ok(game) => Ok(game),
+                Ok(game) => match prebuilt::source_refusal(&game, &projects)? {
+                    Some(reason) => Err(reason),
+                    None => Ok(game),
+                },
                 Err(reason) => Err(reason),
             },
         };
-        game.map_err(|reason| log_warning(&reason.to_string())).ok()
+        prebuilt::or_source(game)?
     };
     check_cancelled()?;
     let plan = match prebuilt {
@@ -2251,16 +1991,14 @@ fn pipeline(
             }).collect::<Vec<_>>(),
             "target": target.name(),
             "rust_target": platform.target,
+            "wasm_internals": wasm_internals,
             "secs": started.elapsed().as_secs(),
             "mods": mods.iter().map(|m| serde_json::json!({
                 "id": m.manifest.id,
                 "version": m.manifest.version,
                 "sha256": digests.get(&m.manifest.id).cloned().flatten(),
-                "internals": m.native().internals,
-                "raw": m.native().injection.iter().filter(|injection| injection.raw.is_some()).map(|injection| serde_json::json!({
-                    "id": injection.id, "target": injection.target, "kind": injection.kind,
-                    "selector": injection.selector, "ordinal": injection.ordinal, "fingerprint": injection.fingerprint,
-                })).collect::<Vec<_>>(),
+                "internals": m.manifest.internals,
+                "inject": m.manifest.inject,
             })).collect::<Vec<_>>(),
         })
     };
@@ -2301,13 +2039,6 @@ fn pipeline(
         let needs_mixins = mods.iter().any(Bundle::needs_mixins);
         progress(Step::Source(revision.clone()));
         let source = source(&revision)?;
-        // The hints are advice: a catalog the launcher can't read never fails the build.
-        match horizon_mod_api_gen::hook_points(&source) {
-            Ok(points) => hook_hints(&mods, &points)
-                .iter()
-                .for_each(|h| log_warning(h)),
-            Err(e) => log_warning(&format!("hook hints skipped: {e}")),
-        }
         // `root()` is already the form horizon-mixins and MinGW take: resolved (no link, which
         // it refuses) and, on Windows, ASCII (which they can't read past), both by build_dir.
         let real = root();
@@ -2323,14 +2054,17 @@ fn pipeline(
                 let tool = tool(&rust, &mixins, &progress)?;
                 let mixin_input = real.join("mixins.incoming");
                 stage_mixins(&ordered, &mixin_input)?;
+                let mixin_source = real.join("mixins.source");
+                prepare_mixins_source(&source, &mixin_source)?;
                 progress(Step::Mixins);
                 let result = run_checked(
-                    apply(&rust, &tool, &source, &mixin_input, &fresh),
+                    apply(&rust, &tool, &mixin_source, &mixin_input, &fresh),
                     "horizon-mixins",
                     |_| {},
                     None,
                 );
                 let _ = fs::remove_dir_all(&mixin_input);
+                let _ = fs::remove_dir_all(&mixin_source);
                 if let Err(ran) = result {
                     check_cancelled()?;
                     let error = blame(ran.error);
@@ -2356,7 +2090,6 @@ fn pipeline(
         }
         // Stage beside `fresh` and publish the tree and catalog only after the mods' sites
         // check, as the prebuilt route validates before it creates its output.
-        let listed = real.join("points.json");
         let pending = real.join("stage.pending");
         let catalog_dir = real.join("catalog.partial");
         let _ = fs::remove_dir_all(&pending);
@@ -2386,6 +2119,8 @@ fn pipeline(
         }
         run(pass, "Marking the game's injection points", |_| {})
             .map_err(|error| discard(&pending, &catalog_dir, error))?;
+        source::stage(&pending, &catalog_dir, &ordered)
+            .map_err(|error| discard(&pending, &catalog_dir, error))?;
         let catalog = internals::Catalog::read(&catalog_dir)
             .map_err(|error| discard(&pending, &catalog_dir, error))?;
         mods.iter()
@@ -2393,13 +2128,15 @@ fn pipeline(
             .map_err(|error| discard(&pending, &catalog_dir, error))?;
         let _ = fs::remove_dir_all(&fresh);
         fs::rename(&pending, &fresh).map_err(|error| discard(&pending, &catalog_dir, error))?;
-        fs::rename(catalog_dir.join(inject::POINTS), &listed)
-            .map_err(|error| discard(&pending, &catalog_dir, error))?;
-        fs::rename(
-            catalog_dir.join(internals::INTERNALS),
-            real.join(internals::INTERNALS),
-        )
-        .map_err(|error| discard(&pending, &catalog_dir, error))?;
+        for name in [
+            inject::POINTS,
+            internals::INTERNALS,
+            horizon_mod_api_gen::points::source::FILE,
+            horizon_mod_api_gen::sites::source::FILE,
+        ] {
+            fs::rename(catalog_dir.join(name), real.join(name))
+                .map_err(|error| discard(&pending, &catalog_dir, error))?;
+        }
         let _ = fs::remove_dir_all(&catalog_dir);
         if !mods.is_empty() {
             // Offline metadata resolves all targets, including packages not fetched for this host.
@@ -2595,8 +2332,25 @@ fn isolated(
                 last = error;
             }
             Err(Failed::Nothing) => return Err(said(&skip, last)),
+            Err(Failed::NoConsent) => return Err(Failed::NoConsent.into()),
             Err(Failed::Other(error)) if error == CANCELLED => return Err(error),
             Err(Failed::Other(error)) => return Err(said(&skip, error)),
+        }
+    }
+}
+
+fn select_build_profile(
+    saved: Profile,
+    requested: Option<Profile>,
+    plan: impl FnOnce() -> Result<Routes, Failed>,
+) -> Result<Profile, String> {
+    check_cancelled()?;
+    match requested {
+        Some(profile) => Ok(profile),
+        None => {
+            let routes = plan();
+            check_cancelled()?;
+            Ok(saved.for_picker(&routes.map_err(String::from)?, false, false))
         }
     }
 }
@@ -2607,18 +2361,27 @@ fn isolated(
 /// build already made is used again. Mods pinning different revisions cannot build together:
 /// the error starts with [`MISMATCH`] and names them; `cargo horizon-mod update --horizon
 /// <commit>` in each mod's folder pins it to the installed game, then build again.
+/// `profile` is an explicit override; None applies the instance's choice only when needed.
 pub fn build(
     base: &str,
     folder: &Path,
     instance: &Instance,
-    profile: Profile,
+    profile: Option<Profile>,
     progress: impl Fn(Step),
-) -> Result<String, String> {
+) -> Result<String, Failed> {
+    require_consent()?;
     CANCEL.store(false, Ordering::Relaxed);
     if let Some(error) = backend::native_mod_architecture_error() {
-        return Err(error);
+        return Err(Failed::Other(error));
     }
-    logged(|| {
+    logged(|cache| {
+        let profile = select_build_profile(instance.native_profile, profile, || {
+            planning::classify(
+                folder,
+                Some(base),
+                cache.map_err(|error| Failed::Other(error.into()))?,
+            )
+        })?;
         let built = isolated(
             |skip| {
                 pipeline(
@@ -2651,6 +2414,7 @@ pub fn build(
         }
         Ok(built.version)
     })
+    .map_err(Failed::Other)
 }
 
 /// Builds `folder`'s mods as the headless engine a dedicated server runs (`horizon-engine`,
@@ -2670,8 +2434,9 @@ pub fn build_server(
     profile: Profile,
     allow_jar_downloads: bool,
     progress: impl Fn(Step),
-) -> Result<PathBuf, String> {
-    logged(|| {
+) -> Result<PathBuf, Failed> {
+    require_consent()?;
+    logged(|_| {
         if output.symlink_metadata().is_ok() {
             return Err(trf(
                 "{path} already exists. Move it away, or build into another folder.",
@@ -2736,6 +2501,7 @@ pub fn build_server(
         let engine = output.join(Target::Server.binary());
         Ok(std::path::absolute(&engine).unwrap_or(engine))
     })
+    .map_err(Failed::Other)
 }
 
 /// Copies the built version folder `from` into `output` (outside the managed versions) as one
@@ -2934,13 +2700,12 @@ fn stale(
 
 #[cfg(test)]
 mod tests {
-    pub(super) static LOG_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     use super::*;
 
     #[test]
     fn isolation_keeps_cancellation_exact_after_a_retry() {
-        let _guard = LOG_TEST.lock().unwrap();
+        let _guard = TEST_STATE.lock().unwrap();
         let mut attempts = 0;
         let result = isolated(
             |skip| {
@@ -2967,7 +2732,7 @@ mod tests {
 
     #[test]
     fn isolation_bounds_recompiles_and_keeps_the_failure() {
-        let _guard = LOG_TEST.lock().unwrap();
+        let _guard = TEST_STATE.lock().unwrap();
         let mut attempts = 0;
         let result = isolated(
             |skip| {
@@ -3135,6 +2900,69 @@ mod tests {
     }
 
     #[test]
+    fn mixins_input_materializes_modules_without_changing_the_download() {
+        let root = dir("mixins-area-input");
+        let source = root.join("download");
+        let prepared = root.join("prepared");
+        let src = source.join("crates/horizon-client/src");
+        let area = src.join("game/items");
+        let hooks = src.join("game/native_hooks");
+        fs::create_dir_all(&area).unwrap();
+        fs::create_dir_all(&hooks).unwrap();
+        let game = "struct Game; mod native_hooks;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/game_modules.rs\"));\n";
+        let native = "include!(concat!(env!(\"OUT_DIR\"), \"/native_hook_modules.rs\"));\n";
+        let helper = "use super::*; impl Game { fn area_helper(&mut self) {} }";
+        fs::write(src.join("game.rs"), game).unwrap();
+        fs::write(area.join(".game-area"), "").unwrap();
+        fs::write(area.join("using_item.rs"), helper).unwrap();
+        fs::write(hooks.join("mod.rs"), native).unwrap();
+        fs::write(
+            hooks.join("base.rs"),
+            "use super::super::*; impl Game { fn native_helper(&mut self) {} }",
+        )
+        .unwrap();
+        prepare_mixins_source(&source, &prepared).unwrap();
+        // External tools parse ordinary mod declarations, without our expansion pass.
+        fn modules(path: &Path) -> Vec<String> {
+            syn::parse_file(&fs::read_to_string(path).unwrap())
+                .unwrap()
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    syn::Item::Mod(module) => Some(module.ident.to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let output = prepared.join("crates/horizon-client/src");
+        assert!(modules(&output.join("game.rs")).contains(&"using_item".into()));
+        assert_eq!(modules(&output.join("game/native_hooks/mod.rs")), ["base"]);
+        assert_eq!(
+            fs::read_to_string(output.join("game/items/using_item.rs")).unwrap(),
+            helper
+        );
+        assert_eq!(fs::read_to_string(src.join("game.rs")).unwrap(), game);
+        assert_eq!(fs::read_to_string(hooks.join("mod.rs")).unwrap(), native);
+        let first = fs::read(output.join("game.rs")).unwrap();
+        // A failed older preparation may have left an area that the next source no longer has.
+        let stale_area = output.join("game/removed");
+        fs::create_dir_all(&stale_area).unwrap();
+        fs::write(stale_area.join(".game-area"), "").unwrap();
+        fs::write(stale_area.join("old.rs"), "fn old() {}").unwrap();
+        prepare_mixins_source(&source, &prepared).unwrap();
+        assert!(!stale_area.exists());
+        assert_eq!(fs::read(output.join("game.rs")).unwrap(), first);
+        let invalid = src.join("game/unmarked");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("misplaced.rs"), "fn misplaced() {}").unwrap();
+        let error = prepare_mixins_source(&source, &prepared).unwrap_err();
+        assert!(error.contains("missing .game-area marker"), "{error}");
+        assert!(!prepared.exists());
+        assert!(invalid.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn horizon_mixins_finds_the_launchers_cargo() {
         for rust in toolchains("/rust/1.99.1-x") {
             horizon_mixins_finds(&rust);
@@ -3172,309 +3000,21 @@ mod tests {
         );
     }
 
-    /// Warning inputs are real flat packages with explicit source helpers.
-    fn bundle_of(id: &str, injections: &str) -> Bundle {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let at = dir(&format!("warn-{id}-{n}"));
-        write_bundle(&at, id, "fn hook() {}");
-        let manifest = project_manifest(id, "0.1.0", A, B)
-            + &injections.replace("[[injection]]", "[[native.injection]]\nhelper='src/lib.rs'");
-        fs::write(at.join(NATIVE_MANIFEST), manifest).unwrap();
-        bundles(&at).unwrap().remove(0)
-    }
-
     #[test]
-    fn two_mods_on_one_hook_warn_in_run_order() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\npriority = 200\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods beta, alpha both inject at hook `render_frame_pre` HEAD; beta runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    /// horizon-mixins defaults a mod's priority to 0, not to the README
-    /// example's 100: a mod without one runs after `priority = 50`.
-    #[test]
-    fn the_default_priority_is_zero() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\npriority = 50\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods beta, alpha both inject at hook `render_frame_pre` HEAD; beta runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    #[test]
-    fn a_priority_tie_orders_by_mod_id() {
-        let mods = [
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"tick\"\nkind = \"HEAD\"\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods alpha, beta both inject at hook `tick` HEAD; alpha runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    #[test]
-    fn an_injections_priority_overrides_its_mods() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"tick\"\nkind = \"HEAD\"\npriority = 50\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"HEAD\"\n",
-            ),
-        ];
-        // beta's is 0 (the default), alpha's 50: alpha first.
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods alpha, beta both inject at hook `tick` HEAD; alpha runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    #[test]
-    fn two_mods_on_one_raw_target_warn_too() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\ntarget = \"game::calls::compute\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\ntarget = \"game::calls::compute\"\nkind = \"HEAD\"\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods alpha, beta both inject at `game::calls::compute` HEAD; alpha runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    /// HEAD and RETURN wrap the whole function: HEAD runs on entry, RETURN
-    /// on return, whatever the priorities, so no "runs first".
-    #[test]
-    fn head_and_return_on_one_function_warn_without_a_runs_first() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"tick\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"RETURN\"\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods alpha (HEAD), beta (RETURN) inject into hook `tick`: HEAD runs on entry, RETURN on return, whatever their priorities."
-            ]
-        );
-    }
-
-    /// Two interior injections of one function with different selectors are
-    /// different places: horizon-mixins resolves the selector against the
-    /// source, the launcher does not guess it.
-    #[test]
-    fn different_selectors_are_different_places() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"tick\"\nkind = \"BEFORE_CALL\"\n\
-                 selector = \"x\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"BEFORE_CALL\"\n\
-                 selector = \"y\"\n",
-            ),
-        ];
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn same_selector_and_ordinal_is_one_place() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"tick\"\nkind = \"BEFORE_CALL\"\n\
-                 selector = \"x\"\nordinal = 1\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"BEFORE_CALL\"\n\
-                 selector = \"x\"\nordinal = 1\n",
-            ),
-        ];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "mods alpha, beta both inject at hook `tick` BEFORE_CALL selector `x` ordinal 1; alpha runs first (priority descending, mod id ascending)."
-            ]
-        );
-    }
-
-    #[test]
-    fn different_sites_stay_quiet() {
-        let mods = [
-            bundle_of(
-                "alpha",
-                "[[injection]]\nid = \"a\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n",
-            ),
-            bundle_of(
-                "beta",
-                "[[injection]]\nid = \"b\"\nhook = \"tick\"\nkind = \"HEAD\"\n",
-            ),
-        ];
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn a_target_that_is_a_hook_points_function_gets_the_hook_hint() {
-        let points =
-            horizon_mod_api_gen::hook_points(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
-                .unwrap();
-        let frame = "horizon_client::game::native_hooks::render_frame_pre::Game<'_>::native_render_frame_pre";
-        let scoped =
-            "horizon_client::game::native_hooks::pre_remove_side_effects::GameLevel<'_>::native_pre_remove_side_effects";
-        let mods = [bundle_of(
-            "alpha",
-            &format!(
-                "[[injection]]\nid = \"raw\"\ntarget = \"{frame}\"\nkind = \"HEAD\"\n\
-                 [[injection]]\nid = \"part\"\ntarget = \"{scoped}\"\nkind = \"HEAD\"\n\
-                 [[injection]]\nid = \"named\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n\
-                 [[injection]]\nid = \"other\"\ntarget = \"game::calls::compute\"\nkind = \"HEAD\"\n"
-            ),
-        )];
-        assert_eq!(
-            hook_hints(&mods, &points),
-            [
-                "alpha's `raw` targets hook point `render_frame_pre`: use `hook = \"render_frame_pre\"`, `hook_version = 1`, or implement `Hooks::render_frame_pre` with no injection.",
-                "alpha's `part` targets hook point `pre_remove_side_effects`: use `hook = \"pre_remove_side_effects\"`, `hook_version = 1`, or implement the `pre_remove_side_effects` Part method with no injection."
-            ]
-        );
-    }
-
-    #[test]
-    fn a_cancelling_head_on_a_raw_hook_point_target_warns() {
-        let points =
-            horizon_mod_api_gen::hook_points(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
-                .unwrap();
-        let frame = "horizon_client::game::native_hooks::render_frame_pre::Game<'_>::native_render_frame_pre";
-        let mods = [bundle_of(
-            "alpha",
-            &format!(
-                "[[injection]]\nid = \"stop\"\ntarget = \"{frame}\"\nkind = \"HEAD\"\ncancellable = true\n"
-            ),
-        )];
-        let hints = hook_hints(&mods, &points);
-        assert_eq!(
-            hints[0],
-            "alpha's `stop` can cancel at hook `render_frame_pre` HEAD: a Break skips the later injections and the function's body."
-        );
-        assert_eq!(hints.len(), 2);
-    }
-
-    #[test]
-    fn a_cancelling_head_on_a_hook_point_warns() {
-        let mods = [bundle_of(
-            "alpha",
-            "[[injection]]\nid = \"stop\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\ncancellable = true\n",
-        )];
-        assert_eq!(
-            warn_conflicts(&mods),
-            [
-                "alpha's `stop` can cancel at hook `render_frame_pre` HEAD: a Break skips the later injections and the function's body."
-            ]
-        );
-    }
-
-    /// Cancellation is allowed on the interior kinds too, but what a Break
-    /// skips there is less than the body: only `HEAD` is said.
-    #[test]
-    fn a_cancelling_interior_kind_stays_quiet() {
-        let mods = [bundle_of(
-            "alpha",
-            "[[injection]]\nid = \"stop\"\nhook = \"tick\"\nkind = \"BEFORE_CALL\"\n\
-             cancellable = true\n",
-        )];
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn a_cancelling_injection_on_a_raw_target_stays_quiet() {
-        // Whether a raw target fires a hook point only the catalog knows,
-        // which the launcher does not read.
-        let mods = [bundle_of(
-            "alpha",
-            "[[injection]]\nid = \"stop\"\ntarget = \"game::tick\"\nkind = \"HEAD\"\n\
-             cancellable = true\n",
-        )];
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn one_mod_with_two_injections_on_one_site_stays_quiet() {
-        let mods = [bundle_of(
-            "alpha",
-            "[[injection]]\nid = \"first\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n\
-             [[injection]]\nid = \"second\"\nhook = \"render_frame_pre\"\nkind = \"HEAD\"\n",
-        )];
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn a_manifest_without_injections_builds_an_empty_list() {
-        let mods = [bundle_of("alpha", "")];
-        assert!(mods[0].injections.is_empty());
-        assert!(warn_conflicts(&mods).is_empty());
-    }
-
-    #[test]
-    fn an_entry_without_a_site_is_refused() {
-        let root = dir("no-site");
+    fn retired_native_fields_are_refused_before_bundle_projection() {
+        let root = dir("retired-native-fields");
         write_bundle(&root, "alpha", "");
-        let text = project_manifest("alpha", "1", A, B)
-            + "[[native.injection]]\nid='no_site'\nkind='HEAD'\nhelper='src/lib.rs'\n";
-        fs::write(root.join(NATIVE_MANIFEST), text).unwrap();
-        assert!(bundles(&root).is_err());
+        for field in ["injection", "internals"] {
+            fs::write(
+                root.join(NATIVE_MANIFEST),
+                project_manifest("alpha", "1", A, B) + &format!("[[native.{field}]]\n"),
+            )
+            .unwrap();
+            let error = bundles(&root).unwrap_err();
+            assert!(error.contains("unknown field"), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3510,7 +3050,7 @@ mod tests {
             ("plain", ""),
             (
                 "ordinary",
-                "[[native.injection]]\nid='ordinary'\ntarget='horizon_client::game::tick'\nkind='HEAD'\nhelper='src/lib.rs'\n",
+                "[[native.module]]\nid='ordinary'\nfile='crates/horizon-client/src/game.rs'\nname='ordinary'\nsource='src/lib.rs'\n",
             ),
             (
                 "slot_injection",
@@ -3659,7 +3199,7 @@ mod tests {
         fs::write(
             injected.join(NATIVE_MANIFEST),
             project_manifest("injected", "0.3.0", A, B)
-                + "[[native.injection]]\nid='marker'\ntarget='game::tick'\nkind='HEAD'\nhelper='src/lib.rs'\n",
+                + "[[native.module]]\nid='marker'\nfile='crates/horizon-client/src/game.rs'\nname='marker'\nsource='src/lib.rs'\n",
         )
         .unwrap();
         let mut mods = found.clone();
@@ -3804,6 +3344,26 @@ mod tests {
             .unwrap(),
             "the ARM64 toolchain has a separate installed build"
         );
+        let path = d.join("horizon-mod.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let declaration = "\n[[inject]]\nid='source'\nat='horizon_client::game::Game::unlisted'\nkind='head'\naccess='internals'\nwith='hook'\nhash='0000000000000000'\n";
+        fs::write(&path, format!("{original}{declaration}")).unwrap();
+        let source = key(A);
+        assert_ne!(
+            first, source,
+            "source adapters require another game artifact"
+        );
+        assert_eq!(source, key(A), "unchanged private rows reuse the artifact");
+        fs::write(
+            &path,
+            format!(
+                "{original}{}",
+                declaration.replace("id='source'", "id='changed'")
+            ),
+        )
+        .unwrap();
+        assert_ne!(source, key(A), "private point identity is part of the key");
+        fs::write(path, original).unwrap();
         assert_ne!(first, key(B));
         assert_ne!(
             first,
@@ -4177,7 +3737,8 @@ mod tests {
     /// and no instance is edited or version selected.
     #[test]
     fn a_server_build_refuses_an_existing_output_before_building() {
-        let _guard = LOG_TEST.lock().unwrap();
+        let _guard = TEST_STATE.lock().unwrap();
+        backend::Settings::load().allow_native_mods().unwrap();
         let output = dir("server-output");
         let folder = dir("server-mods");
         write_bundle(&folder, "hello", "fn hook() {}");
@@ -4192,6 +3753,7 @@ mod tests {
             |_| {},
         )
         .unwrap_err();
+        let err = String::from(err);
         assert!(err.contains("already exists"), "{err}");
         assert!(fs::read_to_string(log_path()).unwrap().contains(&err));
         let managed = root().join("forbidden-export");
@@ -4204,6 +3766,7 @@ mod tests {
             |_| {},
         )
         .unwrap_err();
+        let err = String::from(err);
         assert!(
             err.contains("outside the launcher's managed folders"),
             "{err}"
@@ -4218,17 +3781,164 @@ mod tests {
     }
 
     #[test]
-    fn the_setting_picks_the_profile() {
-        let mut settings = crate::backend::Settings::default();
-        assert_eq!(Profile::chosen(&settings), Profile::Optimized);
-        settings.native_profile = Some(Profile::Developer);
-        assert_eq!(Profile::chosen(&settings), Profile::Developer);
-        assert_eq!(Profile::parse("balanced"), Some(Profile::Balanced));
-        assert_eq!(Profile::parse("fast"), None);
-        assert_eq!(Profile::parse(" optimized "), Some(Profile::Optimized));
-        assert_eq!(Profile::parse("release"), None);
-        let text = serde_json::to_string(&settings).unwrap();
-        assert!(text.contains("\"native_profile\":\"developer\""), "{text}");
+    fn instance_profile_selection_keeps_automatic_builds_and_cancellation_exact() {
+        let _guard = TEST_STATE.lock().unwrap();
+        let previous = CANCEL.swap(false, Ordering::Relaxed);
+        let structural = Routes {
+            mods: vec![(
+                "source".into(),
+                Route::Game {
+                    reason: SourceReason::BuildScript {
+                        mod_id: "source".into(),
+                    },
+                },
+            )],
+            unavailable: None,
+        };
+        assert_eq!(
+            select_build_profile(Profile::default(), None, || Ok(structural.clone())).unwrap(),
+            Profile::Balanced
+        );
+        assert_eq!(
+            Profile::Developer.for_picker(&structural, false, true),
+            Profile::Developer
+        );
+        assert_eq!(
+            select_build_profile(Profile::Developer, None, || Ok(structural)).unwrap(),
+            Profile::Balanced
+        );
+        assert_eq!(
+            select_build_profile(Profile::Developer, None, || Ok(Routes::default())).unwrap(),
+            Profile::Optimized
+        );
+        assert_eq!(
+            select_build_profile(Profile::Balanced, Some(Profile::Developer), || panic!(
+                "explicit overrides need no plan"
+            ))
+            .unwrap(),
+            Profile::Developer
+        );
+        for failed in [false, true] {
+            CANCEL.store(false, Ordering::Relaxed);
+            let result = select_build_profile(Profile::Balanced, None, || {
+                cancel();
+                if failed {
+                    Err(Failed::Other("download failed".into()))
+                } else {
+                    Ok(Routes::default())
+                }
+            });
+            assert_eq!(result.unwrap_err(), CANCELLED);
+        }
+        assert_eq!(
+            select_build_profile(Profile::Balanced, None, || panic!(
+                "cancelled before planning"
+            ))
+            .unwrap_err(),
+            CANCELLED
+        );
+        CANCEL.store(previous, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn automatic_build_does_not_save_its_effective_profile() {
+        let _guard = TEST_STATE.lock().unwrap();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let file = backend::data_dir().join("instances.json");
+        let previous = fs::read(&file).ok();
+        let stored = br#"{"instances":{"horizon":{"native_profile":"balanced"}}}"#;
+        fs::write(&file, stored).unwrap();
+        let instance = instances::find("horizon").unwrap();
+        let folder = dir("automatic-profile");
+        let error = build("v2099.09.09", &folder, &instance, None, |_| {}).unwrap_err();
+        assert!(String::from(error).contains("is not prepared yet"));
+        assert_eq!(fs::read(&file).unwrap(), stored);
+        if let Some(previous) = previous {
+            fs::write(file, previous).unwrap();
+        } else {
+            fs::remove_file(file).unwrap();
+        }
+        fs::remove_dir_all(folder).unwrap();
+        original.save().unwrap();
+    }
+
+    #[test]
+    fn folder_planning_reuses_the_build_snapshot_without_restaging_packages() {
+        let _guard = TEST_STATE.lock().unwrap();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let folder = dir("profile-snapshot");
+        write_bundle(&folder, "snapshot", "");
+        fs::write(
+            folder.join("Cargo.toml"),
+            "[package]\nname='snapshot'\nversion='0.1.0'\n[dependencies]\nhorizon-client='0.1'\n",
+        )
+        .unwrap();
+        let preview = root().join("installed.routes");
+        fs::create_dir_all(&preview).unwrap();
+        let sentinel = preview.join("snapshot-sentinel");
+        fs::write(&sentinel, b"retained").unwrap();
+        let lease = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+        let plan = planning::classify(&folder, None, &lease).unwrap();
+        assert_eq!(plan.mods.len(), 1);
+        assert_eq!(plan.mods[0].0, "snapshot");
+        assert!(
+            matches!(&plan.mods[0].1, Route::Invalid { reason } if reason.contains("E_GAME_DEPENDENCY"))
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"retained");
+        fs::remove_file(sentinel).unwrap();
+        fs::remove_dir_all(folder).unwrap();
+        original.save().unwrap();
+    }
+
+    #[test]
+    fn missing_consent_blocks_all_build_routes_before_http_or_staging() {
+        use std::net::TcpListener;
+        let _guard = TEST_STATE.lock().unwrap();
+        let original = backend::Settings::load();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::create_dir_all(backend::data_dir()).unwrap();
+        fs::write(backend::data_dir().join("settings.json"), serde_json::json!({"native_warning": true, "proxy": format!("http://{}", listener.local_addr().unwrap())}).to_string()).unwrap();
+        let folder = dir("consent-missing");
+        let output = folder.join("export");
+        let log_before = fs::read(log_path()).ok();
+        fn denied<T>(result: Result<T, Failed>) {
+            assert!(matches!(result, Err(Failed::NoConsent)));
+        }
+        let profile = Profile::Optimized;
+        let base = "uninstalled";
+        denied(build_server(base, &folder, &output, profile, false, |_| {}));
+        for choice in [Some(profile), None] {
+            denied(build(base, &folder, &instances::selected(), choice, |_| {}));
+        }
+        denied(sync_internals(&folder));
+        let preview = root().join("installed.routes");
+        fs::create_dir_all(&preview).unwrap();
+        let marker = preview.join("permission-sentinel");
+        fs::write(&marker, b"unchanged").unwrap();
+        denied(routes(&folder, None));
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"unchanged",
+            "preview never stages before consent"
+        );
+        fs::remove_file(marker).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "zero HTTP requests"
+        );
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read(log_path()).ok(),
+            log_before,
+            "no build staging or log writes"
+        );
+        backend::Settings::load().allow_native_mods().unwrap();
+        assert!(backend::Settings::load().native_mods_allowed_at.is_some());
+        require_consent().unwrap();
+        original.save().unwrap();
     }
 
     /// The build log ([`clear_log`], [`append_log`]): fresh for every attempt, and an early
@@ -4236,7 +3946,8 @@ mod tests {
     /// one log file.
     #[test]
     fn the_log_is_fresh_per_attempt_and_keeps_early_failures() {
-        let _guard = LOG_TEST.lock().unwrap();
+        let _guard = TEST_STATE.lock().unwrap();
+        backend::Settings::load().allow_native_mods().unwrap();
         clear_log().unwrap();
         append_log("the last build's output").unwrap();
         clear_log().unwrap();
@@ -4257,12 +3968,13 @@ mod tests {
             |_| {},
         )
         .unwrap_err();
+        let err = String::from(err);
         assert!(err.contains("is not prepared yet"), "{err}");
         let log = fs::read_to_string(log_path()).unwrap();
         assert!(log.contains("is not prepared yet"), "{log}");
         assert!(!log.contains("the last build's output"), "{log}");
         // A failure after compiler output keeps those diagnostics and the final reason.
-        let failure: Result<(), String> = logged(|| {
+        let failure: Result<(), String> = logged(|_| {
             append_log("error[E0425]: cannot find value `missing` in this scope")?;
             Err("Could not export the engine".into())
         });
@@ -4274,7 +3986,7 @@ mod tests {
             "{log}"
         );
         assert!(!log.contains("Build completed."), "{log}");
-        let success: Result<(), String> = logged(|| Ok(()));
+        let success: Result<(), String> = logged(|_| Ok(()));
         success.unwrap();
         assert_eq!(
             fs::read_to_string(log_path()).unwrap(),
@@ -4298,10 +4010,7 @@ mod tests {
         let now = record("aaaaaaa1111", &[("zoom", "1"), ("keys", "1")]);
         assert_eq!(classify(true, None, &now), Plan::UpToDate);
         assert_eq!(classify(false, None, &now), Plan::First);
-        assert_eq!(
-            First_label(),
-            "First build: the whole game (several minutes)"
-        );
+        assert_eq!(First_label(), "First build: the whole game");
         let before = record("aaaaaaa1111", &[("zoom", "1"), ("keys", "0")]);
         assert_eq!(
             classify(false, Some(&before), &now),
@@ -4351,11 +4060,11 @@ mod tests {
         };
         assert_eq!(
             done(42, Profile::Balanced, Plan::Incremental(vec![])).label(),
-            "Built in 42 s (balanced, incremental)"
+            "Built (balanced, incremental)"
         );
         assert_eq!(
             done(125, Profile::Optimized, Plan::First).label(),
-            "Built in 2 min 5 s (optimized, first build)"
+            "Built (optimized, first build)"
         );
     }
 
@@ -4743,7 +4452,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_build_smart_app_control_blocked_says_how_to_build() {
-        let _guard = LOG_TEST.lock().unwrap();
+        let _guard = TEST_STATE.lock().unwrap();
         clear_log().unwrap();
         // cargo's output on Windows 11 25H2 with Smart App Control on (the report in #5911).
         let mut cmd = Command::new("sh");

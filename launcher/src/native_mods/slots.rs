@@ -8,11 +8,21 @@ use horizon_mod_package::{
     Manifest,
 };
 
-pub(super) fn points(manifest: &Manifest) -> impl Iterator<Item = PointInjection> + '_ {
+pub(super) fn points<'a>(
+    listed: &'a [super::inject::ListedPoint],
+    manifest: &'a Manifest,
+) -> impl Iterator<Item = PointInjection> + 'a {
     manifest
         .inject
         .iter()
-        .filter(|entry| entry.access == Access::Internals && entry.call.is_none())
+        .filter(|entry| {
+            entry.access == Access::Internals
+                && entry.call.is_none()
+                && listed.iter().any(|point| {
+                    super::internals::plain_path(&point.target)
+                        == super::internals::plain_path(&entry.at)
+                })
+        })
         .map(|entry| PointInjection {
             mod_id: manifest.id.clone(),
             id: entry.id.clone(),
@@ -30,23 +40,23 @@ pub(super) fn sites<'a>(
         .inject
         .iter()
         .filter(|entry| entry.call.is_some())
-        .map(|entry| {
-            (
-                entry,
-                sites
-                    .iter()
-                    .find(|site| {
-                        super::internals::plain_path(&site.target)
-                            == super::internals::plain_path(&entry.at)
-                            && Some(&site.selector) == entry.call.as_ref()
-                            && Some(site.ordinal) == entry.nth
-                    })
-                    .expect("slot route checked"),
-            )
-        })
+        .map(|entry| (entry, selected(sites, entry).expect("slot route checked")))
+}
+
+fn selected<'a>(sites: &'a [Site], entry: &Inject) -> Option<&'a Site> {
+    sites.iter().find(|site| {
+        super::internals::plain_path(&site.target) == super::internals::plain_path(&entry.at)
+            && Some(&site.call) == entry.call.as_ref()
+            && Some(&site.ctx) == entry.ctx.as_ref()
+            && Some(site.ordinal) == entry.nth
+    })
 }
 
 pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), InjectError> {
+    routes(catalog, manifest).map(|_| ())
+}
+
+pub(super) fn routes(catalog: &Catalog, manifest: &Manifest) -> Result<Vec<Route>, InjectError> {
     let plain = super::internals::plain_path;
     let places = manifest
         .inject
@@ -60,7 +70,7 @@ pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), Inject
             let point = catalog
                 .points
                 .iter()
-                .find(|point| plain(&point.target) == plain(&item.path));
+                .find(|point| !point.private && plain(&point.target) == plain(&item.path));
             Some(Place {
                 at: entry.at.clone(),
                 hash: item.hash.clone(),
@@ -84,17 +94,18 @@ pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), Inject
                 calls: catalog
                     .sites
                     .iter()
-                    .filter(|site| plain(&site.target) == plain(&item.path))
+                    .filter(|site| !site.private && plain(&site.target) == plain(&item.path))
                     .map(|site| CallPlace {
-                        call: site.selector.clone(),
+                        call: site.call.clone(),
                         nth: site.ordinal,
-                        ctx: site.hash.clone(),
+                        ctx: site.ctx.clone(),
                         slots: vec![SlotKind::Site],
                     })
                     .collect(),
             })
         })
         .collect::<Vec<_>>();
+    let mut decisions = Vec::new();
     for inject in &manifest.inject {
         let route = route(
             Entry {
@@ -106,6 +117,18 @@ pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), Inject
             &places,
         )?;
         let pending = match (route, inject.kind, inject.access) {
+            (_, Kind::ModifyCallArg, _) => Some(NoSlotReason::SourcePending),
+            (
+                Route::Source(_),
+                Kind::Head
+                | Kind::Return
+                | Kind::BeforeCall
+                | Kind::AfterCall
+                | Kind::ModifyValue
+                | Kind::WrapCall
+                | Kind::WrapIf,
+                Access::Internals,
+            ) => None,
             (Route::Source(_), _, _) => Some(NoSlotReason::SourcePending),
             (_, Kind::Replace, _) => Some(NoSlotReason::ReplacePending),
             (Route::Slot(SlotKind::Site), _, Access::Api) => Some(NoSlotReason::ApiSitesPending),
@@ -118,13 +141,9 @@ pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), Inject
                 declaration: format!("slots/{}.txt: {} ({route:?})", manifest.id, inject.at),
             });
         }
+        decisions.push(route);
         if inject.kind == Kind::WrapIf
-            && sites(&catalog.sites, manifest)
-                .find(|(entry, _)| entry.id == inject.id)
-                .expect("site checked")
-                .1
-                .output
-                != "()"
+            && selected(&catalog.sites, inject).is_some_and(|site| site.output != "()")
         {
             return Err(InjectError::Invalid {
                 id: format!("{}:{}", manifest.id, inject.id),
@@ -133,30 +152,43 @@ pub(super) fn check(catalog: &Catalog, manifest: &Manifest) -> Result<(), Inject
             });
         }
     }
-    Ok(())
+    Ok(decisions)
 }
 
-pub(super) fn report(manifest: &Manifest) -> impl Iterator<Item = String> + '_ {
-    manifest.inject.iter().map(|entry| {
-        let form = if entry.call.is_some() {
-            "site"
-        } else if entry.kind == Kind::Return {
-            "return"
-        } else {
-            "head"
-        };
-        format!(
-            "{}:{}: {} -> slot ({form}, {})",
-            manifest.id,
-            entry.id,
-            entry.at,
-            if entry.access == Access::Api {
-                "api"
-            } else {
-                "internals"
+pub(super) fn report<'a>(
+    catalog: &'a Catalog,
+    manifest: &'a Manifest,
+) -> impl Iterator<Item = String> + 'a {
+    manifest
+        .inject
+        .iter()
+        .zip(routes(catalog, manifest).expect("checked routes"))
+        .map(|(entry, route)| {
+            if let Route::Source(reason) = route {
+                return format!(
+                    "{}:{}: {} -> source (private slot, {reason})",
+                    manifest.id, entry.id, entry.at
+                );
             }
-        )
-    })
+            let form = if entry.call.is_some() {
+                "site"
+            } else if entry.kind == Kind::Return {
+                "return"
+            } else {
+                "head"
+            };
+            format!(
+                "{}:{}: {} -> slot ({form}, {})",
+                manifest.id,
+                entry.id,
+                entry.at,
+                if entry.access == Access::Api {
+                    "api"
+                } else {
+                    "internals"
+                }
+            )
+        })
 }
 
 #[cfg(test)]

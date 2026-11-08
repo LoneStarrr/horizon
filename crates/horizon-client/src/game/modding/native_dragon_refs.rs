@@ -300,6 +300,7 @@ mod tests {
         with_game(|game| {
             let (_, dragon) = dragon_in(game);
             let cloud = |from_dragon| Breath {
+                join: Default::default(),
                 id: 0,
                 at: [0.0; 3],
                 radius: 5.0,

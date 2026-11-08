@@ -13,6 +13,12 @@ uses `minecraft:`), deduplicated across mods and checked after every mod's conte
 An unknown entry refuses the load with the requesting mod and canonical id, even if the
 key was never attached to a Part. A later mod may supply the requested entry.
 
+The completed block identity table includes every vanilla and mod block, even blocks no mod
+requested. Completion preserves requested slots and appends the remaining canonical names in
+sorted order. Names belong to the installed mod registry; world load and reload prepare a
+separate numeric mapping for every retained key before publishing it. A missing requested
+block refuses completion without publishing a partial table.
+
 Keys are small, private `u32` registration slots on both native and wasm. `key.id(host)`
 returns an owned canonical `String` through the generated read backend for diagnostics; it
 requires a game-backed host and an invalid slot is a boundary error, not an empty name.
@@ -36,6 +42,12 @@ authoritative context or an unavailable mapping returns `None`, not a stale memb
 `block_state_id`, tag names and existing fluid operation arguments remain strings for now.
 
 Declare a tank-only fluid in your own namespace with `r.declare_fluid("chocolate")`; the returned `FluidKey` identifies it for the mod load. Request vanilla or another mod's declared fluid with `r.fluid_key("minecraft:water")` or `r.fluid_key("other:chocolate")`. Requests resolve after all registrations, so declaration order does not matter; an unknown request stops the load and names the requesting mod. Tank-only fluids have no world simulation or world state. Fluid stacks and recipe ingredients use these keys; remaining fluid operations move to them in subsequent changes.
+Declare a fluid that exists in the world with `let mut fluid = WorldFluid::default(); fluid.drop_off = 2; r.declare_world_fluid("oil", fluid);`,
+using `mod_api::WorldFluid`, the code form of a fluid file's `world` object ([content mods](../../how-to/content-mods.md)): it adds the block
+`mymod:oil`, the flowing fluid `mymod:flowing_oil` and the bucket `mymod:oil_bucket`, and its fluid file, if it has one,
+still says how it looks. `r.fluid_part("mymod:oil", Part)` attaches a `FluidPart`, whose `fluid_rules` can change the
+declared values by position on the server. It is asked for every cell a spread looks at, so answer fast.
+
 A saved tank whose fluid's mod is absent carries an opaque unresolved identity. Its stack's
 `key()` is `None`; `UnresolvedFluid::id(host)` reads its saved name. It can move between
 name-backed mod tanks, but not into vanilla buckets or cauldrons.
@@ -46,6 +58,73 @@ uses a key requested through `r.effect_key("minecraft:speed")`. Beacon-selection
 carry `Option<EffectKey>` for each power; `None` is no selection. Enchantment effect-component
 names (for example `minecraft:damage` in `has_enchantment_effect`) are a different registry
 and remain strings, as do labels and tags.
+
+### API-owned values: migration table
+
+| Previous engine value | API-owned value | Mod changes |
+| --- | --- | --- |
+| Package manifest `Side` | `mod_api::Side` | Match `Client` and `Both` on the package metadata snapshot. This is not `HostSide` or the executing logical side. |
+| Command `Suggestion` | `mod_api::Suggestion` | Construct with `Suggestion::new((start, end), text)`; optional `tooltip` and `int_value` remain writable. Offsets are byte offsets. |
+| Package block entity type storage | `mod_api::BlockEntityTypeDecl` | Existing `r.block_entity_type(...).build()` registration is unchanged. The declaration snapshot no longer exposes the package parser's model; the game converts it once when declarations freeze. |
+| File-opening click actions | Not in `text::TextClick` | Mods can neither produce nor round-trip `OpenFile`; untrusted file-opening action metadata is dropped. Part of [per-node origin tracking #1738](https://github.com/arismoko/horizon/issues/1738). |
+
+The API's `GameRuleDecl` records a mod's boolean rule name, category and default.
+Its internal `RuleSchema` input describes vanilla categories and dense rule positions
+through read-only lookups rather than a copied vanilla list or fixed slot numbers.
+Schema validation resolves category references after all mods have declared them and
+returns either all declaration slots or every refusal; it never installs a partial table.
+The game supplies this schema at Parts installation, then builds each world's engine
+rule registry from the installed `GameRuleDecl` snapshots. Existing rule registrar calls
+are unchanged; engine registry construction is no longer exposed through the API.
+
+The game owns package and completion conversion. Mods do not import package-loader or
+client-core types for these values. Completion edits are copied back after subscribed
+listeners run; no listener means no snapshot allocation. Package metadata is copied once
+at startup, retaining declared namespaces and dependencies.
+
+### Owned component trees
+
+The `text` module defines owned component data: literal and translatable contents,
+style overrides, ordered children, selector and NBT sources, inline objects, and click
+and hover actions. Translation keys and argument components stay unresolved until the
+game displays them. `None` style fields inherit; `Some(false)` overrides an inherited
+decoration. Arbitrary profile and component-patch JSON remains data, never engine state.
+Inline player and atlas objects use `Option<Box<Text>>` for their fallback: `None`
+keeps the engine-computed default; `Some` preserves a styled or translatable component
+rather than flattening it to a string.
+
+The recursive tree has one serde model. `TextForm` carries its serialized form for
+finite generated wasm bindings; encoding and decoding refuse more than 100 nested JSON containers, and decoding refuses malformed trees. Component and style
+metadata is retained through serialization rather than discarded by flattening text.
+
+### Item values and tag names
+
+Every item has an `ItemKey`, including vanilla items no mod requested during registration.
+`r.item_key(id)` retains a forward reference in the same load-owned table; after the item
+registry is complete, `host.item_key(&identifier)` resolves any registered item. A key is
+still a private `u32` index, not a copy of an item definition. Resolve once and retain it.
+`host.max_stack_size(key)` and `host.max_damage(key)` read item defaults without exposing
+the engine's item table.
+
+`ItemStack` is owned API data with private fields. `ItemStack::new(key, count)` refuses
+zero, while `ItemStack::of(key)` makes one item. Count mutation refuses zero and arithmetic
+overflow. Registry-dependent maximum count and damage, including component overrides,
+are checked by the game when accepting a write; an oversized value is refused with a typed
+error, never silently clamped. This is the same boundary on native and wasm. Consuming
+`split(n)` returns `StackSplit { taken, remainder }`, both optional; consuming `shrink(n)`
+returns the remainder or `None`. There is no empty-stack sentinel. Component descriptors
+read and write an optional owned NBT patch; a plain stack has no patch allocation.
+
+`host.tags()` and a restricted level host's `tags()` expose the same `Tags` service. Resolve
+a validated identifier once with `tags.key(&identifier)` and retain its `TagKey`. The runtime
+owns tag-name slots for the process; reload replaces membership, not names or key identity.
+`tags.is_in_tag(item_key, tag_key)` tests merged item membership. `tags.items(tag_key)`
+and `tags.fluids(tag_key)` return registered keys in vanilla's member order. Unknown tags
+return false or empty lists. Membership reads return `None` on clients, before authoritative
+tags load, or if the relevant registry mapping is unavailable. Key resolution itself can be
+refused if the runtime cannot allocate a name slot. No lookup stringifies a retained key.
+Block member enumeration moves with the registry-wide `BlockKey` table in the next type slice.
+The engine `TagRegistry`, `StackData`, `StackView` and `DisplayContext` are not API types.
 
 A hook whose catalog entry has a `scope` (`block`, `block_entity`, `item`, `menu`) and a `key`, the argument
 naming the thing it is about, is a method on that scope's trait only: `BlockPart`, `BlockEntityPart` (a

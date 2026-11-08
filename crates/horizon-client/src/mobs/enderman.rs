@@ -9,16 +9,12 @@ use super::{
         RandomLookAround, Stroll, TARGET, goal_clone, reduced,
     },
 };
-use crate::{
-    items::{ItemStack, Items},
-    random_sequences::RandomSequences,
-};
+use crate::items::{BlockLootRoll, ItemStack};
 use horizon_core::{
     geometry::{Aabb, Vec3},
     random::RandomSource,
 };
 use horizon_world::native_load_context::LoopContext;
-use horizon_world::registry::{BlockRegistry, BlockStateId};
 
 pub fn register(m: &mut Mob) {
     let g = &mut m.ai.goals;
@@ -207,7 +203,8 @@ pub fn attacking_speed(m: &Mob) -> f64 {
 /// Enderman.customServerAiStep: in daylight, flee by teleporting. The End has a
 /// fixed time, so `Level.isBrightOutside` is never true there.
 pub fn custom_server_ai_step(m: &mut Mob, cx: &mut Cx) {
-    if cx.w.daylight && !cx.w.end && m.age as i32 >= m.extra.counter + 600 {
+    if cx.w.daylight && !cx.w.dimension_type.has_fixed_time && m.age as i32 >= m.extra.counter + 600
+    {
         let br = super::hostile::mob_brightness(m, cx.w);
         let (x, y, z) = (
             m.position.x.floor() as i32,
@@ -454,6 +451,13 @@ impl Goal for TakeBlock {
             pos: [x, y, z],
             state,
         });
+        // level.gameEvent(BLOCK_DESTROY, pos, Context.of(enderman, blockState)).
+        cx.events.push(MobEvent::GameEvent {
+            event: "minecraft:block_destroy",
+            at: [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5],
+            source: m.id,
+            state,
+        });
         m.extra.carried = Some(state);
     }
 }
@@ -505,38 +509,26 @@ pub fn carried_block_tool() -> ItemStack {
     axe
 }
 
-/// `Enderman.dropCustomDeathLoot`: `BlockState.getDrops` of the carried
-/// state with [`carried_block_tool`] and the enderman as `this` entity,
-/// drawing from the block table's random sequence (`sequences`: the world's
-/// sequences and seed), else `random` (the level random).
-pub fn carried_block_drops(
-    items: &Items,
-    registry: &BlockRegistry,
-    state: BlockStateId,
-    random: &mut impl RandomSource,
-    sequences: Option<(&mut RandomSequences, i64)>,
-) -> Vec<ItemStack> {
-    let tool = carried_block_tool();
-    items
-        .block_drops_exploded(
-            registry,
-            state,
-            Some(&tool),
-            &[],
-            random,
-            sequences,
-            None,
-            true,
-        )
-        .into_iter()
-        .filter(|s| s.count > 0 && &*s.item != "minecraft:air")
-        .collect()
+/// `Enderman.dropCustomDeathLoot`: `BlockState.getDrops`' parameters for a
+/// carried block, `tool` being [`carried_block_tool`] and the enderman `this`.
+pub fn carried_block_roll(tool: &ItemStack) -> BlockLootRoll<'_> {
+    BlockLootRoll {
+        held: Some(tool),
+        breaker: true,
+        ..Default::default()
+    }
+}
+
+/// `spawnAtLocation` leaves out empty stacks.
+pub fn carried_block_drop_kept(stack: &ItemStack) -> bool {
+    stack.count > 0 && &*stack.item != "minecraft:air"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mobs::DamageKind;
+    use horizon_world::registry::BlockRegistry;
     use std::sync::Arc;
 
     fn enderman() -> Mob {
@@ -682,7 +674,9 @@ mod tests {
     /// block comes back as a grass block (not dirt) and a nylium as itself.
     #[test]
     fn a_killed_enderman_drops_its_carried_block() {
+        use crate::items::Items;
         use crate::mobs::drops;
+        use crate::random_sequences::RandomSequences;
         use horizon_world::loot::{LootData, PackOverlay};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.local/horizon-client")
@@ -700,6 +694,7 @@ mod tests {
             loot: &loot,
             damage: None,
             player: None,
+            player_killed: false,
             luck: 0.0,
             vehicle: None,
             mob_drops,
@@ -723,13 +718,13 @@ mod tests {
             let dropped: Vec<String> = out
                 .into_iter()
                 .flat_map(|d| match d {
-                    drops::Drop::CarriedBlock(state) => carried_block_drops(
-                        &items,
-                        registry,
-                        state,
-                        &mut random,
-                        Some((&mut sequences, 0)),
-                    ),
+                    drops::Drop::CarriedBlock(state) => {
+                        let tool = carried_block_tool();
+                        let roll = carried_block_roll(&tool);
+                        let stacks = Some((&mut sequences, 0));
+                        let stacks = items.block_drops(registry, state, roll, &mut random, stacks);
+                        stacks.into_iter().filter(carried_block_drop_kept).collect()
+                    }
                     _ => Vec::new(),
                 })
                 .map(|s| format!("{} {}", s.item, s.count))

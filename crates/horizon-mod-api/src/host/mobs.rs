@@ -81,10 +81,6 @@ pub trait MobsBackend {
     #[access(WorldOnly)]
     fn mob_can_use_portal(&self, mob: MobRef) -> Option<bool>;
     /// Side: server.
-    /// The live leash holder, refusing unresolved saved and unavailable holders.
-    #[access(WorldOnly)]
-    fn mob_leash_holder(&self, mob: MobRef) -> Option<MobLeashHolder>;
-    /// Side: server.
     /// `Mob.getTarget`. Brain-backed mobs read their attack memory; piglins
     /// and hoglins use Horizon's `ai.target` stand-in. Invalid targets, an
     /// unavailable mob or player binding, or a target without a living handle
@@ -164,6 +160,49 @@ pub trait MobsBackend {
     /// one. None for a mob that is no raider or in no raid.
     #[access(WorldOnly)]
     fn mob_raid(&self, mob: MobRef) -> Option<RaidRef>;
+    /// Side: server.
+    /// The unspawned mob's entity type (`minecraft:zombie`). `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_kind(&self, mob: UnspawnedMobRef) -> Result<Identifier, UnspawnedMobError>;
+    /// Side: server.
+    /// Where the unspawned mob will join the level. `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_position(&self, mob: UnspawnedMobRef) -> Result<[f64; 3], UnspawnedMobError>;
+    /// Side: server.
+    /// The stack in `slot` (`LivingEntity.getItemBySlot`) and its count; `None` for an empty slot. `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_equipment(
+        &self,
+        mob: UnspawnedMobRef,
+        slot: EquipmentSlot,
+    ) -> Result<Option<ItemStack>, UnspawnedMobError>;
+    /// Side: server.
+    /// An attribute's base value, before modifiers; `Unsupported` for one the mob's type does not have. `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_attribute_base(
+        &self,
+        mob: UnspawnedMobRef,
+        attribute: &Identifier,
+    ) -> Result<f64, UnspawnedMobError>;
+    /// Side: server.
+    /// An attribute's value with its modifiers, its equipment's included; `Unsupported` for one the mob's type does not have. `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_attribute_value(
+        &self,
+        mob: UnspawnedMobRef,
+        attribute: &Identifier,
+    ) -> Result<f64, UnspawnedMobError>;
+    /// Side: server.
+    /// The tags a mod gave the unspawned mob so far (`Entity.getTags`). `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_tags(&self, mob: UnspawnedMobRef) -> Result<Vec<String>, UnspawnedMobError>;
+    /// Side: server.
+    /// The unspawned mob's custom name, if it has one. `Expired` once the hook that lent it has returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_custom_name(
+        &self,
+        mob: UnspawnedMobRef,
+    ) -> Result<Option<Text>, UnspawnedMobError>;
 }
 /// The handles' writes of the `mobs` area, implemented by the game and reached through [`BackendMut`].
 // hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait

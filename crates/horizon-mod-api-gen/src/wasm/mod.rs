@@ -23,6 +23,7 @@ pub(super) const IMPORTS: &[&str] = &[
     "DrawContext",
     "BlockEntityDrawContext",
     "WorldDrawContext",
+    "CameraDrawContext",
     "LevelHost",
     "LevelRandomHost",
     "LevelTicksHost",
@@ -34,6 +35,8 @@ pub(super) const IMPORTS: &[&str] = &[
     "Players",
     "ClientSession",
     "RenderAssets",
+    "InstanceGroups",
+    "Tags",
     "menu::SlotView",
     "Registrar",
     "CapabilityProviders",
@@ -51,6 +54,7 @@ pub(super) const IMPORTS: &[&str] = &[
     "BlockAndTintGetter",
     "ServerReloadResources",
     "CriterionContext",
+    "UnspawnedMobEdits",
 ];
 
 /// Imported traits a call never hands over, each reached through another's method instead.
@@ -62,6 +66,12 @@ pub(super) const REACHED: &[(&str, &str, &str)] = &[
     ("Players", "server_host", "Ok(h.players())"),
     ("ClientSession", "client_host", "Ok(h.client_session())"),
     ("RenderAssets", "client_host", "Ok(h.render_assets())"),
+    ("InstanceGroups", "client_host", "Ok(h.instance_groups())"),
+    (
+        "Tags",
+        "",
+        "level_host().map(|h| h.tags()).or_else(|_| host().map(|h| h.tags()))",
+    ),
     // A level hook's host first: inside a level write it is the one the call hands over.
     (
         "AttachmentStore",
@@ -106,6 +116,7 @@ const EXPORTS: &[&str] = &[
     "BlockEntityPart",
     "ItemPart",
     "MenuPart",
+    "FluidPart",
     "ServerReloadListener",
     "ClientReloadListener",
     "BlockTintSource",
@@ -375,6 +386,7 @@ pub(super) const SUBSCRIBED: &[(&str, &str)] = &[
     ("BlockEntityPart", "block_entity_subscribed"),
     ("ItemPart", "item_subscribed"),
     ("MenuPart", "menu_subscribed"),
+    ("FluidPart", "fluid_subscribed"),
 ];
 
 /// One trait method as it crosses.
@@ -839,7 +851,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -864,7 +875,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 assert!(
@@ -915,7 +925,6 @@ mod tests {
                 ("mod_api_generated.rs", generated.hooks.as_str()),
                 ("mod_api_generated_host.rs", generated.host.as_str()),
                 ("mod_api_host_areas.rs", generated.areas.as_str()),
-                ("native_render_generated.rs", generated.render.as_str()),
             ];
             let wasm = super::generate(&root, &included).unwrap();
             assert!(types.types.contains_key("world-line"));
@@ -992,7 +1001,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1046,7 +1054,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1163,6 +1170,41 @@ mod tests {
             .unwrap();
     }
 
+    /// `finalize_spawn`'s editor is a shared trait object in its event: the wasm host lends it
+    /// shared for the call, and a mod reaches its edits as imports.
+    #[test]
+    fn finalize_spawn_lends_its_shared_editor() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                let generated =
+                    super::super::sources(&root, super::super::FillMode::Require).unwrap();
+                let included = [
+                    ("mod_api_generated.rs", generated.hooks.as_str()),
+                    ("mod_api_generated_host.rs", generated.host.as_str()),
+                    ("mod_api_host_areas.rs", generated.areas.as_str()),
+                ];
+                let wasm = super::generate(&root, &included).unwrap();
+                let mut resolve = wit_parser::Resolve::default();
+                let package = resolve.push_str("mod-api.wit", &wasm.wit).unwrap();
+                let edits = &resolve.interfaces
+                    [resolve.packages[package].interfaces["unspawned-mob-edits"]];
+                assert!(edits.functions.contains_key("set-equipment"));
+                assert!(edits.functions.contains_key("add-tag"));
+                assert!(wasm.host.contains("frame.unspawned_mob_edits(&*p1.edits)"));
+                assert!(
+                    !wasm
+                        .unbound
+                        .iter()
+                        .any(|name| name.starts_with("UnspawnedMobEdits::"))
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn pack_finders_bind_the_scoped_mutable_repository() {
         std::thread::Builder::new()
@@ -1175,7 +1217,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1210,7 +1251,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1242,7 +1282,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1274,7 +1313,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1325,7 +1363,6 @@ mod tests {
                     ("mod_api_generated.rs", generated.hooks.as_str()),
                     ("mod_api_generated_host.rs", generated.host.as_str()),
                     ("mod_api_host_areas.rs", generated.areas.as_str()),
-                    ("native_render_generated.rs", generated.render.as_str()),
                 ];
                 let wasm = super::generate(&root, &included).unwrap();
                 let mut resolve = wit_parser::Resolve::default();
@@ -1364,7 +1401,6 @@ mod tests {
             ("mod_api_generated.rs", generated.hooks.as_str()),
             ("mod_api_generated_host.rs", generated.host.as_str()),
             ("mod_api_host_areas.rs", generated.areas.as_str()),
-            ("native_render_generated.rs", generated.render.as_str()),
         ];
         let wasm = super::generate(&root, &included).unwrap();
         for u in &wasm.unbound {

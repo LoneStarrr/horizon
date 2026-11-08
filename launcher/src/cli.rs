@@ -12,6 +12,26 @@ use horizon_launcher::native_mods;
 use horizon_launcher::native_status;
 use horizon_launcher::other_launchers;
 use horizon_launcher::server_list;
+use horizon_launcher::storage::{Category, Storage};
+
+#[derive(Clone, Debug)]
+enum ClearStorage {
+    All,
+    Row(Category),
+}
+
+fn parse_storage_row(value: &str) -> Result<ClearStorage, String> {
+    use clap::ValueEnum;
+    if value == "all" {
+        Ok(ClearStorage::All)
+    } else {
+        Category::ALL
+            .into_iter()
+            .find(|category| category.to_possible_value().unwrap().get_name() == value)
+            .map(ClearStorage::Row)
+            .ok_or_else(|| tr("Unknown").into())
+    }
+}
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -330,7 +350,8 @@ enum InstanceCmd {
     /// List the instances other launchers keep (Prism Launcher, MultiMC, the official
     /// launcher, the CurseForge app, the Modrinth App), read without changing anything there
     Others {
-        /// Look in this folder instead: a launcher's folder, its instances/ or one instance
+        /// Look in this folder instead: a launcher's folder, a folder of instances (its
+        /// instances/, the CurseForge app's Instances) or one instance
         #[arg(long)]
         folder: Option<PathBuf>,
     },
@@ -339,7 +360,8 @@ enum InstanceCmd {
     CopyFrom {
         /// Its name, as `instance others` lists it
         name: String,
-        /// Look in this folder instead: a launcher's folder, its instances/ or one instance
+        /// Look in this folder instead: a launcher's folder, a folder of instances (its
+        /// instances/, the CurseForge app's Instances) or one instance
         #[arg(long)]
         folder: Option<PathBuf>,
         /// The new instance's name (default: the same)
@@ -588,7 +610,7 @@ enum ModsCmd {
         /// The instance (default: the selected one)
         #[arg(long)]
         instance: Option<String>,
-        /// You read the mod's source (the link printed) and trust it with full access to this computer
+        /// Allow native code for this install (remembered; revoke in Settings, Storage)
         #[arg(long)]
         trust_native_code: bool,
     },
@@ -603,7 +625,7 @@ enum ModsCmd {
         /// The instance (default: the selected one)
         #[arg(long)]
         instance: Option<String>,
-        /// You read the new source and trust it with full access to this computer
+        /// Allow native code for this install (remembered; revoke in Settings, Storage)
         #[arg(long)]
         trust_native_code: bool,
     },
@@ -755,12 +777,11 @@ enum Cmd {
         #[arg(long)]
         accept_eula: bool,
     },
-    /// Show the native compilation cache's size and limit as JSON. Installed games and saves
-    /// are never removed; builds must be idle
-    NativeCache {
-        /// Clear only fast/release compiler outputs. The next changed build recompiles
-        #[arg(long)]
-        clear: bool,
+    /// Show disposable storage by category as JSON. Builds must be idle
+    Storage {
+        /// Clear build-files, prebuilt-games, spare-game-builds, rust-compiler, other-caches or all implemented rows
+        #[arg(long, value_parser = parse_storage_row)]
+        clear: Option<ClearStorage>,
     },
     /// Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the instance's exact
     /// Horizon source revision with the launcher's own Rust, as the version the instance then
@@ -771,7 +792,8 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["server_output", "instance", "version", "update", "profile"], requires = "folder")]
         sync_internals: bool,
         /// A mod folder (horizon-mod.toml with [native], Cargo.toml and src/), or a folder of them
-        /// (default: the native mods installed and turned on in the instance)
+        /// (default: the native mods installed and turned on in the instance). Server exports
+        /// also read wasm internals declarations from .hmod packages directly in this folder
         folder: Option<PathBuf>,
         /// Export mode: build a standalone dedicated-server engine into this folder instead of
         /// an instance's build. Needs a mod FOLDER; no instance is read or changed, and no
@@ -800,14 +822,14 @@ enum Cmd {
         /// plays (a full rebuild)
         #[arg(long, conflicts_with = "version")]
         update: bool,
-        /// You read the mods' source and trust it with full access to this computer
+        /// Allow native code for this install (remembered; revoke in Settings, Storage)
         #[arg(long)]
         trust_native_code: bool,
-        /// The build mode: optimized (the default: the prebuilt game when the mods allow it, else
-        /// the game built with the release profile), balanced (built here, quicker to rebuild) or
-        /// developer (quickest to rebuild a mod, slow game). Default: the native-profile setting
-        #[arg(long, value_parser = ["optimized", "balanced", "developer"])]
-        profile: Option<String>,
+        /// This instance's build mode: optimized, balanced or developer. Remembers an explicit
+        /// choice for this instance; otherwise uses its saved choice, starting at Balanced.
+        /// Without a picker reason or explicit choice, installed mods use the prebuilt route.
+        #[arg(long, value_enum)]
+        profile: Option<native_mods::Profile>,
     },
     /// Show a release's patch notes (default: the newest)
     Notes { tag: Option<String> },
@@ -829,9 +851,7 @@ enum Cmd {
     /// violet|blue|teal|green|amber|red|pink|#rrggbb|DEGREES (a named accent, any colour, or any
     /// hue), background PATH (a picture behind Home; "default"
     /// shows Horizon's landscape), native-cache-gib N (combined native compilation cache limit
-    /// in GiB, default 30; 0 disables automatic cleanup), native-profile optimized|balanced|developer (the build mode native
-    /// mods use: optimized uses the prebuilt game when it can, balanced builds here and rebuilds
-    /// quicker, developer rebuilds a mod quickest for a slow game)
+    /// in GiB, default 30; 0 disables automatic cleanup)
     Settings {
         #[arg(value_parser = SETTING_KEYS)]
         key: Option<String>,
@@ -981,7 +1001,7 @@ pub fn command() -> clap::Command {
 pub const AI_COMMANDS: [&str; 2] = ["mcp", "agent-config"];
 
 /// The keys `settings` sets.
-const SETTING_KEYS: [&str; 15] = [
+const SETTING_KEYS: [&str; 14] = [
     "selected-version",
     "minecraft-dir",
     "server-dir",
@@ -995,7 +1015,6 @@ const SETTING_KEYS: [&str; 15] = [
     "language",
     "accent",
     "background",
-    "native-profile",
     "native-cache-gib",
 ];
 
@@ -1085,16 +1104,6 @@ fn set_setting(s: &mut backend::Settings, key: &str, value: &str) -> Result<(), 
                 ),
             };
         }
-        "native-profile" => {
-            // "default", as for the other settings, goes back to `optimized`.
-            s.native_profile = match value {
-                "default" => None,
-                _ => Some(
-                    native_mods::Profile::parse(value)
-                        .ok_or_else(|| format!("{value}: say optimized, balanced or developer"))?,
-                ),
-            };
-        }
         "proxy" => {
             if value == "default" || value.is_empty() {
                 s.proxy = None;
@@ -1127,7 +1136,6 @@ fn settings_json(s: &backend::Settings) -> serde_json::Value {
         "language": s.language.map_or("system", |l| l.code()),
         "accent": s.accent.name(),
         "background": horizon_launcher::themes::background(&backend::data_dir(), s.background.as_deref()),
-        "native_profile": native_mods::Profile::chosen(s).name(),
         "native_cache_gib": s.native_cache_gib.unwrap_or(native_mods::DEFAULT_CACHE_GIB),
         "no_ai": backend::no_ai(),
     })
@@ -1281,11 +1289,15 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 );
             }
         }
-        Cmd::NativeCache { clear } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&native_mods::cache_info(clear)?).unwrap()
-            );
+        Cmd::Storage { clear } => {
+            let storage = Storage::open().map_err(native_mods::cache_error)?;
+            let (row, all) = match clear {
+                Some(ClearStorage::Row(row)) => (Some(row), false),
+                Some(ClearStorage::All) => (None, true),
+                None => (None, false),
+            };
+            let report = storage.report(row, all).map_err(native_mods::cache_error)?;
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Cmd::NativeBuild {
             sync_internals,
@@ -1298,9 +1310,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             trust_native_code,
             profile,
         } => {
-            if !trust_native_code {
-                return Err("Native mods run with full access to this computer. Read their source, then pass --trust-native-code.".into());
-            }
+            native_permission(trust_native_code)?;
             if sync_internals {
                 let entries = native_mods::sync_internals(&folder.expect("required by clap"))?;
                 println!(
@@ -1309,15 +1319,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 );
                 return Ok(());
             }
-            let started = std::time::Instant::now();
-            let profile = match profile.as_deref().and_then(native_mods::Profile::parse) {
-                Some(profile) => profile,
-                None => native_mods::Profile::chosen(&backend::Settings::load()),
-            };
-            let steps = |step: native_mods::Step| {
-                let secs = started.elapsed().as_secs();
-                eprintln!("[{:>2}:{:02}] {}", secs / 60, secs % 60, step.label())
-            };
+            let steps = |step: native_mods::Step| eprintln!("{}", step.label());
             if let Some(output) = server_output {
                 // Export mode: a standalone server engine in `output`. No instance is read
                 // or changed, and no launcher config is written; `folder` is required (clap).
@@ -1333,7 +1335,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                     &base,
                     &folder,
                     &output,
-                    profile,
+                    profile.unwrap_or_default(),
                     allow_jar_downloads,
                     steps,
                 )?;
@@ -1356,6 +1358,12 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 Some(name) => instances::find(name)?,
                 None => instances::selected(),
             };
+            let target = match profile {
+                Some(profile) => {
+                    instances::edit(&target.id, |meta| meta.native_profile = Some(profile))?
+                }
+                None => target,
+            };
             let base = match version {
                 Some(v) => backend::resolve_version(Some(&v))?,
                 None => {
@@ -1364,24 +1372,25 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                         .ok_or_else(backend::no_version_installed)?
                 }
             };
+            let explicit = folder.is_some() || profile.is_some();
             let folder = match folder {
                 Some(folder) => folder,
                 None => native_mods::installed_mods(&target.home)?,
             };
+            let profile = explicit.then_some(target.native_profile);
             let built =
-                native_mods::build(&base, &folder, &target, profile, steps).map_err(|e| match e
-                    .starts_with(native_mods::MISMATCH)
-                {
-                    true => trf(
-                        "{error} Run `cargo horizon-mod update --horizon {commit}` in each mod's \
-                        folder to pin it to this game, then build again.",
-                        &[("error", &e), ("commit", &base)],
-                    ),
-                    false => e,
+                native_mods::build(&base, &folder, &target, profile, steps).map_err(|error| {
+                    let error = String::from(error);
+                    if error.starts_with(native_mods::MISMATCH) {
+                        trf("{error} Run `cargo horizon-mod update --horizon {commit}` in each mod's folder to pin it to this game, then build again.", &[("error", &error), ("commit", &base)])
+                    } else { error }
                 })?;
             println!(
-                "{built} built and selected for its instance ({:.0} s).",
-                started.elapsed().as_secs_f64()
+                "{}",
+                trf(
+                    "{build} built and selected for its instance.",
+                    &[("build", &built)]
+                )
             );
         }
         Cmd::Remove { tag } => {
@@ -1942,7 +1951,12 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                         " "
                     };
                     let status = account::session::status(account::store(), &a.uuid);
-                    println!("{mark} {}  {}  {}", a.name, a.uuid, status.label());
+                    // Why it couldn't be checked (a keyring that didn't answer, #12179).
+                    let why = match status.state {
+                        account::session::State::Retry => format!(": {}", status.message),
+                        _ => String::new(),
+                    };
+                    println!("{mark} {}  {}  {}{why}", a.name, a.uuid, status.label());
                 }
                 for n in &accounts.offline {
                     let on = accounts.player() == account::Player::Offline(n.clone());
@@ -1954,7 +1968,11 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                     );
                 }
                 if !accounts.has_owner(account::store()) {
-                    println!("{} {}", account::NoOwner, tr(backend::SIGN_IN_HINT));
+                    println!(
+                        "{} {}",
+                        account::NoOwner::default(),
+                        tr(backend::SIGN_IN_HINT)
+                    );
                 }
             }
         }
@@ -2233,6 +2251,13 @@ fn servers(action: ServersCmd, as_json: bool) -> Result<(), String> {
 
 /// Installs the native mods of `found` (a GitHub link, resolved) into the game folder `home`: the
 /// warning and the exact source link first, and nothing downloaded without `trust`.
+fn native_permission(trust: bool) -> Result<(), String> {
+    if trust {
+        backend::Settings::load().allow_native_mods()?;
+    }
+    native_mods::require_consent().map_err(String::from)
+}
+
 fn github_native(
     home: &Path,
     java: bool,
@@ -2247,12 +2272,7 @@ fn github_native(
     println!("{}", found.label());
     println!("Source, to read: {}", found.source_url());
     eprintln!("{}", github_mods::WARNING);
-    if !trust {
-        return Err(format!(
-            "Read the source at {}, then pass --trust-native-code.",
-            found.source_url()
-        ));
-    }
+    native_permission(trust)?;
     let mods = github_mods::fetch(found)?;
     let chosen = github_mods::choose(&mods, only, all);
     let done = chosen.and_then(|chosen| {
@@ -2280,9 +2300,7 @@ fn github_native(
         );
     }
     println!("Build it next: horizon-launcher native-build --trust-native-code");
-    println!(
-        "Developing a mod? horizon-launcher settings native-profile developer (or native-build --profile developer): a mod edit rebuilds about 6× faster, while game logic runs up to about twice as slow. Use it while developing, not for playing."
-    );
+    println!("{}", tr("Developing a mod? Use native-build --profile developer. The choice is remembered for this instance."));
     Ok(())
 }
 
@@ -2414,7 +2432,7 @@ fn mods(action: ModsCmd, as_json: bool) -> Result<(), String> {
                 }).collect());
             } else {
                 if datapack && !found.is_empty() {
-                    println!("{}\n", horizon_launcher::browser::DATAPACK_SUPPORT);
+                    println!("{}\n", horizon_launcher::browser::datapack_support());
                 }
                 for p in &found {
                     let support = p.support();
@@ -2739,6 +2757,32 @@ fn other_instances(folder: Option<&Path>) -> Result<Vec<other_launchers::Found>,
             other_launchers::scan(Os::current(), &folders)
         }
     })
+}
+
+/// Where `instance others` looked when it found nothing, and what it looks for.
+fn no_other_instances(folder: Option<&Path>) -> String {
+    use horizon_launcher::sources::{Folders, Os};
+    match folder {
+        Some(dir) => format!(
+            "No other launcher's instance found in {}. Name a launcher's own folder (the \
+             official launcher's .minecraft, Prism Launcher, MultiMC, ATLauncher, the Modrinth \
+             App, the CurseForge app's minecraft folder), a folder of instances (instances, or \
+             the CurseForge app's Instances), or one instance's folder.",
+            dir.display()
+        ),
+        None => {
+            let looked: String = Folders::current()
+                .map(|f| other_launchers::scanned_folders(Os::current(), &f))
+                .unwrap_or_default()
+                .iter()
+                .map(|d| format!("\n    {}", d.display()))
+                .collect();
+            format!(
+                "No other launcher's instance found. Looked in:{looked}\nKeep yours somewhere \
+                 else? Name that folder with --folder."
+            )
+        }
+    }
 }
 
 fn other_plays(f: &other_launchers::Found) -> String {
@@ -3094,7 +3138,7 @@ fn instance(action: InstanceCmd, as_json: bool) -> Result<(), String> {
             if as_json {
                 json(found.iter().map(other_json).collect());
             } else if found.is_empty() {
-                println!("No other launcher's instance found.");
+                println!("{}", no_other_instances(folder.as_deref()));
             }
             for f in found.iter().filter(|_| !as_json) {
                 println!(
@@ -3585,7 +3629,12 @@ fn modpack(action: ModpackCmd, as_json: bool) -> Result<(), String> {
                 p.summary(),
                 counts.join(", ")
             );
-            println!("  {} portable, {} carried over", p.portable, p.mods.len());
+            println!(
+                "  {} portable, {} carried over, {} data packs for new worlds",
+                p.portable,
+                p.mods.len(),
+                p.datapacks
+            );
             if let Some(jars) = p.jars() {
                 println!("  {jars}");
             }
@@ -3918,7 +3967,7 @@ mod tests {
             }) => {
                 assert_eq!(version.as_deref(), Some("v2026.10.13"));
                 assert!(!update);
-                assert_eq!(profile.as_deref(), Some("optimized"));
+                assert_eq!(profile, Some(native_mods::Profile::Optimized));
             }
             _ => panic!("expected native-build"),
         }
@@ -3968,13 +4017,25 @@ mod tests {
 
     #[test]
     fn native_cache_command_and_persisted_limit() {
-        for (args, clear) in [
-            (vec!["horizon-launcher", "native-cache"], false),
-            (vec!["horizon-launcher", "native-cache", "--clear"], true),
-        ] {
-            assert!(matches!(Cli::try_parse_from(args).unwrap().command,
-                Some(Cmd::NativeCache { clear: parsed }) if parsed == clear));
-        }
+        assert!(matches!(
+            Cli::try_parse_from(["horizon-launcher", "storage"])
+                .unwrap()
+                .command,
+            Some(Cmd::Storage { clear: None })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "all"])
+                .unwrap()
+                .command,
+            Some(Cmd::Storage {
+                clear: Some(ClearStorage::All)
+            })
+        ));
+        assert!(Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "worlds"]).is_err());
+        assert!(Cli::try_parse_from(["horizon-launcher", "native-cache"]).is_err());
+        assert!(
+            Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "other-caches"]).is_ok()
+        );
         let mut settings = backend::Settings::default();
         set_setting(&mut settings, "native-cache-gib", "12").unwrap();
         let saved = serde_json::to_string(&settings).unwrap();

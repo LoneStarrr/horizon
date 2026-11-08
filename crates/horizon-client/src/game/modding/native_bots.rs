@@ -10,6 +10,7 @@ use horizon_core::geometry::{Aabb, Vec3};
 use horizon_world::block_collision_scan::BlockCollisionScan;
 use horizon_world::collision_context::CollisionContext;
 use mod_api::{NativePlayerInput, NativeSimulatedMove};
+use std::ops::ControlFlow;
 
 /// The most block cells `native_collision_boxes` looks at: a box of about 100 blocks a side.
 const COLLISION_CELLS: usize = 1_000_000;
@@ -52,7 +53,6 @@ fn corners(b: Aabb) -> [f64; 6] {
 }
 
 // Native mods use these; nothing in Horizon does.
-#[allow(dead_code)]
 impl Game<'_> {
     /// One tick of the server player `uuid`'s own movement from `input`, as their client would
     /// play it (`LocalPlayer.aiStep` and `Player.travel`): walking and strafing (`forward` and
@@ -163,6 +163,43 @@ impl Game<'_> {
         level: mod_api::LevelRef,
         aabb: [f64; 6],
     ) -> Option<Vec<[f64; 6]>> {
+        let mut boxes = Vec::new();
+        self.scan_block_collisions(level, aabb, |found| {
+            boxes.extend(found.iter().copied().map(corners));
+            ControlFlow::Continue(())
+        })?;
+        Some(boxes)
+    }
+
+    /// Whether any block collision shape is in `aabb`, the block half of
+    /// `CollisionGetter.noCollision` negated: `level_collision_boxes`'s walk, stopped at the
+    /// first shape. None as for that.
+    pub(super) fn level_has_collisions(
+        &self,
+        level: mod_api::LevelRef,
+        aabb: [f64; 6],
+    ) -> Option<bool> {
+        let mut any = false;
+        self.scan_block_collisions(level, aabb, |found| {
+            any = !found.is_empty();
+            if any {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        Some(any)
+    }
+
+    /// `Level.getBlockCollisions(null, aabb)`'s walk, each block's world-space boxes to `visit`
+    /// until it breaks. None for another level than the one in place, a box that isn't one,
+    /// one over `COLLISION_CELLS` and a read error.
+    fn scan_block_collisions(
+        &self,
+        level: mod_api::LevelRef,
+        aabb: [f64; 6],
+        mut visit: impl FnMut(&[Aabb]) -> ControlFlow<()>,
+    ) -> Option<()> {
         let bounds = aabb_of(aabb)?;
         if !self.level_in_place(level) {
             return None;
@@ -181,14 +218,15 @@ impl Game<'_> {
         ) else {
             return None;
         };
-        let mut boxes = Vec::new();
         for hit in scan {
             let Ok(hit) = hit else {
                 return None;
             };
-            boxes.extend(hit.shape.boxes().iter().copied().map(corners));
+            if visit(hit.shape.boxes()).is_break() {
+                break;
+            }
         }
-        Some(boxes)
+        Some(())
     }
 }
 

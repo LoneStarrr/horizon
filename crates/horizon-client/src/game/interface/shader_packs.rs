@@ -11,7 +11,7 @@ use horizon_client::text::Text;
 use horizon_shaders::{BlockIds, Macros, Pack, Properties, dimension_folder_named, load_post};
 
 use super::{Dim, Game};
-use mod_api::render::EntitySpan;
+use mod_render::render::EntitySpan;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
@@ -168,6 +168,7 @@ pub(super) fn picks_material_pack(settings: &horizon_client::settings::Settings)
 
 /// The ids a pack gives entities and block entities (4.1, 5.3), for the spans of the entity
 /// geometry.
+#[cfg_attr(test, derive(Default))]
 pub(super) struct PackIds {
     entities: HashMap<String, i32>,
     blocks: BlockIds,
@@ -259,6 +260,8 @@ impl Game<'_> {
                     );
                 }
                 Ok(None) => {}
+                // Stopped because it isn't wanted any more: not the pack's failure.
+                Err(refused) if refused.is_cancelled() => {}
                 Err(refused) => {
                     for note in refused.notes {
                         log::warn!("shader pack {name}: {note}");
@@ -668,6 +671,15 @@ impl Game<'_> {
         }
     }
 
+    /// Starts a span for mod model copies (`WorldDrawContext::draw_model_instances`) under a
+    /// pack: block entities, as `BlockEntityDrawContext::model` draws the same model, with the
+    /// id of a block the pack doesn't list, since no block owns them. Nothing without a pack.
+    pub(super) fn mark_model_copies(&self, start: usize) {
+        if let Some(ids) = &self.pack_ids {
+            self.push_span(start, "BLOCK_ENTITIES", ids.missing_block);
+        }
+    }
+
     /// Starts the span of the local player's model; `hidden` in first person, where only a
     /// pack's shadow pass draws it.
     pub(super) fn mark_player(&self, start: usize, hidden: bool) {
@@ -761,7 +773,7 @@ fn block_item_ids(
 
 /// Spans for a native mod (`native_render::RenderNeeds::entity_spans`), without a pack.
 fn native_spans() -> bool {
-    horizon_client::gfx::native_render::render_needs().entity_spans
+    horizon_client::gfx::native_render::needs().entity_spans
 }
 
 /// A span's id for entity type `name` without a pack: stable, so a mod can match runs from one

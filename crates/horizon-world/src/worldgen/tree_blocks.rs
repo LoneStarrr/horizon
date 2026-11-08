@@ -183,6 +183,7 @@ impl TreeBlocks {
                     FluidKind::Water => *flag |= WATER_SOURCE | WATER_FLUID | ANY_FLUID,
                     FluidKind::FlowingWater => *flag |= WATER_FLUID | ANY_FLUID,
                     FluidKind::Lava | FluidKind::FlowingLava => *flag |= LAVA_FLUID | ANY_FLUID,
+                    FluidKind::Mod(_) | FluidKind::ModFlowing(_) => *flag |= ANY_FLUID,
                     FluidKind::Empty => {}
                 }
                 if fluid.is_source() {

@@ -391,6 +391,8 @@ impl Game<'_> {
         if self.riding == Some(c.id) {
             self.dismount_removed_vehicle(p.y);
         }
+        // BlockAttachedEntity.kill, before dropItem.
+        self.entity_killed_event([p.x, p.y, p.z], by_player);
         self.audio.play(
             "minecraft:entity.cushion.break",
             Some([p.x, p.y, p.z]),
@@ -408,6 +410,18 @@ impl Game<'_> {
         }
         let stack = c.item_stack_with_data();
         self.spawn_item(stack, [p.x, p.y, p.z], [0.0; 3], 10);
+    }
+
+    /// `Entity.kill` of a cushion (`/kill`): gone with no drop, its rider let go.
+    pub(super) fn kill_cushion(&mut self, id: u32) {
+        let Some(i) = self.cushions.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let c = self.cushions.remove(i);
+        self.world.modified.insert((c.pos[0] >> 4, c.pos[2] >> 4));
+        if self.riding == Some(c.id) {
+            self.dismount_removed_vehicle(c.position.y);
+        }
     }
 
     /// `Cushion.showBreakingParticles`: ten of the matching wool block.
@@ -529,6 +543,23 @@ impl Game<'_> {
         }
     }
 
+    /// `LivingEntity.dismountVehicle` from a live vehicle at `vehicle` whose
+    /// block (`blockPosition`) is in `#minecraft:portals`: the rider leaves by
+    /// the same free-position branch as from a removed vehicle, not beside it.
+    /// True when it did.
+    pub(super) fn dismount_in_portal(&mut self, vehicle: Vec3) -> bool {
+        let pos = [
+            vehicle.x.floor() as i32,
+            vehicle.y.floor() as i32,
+            vehicle.z.floor() as i32,
+        ];
+        if !self.named_block_in_tag("minecraft:portals", &self.block_name(pos)) {
+            return false;
+        }
+        self.dismount_removed_vehicle(vehicle.y);
+        true
+    }
+
     /// `Entity.positionRider` for the mobs (and other players) sitting on a
     /// cushion: its passenger attachment `(0, 0.25, 0)`, less the rider's own
     /// vehicle attachment. A server sends no position for a passenger, so
@@ -583,7 +614,7 @@ impl Game<'_> {
     pub(super) fn cushion_geometry(
         &self,
         camera: glam::DVec3,
-        out: &mut Vec<mod_api::render::Vertex>,
+        out: &mut Vec<mod_render::render::Vertex>,
     ) {
         let Some(model) = self.cushion_model.as_ref() else {
             return;

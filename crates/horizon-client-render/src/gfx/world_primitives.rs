@@ -1,6 +1,7 @@
 //! Native mods' world primitives (`native_world_primitives`, docs/native-mods.md): lines, boxes,
-//! beams and text a mod hands the game each frame, drawn here with Horizon's own pipelines at
-//! the end of the world pass, after the entities and before the first-person hand. They draw
+//! beams and text a mod hands the game each frame, drawn here with Horizon's own pipelines in
+//! the world pass at the stages they were given (`render_level_stage`), the last one after the
+//! entities and before the first-person hand. They draw
 //! into the world's targets, so they take the world's reversed depth, its draw resolution and
 //! TAA's jitter; a mod never touches wgpu for them.
 
@@ -9,6 +10,9 @@ use glam::Mat4;
 
 /// Initial per-view line and quad limits, shared by CPU submission and GPU setup.
 pub const DEFAULT_CAPACITY: u32 = 4096;
+
+/// The stages a frame draws primitives at, in frame order (`RenderLevelStage`).
+pub const STAGES: usize = 5;
 
 /// A frame's primitives, camera-relative, as the game tessellated them: quads of 4 vertices
 /// from the shared atlas (plain colours on its white texel, text on its glyphs, beams on the
@@ -20,6 +24,10 @@ pub struct Batch<'a> {
     pub quads_through: &'a [Vertex],
     pub lines: &'a [[f32; 8]],
     pub lines_through: &'a [[f32; 8]],
+    /// Where each stage but the last ends, as counts of quads, quads through walls, lines and
+    /// lines through walls: each slice holds its stages in frame order, and what follows the
+    /// last end is the last stage's. All zero, everything draws at the last stage.
+    pub stage_ends: [[u32; 4]; STAGES - 1],
 }
 
 impl Batch<'_> {
@@ -56,6 +64,8 @@ pub struct WorldPrimitives {
     index_data: Vec<u32>,
     /// Quads depth tested, quads through walls, lines depth tested, lines through walls.
     counts: [u32; 4],
+    /// The batch's `stage_ends`, clamped to `counts`.
+    stage_ends: [[u32; 4]; STAGES - 1],
 }
 
 struct AtlasGroup {
@@ -226,6 +236,7 @@ impl WorldPrimitives {
             line_instances: Vec::new(),
             index_data: Vec::new(),
             counts: [0; 4],
+            stage_ends: [[0; 4]; STAGES - 1],
         }
     }
 
@@ -280,6 +291,7 @@ impl WorldPrimitives {
         let quads = [batch.quads, batch.quads_through].map(|q| (q.len() / 4) as u32);
         let lines = [batch.lines, batch.lines_through].map(|l| l.len() as u32);
         self.counts = [quads[0], quads[1], lines[0], lines[1]];
+        self.stage_ends = clamped_ends(batch.stage_ends, self.counts);
         if batch.is_empty() {
             return false;
         }
@@ -331,20 +343,33 @@ impl WorldPrimitives {
         true
     }
 
-    /// Draws what [`Self::prepare`] uploaded into a pass over the world's colour and depth:
-    /// the depth-tested quads and lines, then those seen through walls over everything.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Draws the stages from `*next` to `stage` that [`Self::prepare`] uploaded into a pass
+    /// over the world's colour and depth, and moves `next` past them: a stage the frame did
+    /// not reach in this pass draws here, after those before it. Within the stages, the
+    /// depth-tested quads and lines, then those seen through walls over everything. Leaves
+    /// the pass with its own pipeline, bind group 0 and buffers.
+    pub fn draw_through(&self, pass: &mut wgpu::RenderPass<'_>, next: &mut usize, stage: usize) {
+        let (first, last) = (*next, stage.min(STAGES - 1));
+        if first > last {
+            return;
+        }
+        *next = last + 1;
         let Some(AtlasGroup { group, .. }) = &self.group else {
             return;
         };
-        let [quads, quads_through, lines, lines_through] = self.counts;
+        let [quads, quads_through, lines, lines_through] =
+            spans(self.counts, &self.stage_ends, first, last);
+        if quads.is_empty()
+            && quads_through.is_empty()
+            && lines.is_empty()
+            && lines_through.is_empty()
+        {
+            return;
+        }
         pass.set_bind_group(0, group, &[]);
-        for (through, (quad_range, line_range)) in [
-            (0..quads, 0..lines),
-            (quads..quads + quads_through, lines..lines + lines_through),
-        ]
-        .into_iter()
-        .enumerate()
+        for (through, (quad_range, line_range)) in [(quads, lines), (quads_through, lines_through)]
+            .into_iter()
+            .enumerate()
         {
             if !quad_range.is_empty() {
                 pass.set_pipeline(&self.quad_pipelines[through]);
@@ -359,6 +384,35 @@ impl WorldPrimitives {
             }
         }
     }
+}
+
+/// A batch's stage ends made safe to draw from: never decreasing, never past `counts`.
+fn clamped_ends(ends: [[u32; 4]; STAGES - 1], counts: [u32; 4]) -> [[u32; 4]; STAGES - 1] {
+    let mut floor = [0; 4];
+    ends.map(|end| {
+        floor = std::array::from_fn(|i| end[i].clamp(floor[i], counts[i]));
+        floor
+    })
+}
+
+/// The uploaded quads and lines of stages `first..=last`: quads depth tested, quads through
+/// walls, lines depth tested, lines through walls, each as a range of its buffer, where the
+/// through-walls ones follow all the depth-tested ones.
+fn spans(
+    counts: [u32; 4],
+    ends: &[[u32; 4]; STAGES - 1],
+    first: usize,
+    last: usize,
+) -> [std::ops::Range<u32>; 4] {
+    let start = first.checked_sub(1).map_or([0; 4], |stage| ends[stage]);
+    let end = ends.get(last).copied().unwrap_or(counts);
+    let [quads, _, lines, _] = counts;
+    [
+        start[0]..end[0],
+        quads + start[1]..quads + end[1],
+        start[2]..end[2],
+        lines + start[3]..lines + end[3],
+    ]
 }
 
 #[cfg(test)]
@@ -421,6 +475,40 @@ mod tests {
     }
 
     #[test]
+    fn each_stage_draws_its_own_part_of_every_slice() {
+        // Quads, quads through walls, lines, lines through walls: 6, 2, 4, 3 in all.
+        let counts = [6, 2, 4, 3];
+        // AfterSky has 1 quad; AfterOpaqueBlocks nothing; AfterTranslucentBlocks 2 quads and
+        // a line; AfterWeather a quad through walls; AfterLevel the rest.
+        let ends = [[1, 0, 0, 0], [1, 0, 0, 0], [3, 0, 1, 0], [3, 1, 1, 0]];
+        assert_eq!(spans(counts, &ends, 0, 0), [0..1, 6..6, 0..0, 4..4]);
+        assert_eq!(spans(counts, &ends, 1, 1), [1..1, 6..6, 0..0, 4..4]);
+        assert_eq!(spans(counts, &ends, 2, 2), [1..3, 6..6, 0..1, 4..4]);
+        assert_eq!(spans(counts, &ends, 3, 3), [3..3, 6..7, 1..1, 4..4]);
+        assert_eq!(spans(counts, &ends, 4, 4), [3..6, 7..8, 1..4, 4..7]);
+        // A pass that skipped the middle stages draws them with the next one, in order.
+        assert_eq!(spans(counts, &ends, 1, 3), [1..3, 6..7, 0..1, 4..4]);
+        // Everything, as a batch without stages draws.
+        assert_eq!(spans(counts, &ends, 0, 4), [0..6, 6..8, 0..4, 4..7]);
+        assert_eq!(
+            spans(counts, &[[0; 4]; STAGES - 1], 4, 4),
+            [0..6, 6..8, 0..4, 4..7]
+        );
+    }
+
+    #[test]
+    fn stage_ends_past_the_counts_or_going_back_are_clamped() {
+        let ends = clamped_ends(
+            [[9, 0, 2, 0], [1, 0, 1, 0], [9, 9, 9, 9], [0; 4]],
+            [6, 2, 4, 3],
+        );
+        assert_eq!(
+            ends,
+            [[6, 0, 2, 0], [6, 0, 2, 0], [6, 2, 4, 3], [6, 2, 4, 3]]
+        );
+    }
+
+    #[test]
     fn uploads_preserve_ranges_and_reuse_high_water_storage() {
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
@@ -455,6 +543,7 @@ mod tests {
             quads_through: &through,
             lines: &lines,
             lines_through: &lines_through,
+            ..Default::default()
         };
         assert!(!primitives.prepare(
             &device,
@@ -677,6 +766,7 @@ mod tests {
             quads_through: &quads_through,
             lines: &lines,
             lines_through: &lines_through,
+            ..Default::default()
         };
 
         let mut primitives = WorldPrimitives::new(&device, format);
@@ -752,7 +842,7 @@ mod tests {
                 }),
                 ..Default::default()
             });
-            primitives.draw(&mut pass);
+            primitives.draw_through(&mut pass, &mut 0, STAGES - 1);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,

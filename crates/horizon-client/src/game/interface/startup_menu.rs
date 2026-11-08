@@ -124,7 +124,7 @@ impl StartupMenu {
     }
 
     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
-        let registry = Arc::new(mod_api::__private::game_rule_registry());
+        let registry = Arc::new(crate::game::api_values::game_rule_registry());
         if let Some(PendingWorldEntry::Local {
             create: Some(options),
             ..
@@ -705,6 +705,11 @@ impl Loading {
                     let dir = std::path::PathBuf::from("recordings");
                     let _ = std::fs::create_dir_all(&dir);
                     packs::open_folder(&dir);
+                }
+                Event::OpenStudioReplay(path) => {
+                    self.menu.options_open = false;
+                    self.menu.dragging = false;
+                    self.menu.pending = Some(PendingWorldEntry::StudioReplay(path));
                 }
             }
         }

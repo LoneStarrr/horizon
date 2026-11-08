@@ -10,7 +10,7 @@ pub(super) const NATIVE_EXPLOSION_MAX_RADIUS: f32 = 32.0;
 
 /// What a mod's blast does to blocks (`Level.ExplosionInteraction`). Built by
 /// mods only.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "native mod API (docs/native-mods.md)")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum NativeBlast {
     /// Blocks stay; entities are hurt and pushed (`ExplosionInteraction.NONE`).
@@ -34,7 +34,7 @@ fn blast_ok(center: [f64; 3], radius: f32) -> bool {
         && radius <= NATIVE_EXPLOSION_MAX_RADIUS
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "native mod API (docs/native-mods.md)")]
 impl Game<'_> {
     /// Explodes at `center` in the level in place, `dimension`, as
     /// `Level.explode(null, x, y, z, radius, fire, interaction)` does: the
@@ -91,6 +91,7 @@ impl Game<'_> {
         let c = &mut self.combat;
         BlastState {
             source: c.explosion_source.take(),
+            direct: c.explosion_direct.take(),
             cause: c.explosion_cause.take(),
             source_named: std::mem::take(&mut c.explosion_source_named),
             in_water: std::mem::take(&mut c.explosion_in_water),
@@ -104,6 +105,7 @@ impl Game<'_> {
     fn restore_blast_state(&mut self, s: BlastState) {
         let c = &mut self.combat;
         c.explosion_source = s.source;
+        c.explosion_direct = s.direct;
         c.explosion_cause = s.cause;
         c.explosion_source_named = s.source_named;
         c.explosion_in_water = s.in_water;
@@ -116,6 +118,7 @@ impl Game<'_> {
 /// The fields of `CombatTracker` that describe the blast going off now.
 struct BlastState {
     source: Option<u32>,
+    direct: Option<u32>,
     cause: Option<horizon_client::advancements::EntityView>,
     source_named: bool,
     in_water: bool,

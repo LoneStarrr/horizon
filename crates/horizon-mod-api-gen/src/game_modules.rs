@@ -56,7 +56,11 @@ pub(crate) fn declarations(game: &Path) -> Result<String, String> {
                     file.display()
                 ));
             }
-            let cfg = if name.ends_with("_tests")
+            let cfg = if name == "friends" {
+                "#[cfg(feature = \"friends\")]\n"
+            } else if name == "friends_off" {
+                "#[cfg(not(feature = \"friends\"))]\n"
+            } else if name.ends_with("_tests")
                 && !source
                     .lines()
                     .any(|line| line == "// game-module-cfg: always")
@@ -66,8 +70,13 @@ pub(crate) fn declarations(game: &Path) -> Result<String, String> {
                 ""
             };
             let absolute = file.canonicalize().map_err(|e| e.to_string())?;
+            let declaration_name = if name == "friends_off" {
+                "friends".to_owned()
+            } else {
+                name.clone()
+            };
             let declaration = format!(
-                "{cfg}#[path = {:?}]\n{visibility} mod {name};\n",
+                "{cfg}#[path = {:?}]\n{visibility} mod {declaration_name};\n",
                 absolute.to_string_lossy()
             );
             if modules.insert(name.clone(), declaration).is_some() {
@@ -193,6 +202,21 @@ pub(crate) fn expand(path: &Path, source: &str) -> Result<String, String> {
     Ok(lines.concat())
 }
 
+/// Materialize generated module lists in a disposable game source copy before external tools
+/// traverse it. Uses the same source view as point discovery and internals widening, without
+/// widening visibility, adding points or requiring an OUT_DIR. Never pass a downloaded cache.
+pub fn materialize_game_modules(root: &Path) -> Result<(), String> {
+    for file in crate::points::game_files(&root.join("crates/horizon-client/src"), false)? {
+        let source =
+            fs::read_to_string(&file.path).map_err(|e| format!("{}: {e}", file.path.display()))?;
+        let expanded = expand(&file.path, &source)?;
+        if expanded != source {
+            fs::write(&file.path, expanded).map_err(|e| format!("{}: {e}", file.path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parse(path: &Path, source: &str) -> Result<syn::File, String> {
     syn::parse_file(&expand(path, source)?).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -200,6 +224,44 @@ pub(crate) fn parse(path: &Path, source: &str) -> Result<syn::File, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialization_writes_a_plain_module_view_without_instrumentation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("materialized-areas-{}", std::process::id()));
+        let src = root.join("crates/horizon-client/src");
+        let area = src.join("game/runtime");
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join(".game-area"), "").unwrap();
+        fs::write(src.join("game.rs"), format!("{INCLUDE}\n")).unwrap();
+        let body = "fn untouched() -> u32 { 7 }";
+        fs::write(area.join("feature.rs"), body).unwrap();
+        materialize_game_modules(&root).unwrap();
+        let source = fs::read_to_string(src.join("game.rs")).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let [syn::Item::Mod(module)] = file.items.as_slice() else {
+            panic!("{source}")
+        };
+        assert_eq!(module.ident, "feature");
+        let syn::Meta::NameValue(path) = &module.attrs[0].meta else {
+            panic!("{source}")
+        };
+        let syn::Expr::Lit(value) = &path.value else {
+            panic!("{source}")
+        };
+        let syn::Lit::Str(relative) = &value.lit else {
+            panic!("{source}")
+        };
+        assert_eq!(
+            fs::read_to_string(src.join(relative.value())).unwrap(),
+            body
+        );
+        assert_eq!(fs::read_to_string(area.join("feature.rs")).unwrap(), body);
+        materialize_game_modules(&root).unwrap();
+        assert_eq!(fs::read_to_string(src.join("game.rs")).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Git for Windows checks sources out with CRLF by default.
     #[test]

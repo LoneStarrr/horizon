@@ -1,9 +1,6 @@
 //! Read-only block, tag and fluid queries for native mods.
 use super::{Dim, Game};
-use horizon_client::{
-    items::{ItemStack, Items},
-    world::World,
-};
+use horizon_client::{items::Items, world::World};
 use horizon_world::{
     chunk::BlockState,
     fluid::{FluidKind, FluidState as EngineFluidState},
@@ -11,7 +8,7 @@ use horizon_world::{
     registry::{BlockRegistry, BlockStateId},
 };
 use mod_api::BlockKey;
-use mod_api::{FluidState, LevelRef, NativeLifecycleContext, TagRegistry, UnresolvedFluid};
+use mod_api::{FluidState, LevelRef, NativeLifecycleContext, UnresolvedFluid};
 
 /// Why a server block cannot be read.
 #[allow(dead_code)]
@@ -71,16 +68,6 @@ pub(super) fn block_in_tag(block: BlockKey, tag: &str) -> Option<bool> {
     }))
 }
 
-/// `ItemStack.is(TagKey)` over the merged item tags. An empty stack tests `minecraft:air`.
-pub(super) fn stack_in_tag(items: &Items, stack: &ItemStack, tag: &str) -> bool {
-    let item = if stack.count == 0 {
-        "minecraft:air"
-    } else {
-        &stack.item
-    };
-    items.item_in_tag(&horizon_client::command::args::normalized(tag), item)
-}
-
 /// `BlockState.getFluidState`. None for an id no state has.
 pub(super) fn state_fluid(
     behaviours: &Behaviours,
@@ -107,6 +94,20 @@ pub(super) fn fluid_in_tag(items: &Items, fluid: &str, tag: &str) -> bool {
     )
 }
 
+/// `FluidState.getShape`'s one box for `fluid` with `above` over it: up to a full block under
+/// the same fluid (`FluidState.getHeight`), else to the fluid's own height. None for no fluid.
+fn fluid_shape(fluid: EngineFluidState, above: Option<EngineFluidState>) -> Option<[f64; 6]> {
+    if fluid.kind() == FluidKind::Empty {
+        return None;
+    }
+    let height = if above.is_some_and(|above| above.kind().same_family(fluid.kind())) {
+        1.0
+    } else {
+        f64::from(fluid.own_height())
+    };
+    Some([0.0, 0.0, 0.0, 1.0, height, 1.0])
+}
+
 /// The fluid a registry id names, with or without `minecraft:`.
 fn fluid_kind(fluid: &str) -> Option<FluidKind> {
     FluidKind::from_name(&horizon_client::command::args::normalized(fluid))
@@ -118,29 +119,35 @@ impl Game<'_> {
         mod_api::__private::unresolved_fluid_name(fluid)
     }
 
-    /// The merged tag tables, once the world has built them. None on a server's client, whose
-    /// tags are not the server's, and before the world has loaded its tags (the world lock is
-    /// installed after they are built).
+    /// The tag tables mods read: on a client the tags its server sent, once they are installed
+    /// (`install_remote_tags`), elsewhere the merged tables, once the world has built them (the
+    /// world lock is installed after they are built). None before that.
     pub(super) fn native_tag_items(&self) -> Option<&Items> {
-        (!self.options.execution_role.is_client() && self.session_lock.is_some())
-            .then(|| self.items())
+        if self.options.execution_role.is_client() {
+            return self.remote.as_ref()?.tags.as_ref();
+        }
+        self.session_lock.is_some().then(|| self.items())
     }
 
-    /// Whether the resolved block is in the world's merged block tag. Unknown tags return false;
-    /// unavailable authoritative tags or owning-thread block mappings return None.
+    /// `items`' block tags, over this game's block ids.
+    pub(super) fn block_tag_sets(
+        &self,
+        items: &Items,
+    ) -> std::collections::HashMap<String, horizon_world::level::data::BlockSet> {
+        let registry = self.pack.assets.registry;
+        prepare_block_tags(items, |name| {
+            registry
+                .default_state(name)
+                .map(|state| self.res.behaviours().block(state))
+        })
+    }
+
+    /// Whether the resolved block is in the world's merged block tag, on a client the tag its
+    /// server sent. Unknown tags return false; unavailable tags or owning-thread block mappings
+    /// return None.
     pub(super) fn block_in_tag(&self, block: BlockKey, tag: &str) -> Option<bool> {
         self.native_tag_items()?;
         block_in_tag(block, tag)
-    }
-
-    /// The members of a tag in vanilla's order (`HolderSet.Named` iteration: file order, nested
-    /// tags in place, first occurrence kept), over the merged tags. Empty for an unknown tag.
-    /// None as for `block_in_tag`.
-    pub(super) fn tag_members(&self, registry: TagRegistry, tag: &str) -> Option<Vec<String>> {
-        let members = self
-            .native_tag_items()?
-            .tag_members(registry, &horizon_client::command::args::normalized(tag));
-        Some(members.map(<[String]>::to_vec).unwrap_or_default())
     }
 
     /// The outline of `state` as `BlockState.getShape` answers it with an empty getter at the
@@ -160,8 +167,8 @@ impl Game<'_> {
     }
 
     /// Whether `fluid` is in the fluid tag `tag` (`FluidState.is(TagKey)`, `minecraft:water` or
-    /// `water`), over the merged fluid tags. An unknown tag is false. None as for
-    /// `block_in_tag`.
+    /// `water`), over the merged fluid tags, on a client those its server sent. An unknown tag
+    /// is false. None as for `block_in_tag`.
     pub(super) fn fluid_in_tag(&self, fluid: &str, tag: &str) -> Option<bool> {
         Some(fluid_in_tag(self.native_tag_items()?, fluid, tag))
     }
@@ -172,6 +179,23 @@ impl Game<'_> {
     pub(super) fn level_fluid_state(&self, level: LevelRef, pos: [i32; 3]) -> Option<FluidState> {
         let state = self.level_block_state(level, pos)?;
         self.state_fluid_state(state)
+    }
+
+    /// The fluid's shape at `pos` (`FluidState.getShape`), block-local: none for no fluid, else
+    /// the floor to `FluidState.getHeight`, a full block under the same fluid and the fluid's
+    /// own height otherwise. None as for `level_block_state`; an unloaded block above is no
+    /// fluid.
+    pub(super) fn level_fluid_shape(
+        &self,
+        level: LevelRef,
+        pos: [i32; 3],
+    ) -> Option<Vec<[f64; 6]>> {
+        let behaviours = self.res.behaviours();
+        let fluid = behaviours.fluid(self.level_block_state(level, pos)?);
+        let above = self
+            .level_block_state(level, [pos[0], pos[1] + 1, pos[2]])
+            .map(|state| behaviours.fluid(state));
+        Some(fluid_shape(fluid, above).into_iter().collect())
     }
 
     /// Whether `fluid` and `other` are the same fluid (`Fluid.isSame`): a source and its
@@ -253,13 +277,42 @@ mod tests {
     use super::super::native_entity_refs::tests::with_game;
     use super::*;
     use horizon_client::chunk::Chunk;
+    use horizon_client::items::TagRegistry;
     use mod_api::LevelHost;
     use std::sync::Arc;
 
     #[test]
+    fn a_fluid_shape_is_full_under_the_same_fluid_and_its_own_height_otherwise() {
+        let source = EngineFluidState::WATER;
+        let shallow = EngineFluidState::new(FluidKind::FlowingWater, 3, false);
+        let lava = EngineFluidState::new(FluidKind::Lava, 8, false);
+        assert_eq!(fluid_shape(EngineFluidState::EMPTY, Some(source)), None);
+        // FlowingFluid.getOwnHeight: amount / 9, so a source is 8/9 high under air.
+        let top = |shape: Option<[f64; 6]>| shape.map(|b| b[4]);
+        assert_eq!(
+            top(fluid_shape(source, None)),
+            Some(f64::from(8.0f32 / 9.0))
+        );
+        assert_eq!(
+            top(fluid_shape(shallow, None)),
+            Some(f64::from(3.0f32 / 9.0))
+        );
+        // Flowing water under a source is the same fluid: a full block.
+        assert_eq!(top(fluid_shape(shallow, Some(source))), Some(1.0));
+        assert_eq!(
+            top(fluid_shape(source, Some(lava))),
+            Some(f64::from(8.0f32 / 9.0))
+        );
+        assert_eq!(
+            fluid_shape(source, Some(source)),
+            Some([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
     fn fluid_state_conversion_preserves_source_and_empty_invariants() {
         mod_api::__private::install(Default::default());
-        mod_api::__private::part_tests::register_game_keys([]);
+        crate::game::api_values::register_game_keys([]);
         for kind in FluidKind::ALL {
             let engine =
                 EngineFluidState::new(kind, if kind == FluidKind::Empty { 0 } else { 8 }, true);
@@ -281,7 +334,10 @@ mod tests {
         use horizon_world::level::states::BlockId;
         use mod_api::__private::{ResolvedBlock, part_tests, resolve_blocks};
         mod_api::__private::install(Default::default());
-        part_tests::register_game_keys(["minecraft:stone".into(), "test:machine".into()]);
+        crate::game::api_values::register_game_keys([
+            "minecraft:stone".into(),
+            "test:machine".into(),
+        ]);
         let stone = part_tests::block_key("stone");
         let machine = part_tests::block_key("test:machine");
         let mut items = Items::for_tests(Default::default());
@@ -435,30 +491,43 @@ mod tests {
                 "stripped_oak_wood",
             ]
             .map(|name| format!("minecraft:{name}"));
+            let engine_members = |registry, tag: &str| {
+                game.native_tag_items().map(|items| {
+                    items
+                        .tag_members(registry, &horizon_client::command::args::normalized(tag))
+                        .unwrap_or_default()
+                        .to_vec()
+                })
+            };
             for registry in [TagRegistry::Block, TagRegistry::Item] {
                 assert_eq!(
-                    game.tag_members(registry, "oak_logs").as_deref(),
+                    engine_members(registry, "oak_logs").as_deref(),
                     Some(&oak[..])
                 );
             }
             {
                 let host: &dyn mod_api::Host = game;
+                let tags = host.tags();
+                let oak_tag = tags
+                    .key(&mod_api::Identifier::parse("minecraft:oak_logs").unwrap())
+                    .unwrap();
                 assert_eq!(
-                    host.tag_members(TagRegistry::Item, "oak_logs").as_deref(),
+                    tags.items(oak_tag)
+                        .map(|keys| keys.into_iter().map(|key| key.id(host)).collect::<Vec<_>>())
+                        .as_deref(),
                     Some(&oak[..])
                 );
-                assert_eq!(
-                    host.item_stack_in_tag(&ItemStack::new("minecraft:oak_log", 1), "oak_logs"),
-                    Some(true)
-                );
+                let item = host
+                    .item_key(&mod_api::Identifier::parse("minecraft:oak_log").unwrap())
+                    .unwrap();
+                assert_eq!(tags.is_in_tag(item, oak_tag), Some(true));
             }
             assert_eq!(
-                game.tag_members(TagRegistry::Fluid, "minecraft:water")
-                    .unwrap(),
+                engine_members(TagRegistry::Fluid, "minecraft:water").unwrap(),
                 ["minecraft:water", "minecraft:flowing_water"]
             );
             assert_eq!(
-                game.tag_members(TagRegistry::Item, "nope:missing"),
+                engine_members(TagRegistry::Item, "nope:missing"),
                 Some(Vec::new())
             );
 
@@ -724,11 +793,15 @@ mod tests {
             assert_eq!(game.world.chunks.len(), chunks, "nothing was loaded");
             game.options.execution_role = super::super::execution_role::ExecutionRole::Client;
             let host: &dyn mod_api::Host = game;
-            assert_eq!(host.tag_members(TagRegistry::Item, "oak_logs"), None);
-            assert_eq!(
-                host.item_stack_in_tag(&ItemStack::new("minecraft:oak_log", 1), "oak_logs"),
-                None
-            );
+            let tags = host.tags();
+            let oak_tag = tags
+                .key(&mod_api::Identifier::parse("minecraft:oak_logs").unwrap())
+                .unwrap();
+            let item = host
+                .item_key(&mod_api::Identifier::parse("minecraft:oak_log").unwrap())
+                .unwrap();
+            assert_eq!(tags.items(oak_tag), None);
+            assert_eq!(tags.is_in_tag(item, oak_tag), None);
             game.session_lock = None;
             let _ = std::fs::remove_dir_all(dir);
         });
@@ -767,28 +840,5 @@ mod tests {
             assert_eq!(host.fluid_pickup_sound("minecraft:empty"), None);
             assert_eq!(host.fluid_pickup_sound("nope:missing"), None);
         });
-    }
-
-    #[test]
-    fn an_empty_stack_tests_air() {
-        let mut tags = std::collections::HashMap::new();
-        tags.insert(
-            "minecraft:x".to_owned(),
-            ["minecraft:air".to_owned()].into_iter().collect(),
-        );
-        let items = Items::for_tests(tags);
-        let stack = |item: &str, count| ItemStack {
-            item: item.into(),
-            count,
-            damage: 0,
-            extra: None,
-        };
-        assert!(stack_in_tag(&items, &stack("minecraft:stone", 0), "x"));
-        assert!(!stack_in_tag(&items, &stack("minecraft:stone", 1), "x"));
-        assert!(!stack_in_tag(
-            &items,
-            &stack("minecraft:stone", 0),
-            "minecraft:y"
-        ));
     }
 }

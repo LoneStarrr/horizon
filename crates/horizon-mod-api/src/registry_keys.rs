@@ -9,8 +9,12 @@ impl BlockKey {
     pub(crate) fn from_slot(slot: u32) -> Result<Self, &'static str> {
         crate::parts::with_registering_keys(|registering| {
             registering
-                .unwrap_or(crate::parts::requested_keys())
-                .blocks
+                .map(|requests| &requests.blocks)
+                .unwrap_or_else(|| {
+                    resolved_block_keys()
+                        .get()
+                        .unwrap_or(&crate::parts::requested_keys().blocks)
+                })
                 .id(slot)
                 .ok_or("unknown BlockKey slot")?;
             Ok(Self(slot))
@@ -36,14 +40,71 @@ impl FluidKey {
 impl ItemKey {
     pub(crate) fn from_slot(slot: u32) -> Result<Self, &'static str> {
         crate::parts::with_registering_keys(|registering| {
-            registering
-                .unwrap_or(crate::parts::requested_keys())
-                .items
-                .id(slot)
-                .ok_or("unknown ItemKey slot")?;
+            let names = match registering {
+                Some(requests) => &requests.items,
+                None => resolved_items()
+                    .get()
+                    .unwrap_or(&crate::parts::requested_keys().items),
+            };
+            names.id(slot).ok_or("unknown ItemKey slot")?;
             Ok(Self(slot))
         })
     }
+}
+
+fn resolved_items() -> &'static std::sync::OnceLock<horizon_mod_runtime::registry_keys::Names> {
+    static EMPTY: std::sync::OnceLock<horizon_mod_runtime::registry_keys::Names> =
+        std::sync::OnceLock::new();
+    crate::parts::installed().map_or(&EMPTY, |installed| &installed.resolved_items)
+}
+
+/// Complete the load-owned item table with all registry entries, preserving requested slots.
+/// Missing forward references are refused before publishing any keys.
+pub fn resolve_items<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Vec<crate::parts::ItemKeyError>> {
+    let names = crate::parts::requested_keys()
+        .items
+        .complete(ids, |mod_id, id| crate::parts::ItemKeyError {
+            mod_id,
+            id: id.to_owned(),
+        })?;
+    let _ = resolved_items().set(names);
+    Ok(())
+}
+
+fn resolved_block_keys() -> &'static std::sync::OnceLock<horizon_mod_runtime::registry_keys::Names>
+{
+    static EMPTY: std::sync::OnceLock<horizon_mod_runtime::registry_keys::Names> =
+        std::sync::OnceLock::new();
+    crate::parts::installed().map_or(&EMPTY, |installed| &installed.resolved_blocks)
+}
+
+/// Complete block identities at the same load boundary as item identities. World mappings
+/// remain owning-thread data; these names belong to the installed mod registry.
+pub fn resolve_block_keys<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<(), Vec<String>> {
+    let names = crate::parts::requested_keys()
+        .blocks
+        .complete(ids, |mod_id, id| {
+            format!("mod {mod_id} requested unknown block {id}")
+        })?;
+    let _ = resolved_block_keys().set(names);
+    Ok(())
+}
+
+/// Find a block in the completed registry without allocating at a hook boundary.
+pub fn block_key(id: &str) -> Option<BlockKey> {
+    Some(BlockKey(*resolved_block_keys().get()?.slots.get(id)?))
+}
+
+/// Find an item in the completed registry without allocating at a hook boundary.
+pub fn item_key(id: &str) -> Option<ItemKey> {
+    Some(ItemKey(*resolved_items().get()?.slots.get(id)?))
+}
+
+/// Resolve a typed identifier at a load boundary without formatting it as a string.
+pub fn item_key_by_identifier(id: &crate::Identifier) -> Option<ItemKey> {
+    Some(ItemKey(*resolved_items().get()?.identifiers.get(id)?))
 }
 
 impl EffectKey {
@@ -161,13 +222,16 @@ pub fn resolve_fluids(ids: &[&str]) -> Result<(), Vec<UnknownFluid>> {
 
 /// Resolve an engine fluid kind through the load-owned mapping.
 pub fn world_fluid_key(kind: horizon_world::fluid::FluidKind) -> Option<FluidKey> {
-    crate::parts::resolved_fluids()
-        .get()?
-        .world_fluids
-        .get(kind as usize)
-        .copied()
-        .flatten()
-        .map(FluidKey)
+    let names = crate::parts::resolved_fluids().get()?;
+    match kind.vanilla_index() {
+        Some(index) => names
+            .world_fluids
+            .get(usize::from(index))
+            .copied()
+            .flatten()
+            .map(FluidKey),
+        None => names.slots.get(kind.name()).copied().map(FluidKey),
+    }
 }
 
 /// Find a fluid key at a data-loading boundary.
@@ -255,8 +319,9 @@ thread_local! {
 pub fn prepare_blocks(
     mut resolve: impl FnMut(&str) -> Option<ResolvedBlock>,
 ) -> Result<Vec<ResolvedBlock>, Vec<String>> {
-    crate::parts::requested_keys()
-        .blocks
+    resolved_block_keys()
+        .get()
+        .unwrap_or(&crate::parts::requested_keys().blocks)
         .resolve(&mut resolve, |mod_id, id| {
             format!("mod {mod_id} requested unknown block {id}")
         })
@@ -324,12 +389,18 @@ pub fn effect_id(key: EffectKey) -> Option<&'static str> {
 
 /// Canonical diagnostic name of a trusted, load-owned slot, independent of world resolution.
 pub fn block_id(key: BlockKey) -> Option<&'static str> {
-    Some(&crate::parts::requested_keys().blocks.entries[key.0 as usize].id)
+    resolved_block_keys()
+        .get()
+        .unwrap_or(&crate::parts::requested_keys().blocks)
+        .id(key.0)
 }
 
 /// Canonical diagnostic name retained by an item registration slot.
 pub fn item_id(key: ItemKey) -> Option<&'static str> {
-    crate::parts::requested_keys().items.id(key.0)
+    resolved_items()
+        .get()
+        .unwrap_or(&crate::parts::requested_keys().items)
+        .id(key.0)
 }
 
 /// The API key for an engine registry index, also for entries not explicitly requested by mods.
@@ -351,5 +422,130 @@ impl crate::BoolGameRuleKey {
                 .ok_or("unknown bool rule slot")?;
             Ok(Self(slot))
         })
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use crate::{Hooks, ModEntry, Registrar, RegistrationContext};
+
+    struct Requests;
+    #[crate::__subscriptions]
+    impl Hooks for Requests {
+        fn register(&self, registrar: &mut dyn Registrar, _: &RegistrationContext) {
+            assert_eq!(registrar.block_key("stone").0, 0);
+        }
+    }
+
+    #[test]
+    fn completed_blocks_preserve_slots_and_bind_unrequested_states() {
+        crate::install_parts(
+            &[ModEntry::new("test", Box::new(Requests))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
+        assert!(resolve_block_keys(["minecraft:air"]).is_err());
+        assert!(block_key("minecraft:air").is_none());
+        let names = [
+            "test:machine",
+            "minecraft:zombie_head",
+            "minecraft:stone",
+            "minecraft:air",
+            "minecraft:birch_log",
+            "minecraft:air",
+        ];
+        resolve_block_keys(names).unwrap();
+        let stone = block_key("minecraft:stone").unwrap();
+        let air = block_key("minecraft:air").unwrap();
+        assert_eq!(stone, BlockKey(0));
+        assert_eq!(air, BlockKey(1));
+        assert_eq!(BlockKey::from_slot(air.0), Ok(air));
+        assert_eq!(block_key("minecraft:birch_log"), Some(BlockKey(2)));
+        assert_eq!(block_key("minecraft:zombie_head"), Some(BlockKey(3)));
+        assert_eq!(block_key("test:machine"), Some(BlockKey(4)));
+        assert!(BlockKey::from_slot(5).is_err());
+        for name in [
+            "",
+            "missing:block",
+            "minecraft:不存在",
+            &"x".repeat(100_000),
+        ] {
+            assert_eq!(block_key(name), None);
+        }
+        assert_eq!(block_id(air), Some("minecraft:air"));
+        let mapping = prepare_blocks(|name| {
+            let state = match name {
+                "minecraft:air" => 0,
+                "minecraft:stone" => 1,
+                "minecraft:birch_log" => 2,
+                "minecraft:zombie_head" => 3,
+                "test:machine" => 4,
+                _ => return None,
+            };
+            Some(ResolvedBlock {
+                default: BlockStateId(state),
+                states: BlockStateRange::new(BlockStateId(state), 1),
+                block: horizon_world::level::states::BlockId(state as u16),
+            })
+        })
+        .unwrap();
+        install_blocks(mapping);
+        assert_eq!(block(air).unwrap().default, BlockStateId(0));
+        assert_eq!(block(stone).unwrap().default, BlockStateId(1));
+        assert!(prepare_blocks(|_| None).is_err());
+        assert_eq!(block(stone).unwrap().default, BlockStateId(1));
+        // Reversing the registry's enumeration cannot change any completed key.
+        crate::install_parts(
+            &[ModEntry::new("test", Box::new(Requests))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
+        resolve_block_keys(names.into_iter().rev()).unwrap();
+        for (name, slot) in [
+            ("minecraft:stone", 0),
+            ("minecraft:air", 1),
+            ("minecraft:birch_log", 2),
+            ("minecraft:zombie_head", 3),
+            ("test:machine", 4),
+        ] {
+            assert_eq!(block_key(name), Some(BlockKey(slot)));
+        }
+        // Replacing Parts replaces the load-owned identities, not a second global registry.
+        crate::install_parts(&[], &crate::parts::tests::rule_schema()).unwrap();
+        assert!(block_key("minecraft:air").is_none());
+        assert!(BlockKey::from_slot(air.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod item_tests {
+    use super::*;
+    use crate::{Hooks, ModEntry, Registrar, RegistrationContext};
+
+    struct Requests;
+    #[crate::__subscriptions]
+    impl Hooks for Requests {
+        fn register(&self, registrar: &mut dyn Registrar, _: &RegistrationContext) {
+            assert_eq!(registrar.item_key("stick").0, 0);
+        }
+    }
+
+    #[test]
+    fn completed_items_preserve_forward_slots_and_refuse_unresolved_requests() {
+        crate::install_parts(
+            &[ModEntry::new("test", Box::new(Requests))],
+            &crate::parts::tests::rule_schema(),
+        )
+        .unwrap();
+        assert!(resolve_items(["minecraft:stone"]).is_err());
+        assert!(item_key("minecraft:stone").is_none());
+        resolve_items(["minecraft:stone", "minecraft:stick", "minecraft:apple"]).unwrap();
+        assert_eq!(item_key("minecraft:stick"), Some(ItemKey(0)));
+        let apple = item_key("minecraft:apple").unwrap();
+        assert_ne!(apple, ItemKey(0));
+        assert_eq!(ItemKey::from_slot(apple.0), Ok(apple));
+        assert_eq!(item_id(apple), Some("minecraft:apple"));
+        assert!(ItemKey::from_slot(3).is_err());
     }
 }

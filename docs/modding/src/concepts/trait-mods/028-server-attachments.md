@@ -27,6 +27,32 @@ identity: `Entity`, `Player`, `BlockEntity`, `Chunk` or `Level`. It is `Copy`, d
 anything loaded, and follows each handle's ordinary stale-world and unload rules. Unlike
 the storage-relative `Holder`, it carries the handle's world scope.
 
+Import `AttachmentQueries` to use `host.query(&TYPE)` on either host side. The
+returned batch is a **snapshot** of membership and stored value bindings in the
+host's current dimension. Its `iter()` borrows `&T` without cloning values and
+lazily decodes saved entries; malformed or incompatible values produce row errors,
+not defaults. Later sets, removals and unloads appear only in fresh queries. This
+is a residency view: an entity queued for removal but not yet swept can still
+appear. Captured handles do not keep holders loaded, and stale writes fail.
+Interior mutability inside `T` is not deep-frozen by a snapshot.
+
+On a server, import `AttachmentQueriesMut` for `host.query_mut(&TYPE)` (`T: Clone`).
+Each borrowed row has `holder()`, `value()`, and explicit `set(host, replacement)` /
+`remove(host)` methods. These validate residency against the host's current
+dimension and then use the ordinary attachment journal. There is no `&mut T`,
+implicit transaction, or commit on drop: wrap a system in `host.transaction` for
+all-or-nothing writes. Unload or replacement produces `AttachmentRowError::StaleHolder`.
+Rows retain captured values even after successful write-through updates.
+
+Traversal follows dense index order: insertion appends, and removal fills its slot
+with the last row. The same ordered mutation history is deterministic, but the
+order is neither sorted nor stable across structural changes. Retaining a batch
+can make the next live mutation copy row metadata and shared pointers once;
+retaining many batches keeps their old bindings alive. Native acquisition clones
+only the bucket Arc. The generated component boundary transfers the whole owned
+batch; it does not import one host call per row. Erased values from an incompatible
+type domain report `TypeMismatch` rather than falling back to saved decoding.
+
 ```rust
 use mod_api::{AttachmentCodec, AttachmentError, AttachmentType, Compound, Holder, Tag};
 

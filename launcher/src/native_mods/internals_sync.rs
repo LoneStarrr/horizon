@@ -30,7 +30,7 @@ impl std::fmt::Display for Error {
                 "E_INTERNAL_SOURCE_UNAVAILABLE: internals sync needs the source for {revision}. It is not cached and could not be downloaded: {error}",
                 &[("revision", revision), ("error", reason)],
             )),
-            Self::SourceInjection => f.write_str(crate::i18n::tr("E_INTERNAL_SOURCE_INJECTION: internals sync checks library code and raw listeners, not source-spliced helpers or modules. Use cargo horizon-mod internals add for this mod.")),
+            Self::SourceInjection => f.write_str(crate::i18n::tr("E_INTERNAL_SOURCE_INJECTION: internals sync checks library code and raw listeners, not source listeners, helpers or modules. Use cargo horizon-mod internals add for this mod.")),
             Self::Check(reason) => f.write_str(reason),
         }
     }
@@ -43,10 +43,10 @@ pub(crate) fn check(folder: &Path) -> Result<Vec<ListedInternal>, Error> {
     let _lease = crate::native_cache::Cache::acquire(&crate::backend::build_dir())
         .map_err(|error| Error::Check(super::cache_error(error)))?;
     super::clear_log()?;
-    discover(folder)
+    discover(folder, &super::root().join("internals-sync"))
 }
 
-fn discover(folder: &Path) -> Result<Vec<ListedInternal>, Error> {
+fn discover(folder: &Path, cache_root: &Path) -> Result<Vec<ListedInternal>, Error> {
     let bundle = super::bundle_in(folder)?.ok_or_else(|| {
         trf(
             "{path} is not a native mod project.",
@@ -71,7 +71,7 @@ fn discover(folder: &Path) -> Result<Vec<ListedInternal>, Error> {
         .as_ref()
         .expect("native bundle")
         .horizon;
-    let cache = super::root().join("internals-sync").join(revision);
+    let cache = cache_root.join(revision);
     let game = cache.join("game");
     if !game.join(".discovery-ready").is_file() {
         let source = super::source(revision).map_err(|reason| Error::SourceUnavailable {
@@ -91,6 +91,9 @@ fn discover(folder: &Path) -> Result<Vec<ListedInternal>, Error> {
         )?;
         fs::write(fresh.join(".discovery-ready"), "").map_err(|e| e.to_string())?;
         fs::rename(&fresh, &game).map_err(|e| e.to_string())?;
+    }
+    if super::prebuilt::source_refusal(&game, &projects)?.is_some() {
+        return Err(Error::SourceInjection);
     }
     let stage = cache.join("stage");
     prepare_stage(&game, &stage)?;
@@ -272,6 +275,40 @@ fn parse(line: &str, mod_dir: &Path, stage: &Path) -> Option<Message> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn discovery_refuses_private_source_listeners_before_facade_assembly() {
+        for kind in ["before_call", "after_call", "modify_value"] {
+            let root = super::super::tests::dir("discovery-source-listener");
+            let folder = root.join("mod");
+            super::super::tests::write_bundle(&folder, "example", "");
+            fs::write(
+                folder.join("Cargo.toml"),
+                "[package]\nname='example'\nversion='0.1.0'\n[dependencies]\nmod_api={package='horizon-mod-api',version='0.1'}\n",
+            )
+            .unwrap();
+            let manifest = folder.join(horizon_mod_package::manifest::MANIFEST);
+            let text = fs::read_to_string(&manifest).unwrap();
+            fs::write(manifest, format!("{text}\n[[inject]]\nid='value'\nat='game::run'\nkind='{kind}'\nwith='listen'\naccess='internals'\nhash='signature'\ncall='game::other'\nnth=0\nctx='statement'\n")).unwrap();
+            let bundle = super::super::bundle_in(&folder).unwrap().unwrap();
+            let game = root
+                .join(&bundle.manifest.native.as_ref().unwrap().horizon)
+                .join("game");
+            fs::create_dir_all(&game).unwrap();
+            fs::write(game.join(".discovery-ready"), "").unwrap();
+            fs::write(game.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            fs::write(game.join("points.json"), r#"{"points":[],"sites":[]}"#).unwrap();
+            fs::write(game.join("internals.json"), json!([{
+                "path":"game::run", "kind":"fn", "signature":"fn run()", "hash":"signature", "cfg":"", "shape_only":false
+            }]).to_string()).unwrap();
+            let result = std::panic::catch_unwind(|| discover(&folder, &root));
+            assert!(
+                matches!(result, Ok(Err(Error::SourceInjection))),
+                "discovery must return the typed source refusal, not panic: {result:?}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn discovery_cache_keeps_the_resolved_lock_and_game_sources_but_replaces_mods() {

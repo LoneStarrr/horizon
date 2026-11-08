@@ -56,6 +56,21 @@ impl Game<'_> {
         true
     }
 
+    /// `ServerPlayer.closeContainer` of a guest's menu: every menu they have open closes through
+    /// the path a disconnect and a `stillValid` failure use, then their client is told. Refuses
+    /// clients, stale menus, a player swapped in for a turn, and the inventory menu (window 0),
+    /// which is never closed.
+    pub(super) fn menu_close_container(&mut self, menu: MenuRef) -> bool {
+        if !self.is_logical_server() || menu.fields().window == 0 {
+            return false;
+        }
+        let Some(conn) = self.native_menu_guest(menu).map(|guest| guest.conn) else {
+            return false;
+        };
+        self.guest_close_menus_and_tell(conn);
+        true
+    }
+
     /// Press button `button` of the local player's open menu as a click on
     /// one of its buttons does (`MultiPlayerGameMode.handleInventoryButtonClick`,
     /// `ContainerButtonClick`): the server's menu decides what it does
@@ -68,6 +83,43 @@ impl Game<'_> {
         !self.is_logical_server()
             && self.native_client_menu_name(menu).is_some()
             && self.remote_button_click(button)
+    }
+
+    pub(super) fn menu_slot_boxes(&self, menu: MenuRef) -> Option<Vec<Option<[f32; 4]>>> {
+        if self.screen != super::Screen::Inventory || !self.screen_hooks_open() {
+            return None;
+        }
+        let name = self.native_client_menu_name(menu)?;
+        let renderer = self.renderer.as_ref()?;
+        let batch = super::HudBatch::new(
+            [renderer.config.width, renderer.config.height],
+            self.settings.gui_scale_inputs(),
+        );
+        self.inventory_menu_slot_boxes(name, &batch)
+    }
+
+    fn inventory_menu_slot_boxes(
+        &self,
+        name: &str,
+        batch: &super::HudBatch,
+    ) -> Option<Vec<Option<[f32; 4]>>> {
+        Self::inventory_screen_slot(name, 0)?;
+        if self.book_covers_menu(batch.width) {
+            return None;
+        }
+        let visible = self.slots();
+        let (ox, oy) = self.inventory_origin(batch);
+        Some(
+            (0..)
+                .map_while(|slot| Self::inventory_screen_slot(name, slot))
+                .map(|slot| {
+                    visible.contains(&slot).then(|| {
+                        let (x, y) = self.slot_position(slot);
+                        [ox + x, oy + y, 16.0, 16.0]
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn native_client_menu_name(&self, menu: MenuRef) -> Option<&str> {
@@ -426,6 +478,7 @@ fn client_click_ops(
 
 #[cfg(test)]
 mod tests {
+    use super::super::api_values::TryIntoApi;
     use super::super::{lan::LanSettings, native_entity_refs::tests::with_game};
     use super::*;
     use horizon_client::lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig};
@@ -434,6 +487,28 @@ mod tests {
         Arc,
         atomic::{AtomicI32, AtomicUsize},
     };
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn inventory_boxes_follow_menu_indices_and_the_input_layout() {
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            game.screen = super::super::Screen::Inventory;
+            let batch = super::super::HudBatch::new([800, 600], game.settings.gui_scale_inputs());
+            let boxes = game.inventory_menu_slot_boxes("inventory", &batch).unwrap();
+            assert_eq!(boxes.len(), 46);
+            for (index, expected_slot) in [(0, 200), (9, 9), (36, 0), (45, 504)] {
+                let [x, y, w, h] = boxes[index].unwrap();
+                assert_eq!(
+                    game.slot_at(&batch, x + w / 2.0, y + h / 2.0),
+                    Some(expected_slot)
+                );
+            }
+            assert!(
+                game.inventory_menu_slot_boxes("unsupported", &batch)
+                    .is_none()
+            );
+        });
+    }
 
     #[test]
     fn client_click_actions_encode_vanilla_ops() {
@@ -571,6 +646,115 @@ mod tests {
 
     #[test]
     #[ignore = "needs prepared resources"]
+    fn a_server_closes_a_guests_menu_and_sets_their_selected_slot() {
+        with_game(|game| {
+            let config = HubConfig {
+                default_game_mode: 0,
+                guest_commands: false,
+                force_game_mode: false,
+                hardcore: false,
+                view_distance: 4,
+                simulation_distance: 4,
+                dimension: "minecraft:overworld".into(),
+                allow_flight: true,
+                seed: 0,
+                max_players: 10,
+                integrated: true,
+                levels: game.level_shapes,
+            };
+            let mut net = NetConfig::lan(0, "test".into(), 10);
+            net.listen = false;
+            game.lan_host(
+                LanSettings {
+                    port: 0,
+                    guest_commands: false,
+                    force_game_mode: false,
+                },
+                net,
+                config,
+            )
+            .unwrap();
+            game.lan.as_mut().unwrap().hub.guests.push(guest());
+            let player = game.player(123).unwrap();
+
+            // The selected slot: a slot past the hotbar is refused, a real one is held.
+            assert_eq!(player.selected_slot(game), Some(0));
+            assert!(!player.set_selected_slot(game, 9));
+            assert!(player.set_selected_slot(game, 4));
+            assert!(
+                player.set_selected_slot(game, 4),
+                "the same slot is no error"
+            );
+            assert_eq!(player.selected_slot(game), Some(4));
+            assert_eq!(game.lan.as_ref().unwrap().hub.guests[0].selected, 4);
+
+            // A menu: closing it returns the carried stack and leaves no menu behind.
+            let stone = ItemStack::new("minecraft:stone", 4);
+            let host = game.lan.as_mut().unwrap();
+            {
+                let value = Some(stone.clone());
+                host.hub.guests.update(0, |guest| guest.carried = value);
+            }
+            host.hub
+                .open_native_menu(
+                    1,
+                    1,
+                    horizon_core::nbt::Tag::String("test".into()),
+                    vec![Some(stone.clone())],
+                )
+                .unwrap();
+            let menu = game.player_container_menu(player).unwrap();
+            assert_ne!(menu.container_id(game), Some(0));
+            assert!(menu.close_container(game));
+            let guest = &game.lan.as_ref().unwrap().hub.guests[0];
+            assert!(guest.menu.is_none(), "the menu is gone");
+            assert!(guest.carried.is_none(), "the cursor stack went back");
+            assert_eq!(
+                guest
+                    .inventory
+                    .iter()
+                    .flatten()
+                    .map(|s| s.count)
+                    .sum::<u32>(),
+                4,
+                "to the inventory, none lost or doubled"
+            );
+            assert!(!menu.close_container(game), "a stale menu is refused");
+            // The player's own inventory menu is never closed.
+            let inventory = game.player_container_menu(player).unwrap();
+            assert_eq!(inventory.container_id(game), Some(0));
+            assert!(!inventory.close_container(game));
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources"]
+    fn a_stack_is_thrown_from_the_eyes_as_player_drop_does() {
+        use horizon_client::motion::PlayerMotion;
+        use horizon_core::geometry::Vec3;
+
+        with_game(|game| {
+            // A body to throw from: `with_game` makes none.
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            let stone = ItemStack::new("minecraft:stone", 3);
+            let before = game.dropped.len();
+            let id = game.drop_stack_from_eyes(stone.clone(), true).unwrap();
+            assert_eq!(game.dropped.len(), before + 1);
+            let thrown = game.dropped.last().unwrap();
+            assert_eq!((thrown.id, &thrown.stack), (id, &stone));
+            assert!(thrown.thrower.is_some(), "the drop key names the thrower");
+            game.drop_stack_from_eyes(stone.clone(), false).unwrap();
+            assert!(game.dropped.last().unwrap().thrower.is_none());
+            assert_eq!(
+                game.drop_stack_from_eyes(ItemStack::new("minecraft:stone", 0), true),
+                None,
+                "an empty stack is no drop"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources"]
     fn menus_read_storage_and_invalidate_on_replacement_wrap_and_reconnect() {
         with_game(|game| {
             let config = HubConfig {
@@ -635,10 +819,19 @@ mod tests {
             assert_eq!(menu.container_id(game), Some(window));
             assert_eq!(menu.kind(game), Some(Some("minecraft:generic_9x1".into())));
             assert_eq!(menu.slot_count(game), Some(45));
-            assert_eq!(menu.slot(game, 0), Some(Some(stone.clone())));
+            assert_eq!(
+                menu.slot(game, 0),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
             assert_eq!(menu.slot(game, 1), Some(None));
-            assert_eq!(menu.slot(game, 9), Some(Some(stone.clone())));
-            assert_eq!(menu.carried(game), Some(Some(stone)));
+            assert_eq!(
+                menu.slot(game, 9),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
+            assert_eq!(
+                menu.carried(game),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
             assert_eq!(
                 game.menu_slot_backing(menu, 0),
                 Some(MenuSlotBacking::Native(0))
@@ -709,7 +902,10 @@ mod tests {
                     slot: 0
                 })
             );
-            assert_eq!(menu.slot(game, 2), Some(Some(stone.clone())));
+            assert_eq!(
+                menu.slot(game, 2),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
             let vehicle = (i32::MAX - 15, VEHICLE_KEY_Y, 42);
             game.world
                 .block_entities
@@ -731,7 +927,10 @@ mod tests {
                     slot: 0
                 })
             );
-            assert_eq!(menu.slot(game, 0), Some(Some(stone)));
+            assert_eq!(
+                menu.slot(game, 0),
+                Some(Some(stone.try_into_api().unwrap()))
+            );
 
             // Identical coordinates in different dimensions must not alias.
             let gold = ItemStack::new("minecraft:gold_ingot", 2);
@@ -776,7 +975,10 @@ mod tests {
             let other_player = game.player(456).unwrap();
             let nether_menu = game.player_container_menu(other_player).unwrap();
             let nether = game.level("minecraft:the_nether").unwrap();
-            assert_eq!(overworld_menu.slot(game, 0), Some(Some(gold)));
+            assert_eq!(
+                overworld_menu.slot(game, 0),
+                Some(Some(gold.try_into_api().unwrap()))
+            );
             assert_eq!(
                 game.menu_slot_backing(overworld_menu, 0),
                 Some(MenuSlotBacking::BlockEntity {
@@ -789,7 +991,10 @@ mod tests {
                 game.enter_command_level(super::super::Dim::Overworld)
                     .is_some()
             );
-            assert_eq!(nether_menu.slot(game, 0), Some(Some(emerald)));
+            assert_eq!(
+                nether_menu.slot(game, 0),
+                Some(Some(emerald.try_into_api().unwrap()))
+            );
             assert_eq!(
                 game.menu_slot_backing(nether_menu, 0),
                 Some(MenuSlotBacking::BlockEntity {

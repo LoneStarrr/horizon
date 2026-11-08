@@ -666,10 +666,10 @@ mod tests {
                 manifest +=
                     &format!("[native]\ngame = '26.3'\nhorizon = '{pin}'\nmixins = '{pin}'\n");
                 if id == "tracked_code" || id == "local_code" {
-                    manifest += &format!(
-                        "internals = [{{path = 'horizon_client::game::Game', hash = '{}'}}]\n",
+                    manifest = manifest.replace("[native]", &format!(
+                        "internals = [{{path = 'horizon_client::game::Game', hash = '{}'}}]\n[native]",
                         "b".repeat(64)
-                    );
+                    ));
                 }
             }
             let mut zip = zip::ZipWriter::new(std::fs::File::create(home.join(&file)).unwrap());

@@ -20,17 +20,18 @@ impl BlockPart for Probe {
         _: HostSide,
         event: &mut ItemAfterVerticalCollisionEvent<'_>,
     ) -> Flow {
+        let stack = event.stack.as_ref().expect("active item stack");
         self.contacts.lock().unwrap().push((
             event.client,
             event.entity,
             event.block_pos,
             event.item_pos,
-            event.stack.count,
+            stack.count(),
         ));
-        if event.stack.count == 1 {
+        if stack.count() == 1 {
             return Flow::Cancel;
         }
-        event.stack.count = event.stack.count.saturating_sub(2);
+        *event.stack = event.stack.take().unwrap().shrink(2);
         Flow::Continue
     }
 }
@@ -121,9 +122,9 @@ fn the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entit
     let mods: mod_api::Mods =
         vec![mod_api::ModEntry::new("contact", Box::new(probe.clone()))].into();
     mod_api::testing::with_mods(mods.clone(), || {
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         let registry = game.pack.assets.registry;
-        mod_api::__private::part_tests::register_game_keys(
+        crate::game::api_values::register_game_keys(
             (0..registry.len())
                 .map(|i| {
                     registry

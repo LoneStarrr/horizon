@@ -3,7 +3,7 @@ name = "horizon-mod-package"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.95"
+rust-version.workspace = true
 description = "Horizon's mod files: content mods, modpacks and the registry index (docs/modding/src/how-to/content-mods.md)"
 
 [dependencies]
@@ -22,7 +22,13 @@ minisign-verify = { version = "0.3", optional = true }
 # A shader pack's check (kind `shader`): the one the game runs before it loads a pack.
 horizon-shader-api = { path = "../horizon-shader-api", optional = true }
 
+# Bounded, checksummed prebuilt metadata; used only by the launcher and mod tools.
+cap-std = { version = "3.4.6", optional = true }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"], optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+
 [features]
+prebuilt = ["dep:cap-std", "dep:flate2", "dep:tar"]
 # The mod registry's index (docs/modding/src/reference/registry-index.md): the launcher, the registry server and its CI.
 index = ["dep:minisign-verify", "dep:horizon-shader-api"]
 

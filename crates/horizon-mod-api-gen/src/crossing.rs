@@ -396,6 +396,8 @@ pub struct Named {
     pub generic: bool,
     /// A layout the staging metadata does not prove can be accessed.
     pub opaque_reason: Option<&'static str>,
+    /// Conditional fields or variants forbid copying and field access, but not handles.
+    pub guarded: bool,
     /// Declared in another crate than the game's, where the table reads it.
     pub foreign: bool,
     /// `#[non_exhaustive]` on it or a case of it: another crate can't build it.
@@ -473,8 +475,6 @@ impl Rule {
                 Some(reason)
             } else if generic {
                 Some("generic type")
-            } else if guarded {
-                Some("conditional field or variant")
             } else if foreign && API_CRATES.contains(&path.split("::").next().unwrap_or_default()) {
                 // Listed lower types and reachable shapes are both widened in the staged copy;
                 // the mod API's own layouts never are.
@@ -491,6 +491,7 @@ impl Rule {
                     lifetimes,
                     generic,
                     opaque_reason,
+                    guarded,
                     foreign,
                     sealed,
                 },
@@ -865,7 +866,10 @@ impl Rule {
             .iter()
             .map(|field| self.shape(&named.module, Some(path), field.ty))
             .collect();
-        let crossing = self.all(parts.iter(), open);
+        let crossing = match self.all(parts.iter(), open) {
+            Crossing::Copy(_) if named.guarded => Crossing::Opaque,
+            crossing => crossing,
+        };
         open.pop();
         self.memo.borrow_mut().insert(path.to_owned(), crossing);
         crossing
@@ -923,6 +927,24 @@ pub(crate) mod tests {
             shape_only: false,
             opaque_reason: None,
             refs: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn guarded_copy_layouts_stay_opaque() {
+        for signature in [
+            "struct Small { #[cfg(feature = \"x\")] value: u8 }",
+            "enum Small { Always, #[cfg(feature = \"x\")] Conditional(u8) }",
+        ] {
+            let kind = if signature.starts_with("enum") {
+                "enum"
+            } else {
+                "struct"
+            };
+            let rule = Rule::new(&[internal("horizon_client::Small", kind, signature)]);
+            let shape = rule.shape("horizon_client", None, &syn::parse_str("Small").unwrap());
+            assert!(matches!(shape, Shape::Named(..)));
+            assert_eq!(rule.crossing_of(&shape), Crossing::Opaque);
         }
     }
 

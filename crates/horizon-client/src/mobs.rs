@@ -262,6 +262,19 @@ impl ModelNormals {
         }
         self
     }
+    fn part_rotated(mut self, pose: [f32; 9], rotation: glam::Mat3) -> Self {
+        self.matrix *= rotation;
+        let scale = glam::Vec3::new(pose[6], pose[7], pose[8]);
+        if scale.x.abs() == scale.y.abs() && scale.x.abs() == scale.z.abs() {
+            if scale.min_element() < 0.0 {
+                self.matrix *= glam::Mat3::from_diagonal(scale.signum());
+            }
+        } else {
+            self.matrix *= glam::Mat3::from_diagonal(scale.recip());
+            self.trusted = false;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -792,21 +805,12 @@ impl MobTypes {
     }
 }
 pub use horizon_client_core::who::Who;
-impl From<mod_api::NativeEffectDamage> for DamageKind {
-    fn from(damage: mod_api::NativeEffectDamage) -> Self {
-        match damage {
-            mod_api::NativeEffectDamage::Magic => Self::Magic,
-            mod_api::NativeEffectDamage::Wither => Self::Wither,
-            _ => unreachable!("NativeEffectDamage: unhandled variant"),
-        }
-    }
-}
-
 /// A native damage type's registry name and the tags consumed by mob combat.
 ///
-/// Native code supplies a static name (no interning or leaked runtime strings)
-/// and flags matching its data-pack damage tags. Register the same name/data for
-/// player damage, death messages and loot predicates. Unset tags are false.
+/// Native code supplies a static name and flags matching its data-pack damage
+/// tags; `NamedDamage::registered` builds both from a damage registry entry,
+/// interning its name. Register the same name/data for player damage, death
+/// messages and loot predicates. Unset tags are false.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamedDamage {
     pub name: &'static str,
@@ -825,8 +829,54 @@ impl NamedDamage {
     pub const IS_FALL: u32 = 1 << 9;
     pub const BYPASSES_ENCHANTMENTS: u32 = 1 << 10;
 
+    /// Each flag with the damage tag it stands for.
+    const TAG_FLAGS: [(u32, &'static str); 11] = [
+        (Self::IS_FIRE, "minecraft:is_fire"),
+        (Self::BYPASSES_ARMOR, "minecraft:bypasses_armor"),
+        (Self::NO_KNOCKBACK, "minecraft:no_knockback"),
+        (
+            Self::BYPASSES_INVULNERABILITY,
+            "minecraft:bypasses_invulnerability",
+        ),
+        (Self::BYPASSES_EFFECTS, "minecraft:bypasses_effects"),
+        (Self::BYPASSES_RESISTANCE, "minecraft:bypasses_resistance"),
+        (Self::PANIC_CAUSES, "minecraft:panic_causes"),
+        (Self::IS_PROJECTILE, "minecraft:is_projectile"),
+        (Self::IS_EXPLOSION, "minecraft:is_explosion"),
+        (Self::IS_FALL, "minecraft:is_fall"),
+        (
+            Self::BYPASSES_ENCHANTMENTS,
+            "minecraft:bypasses_enchantments",
+        ),
+    ];
+
     pub const fn new(name: &'static str, tags: u32) -> Self {
         Self { name, tags }
+    }
+
+    /// The registered damage type `name` with the tags `catalog` gives it,
+    /// or None when the registry has no such type. The name is interned: the
+    /// registries hold a handful of ids, so one copy of each is kept for the
+    /// rest of the run.
+    pub fn registered(catalog: &horizon_world::damage_source::Catalog, name: &str) -> Option<Self> {
+        use std::{collections::HashSet, sync::Mutex};
+        static NAMES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+        let id = catalog.id(name)?;
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let names = names.get_or_insert_with(HashSet::new);
+        let name = match names.get(name) {
+            Some(&found) => found,
+            None => {
+                let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+                names.insert(leaked);
+                leaked
+            }
+        };
+        let tags = Self::TAG_FLAGS
+            .iter()
+            .filter(|(_, tag)| catalog.in_tag(id, tag))
+            .fold(0, |tags, (flag, _)| tags | flag);
+        Some(Self { name, tags })
     }
     pub const fn has(self, tag: u32) -> bool {
         self.tags & tag != 0
@@ -1167,6 +1217,10 @@ pub fn anger_left(anger_end: i64, game_time: i64) -> i32 {
 pub struct Extra {
     /// Saved fish/axolotl bucket flag; tadpoles save a constant true value.
     pub from_bucket: bool,
+    /// Tags a mod gave the mob before it joined a level (`finalize_spawn`'s
+    /// `UnspawnedMobEdits`): the level keeps a joined entity's tags with its
+    /// saved data, so they move there when the mob joins.
+    pub spawn_tags: Vec<String>,
     /// Command-created armor instances, shared by commands and runtime damage.
     pub armor_attributes: Option<Box<horizon_world::attributes::entity::EntityAttributes>>,
     /// `Mob.lootTable`: the table its death rolls instead of its type's
@@ -1249,6 +1303,9 @@ pub struct Extra {
     pub items: Vec<Option<crate::items::ItemStack>>,
     /// Occupied InventoryCarrier stacks: Piglin/trader (8 slots), Pillager (5).
     pub inventory: Vec<crate::items::ItemStack>,
+    /// `AbstractHorse.temper` of every equine (horses, llamas, camels).
+    /// Loaded signed values are independent of the gameplay modification cap.
+    pub equine_temper: i32,
     pub tame: bool,
     pub sitting: bool,
     /// `Parrot.partyParrot` and `jukebox`: the playing jukebox it dances to.
@@ -1276,6 +1333,7 @@ pub struct Extra {
     /// radius, 3 unless the save or a command says otherwise; a powered
     /// creeper blows with twice it (`explodeCreeper`).
     pub explosion_radius: i8,
+    pub adopted_body: Option<Arc<str>>,
     pub using_item: i32,
     pub using_off_hand: bool,
     /// `LivingEntity.recentKineticEnemies`: when the entities this mob's
@@ -1337,6 +1395,9 @@ pub struct Extra {
     /// Species scratch values (the wither's head targets and clocks).
     pub ints: [i32; 6],
     pub counter: i32,
+    /// Nautilus ATTACK_TARGET_COOLDOWN saved slot: None is absent,
+    /// Some(MAX) is permanent, otherwise the remaining lifetime. The value is `counter`.
+    pub nautilus_attack_cooldown_ttl: Option<i64>,
     pub counter2: i32,
     pub home: Option<[i32; 3]>,
     /// A copper golem's `openedChestPos`.
@@ -1395,6 +1456,9 @@ pub struct Extra {
     /// `getFirstPassenger`).
     pub mount: Option<u32>,
     pub rider: Option<u32>,
+    /// This rider's place in its vehicle's `getPassengers`, beside `Guest.vehicle_order`: the
+    /// lowest goes first. Passengers that load together keep 0 and their list order.
+    pub vehicle_order: i64,
     /// Where `positionRider` last seated this rider: its own vehicle
     /// attachment (`getPassengerRidingPosition(this).y` is its feet plus this)
     /// and the vehicle's box (`Mob.getAttackBoundingBox`, `getHitbox`).
@@ -1665,6 +1729,9 @@ pub struct Mob {
     /// `Entity.needsSync`: knocked back, pushed or jumped since its server
     /// last sent it, so the next update goes out at once.
     pub needs_sync: bool,
+    /// `Entity.syncPosition`: it bounced this tick (`restituteMovementAfterCollisions`),
+    /// so its tracker keeps this position as a step of the next move it sends.
+    pub sync_position: bool,
     /// `getAttributeValue(KNOCKBACK_RESISTANCE)` with the modifiers of the
     /// items it wears or holds (`Extra::gear_knockback`), which the game
     /// works out each tick for a mob that has any (the mob itself knows no
@@ -1779,6 +1846,9 @@ pub struct Mob {
     pub profile: Option<horizon_protocol::entity_data::Profile>,
     /// The packs' random texture variants it wears (`random_textures::choose`).
     pub random_textures: random_textures::Choice,
+    /// What `entity_size` answered for its pose and vanilla size (`EntityEvent.Size`):
+    /// `dims` uses it while it holds.
+    pub size_answer: Option<crate::pose::SizeAnswer>,
 }
 impl crate::entity_rules::EntityRules for Mob {
     fn is_no_gravity(&self) -> bool {
@@ -1937,6 +2007,8 @@ pub enum MobEvent {
     ChestOpen {
         chest: [i32; 3],
         open: bool,
+        /// The golem, the source of the container's game event.
+        mob: u32,
     },
     /// `BeeEnterHiveGoal.start`: the bee goes into its hive (the host stores
     /// its tag with `BeehiveBlockEntity.addOccupant` and discards it).
@@ -1959,9 +2031,12 @@ pub enum MobEvent {
         slot: usize,
         stack: Option<crate::items::ItemStack>,
     },
-    /// `InfestedMobEffect.onMobHurt`: the mob was hurt while infested.
+    /// `InfestedMobEffect.onMobHurt`: the mob was hurt while infested and its
+    /// draws (`infested_silverfish`) spawn silverfish at `at`, half its height
+    /// up where it was hurt, each thrown with its velocity.
     Infested {
-        mob: u32,
+        at: [f64; 3],
+        velocities: Vec<Vec3>,
     },
     /// `LivingEntity.hurtArmor` (`doHurtEquipment`): a hit that landed on a mob
     /// wearing body armour (a horse's) leaves the piece owing
@@ -1972,6 +2047,14 @@ pub enum MobEvent {
         mob: u32,
         amount: f32,
         kind: DamageKind,
+    },
+    /// `LivingEntity.updateFallFlying`: every 20 glide ticks the glider in
+    /// `slot` (the one `Util.getRandom` picked) takes one point of wear,
+    /// `ItemStack.hurtAndBreak(1, this, slot)`. The host applies it with the
+    /// item's maximum and Unbreaking.
+    GliderWear {
+        mob: u32,
+        slot: horizon_core::equipment_slot::EquipmentSlot,
     },
     /// `OfferFlowerGoal.stop`: the item goes to the target's antenna (saddle)
     /// slot if it is empty, as a guaranteed drop.
@@ -2113,8 +2196,8 @@ pub enum MobEvent {
         kind: String,
     },
     /// The centre, the radius and the kind of the mob blowing up (it may be
-    /// gone from the list by the time the blast is handled).
-    Explode([f64; 3], f32, Species),
+    /// gone from the list by the time the blast is handled), and its `Silent`.
+    Explode([f64; 3], f32, Species, bool),
     /// `Creeper.spawnLingeringCloud`, right after its `Explode`: an `AreaEffectCloud` at the
     /// creeper with its active effects `(id, remaining ticks, amplifier)`, in their mixed colour.
     LingeringCloud {
@@ -2255,6 +2338,12 @@ pub enum MobEvent {
         count: u32,
         at: [f64; 3],
     },
+    /// `Entity.spawnAtLocation` with the complete stack and its components.
+    DropStack {
+        mob: u32,
+        stack: crate::items::ItemStack,
+        at: [f64; 3],
+    },
     /// `new ItemEntity(.., stack)` thrown by `mob` (`setThrower`): `Dolphin.ItemGoal.drop`.
     ThrowItem {
         mob: u32,
@@ -2357,6 +2446,10 @@ pub enum MobEvent {
         /// The mob whose breaking this is, when it is one `LivingDestroyBlockEvent`
         /// hears (a wither's, a ravager's, a silverfish's, a zombie's).
         by: Option<u32>,
+        /// The entity `destroyBlock` names when that event doesn't hear of it (a
+        /// villager's harvest, a ravager's crop): it asks the mods nothing, and
+        /// its loot's `LootContextParams.THIS_ENTITY` is this one, as `by`'s is.
+        breaker: Option<u32>,
     },
     /// `EndermanTakeBlockGoal`: the enderman `mob` picks up the block `state` at
     /// `pos` (it already holds it); the block turns to air unless a mod stops it
@@ -2475,6 +2568,12 @@ pub enum MobEvent {
     Buck {
         mob: u32,
     },
+    /// `Entity.unRide`'s `ejectPassengers` before a move (a shulker's
+    /// teleport): whoever rides `mob` gets off where it stood, `from`.
+    EjectPassengers {
+        mob: u32,
+        from: Vec3,
+    },
     /// A piglin's admiring is over: barter or keep the item.
     FinishAdmiring {
         mob: u32,
@@ -2497,6 +2596,12 @@ pub enum MobEvent {
     VillagerMeet {
         mob: u32,
         other: u32,
+    },
+    /// `Villager.customServerAiStep`: deliver the pending TRADE reputation
+    /// event for the actual player recorded by rewardTradeXp.
+    VillagerTrade {
+        mob: u32,
+        player: [i32; 4],
     },
     /// `AbstractVillager.getOffers` for a villager whose offers are not made
     /// yet: the level rolls them (the brain has no trade data), so the
@@ -3209,6 +3314,7 @@ pub fn apply_brain_events(
                     attacker: mob as i32,
                     // Pufferfish.touch uses DamageSources.sting: the fish, no projectile.
                     projectile: None,
+                    direct: None,
                     held: [held, None],
                     player_uuid: None,
                 };
@@ -3414,7 +3520,7 @@ pub struct MobWorld<'a> {
     pub day_time: i64,
     pub raining: bool,
     pub thundering: bool,
-    pub nether: bool,
+    pub level: horizon_core::LevelKey,
     pub block_tags: &'a HashMap<String, std::collections::HashSet<String>>,
     /// Each block's `fallOn` rule (the player's landing registry).
     pub landing: &'a horizon_world::block_landing::BlockLandingRegistry,
@@ -3430,8 +3536,8 @@ pub struct MobWorld<'a> {
     /// `getCurrentDifficultyAt` at the mob being ticked (near the player
     /// outside the mob tick).
     pub difficulty: spawning::LocalDifficulty,
-    /// The End (its dimension type's monster spawn light rules).
-    pub end: bool,
+    /// The level's dimension type.
+    pub dimension_type: &'a horizon_world::dimension_type::DimensionFacts,
     /// The world seed (slime chunks).
     pub world_seed: i64,
     /// `Level.getSeaLevel` (63 in the overworld, -63 in a flat world).
@@ -3457,6 +3563,10 @@ pub struct MobWorld<'a> {
     pub asks_living_destroy_block: bool,
     /// Whether a server listener can cancel baby spawning.
     pub asks_baby_spawn: bool,
+    /// `Level.getEntity(uuid)`, for the UUIDs a mob kept of entities that were
+    /// not in the level (a warden's anger, `AngerManagement.angerByUuid`).
+    /// None: this world keeps no entity UUIDs, so nothing is resolved.
+    pub who_lookup: Option<&'a dyn WhoLookup>,
     /// The level's world border, whose walls stop a mob's moves
     /// (`Entity.collectColliders`); None: nothing stops them there.
     pub border: Option<&'a horizon_core::geometry::border::BorderGeometry>,
@@ -3519,6 +3629,13 @@ impl MobWorld<'_> {
         visibility.clamp(0.0, 10.0)
     }
 }
+/// `Level.getEntity(UUID)` for a reference a mob stored: the entity that UUID
+/// names while it is in the level, never some other entity as a stand-in. Only
+/// the game layer keeps entity UUIDs, so it answers this (`Game::who_by_uuid`)
+/// and the mob layer reaches it through `MobWorld`.
+pub trait WhoLookup {
+    fn who_by_uuid(&self, uuid: [i32; 4]) -> Option<Who>;
+}
 /// `Entity.getTeam` of the player and of the mobs on a team.
 #[derive(Clone, Debug, Default)]
 pub struct Teams<'a> {
@@ -3532,6 +3649,35 @@ impl<'a> Teams<'a> {
             Who::Mob(id) => self.mobs.get(&id).copied(),
         }
     }
+}
+/// `InfestedMobEffect.onMobHurt`'s draws from the bearer's random
+/// (`mob.getRandom()`): a 10% chance of one or two silverfish, each thrown
+/// along `look` (`spawnSilverfish`). Their velocities; none when the chance
+/// fails.
+pub fn infested_silverfish(random: &mut LegacyRandom, look: [f64; 3]) -> Vec<Vec3> {
+    if random.next_float() > 0.1 {
+        return Vec::new();
+    }
+    let count = 1 + random.next_int_bound(2).unwrap_or(0);
+    (0..count)
+        .map(|_| {
+            // Mth.randomBetween(-PI / 2, PI / 2), then in floats (JOML
+            // Vector3f): the look direction `.mul(0.3f).mul(1, 1.5f, 1)`,
+            // `.rotateY(angle)`.
+            let half = std::f32::consts::FRAC_PI_2;
+            let angle = random.next_float() * (2.0 * half) - half;
+            let sin = horizon_assets::math::joml_sin(angle);
+            let cos = horizon_assets::math::cos_from_sin(sin, angle);
+            let x = look[0] as f32 * 0.3;
+            let y = look[1] as f32 * 0.3 * 1.5;
+            let z = look[2] as f32 * 0.3;
+            Vec3::new(
+                f64::from(x * cos + z * sin),
+                f64::from(y),
+                f64::from(-x * sin + z * cos),
+            )
+        })
+        .collect()
 }
 /// `Entity.random` of a client's copy of entity `id` first seen at `position`: vanilla's is its
 /// own (`RandomSource.create()`), drawn on by nothing else; this one is seeded from the two.
@@ -3585,6 +3731,7 @@ impl Mob {
             horizontal_collision: false,
             vertical_collision_below: false,
             needs_sync: false,
+            sync_position: false,
             gear_knockback_resistance: None,
             hurt_time: 0,
             invulnerable: 0,
@@ -3644,6 +3791,7 @@ impl Mob {
             cape: None,
             profile: None,
             random_textures: Default::default(),
+            size_answer: None,
             attrs: Attrs {
                 speed: kind.speed,
                 attack_damage: kind.attack_damage,
@@ -3835,11 +3983,19 @@ impl Mob {
         self.damage_with(level, amount, source, None)
     }
     /// `LivingEntity.isInvulnerableTo` and dead or removed: only #bypasses_invulnerability gets
-    /// past the flag. The guard every damage hook runs after (`LivingIncomingDamageEvent`).
+    /// past the flag. Fire-immune mobs also refuse fire, except a ghast's reflected fireball.
+    /// The guard every damage hook runs after (`LivingIncomingDamageEvent`).
     pub fn refuses_damage(&self, source: &Damage) -> bool {
         !self.alive()
             || self.removed
             || (self.invulnerable_flag && !source.kind.bypasses_invulnerability())
+            || (source.is_fire() && self.kind.flags.fire_immune && !self.reflected_fireball(source))
+    }
+    /// `Ghast.isReflectedFireball`: its fire immunity does not refuse a player's return hit.
+    fn reflected_fireball(&self, source: &Damage) -> bool {
+        &*self.kind.id == "minecraft:ghast"
+            && source.kind == DamageKind::Fireball
+            && source.attacker == Some(Who::Player)
     }
     /// `LivingEntity.hurtServer`'s partial mob adapter, with health reductions inline.
     /// `damage` by a source with a weapon: `armor_effectiveness` runs the
@@ -3888,12 +4044,7 @@ impl Mob {
         }
         // Ghast.isReflectedFireball: a fireball a player turned back is
         // no fire to it, and kills it (Ghast.hurtServer: 1000 damage).
-        let reflected = &*self.kind.id == "minecraft:ghast"
-            && source.kind == DamageKind::Fireball
-            && source.attacker == Some(Who::Player);
-        if source.is_fire() && (self.kind.flags.fire_immune) && !reflected {
-            return false;
-        }
+        let reflected = self.reflected_fireball(&source);
         if !ai::accepts_damage(self, &source, amount, level.attack().player_uuid) {
             return false;
         }
@@ -4152,6 +4303,13 @@ impl Mob {
                         .push(MobEvent::Sound(sound, at, ai::sound_volume(self), pitch));
                 }
             }
+            // playSecondaryHurtSound: a thorns hit sounds where the mob
+            // stands, silent or not.
+            if source.kind == DamageKind::Thorns {
+                let at = [self.position.x, self.position.y, self.position.z];
+                self.outbox
+                    .push(MobEvent::Sound("enchant.thorns.hit", at, 1.0, 1.0));
+            }
         }
         // IronGolem.hurtServer: a new crack level plays the damage sound.
         if let Some(before) = crackiness
@@ -4162,8 +4320,25 @@ impl Mob {
             self.outbox
                 .push(MobEvent::Sound("entity.iron_golem.damage", at, 1.0, 1.0));
         }
+        // LivingEntity.hurtServer ends with MobEffectInstance.onMobHurt, so
+        // Infested draws from the mob's random here, before a subclass's own
+        // draws after `super.hurtServer` (an enderman's or a shulker's
+        // teleport), and its silverfish come out where the mob was hurt.
         if success && self.has_effect("minecraft:infested") {
-            self.outbox.push(MobEvent::Infested { mob: self.id });
+            let look = self.view_vector();
+            let velocities = infested_silverfish(&mut self.random, look);
+            if !velocities.is_empty() {
+                let at = [
+                    self.position.x,
+                    self.position.y + f64::from(self.height()) / 2.0,
+                    self.position.z,
+                ];
+                self.outbox.push(MobEvent::Infested { at, velocities });
+            }
+        }
+        // Shulker.hurtServer: the low-health teleport roll after `super.hurtServer`.
+        if success && self.species() == Species::Shulker {
+            shulker::after_hurt(self);
         }
         // Squid.hurtServer: a squid hurt after a living entity hit it squirts ink.
         if matches!(self.species(), Species::Squid | Species::GlowSquid)
@@ -4430,8 +4605,10 @@ impl Mob {
     /// Removes effects and schedules the effect-status update when needed.
     pub fn retain_effects(&mut self, mut keep: impl FnMut(&StoredEffect) -> bool) -> bool {
         let before = self.extra.effects.len();
+        let mut boost_removed = false;
         self.extra.effects.retain(|e| {
             let keep = keep(e);
+            boost_removed |= !keep && e.id == "minecraft:health_boost";
             if !keep && e.id == "minecraft:absorption" {
                 self.absorption = (self.absorption - 4.0 * (e.amplifier + 1) as f32).max(0.0);
             }
@@ -4449,6 +4626,9 @@ impl Mob {
             self.extra
                 .ambient_effects
                 .retain(|e| effects.iter().any(|x| x.id == *e));
+        }
+        if boost_removed {
+            finalize::health_boost_changed(self);
         }
         self.effects_dirty |= changed;
         changed
@@ -4533,7 +4713,13 @@ impl Mob {
             self.extra.hidden_effects.push(effect);
         }
         if effect == "minecraft:absorption" {
-            self.absorption = self.absorption.max(4.0 * (incoming.amplifier + 1) as f32);
+            self.absorption = self
+                .absorption
+                .max(4.0 * (incoming.amplifier + 1) as f32)
+                .clamp(0.0, armor::max_absorption(self));
+        }
+        if changed && effect == "minecraft:health_boost" {
+            finalize::health_boost_changed(self);
         }
         self.effects_dirty |= changed;
         changed
@@ -4629,6 +4815,7 @@ impl Mob {
         match effect {
             // `LivingEntity.removeAllEffects`: the absorption hearts go with it.
             ConsumeEffect::ClearAllEffects => {
+                self.extra.effect_chains.clear();
                 for e in std::mem::take(&mut self.extra.effects) {
                     if e.id == "minecraft:absorption" {
                         self.absorption =
@@ -4642,6 +4829,9 @@ impl Mob {
                     !ids.iter()
                         .any(|id| id.trim_start_matches("minecraft:") == held)
                 });
+                self.extra
+                    .effect_chains
+                    .retain(|h| self.extra.effects.iter().any(|e| e.id == h.id));
             }
             // `ApplyStatusEffectsConsumeEffect.apply`: one random draw, even at
             // probability 1.
@@ -4751,7 +4941,21 @@ impl Mob {
         if self.species() == Species::Wither || !self.can_be_affected(effect) {
             return;
         }
+        let had = self.extra.effects.iter().any(|e| e.id == effect);
+        let ambient = self.extra.ambient_effects.contains(&effect);
+        let hidden = self.extra.hidden_effects.contains(&effect);
         self.add_effect_with(effect, ticks, amplifier, false, true);
+        // The basic overload changes the chain, not the existing active flags.
+        if had {
+            self.extra.ambient_effects.retain(|id| *id != effect);
+            if ambient {
+                self.extra.ambient_effects.push(effect);
+            }
+            self.extra.hidden_effects.retain(|id| *id != effect);
+            if hidden {
+                self.extra.hidden_effects.push(effect);
+            }
+        }
     }
     pub fn speed_bonus(&self) -> f64 {
         ai::speed_bonus(self)
@@ -6040,6 +6244,52 @@ mod magic_absorb_tests {
         assert!(m.extra.hidden_effects.is_empty());
     }
 
+    /// `LivingEntity.playSecondaryHurtSound`: a `thorns` hit that lands whole
+    /// sounds `enchant.thorns.hit` where the mob stands, after its own hurt
+    /// sound and for a silent mob too (`level.playSound`, not the mob's). The
+    /// rest of a stronger hit inside the hurt cooldown makes no sound, and
+    /// another kind of hit makes none.
+    #[test]
+    fn a_thorns_hit_sounds_where_the_mob_stands() {
+        let mut fixture = crate::health::TestLevel::new(0);
+        let level = &mut fixture.level();
+        let thorns = Damage {
+            kind: DamageKind::Thorns,
+            attacker: Some(Who::Player),
+            from: Some([4.0, 2.0, 3.0]),
+            attacker_species: None,
+        };
+        let sounds = |m: &Mob| -> Vec<(&'static str, [f64; 3], f32, f32)> {
+            m.outbox
+                .iter()
+                .filter_map(|e| match e {
+                    MobEvent::Sound(s, at, volume, pitch) => Some((*s, *at, *volume, *pitch)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut m = witch();
+        m.position = Vec3::new(1.0, 2.0, 3.0);
+        m.silent = true;
+        assert!(m.damage(level, 4.0, thorns));
+        assert_eq!(
+            sounds(&m),
+            vec![("enchant.thorns.hit", [1.0, 2.0, 3.0], 1.0, 1.0)]
+        );
+        m.outbox.clear();
+        m.damage(level, 8.0, thorns);
+        assert!(sounds(&m).is_empty(), "inside the hurt cooldown");
+
+        let mut loud = witch();
+        assert!(loud.damage(level, 4.0, thorns));
+        let heard = sounds(&loud);
+        assert_eq!(heard.last().map(|s| s.0), Some("enchant.thorns.hit"));
+        let mut hit = witch();
+        assert!(hit.damage(level, 4.0, Damage::player([4.0, 2.0, 3.0])));
+        assert_eq!(heard.len(), sounds(&hit).len() + 1, "{heard:?}");
+        assert!(sounds(&hit).iter().all(|s| s.0 != "enchant.thorns.hit"));
+    }
+
     /// `Witch.getDamageAfterMagicAbsorb`: `#witch_resistant_to` (`magic`,
     /// `indirect_magic`, `sonic_boom`, `thorns`) takes 15% of the hit, which
     /// leaves a 10 health witch on 7 of a 20 hit it would not survive whole.
@@ -6968,5 +7218,155 @@ mod visibility_percent_tests {
         sneaking.head = Some(Arc::from("minecraft:skeleton_skull"));
         sneaking.sneaking = true;
         assert_eq!(sneaking.visibility_percent(Species::Skeleton), 0.4);
+    }
+}
+
+#[cfg(test)]
+mod hidden_speed_mob_tick_tests {
+    use super::*;
+    fn full_tick_promotes(no_ai: bool) {
+        let admitted = crate::mobs::world::with_built_test_world(
+            &[],
+            |world, registry| {
+                let stone = registry.default_state("minecraft:stone").unwrap();
+                world
+                    .chunks
+                    .insert((0, 0), Arc::new(crate::chunk::Chunk::empty(0, 0)));
+                world.set(2, 199, 4, stone).unwrap();
+            },
+            |w, types| {
+                let mut m = Mob::new(
+                    202,
+                    Arc::new(types.types["minecraft:pig"].clone()),
+                    Vec3::new(2.5, 200.0, 4.5),
+                    0.0,
+                );
+                m.no_ai = no_ai;
+                m.no_gravity = true;
+                assert!(m.add_effect_with("minecraft:speed", 200, 0, false, true));
+                assert!(m.add_effect_with("minecraft:speed", 40, 1, false, true));
+                assert_eq!(
+                    m.extra
+                        .effects
+                        .iter()
+                        .map(|e| (e.id, e.duration, e.amplifier))
+                        .collect::<Vec<_>>(),
+                    [("minecraft:speed", 40, 1)]
+                );
+                let mut test_level = crate::health::TestLevel::new(202);
+                let mut events = Vec::new();
+                for _ in 0..39 {
+                    assert!(m.tick(w, &mut test_level.level(), &mut events));
+                }
+                assert_eq!(
+                    m.extra
+                        .effects
+                        .iter()
+                        .map(|e| (e.id, e.duration, e.amplifier))
+                        .collect::<Vec<_>>(),
+                    [("minecraft:speed", 1, 1)]
+                );
+                assert!(m.tick(w, &mut test_level.level(), &mut events));
+                assert_eq!(
+                    m.extra
+                        .effects
+                        .iter()
+                        .map(|e| (e.id, e.duration, e.amplifier))
+                        .collect::<Vec<_>>(),
+                    [("minecraft:speed", 160, 0)],
+                    "actual Mob tick must promote its counted-down fallback"
+                );
+                assert_eq!(m.age, 40);
+                assert!(m.tick(w, &mut test_level.level(), &mut events));
+                assert_eq!(
+                    m.extra
+                        .effects
+                        .iter()
+                        .map(|e| (e.id, e.duration, e.amplifier))
+                        .collect::<Vec<_>>(),
+                    [("minecraft:speed", 159, 0)]
+                );
+            },
+        );
+        // Without the vanilla data under .local/horizon-client there is no Mob
+        // world to tick: the test has nothing to check.
+        let _ = admitted;
+    }
+    #[test]
+    fn noai_full_mob_tick_promotes_speed() {
+        full_tick_promotes(true)
+    }
+    #[test]
+    fn ai_full_mob_tick_promotes_speed() {
+        full_tick_promotes(false)
+    }
+    // Added causal controls; the three original old/fixed tests remain above.
+    #[test]
+    fn hidden_only_updates_copy_and_clear_readd_keep_active_authority() {
+        let mut kind = (*sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:pig".into();
+        kind.species = Species::Pig;
+        let mut m = Mob::new(202, Arc::new(kind), Vec3::ZERO, 0.0);
+        m.add_effect("night_vision", 400, 0);
+        assert!(m.add_effect_with("speed", 200, 0, true, false));
+        assert!(m.add_effect_with("speed", 40, 1, false, true));
+        assert_eq!(
+            (
+                m.extra.effect_chains[0].ambient,
+                m.extra.effect_chains[0].visible
+            ),
+            (true, false)
+        );
+        assert!(!m.add_effect_with("speed", 300, 0, false, true));
+        assert_eq!(
+            m.extra
+                .effects
+                .iter()
+                .map(|e| (e.id, e.duration, e.amplifier))
+                .collect::<Vec<_>>(),
+            [
+                ("minecraft:night_vision", 400, 0),
+                ("minecraft:speed", 40, 1)
+            ]
+        );
+        assert_eq!(m.extra.effect_chains[0].duration, 300);
+        assert!(!m.add_effect_with("speed", 40, 1, false, true));
+        let mut to = Mob::new(203, m.kind.clone(), Vec3::ZERO, 0.0);
+        conversion::single(&m, &mut to, conversion::Params::KEEP_ALL);
+        assert_eq!(to.extra.effects, m.extra.effects);
+        assert_eq!(to.extra.effect_chains, m.extra.effect_chains);
+        to.extra.effect_chains[0].duration = 222;
+        assert_eq!(m.extra.effect_chains[0].duration, 300);
+        m.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::RemoveEffects(vec!["minecraft:speed".into()]),
+        );
+        assert_eq!(
+            m.extra
+                .effects
+                .iter()
+                .map(|e| (e.id, e.duration, e.amplifier))
+                .collect::<Vec<_>>(),
+            [("minecraft:night_vision", 400, 0)]
+        );
+        assert!(m.extra.effect_chains.is_empty());
+        m.add_effect("speed", 20, 0);
+        assert!(m.extra.effect_chains.is_empty());
+        m.add_effect("speed", 5, 1);
+        assert_eq!(m.extra.effect_chains[0].duration, 20);
+        m.apply_death_effect(
+            &mut crate::health::TestLevel::new(0).level(),
+            &crate::items::ConsumeEffect::ClearAllEffects,
+        );
+        assert!(m.extra.effects.is_empty() && m.extra.effect_chains.is_empty());
+        // The basic add has default incoming flags, while preserving its
+        // existing active flag policy; a newly retained weaker node gets them.
+        assert!(m.add_effect_with("speed", 200, 0, true, false));
+        assert!(m.add_effect_with("speed", 40, 1, true, false));
+        m.add_effect("speed", 300, 0);
+        assert!(m.extra.ambient_effects.contains(&"minecraft:speed"));
+        assert!(m.extra.hidden_effects.contains(&"minecraft:speed"));
+        assert!(!m.extra.effect_chains[0].ambient);
+        assert!(m.extra.effect_chains[0].visible);
     }
 }

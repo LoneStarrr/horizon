@@ -538,7 +538,7 @@ place; `native_server_tick` does not define one, so name the dimension and expec
   is, and kept when its chunk unloads. Nothing is spawned outside `/summon`'s bounds, in a chunk that isn't loaded, or a monster on peaceful.
 - `native_mob(dimension, id)` and `native_mobs(dimension)` read the living mobs: id, dimension, kind, position, yaw, health and maximum health.
 - A mob's health is set with `living.set_health(host, health)` on its `LivingRef`.
-- `native_kill_mob(dimension, id)` kills as `/kill` does, with its loot. `EntityRef::discard` removes an entity without death or loot.
+- `native_kill_mob(dimension, id)` kills as `/kill` does, with its loot. `EntityRef::discard` removes an entity without death or loot: from the call on selectors and handles no longer find it, its passengers are off and `entity_leave_level` has fired, in the same hook.
 - While the game ticks its mobs they are out of the level: from a hook inside that tick, a spawned mob joins after the tick, and the others
   read as gone.
 
@@ -580,6 +580,12 @@ Changing loot a mod didn't make, as NeoForge's `LootTableLoadEvent` and global l
   NeoForge's `GetEquipmentDropChanceEvent`. Change the chance a dying mob rolls for the item `stack` in `slot`; `original_chance`
   is the recorded chance before enchantments and `preserved` says the slot drops without a player kill. Each slot is asked at its
   own point of `Mob.dropCustomDeathLoot`, just before its roll, and the roll is drawn whatever the chance is.
+- **`native_enchanted_entity_loot(entity, source, attacker, enchantment, level)`**:
+  NeoForge's `EnchantedEntityLootEvent`. Change the level an entity's loot table uses of `enchantment`, in the middle of the roll:
+  `EnchantedCountIncreaseFunction` and `LootItemRandomChanceWithEnchantedBonusCondition` ask each time they are evaluated, on a death and on
+  `/loot ... kill`, whose `source` is `minecraft:magic` and whose `attacker` is the command's source. `entity` and `attacker` are live handles;
+  `attacker` is None without one and may not be living, and `level` then starts at 0, otherwise at the living attacker's level. It is unsigned, so
+  the negative levels `setEnchantmentLevel` throws on can't be written, and above 1024 it counts as 1024, so a mod's value can't size a loop. Without a listener the roll asks nothing, and its random's order is vanilla's.
 
 ### A mod block entity's data on its item
 
@@ -635,7 +641,7 @@ handle, an entity the client doesn't track and a level it doesn't show:
 - `level.day_time(host)`: the synchronized Overworld clock in ticks (counting past 24000), advanced at the
   server-supplied rate while the client level runs. This remains the Overworld clock in the End, even though
   the sky uses the End's own default clock. Only a handle for the level the client shows can read it.
-- `living.equipment(host, slot)`, `hand_item`, `effect`, `effects`, `health` and `max_health`, for the local player.
+- `living.equipment(host, slot)`, `hand_item`, `effect`, `effects`, `potion_affected` (`hasEffect`), `health` and `max_health`, for the local player.
   Another entity's equipment, effects and health stay server reads, and so does every write.
 - `player.last_death_location(host)`, for the local player: the position the login and respawn packets carried.
 - `player.inventory(host)` reads non-empty main inventory `ItemStack`s in slot order, with components. It returns `None` for a stale or unavailable player; on a client only the local player's inventory is available. Armor and offhand are separate equipment.
@@ -785,13 +791,17 @@ handle, an entity the client doesn't track and a level it doesn't show:
   at 0 after a blended addition and interpolate to their post-countdown target each client tick (1 while active, 0 once
   expired). An unblended addition starts at its target immediately; a replacement packet preserves the old blend.
   Partial ticks are not clamped. A missing effect reads 0. The client keeps no other entity's effects, so they read `None`.
+- `host.fishing_hook(entity)` gives a `FishingHookRef` for a cast hook (`FishingHook`); `hook.entity()` goes back.
+  `player_owner(host)` is the player who cast it, `hooked_in(host)` what it holds (None when nothing, or when that is
+  gone) and `open_water(host)` is `isOpenWaterFishing`. `item_fished` names a hook by id, and `LevelRef::entities_in`
+  finds them. Discarding one takes it out. It is not a `ProjectileRef`, and selectors do not find it yet.
 - `host.projectile(entity)` gives a `ProjectileRef` for a projectile in the level's projectile list (arrows, a mob's
   trident, thrown items, fireballs, wind charges, skulls, shulker bullets, mods' thrown types), a trident a player
   threw or a firework rocket; `projectile.entity()` goes back. A player's trident and a rocket have an owner and a
   deflection only: `pickup`, `base_damage` and `critical` read None and their setters return false, and a player's
   trident always has a player owner (`set_owner` or `deflect` with none or a mob returns false). `owner(host)` resolves the owner to a current `EntityRef` (None when gone
-  or in another level) and `set_owner(host, owner)` takes a player or mob (`Projectile.setOwner`; false for another
-  kind). `deflect(host, deflection, by, new_owner, by_attack, power)` is `Projectile.deflect`: `NativeDeflection::Reverse`
+  or in another level) and `set_owner(host, owner)` takes any entity but a fishing hook (`Projectile.setOwner`). An owner that is neither a
+  player nor a mob is kept by its UUID: `owner` resolves it and a save keeps it, but a hit credits no one for it. `deflect(host, deflection, by, new_owner, by_attack, power)` is `Projectile.deflect`: `NativeDeflection::Reverse`
   draws one float for the turn from the projectile's own random (`Entity.random`, never the level's), `AimDeflect`
   and `MomentumDeflect` use the look or the known speed (last tick's move, `Entity.getKnownSpeed`) of `by` and do
   nothing without it; the new owner is set and a fireball's or wind charge's acceleration power becomes 0.1 by an
@@ -1303,11 +1313,12 @@ stock client shows as a chest (`generic_9x1` to `generic_9x6`); nothing is insta
 
 ### Render hook points
 
-`crates/horizon-mod-api/src/render.rs`: the renderer's own hook points, free functions rather than
-`Game` methods, which a bundle targets as `mod_api::render::native_<name>`. They run on the
-render thread with the frame's wgpu objects; what a mod draws there shows in that frame.
+`crates/horizon-mod-render/src/render.rs`: native-only, unstable raw frame places, outside `mod_api`.
+Use `[[inject]]` with `access = "internals"`, `kind = "head"` and a checked listener signature at
+`horizon_mod_render::render::<name>`. They run on the render thread with the frame's wgpu objects;
+what a mod draws there shows in that frame. Draw contexts remain the API-typed drawing route.
 
-- `native_world_drawn(world)`: the world is drawn (sky, terrain, entities, particles, weather and the world post pass),
+- `world_drawn(world)`: the world is drawn (sky, terrain, entities, particles, weather and the world post pass),
   the first-person hand, the HUD and screens not yet. `WorldDrawn` holds the device, queue and encoder, the frame's
   colour target (copy it out before sampling it), the world's reversed depth and its size, the camera's position and
   its matrices with and without TAA's jitter, the frame's camera-relative entity quads with their runs by entity, the
@@ -1315,14 +1326,14 @@ render thread with the frame's wgpu objects; what a mod draws there shows in tha
   called on the title screen's panorama. `motion` says which mob, player or dropped item each run of the entity quads
   is, by its entity id, so a mod can match an entity's vertices with last frame's (a motion blur's own motion
   vectors); `spans` only name the type.
-- `native_hand_drawn(hand)`: the first-person hand and held item are drawn, after `native_world_drawn` and before
-  entity outlines, post effects, screen effects and the HUD, on every frame `native_world_drawn` runs. `HandDrawn`
+- `hand_drawn(hand)`: the first-person hand and held item are drawn, after `world_drawn` and before
+  entity outlines, post effects, screen effects and the HUD, on every frame `world_drawn` runs. `HandDrawn`
   holds the device, queue and encoder, the frame's colour target with the hand in it, the hand's camera-relative
   quads (empty when no hand drew: third person, F1, a shader pack's own hand), the hand's clip matrix (its own field
   of view and the view bob, no jitter), the camera, the entity atlas and the quad index buffer. The hand's depth isn't
   kept: draw its quads into a depth of your own. A motion blur can match the hand's quads with last frame's for the
   swing, attack, equip and bob motion, and blur the picture with the hand in it.
-- `native_render_needs(needs)`: set `entity_spans` to have the entity geometry split into runs by entity without a
+- `render_needs(needs)`: set `entity_spans` to have the entity geometry split into runs by entity without a
   shader pack (each run's id is stable from frame to frame: a hash of the entity type's name, a block entity's state),
   and `world_depth` to keep the world pass's depth when nothing else needs it. Set what you need and leave the rest:
   several mods can ask. It's asked as each frame is built, so keep it cheap.
@@ -1540,6 +1551,10 @@ the hit, which doesn't tell every vanilla type apart yet:
 - A blast a mob caused (an end crystal a skeleton shot, a creeper's) is `minecraft:explosion` on the dragon, not
   `minecraft:player_explosion`
 
+A registered damage type Horizon keeps no kind of its own for keeps its id and its tags on a mob and the dragon: a
+datapack's `demo:heat` hurt through `ApplyEffectTickEvent::hurt` or `entity_hurt` reaches the hurt hooks as
+`demo:heat`.
+
 The causing and direct entities are 0 for now in these cases:
 
 - A player's direct entity outside a projectile hit, and `magic()` dealt during one (an ownerless wither
@@ -1629,8 +1644,8 @@ one, where vanilla gives the `by` one.
   the game tells them after the hub's network step for that level, so a handler sees the state after that step; the order per
   player and chunk is vanilla's. The far ring's columns past the view distance aren't told, and the server stopping doesn't unwatch.
 
-- [the renderer's hook points](#render-hook-points): `native_world_drawn`, called once the world is drawn with its colour, depth, matrices and entity geometry, and
-  `native_render_needs`, where a mod asks for the entity runs and the world's depth without a shader pack.
+- [the renderer's hook points](#render-hook-points): `world_drawn`, called once the world is drawn with its colour, depth, matrices and entity geometry, and
+  `render_needs`, where a mod asks for the entity runs and the world's depth without a shader pack.
 
 - [entities](#entities) for server mods: `native_summon(dimension, kind, pos, nbt)` spawns any entity from its compound
   as `/summon` does.
@@ -1647,7 +1662,7 @@ one, where vanilla gives the `by` one.
 
 - Nicknames for server mods: `player.set_nickname(host, Option<&str>)` shows a name in place of a player's in chat (their messages, `/me`, `/msg`) and the Tab list, the real name on hover and everywhere else; `host.messages().text_allowed(text)` asks the server's chat filter. Obtain a `PlayerRef` from `host.players().server_players()` or `.acting_player()` and retain that value, not the borrowed service. The handle is tied to its world epoch and entity identity: nickname writes refuse stale or offline players, but can reach a connected player displaced by another player's turn. A nickname already set persists across reconnects until changed or the server stops.
 
-- Tag and fluid reads from any hook that has a `Host`: `host.block_in_tag(oak_log, "minecraft:logs")`, `host.item_stack_in_tag(&stack, tag)` (`ItemStack.is(TagKey)`), `host.state_fluid_state(state)` (`BlockState.getFluidState`: water for a waterlogged state, `None` for an id no state has) and `host.fluid_in_tag("minecraft:water", "minecraft:water")`. The tag may be written with or without `minecraft:`, with no `#`. They read the world's merged tags, data packs and content mods included; an unknown tag is false and an empty stack tests `minecraft:air`. The tag reads are `None` on a client and before the world loads its tags. `host.state_outline(state)` (`BlockState.getShape` with an empty getter at the origin) gives a state's outline boxes in the block's own space, with no random offset and no world context; empty for air, `None` for an id no state has. `host.tag_members(TagRegistry::Block, tag)` (also `Item` and `Fluid`; `HolderSet.Named` iteration) lists a tag's members in vanilla's order, the file's order with nested tags in place and the first occurrence kept: an unknown tag lists nothing, and it is `None` where the tag reads are. `level.fluid_state(host, pos)` (`BlockGetter.getFluidState`) reads the fluid at a position, `None` where the block read is (an unloaded chunk or a `y` outside the world).
+- Tag and fluid reads from any hook that has a `Host`: `host.block_in_tag(oak_log, "minecraft:logs")`, `host.item_stack_in_tag(&stack, tag)` (`ItemStack.is(TagKey)`), `host.state_fluid_state(state)` (`BlockState.getFluidState`: water for a waterlogged state, `None` for an id no state has) and `host.fluid_in_tag("minecraft:water", "minecraft:water")`. The tag may be written with or without `minecraft:`, with no `#`. They read the world's merged tags, data packs and content mods included; an unknown tag is false and an empty stack tests `minecraft:air`. On a client they read the tags its server sent. The tag reads are `None` before those or the world's tags are loaded. `host.state_outline(state)` (`BlockState.getShape` with an empty getter at the origin) gives a state's outline boxes in the block's own space, with no random offset and no world context; empty for air, `None` for an id no state has. `host.tag_members(TagRegistry::Block, tag)` (also `Item` and `Fluid`; `HolderSet.Named` iteration) lists a tag's members in vanilla's order, the file's order with nested tags in place and the first occurrence kept: an unknown tag lists nothing, and it is `None` where the tag reads are. `level.fluid_state(host, pos)` (`BlockGetter.getFluidState`) reads the fluid at a position, `None` where the block read is (an unloaded chunk or a `y` outside the world).
 - Fluid facts from any hook that has a `Host`, on either side and with no world: `host.fluid_is_same("minecraft:water", "minecraft:flowing_water")` (`Fluid.isSame`: a source and its flowing form are one fluid; false when either id names no fluid), `host.fluid_bucket(fluid)` (`Fluid.getBucket`: `minecraft:water_bucket` or `minecraft:lava_bucket`) and `host.fluid_pickup_sound(fluid)` (`Fluid.getPickupSound`: `minecraft:item.bucket.fill` or `minecraft:item.bucket.fill_lava`). Fluids are named by id, with or without `minecraft:`. The bucket and the sound are `None` for `minecraft:empty`, which has neither (vanilla's bucket there is air), and for an id no fluid has.
 
 - A block part's `is_pathfindable` changes whether a path of a `PathComputationType` (`Land`, `Water`, `Air`) may go through the block's states (`BlockBehaviour.isPathfindable`); `event.pathfindable` starts with the block's own answer. The answer depends on the state and the type alone: the game asks once per state and type when parts resolve (at world load and on every `/reload`) and path finding, spawning and the goals read the stored answer, so a part cannot answer from a position, a level or the time. Server-side.
@@ -1666,9 +1681,18 @@ one, where vanilla gives the `by` one.
 `Hooks::component_types`, `blocks`, `items` and `standalone_models` take
 `&RegistrationContext` before their event; `Hooks::register` takes it after
 its `Registrar`. `context.mods()` returns a read-only `LoadedMods` view whose
-`ids()` lists startup code and selected content packages in dispatch order. These
-contexts are supplied by the engine and have no game `Host`, handle constructors
-or transactions. Declarations still go on each event or registrar.
+`ids()` lists startup code and selected content packages in dispatch order.
+`context.registry("minecraft:item")` lists a built-in registry's names in ID order and
+`context.setting(mod_id, key)` reads a loaded mod's setting, so a mod can validate the keys it
+declares before its Parts are finalized. Both read one view the engine captures before the first
+registration hook runs: every registration step sees the same registries (as `registries.json`
+lists them, without what mods declare during registration) and the settings on disk at that
+moment, whatever the dispatch order. A read fails with a `RegistrationReadError` rather than
+panicking: `InvalidRegistryName` for a name that is not a namespaced identifier,
+`UnknownRegistry`, `InvalidSettingKey` for an empty key or one naming a path, `UnknownMod` for a
+package that is not loaded, and `Unavailable` when the engine supplied no data. These contexts are
+supplied by the engine and have no game `Host`, handle constructors or transactions. Declarations
+still go on each event or registrar.
 
 - `native_component_types(context, types)` runs once before content loads. Append namespaced component IDs; duplicates, invalid IDs and the `minecraft` namespace stop startup. `native_component`, `native_set_component` and `native_remove_component` read, set and remove registered components, including item defaults. Values use NBT and must fit the network reader limits.
 
@@ -1762,6 +1786,7 @@ or transactions. Declarations still go on each event or registrar.
 
 - `native_item_burn_time(item)` answers the item's cooking-fuel burn time in ticks (`FuelValues.burnDuration`: its `cooking_fuel` component, the data pack's context int provider resolved), None where it is no fuel. `native_item_compost_chance(item)` answers the chance the item raises a composter's level (its `compostable` component's layers provider resolved; the `compostables` data map), None where it is not compostable. A mod cannot resolve either from the item's default component, which holds only the provider's name. Client-side, API next.
 - `native_screen_hovered_item()` answers the id of the item in the slot under the pointer on the open container screen (`AbstractContainerScreen.getHoveredSlot()`'s stack), None over no slot, an empty one, or with no window. A recipe viewer reads it for its look-up keys. Client-side, API next.
+- `menu.slot_boxes(host)` (`menu_slot_boxes`) answers the open inventory screen's slot rectangles (`[x, y, width, height]`, GUI pixels) in menu slot order: `AbstractContainerScreen.leftPos`/`topPos` plus each `Slot.x`/`Slot.y`, 16 by 16, so a mod that highlights or searches slots in `native_screen_render_post` draws where vanilla's own slot highlight does. `None` entries are slots the screen does not show; the whole answer is `None` for a stale menu, another screen, or an inventory covered by the recipe book. Client-side.
 
 - `native_modify_default_components(context, item, components)`, in `horizon-world`'s `item_defaults.rs`: an item's default
   components in `items.json`'s form, for any item, vanilla's included (NeoForge's `ModifyDefaultComponentsEvent`). Insert
@@ -1906,7 +1931,7 @@ tick. This first slice supports only linear size/opacity curves and constant gra
 there is no per-particle code hook.
 
 
-- the open screen hears of a key press (`native_screen_key_pressed_pre`) and of each character it types (`native_screen_char_typed_pre`), as vanilla's `ScreenEvent.KeyPressed.Pre` and `.CharacterTyped.Pre`: the screen, vanilla's key name (`key.keyboard.e`; a key with no name fires nothing), whether the press is an auto-repeat, the character, GLFW's modifier bits (shift 1, control 2, alt 4, super 8), and `screen.mouse` for the pointer. A cancelled press goes no further — no focus move, no Escape-close, no inventory or hotbar key, no typing by the key itself — while its release still arrives and the characters no mod cancelled still reach the text box, as vanilla's separate `charTyped` comes for a cancelled `keyPressed` too. A cancelled character drops only that character and never reaches a text box; control characters (Enter, Backspace, Tab, Delete, Escape, a Control letter) are keys and fire nothing. A key's characters fire after the key has acted, as GLFW's char callback comes after its key callback, so a key that closes the screen (the inventory key) reports no character (the closed screen hears none) and one that moves the focus types into the box it moved to. The input method's committed text fires the character hook too. They fire for the window and the control socket's `key` and `type` (not its `\b` backspace), after the fullscreen, screenshot, debug and narrator keys, never on the title screen itself (Options and the pack list opened from it do fire), the connect and loading screens, the prompts, books and sign editors drawn over gameplay, or while a world loads or saves.
+- the open screen hears of a key press (`native_screen_key_pressed_pre`) and of each character it types (`native_screen_char_typed_pre`), as vanilla's `ScreenEvent.KeyPressed.Pre` and `.CharacterTyped.Pre`: the screen, vanilla's key name (`key.keyboard.e`; a key with no name fires nothing), whether the press is an auto-repeat, the character, GLFW's modifier bits (shift 1, control 2, alt 4, super 8), and `screen.mouse` for the pointer. A cancelled press goes no further — no focus move, no Escape-close, no inventory or hotbar key, no typing by the key itself — while its release still arrives and the characters no mod cancelled still reach the text box, as vanilla's separate `charTyped` comes for a cancelled `keyPressed` too. A cancelled character drops only that character and never reaches a text box, and the character hook's `field` is a copy of the focused box whose edits the box takes through its own filter, length limit and responders; control characters (Enter, Backspace, Tab, Delete, Escape, a Control letter) are keys and fire nothing. A key's characters fire after the key has acted, as GLFW's char callback comes after its key callback, so a key that closes the screen (the inventory key) reports no character (the closed screen hears none) and one that moves the focus types into the box it moved to. The input method's committed text fires the character hook too. They fire for the window and the control socket's `key` and `type` (not its `\b` backspace), after the fullscreen, screenshot, debug and narrator keys, never on the connect and loading screens, the prompts, books and sign editors drawn over gameplay, or while a world loads or saves.
 
 - `native_push_player([x, y, z])` on a client, added to the local player's velocity as an explosion's knockback is.
 
@@ -2044,7 +2069,7 @@ boxed apply closure per listener. No new work or filesystem reads run on the tic
 The existing post-success server-data notice below is a different moment, not a second
 reload registration path.
 
-- `native_server_data_loaded(reload)` fires once the server's data tables are built (NeoForge's `TagsUpdatedEvent` with `SERVER_DATA_LOAD`): the recipes, tags, loot and advancements of the world's data packs and of `native_data_pack_files` are what the helpers read from then on. `reload` is false on a world's first open, before its chunks and players are loaded, and true after `/reload`, once the players were sent the new data. It is where a mod drops caches derived from the data and rebinds what depends on it. Server-side, the single player's integrated server included; a client connected to a server never fires it.
+- `native_tags_updated(cause)` fires once tags changed (NeoForge's `TagsUpdatedEvent`), on both sides. `TagsUpdateCause::ServerDataLoad { reload }` fires once the server's data tables are built: the recipes, tags, loot and advancements of the world's data packs and of `native_data_pack_files` are what the helpers read from then on. `reload` is false on a world's first open, before its chunks and players are loaded, and true after `/reload`, once the players were sent the new data. `TagsUpdateCause::ClientPacketReceived { integrated_server }` fires on a client once per set of tags from its server: at login, and for every update in play, on the game thread, with the new tags in the tag helpers. It is where a mod drops caches derived from the data and rebinds what depends on it. In single player both fire, each on its own thread; `cause.should_update_static_data()` is false only for an integrated server's client packet, so data the two share is updated once, on the server. A remote client's packet returns true.
 
 ### Client asset reload listeners
 
@@ -2217,7 +2242,7 @@ registration path.
 
 - An entity getting on or off a vehicle, which a mod can cancel, through `native_entity_mount` (NeoForge's `EntityMountEvent`): the rider's id and type (`minecraft:player`, `minecraft:zombie`), the vehicle's id and type (`minecraft:oak_boat`, `minecraft:horse`), whether it is mounting, and a `canceled` flag. Set `canceled` and the rider does not board, or keeps riding; a `/ride` that is canceled fails. It is told for a player boarding a boat, minecart, cushion or mount (pig, strider, horse and its kin, llama, nautilus, happy ghast) and getting off by their own input, `/ride`, a stab, a buck, a teleport or spectator mode, and for the mobs Horizon seats on a vehicle (jockeys, raiders on a ravager, `/ride`) and lets off one with `/ride` or a stab. It is not told for a rider whose vehicle is gone or dies, nor for riders loaded with a save. On the single player server thread and on a dedicated server.
 
-- `native_interaction_key_mapping_triggered(key, hand, swing_hand, canceled)` fires while playing when an interaction key is about to act on the crosshair (NeoForge's `InputEvent.InteractionKeyMappingTriggered`): `key` is `InteractionKey::Attack` (when an attack is allowed, and each tick a held key keeps digging a block), `Use` (once for each hand tried, main first, before the hand's target and item) or `PickBlock` (only with a block or entity aimed at). Set `canceled` to skip the action; a cancelled use ends the click, so the other hand gets no turn. A cancelled attack or use still swings `hand` unless the mod clears `swing_hand` (true on entry). A single player's window and a server's player (any window that plays on a server).
+- `native_interaction_key_mapping_triggered(key, hand, attempt, swing_hand, canceled)` fires while playing when an interaction key is about to act on the crosshair (NeoForge's `InputEvent.InteractionKeyMappingTriggered`): `key` is `InteractionKey::Attack` (when an attack is allowed, and each tick a held key keeps digging a block), `Use` (once for each hand tried, main first, before the hand's target and item) or `PickBlock` (only with a block or entity aimed at). `attempt` distinguishes a queued press from a held mapping. Set `canceled` to skip the action; a cancelled use ends the click, so the other hand gets no turn. A cancelled attack or use still swings `hand` unless the mod clears `swing_hand` (true on entry). A single player's window and a server's player (any window that plays on a server).
 
 - `native_key_mapping_pre(mapping, pressed, canceled)` is asked while playing, before the game acts on a physical key or mouse button bound to a gameplay mapping (`key.jump`, `key.attack`...), once for each mapping bound to it. `pressed` is true for a press (a key's repeats too) and false for its release. Set `canceled` on a press to drop it for every mapping bound to that input: the mapping is not held, nothing acts on it, and a mouse press is not counted as a click. A cancel on a release is ignored, so what the game holds is always let go. A release is asked too, while playing: a screen that opens lets go of what it holds without asking. A key bound to two mappings (forward and sprint) is canceled as one. It is asked for the window's keys and mouse buttons, agent control's included, after the window's own shortcuts (fullscreen, screenshot, debug keys) and with no screen open. A controller's presses are not asked.
 
@@ -2229,7 +2254,7 @@ registration path.
 
 - An energy buffer on a mod block's block entity. `native_block_entity_energy` declares the buffer as `SimpleEnergyHandler` is built: its capacity, the most one insert and one extract moves, and the faces a fill may come through and a drain may leave by. The amount lives in the entity's saved compound as the int `energy`, so it survives restarts and the block's own tick reads it there. The game's own energy capability answers it (see "A block's energy").
 
-- Data maps (`RegisterDataMapTypesEvent`). `native_data_map_types(types)` pushes the types a mod registers: an `id` (`mod_id:name`, not in `minecraft`) for a `registry`, `minecraft:item` or `minecraft:block` so far; asked once per load of the server's data (a world's first open and every `/reload`). The values come from `data/<mod_id>/data_maps/<registry path>/<name>.json` in the world's data packs and from files a mod pushes through `native_data_pack_files` under the key `data_maps/<mod_id>:<registry path>/<name>`: `{"replace": false, "values": {"minecraft:coal": ..., "#minecraft:logs": ...}, "remove": [...]}`, an entry's value being the data itself or `{"value": ..., "replace": false}`; `replace` clears what earlier files set, a tag gives every entry in it the value, `remove` applies after the file's own values, and a newer value overrides an older one. `native_data_map(registry, type, entry)` reads an entry's value (the JSON the file held) and `native_data_map_entries(registry, type)` lists them. Server side only and not synced to clients; mergers, conditions, other registries and mod datapack registries are not here yet.
+- Data maps (`RegisterDataMapTypesEvent`). `native_data_map_types(types)` pushes the types a mod registers: an `id` (`mod_id:name`, not in `minecraft`) for a `registry`, `minecraft:item` or `minecraft:block` so far; asked once per load of the server's data (a world's first open and every `/reload`). The values come from `data/<mod_id>/data_maps/<registry path>/<name>.json` in the world's data packs and from files a mod pushes through `native_data_pack_files` under the key `data_maps/<mod_id>:<registry path>/<name>`: `{"replace": false, "values": {"minecraft:coal": ..., "#minecraft:logs": ...}, "remove": [...]}`, an entry's value being the data itself or `{"value": ..., "replace": false}`; `replace` clears what earlier files set, a tag gives every entry in it the value, `remove` applies after the file's own values, and a newer value overrides an older one. `native_data_map(registry, type, entry)` reads an entry's value (the JSON the file held) and `native_data_map_entries(registry, type)` lists them. Server side only and not synced to clients; mergers, conditions, other registries and mod datapack registries are not here yet. `native_data_maps_updated(registry, cause)` (NeoForge's `DataMapsUpdatedEvent`) fires once for each registry that has a type, right after `native_tags_updated`'s `ServerDataLoad`, on a world's first open and after every `/reload`, with `DataMapsUpdateCause::ServerReload`: the place to build caches from the new values. `DataMapsUpdateCause::ClientSync` is for a client applying synced data maps, which does not exist yet.
 
 `native_living_fall(context, entity, kind, distance, multiplier, cancel)` corresponds to NeoForge's `LivingFallEvent` at `LivingEntity.causeFallDamage`. Mods may change the distance and damage multiplier or cancel fall handling; cancellation does not reverse physical movement. This free function receives the entity ID and type and cannot call game helpers. Player landings, mounted player falls and non-equine mob falls are wired. Equines use their own fall-damage override rather than `LivingEntity.causeFallDamage`. `context` is the loop context of the side that ticks the entity; the hook fires inside the landing, so it takes no `Host` (a deferred call would reorder the fall damage and block effects). `farmland_trample` and `ender_entity_teleport` take the context the same way, and so does `living_jump`, which fires inside the jump. Contract version `2` for all four: a mod written for `1` takes the context as a new first argument of the `Hooks` method.
 
@@ -2622,7 +2647,7 @@ registration path.
 
 - `native_item_expire(entity, stack, extra_life)`, a dropped item reaching its lifetime on the server (NeoForge's `ItemExpireEvent`, vanilla `ItemEntity.tick`): every mod may set or add to `extra_life`, in ticks from zero; a positive total keeps the item that much longer, zero or less lets it expire. Extensions are capped at 32766 ticks.
 
-- The title's own screens to the screen hooks. `NativeScreenView.id` has one id per title state (`title`, `world_select`, `world_create`, `world_create_flat`, `world_create_buffet`, `world_edit`, `world_backup`, `world_backup_confirm`, `world_optimize_confirm`, `world_optimize`, `low_disk_space`, `world_delete`, `world_recover`, `world_recovered`, `error`, `multiplayer`, `add_server`, `edit_server`, `direct_connect`, `server_delete`, `friends_join`, `disconnected`, `multiplayer_warning`, `onboarding`, `ban_notice`), with no `menu`, no `title` and no `slots`, and the whole window as `rect`. `native_screen_render_post` fires after the title draws its screen (before its toasts), and the `_pre` input hooks — mouse buttons, drag, wheel, key press and release, character typed — fire on it and can cancel it as on any screen, so a mod draws its own button or browser over Create New World and takes the clicks. A dialog, a prompt or a server's pack prompt over the title keeps them away, and typing still goes to the title's own boxes (the key's text stays on the key there, as on Options, so `native_screen_char_typed_pre` does not fire from the keyboard on the title's own screens; the control socket's `type` types into them). `native_instance_dir()` is the instance folder, where `options.txt`, `saves/`, `resourcepacks/`, `shaderpacks/` and `horizon-mods/` are; a world's `datapacks/` is in that world's folder.
+- The title's own screens to the screen hooks. `NativeScreenView.id` has one id per title state (`title`, `world_select`, `world_create`, `world_create_flat`, `world_create_buffet`, `world_edit`, `world_backup`, `world_backup_confirm`, `world_optimize_confirm`, `world_optimize`, `low_disk_space`, `world_delete`, `world_recover`, `world_recovered`, `error`, `multiplayer`, `add_server`, `edit_server`, `direct_connect`, `server_delete`, `friends_join`, `disconnected`, `multiplayer_warning`, `onboarding`, `ban_notice`), with no `menu`, no `title` and no `slots`, and the whole window as `rect`. `native_screen_render_post` fires after the title draws its screen (before its toasts), and the `_pre` input hooks — mouse buttons, drag, wheel, key press and release, character typed — fire on it and can cancel it as on any screen, so a mod draws its own button or browser over Create New World and takes the clicks. A dialog, a prompt or a server's pack prompt over the title keeps them away, and typing still goes to the title's own boxes (with no box focused the key's text stays on the key, as on Options, so `native_screen_char_typed_pre` fires before the key acts there). `native_instance_dir()` is the instance folder, where `options.txt`, `saves/`, `resourcepacks/`, `shaderpacks/` and `horizon-mods/` are; a world's `datapacks/` is in that world's folder.
 
 - A player took an anvil's result: `native_anvil_craft_post(player, name, pos, craft)` (NeoForge's `AnvilCraftEvent.Post`) is heard after the levels, the inputs and the anvil wear are done, so a broken anvil is already air. `craft` holds the inputs and the result as they were before. Not heard when `native_anvil_craft_pre` cancelled.
 
@@ -2986,7 +3011,7 @@ registration path.
   (`DiodeBlock.updateNeighborsInFront`). Both act on the level in place and are refused elsewhere.
 
 - Item behaviour, on the server for every player: `native_hurt_enemy` hears a player's hit land on a mob with the
-  held stack, `native_inventory_tick` runs each tick for every stack a player carries (armour and off hand included), and
+  held stack, `native_inventory_tick` runs each tick, on the `ItemPart`s of every stack a player carries (armour and off hand included), and
   the stack is the place `ItemPlace::PlayerSlot { player, slot }`, read and written as any item place, and
   `native_on_equip` hears an equipment slot take a different item.
 
@@ -3031,6 +3056,12 @@ registration path.
   alone): it is asked when a chunk holding it is sent and when its block changes, and the client merges it into the
   copy's `nbt`. A saved chunk sent past the view distance asks it on its own thread, so read only `entity`. Keep it to what clients show (a machine running, its facing, a tank's level), not a menu's progress:
   menus have their own data slots.
+
+- One-shot fields ride that tag. `entity.set_client_update_fields(fields)` on a `ModBlockEntityView` queues them in
+  the runtime under the entity's identity, for native and wasm mods alike; they are not part of the plain-data entity,
+  so saves, clones and comparisons never see them and its revision stays. Once a block change (`block_entity_sync`)
+  reaches viewers, the game builds one tag, puts the fields over `native_block_entity_update_tag`'s and sends it to
+  them all. A change nobody sees, a chunk send and a single player's resend leave them waiting; removal or unload drops them.
 
 - `native_affect_neighbors_after_removal` is a mod block's `Block.affectNeighborsAfterRemoval`: the block was
   removed from `pos` (`moved`: a piston pushed it) with `UPDATE_NEIGHBORS` or the piston flag. There is no bus

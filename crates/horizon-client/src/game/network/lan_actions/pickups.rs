@@ -117,7 +117,9 @@ impl Game<'_> {
             Vec3::new(at[0] + w, at[1] + f64::from(dims.height), at[2] + w),
         )
         .inflate(Vec3::new(1.0, 0.5, 1.0));
-        let mut projectiles = std::mem::take(&mut self.creatures.projectiles);
+        let mut projectiles = self.creatures.projectiles.lift();
+        #[cfg(test)]
+        crate::game::entity::taken_pass_tests::after_take(self);
         let mut picked = Vec::new();
         projectiles.retain(|shot| {
             let Some(a) = shot.arrow.as_ref().filter(|a| !a.removed) else {
@@ -147,7 +149,10 @@ impl Game<'_> {
             }
             !taken
         });
-        self.creatures.projectiles = projectiles;
+        self.creatures.projectiles.restore(
+            projectiles,
+            horizon_client::join_seq::RestoreOrder::SurvivorsFirst,
+        );
         for shot in picked {
             if let Some(arrow) = shot.arrow.as_ref() {
                 self.native_player_pickup_arrow(player, &name, shot.id, &arrow.pickup_item.item);

@@ -314,6 +314,7 @@ impl Game<'_> {
             self.sync_block_entity(pos, None, state);
             // LevelChunk.replaceWithPacketData: the block entity loads its update tag.
             self.remote_block_entity_data([pos.0, pos.1, pos.2], info.kind, &info.tag);
+            self.bind_remote_attachment(Holder::BlockEntity([pos.0, pos.1, pos.2]));
         }
         if let Some(r) = self.remote.as_mut() {
             r.attachments.retain(|holder, _| match *holder {

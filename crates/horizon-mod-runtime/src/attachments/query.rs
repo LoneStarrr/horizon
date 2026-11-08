@@ -3,7 +3,7 @@ use std::{fmt, hash::Hash, slice, sync::Arc};
 
 use super::{
     AttachmentError, AttachmentType,
-    index::{AttachmentIndex, AttachmentRow},
+    index::{AttachmentIndex, AttachmentOwner, AttachmentRow},
 };
 
 /// A failed row read or write through a retained batch.
@@ -32,13 +32,24 @@ impl std::error::Error for AttachmentRowError {}
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AttachmentBatch<H> {
-    rows: Arc<Vec<AttachmentRow<H>>>,
+    rows: Option<Arc<Vec<AttachmentRow<H>>>>,
 }
 
 impl<H> AttachmentBatch<H> {
     /// Wrap a captured index bucket without copying its contents.
     pub fn new(rows: Arc<Vec<AttachmentRow<H>>>) -> Self {
-        Self { rows }
+        Self { rows: Some(rows) }
+    }
+
+    /// An empty batch requiring no allocation, even without a live index.
+    pub fn empty() -> Self {
+        Self { rows: None }
+    }
+
+    /// Borrow the captured rows for an owned boundary conversion.
+    /// Native query construction does not invoke that conversion.
+    pub fn rows(&self) -> &[AttachmentRow<H>] {
+        self.rows.as_deref().map_or(&[], |rows| rows.as_slice())
     }
 
     /// Bind the key once, checking its policy before any row is read.
@@ -66,7 +77,7 @@ impl<H: Copy, T: Send + Sync + 'static> AttachmentQuery<'_, H, T> {
     /// or per-item allocation. A first saved decode may allocate in the codec/cache.
     pub fn iter(&self) -> AttachmentIter<'_, H, T> {
         AttachmentIter {
-            rows: self.batch.rows.iter(),
+            rows: self.batch.rows().iter(),
             key: self.key,
         }
     }
@@ -113,9 +124,14 @@ pub struct AttachmentRowRef<'q, H, T> {
 }
 
 impl<H: Copy + Eq + Hash, T> AttachmentRowRef<'_, H, T> {
-    /// Validate immediately before a write through the ordinary holder write path,
-    /// under the same owning-thread access. Value replacement or attachment removal
-    /// alone does not stale a row, but unloading or re-registering the holder does.
+    /// Capture non-forgeable residency authority for validation by the host.
+    /// Value replacement or attachment removal alone does not stale the token,
+    /// but unloading or re-registering the holder does.
+    pub fn write_token(&self) -> AttachmentOwner<H> {
+        self.row.write_token()
+    }
+
+    /// Validate residency under the owning index immediately before writing.
     pub fn validate_write(&self, index: &AttachmentIndex<H>) -> Result<(), AttachmentRowError> {
         index.validate_row(self.row)
     }
@@ -218,12 +234,25 @@ mod tests {
         let two = index.register(2, [(key(), entry(20u32))]).into_result();
         index.register(3, [(key(), entry(30u32))]).into_result();
         let captured = query(&index);
+        let tokens: Vec<_> = captured
+            .iter()
+            .map(|row| row.unwrap().write_token())
+            .collect();
         index.set(&one, &key(), entry(11u32)).into_result();
         index.remove(&two, &key()).into_result();
         assert_eq!(values(&captured), [(1, 10), (2, 20), (3, 30)]);
         assert_eq!(values(&query(&index)), [(1, 11), (3, 30)]);
-        for row in captured.iter() {
+        let mut other_index = AttachmentIndex::default();
+        other_index
+            .register(1, [(key(), entry(100u32))])
+            .into_result();
+        assert_eq!(
+            other_index.validate_owner(&tokens[0]),
+            Err(AttachmentRowError::StaleHolder)
+        );
+        for (row, token) in captured.iter().zip(&tokens) {
             assert_eq!(row.unwrap().validate_write(&index), Ok(()));
+            assert_eq!(index.validate_owner(token), Ok(()));
         }
         index.unload(1).into_result();
         // Even reusing the identical entry pointer creates a new registration.
@@ -239,6 +268,19 @@ mod tests {
             Err(AttachmentRowError::StaleHolder)
         );
         assert_eq!(rows[1].validate_write(&index), Ok(()));
+        assert_eq!(
+            index.validate_owner(&tokens[0]),
+            Err(AttachmentRowError::StaleHolder)
+        );
+        assert_eq!(
+            index.validate_owner(&tokens[2]),
+            Err(AttachmentRowError::StaleHolder)
+        );
+        assert_eq!(index.validate_owner(&tokens[1]), Ok(()));
+        assert_eq!(
+            AttachmentIndex::default().validate_owner(&tokens[1]),
+            Err(AttachmentRowError::StaleHolder)
+        );
         assert_eq!(values(&captured), [(1, 10), (2, 20), (3, 30)]);
         assert_eq!(
             rows[1].validate_write(&AttachmentIndex::default()),
@@ -308,6 +350,40 @@ mod tests {
         assert_eq!(allocations, 0);
         assert_eq!(expected_holder, 1000);
         assert_eq!(total, 500500);
+    }
+
+    #[test]
+    fn named_lookup_and_missing_index_batch_allocate_nothing() {
+        let mut index = AttachmentIndex::default();
+        let unicode_key = ("query😀".into(), "value水".into());
+        index
+            .register(1u32, [(unicode_key.clone(), entry(42u32))])
+            .into_result();
+        let expected = index.snapshot(&unicode_key);
+        ALLOCATIONS.with(|n| n.set(Some(0)));
+        let present = index.snapshot_named("query😀", "value水");
+        let absent_name = index.snapshot_named("query😀", "absent");
+        let absent_namespace = index.snapshot_named("absent", "value水");
+        let empty = AttachmentBatch::<u32>::empty().query(&KEY).unwrap();
+        let allocations = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+        assert_eq!(allocations, 0);
+        assert!(Arc::ptr_eq(&present, &expected));
+        assert!(absent_name.is_empty());
+        assert!(Arc::ptr_eq(&absent_name, &absent_namespace));
+        assert_eq!(empty.iter().len(), 0);
+        index.unload(1).into_result();
+        assert!(index.snapshot_named("query😀", "value水").is_empty());
+    }
+
+    #[test]
+    fn unpaired_surrogate_lookup_preserves_stored_units() {
+        let mut index = AttachmentIndex::default();
+        let key = (horizon_core::nbt::JavaString(vec![0xd800]), "name".into());
+        index
+            .register(1u32, [(key.clone(), entry(42u32))])
+            .into_result();
+        assert!(index.snapshot_named("\u{fffd}", "name").is_empty());
+        assert_eq!(index.snapshot(&key).len(), 1);
     }
 
     #[test]

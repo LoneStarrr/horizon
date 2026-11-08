@@ -86,7 +86,10 @@ impl BlockPart for Observed {
             .level
             .capability(host, &ITEMS, [2, 64, 0], None)
             .unwrap();
-        let sticks = ItemResource::of(&ItemStack::new("minecraft:stick", 1));
+        let sticks = ItemResource::of(
+            &mod_api::ItemStack::new(mod_api::__private::item_key("minecraft:stick").unwrap(), 1)
+                .unwrap(),
+        );
         assert_eq!(
             host.transaction(|host, tx| {
                 assert_eq!(source.insert(host, tx, 0, &sticks, 2), 2);
@@ -143,7 +146,7 @@ fn with_changes(
     )]
     .into();
     mod_api::__private::install(mods.clone());
-    mod_api::__private::install_parts(&mods).unwrap();
+    crate::game::api_values::install_parts(&mods).unwrap();
     let base = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let root = crate::game::mods::content_root(&base, &Default::default())
         .unwrap()
@@ -175,7 +178,13 @@ fn a_contents_notice_reads_the_root_commit_and_not_aborted_writes() {
             place(game, level, pos, "minecraft:chest");
             let items = level.capability(game, &ITEMS, pos, None).unwrap();
             let entity = game.block_entity(level, pos).unwrap();
-            let sticks = ItemResource::of(&ItemStack::new("minecraft:stick", 1));
+            let sticks = ItemResource::of(
+                &mod_api::ItemStack::new(
+                    mod_api::__private::item_key("minecraft:stick").unwrap(),
+                    1,
+                )
+                .unwrap(),
+            );
             changes.0.lock().unwrap().clear();
             let committed = game.transaction(|host, tx| {
                 assert_eq!(items.insert(host, tx, 0, &sticks, 2), 2);
@@ -372,7 +381,13 @@ fn a_double_container_notifies_each_backing_block_once() {
             }
             let items = level.capability(game, &ITEMS, [0, 64, 0], None).unwrap();
             assert_eq!(items.size(game), 54);
-            let sticks = ItemResource::of(&ItemStack::new("minecraft:stick", 1));
+            let sticks = ItemResource::of(
+                &mod_api::ItemStack::new(
+                    mod_api::__private::item_key("minecraft:stick").unwrap(),
+                    1,
+                )
+                .unwrap(),
+            );
             changes.0.lock().unwrap().clear();
             assert_eq!(
                 game.transaction(|host, tx| {

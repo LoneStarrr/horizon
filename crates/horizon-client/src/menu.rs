@@ -17,10 +17,11 @@ use crate::{
 #[cfg(test)]
 use horizon_world::native_load_context::{DataLoadOrigin, LoadContext, LoadInputs};
 use horizon_world::native_load_context::{LoopContext, LoopSide};
-use mod_api::__private::game::IngredientTest;
-pub use mod_api::menu::{
+pub use mod_api::menu::{LogicalSide, MenuButtonContext};
+mod models;
+pub use models::{
     AnvilCraft, AnvilUpdate, AnvilVanilla, CarriedAccess, GrindstonePlace, GrindstoneTake,
-    LogicalSide, MenuButtonContext, SlotView, StackedOnOther,
+    SlotView, StackedOnOther,
 };
 use std::sync::Arc;
 
@@ -81,6 +82,7 @@ impl KnownRecipes for &[&str] {
 }
 
 /// What a menu needs to know about items and recipes.
+#[derive(Clone, Copy)]
 pub struct Env<'a> {
     /// UUID of the player operating this menu, when a player is available.
     pub player: Option<u128>,
@@ -113,6 +115,8 @@ pub struct Env<'a> {
 
 /// The maps of the level a menu is in.
 pub trait Maps {
+    /// Stage derived maps and id reservations with a menu edit.
+    fn with_staged(&self, edit: &mut dyn FnMut(&dyn Maps) -> bool) -> bool;
     /// `MapItem.getSavedData`: whether map `id` is locked, and its scale;
     /// None when the level has no such map.
     fn state(&self, id: i32) -> Option<(bool, u8)>;
@@ -313,6 +317,41 @@ struct MenuSlotView<'a, 'e> {
 }
 
 impl SlotView for MenuSlotView<'_, '_> {
+    fn with_staged(&mut self, edit: &mut dyn FnMut(&mut dyn SlotView) -> bool) -> bool {
+        let mut menu = self.menu.clone();
+        let mut run = |maps: Option<&dyn Maps>, maker: Option<&dyn crate::merchant::MapMaker>| {
+            let trade = self.env.trade.map(|trade| crate::merchant::TradeEnv {
+                maps: maker,
+                ..*trade
+            });
+            let env = Env {
+                maps,
+                trade: trade.as_ref(),
+                ..*self.env
+            };
+            edit(&mut MenuSlotView {
+                menu: &mut menu,
+                env: &env,
+                slot: self.slot,
+            })
+        };
+        let mut with_maps = |maker: Option<&dyn crate::merchant::MapMaker>| match self.env.maps {
+            Some(maps) => maps.with_staged(&mut |maps| run(Some(maps), maker)),
+            None => run(None, maker),
+        };
+        let accepted = match self.env.trade.and_then(|trade| trade.maps) {
+            Some(maker) => maker.with_staged(&mut |maker| with_maps(Some(maker))),
+            None => with_maps(None),
+        };
+        if accepted {
+            *self.menu = menu;
+        }
+        accepted
+    }
+    fn items(&self) -> &crate::items::Items {
+        self.env.items
+    }
+
     fn item(&self) -> Option<ItemStack> {
         self.menu.slot(self.slot).cloned()
     }
@@ -385,6 +424,7 @@ const RESULT: usize = 3;
 const CONTAINER_MAX: u32 = 99;
 const OFFHAND: usize = 40;
 
+#[derive(Clone)]
 pub struct Menu {
     kind: Kind,
     registry_id: Option<Box<str>>,
@@ -693,12 +733,28 @@ impl Menu {
             }
             Kind::Mod(t) => {
                 containers[MAIN] = vec![None; t.slots];
-                slots.extend((0..t.slots).map(|index| Slot {
-                    container: MAIN,
-                    index,
-                    role: match t.results.contains(&index) {
-                        true => Role::ModResult,
-                        false => Role::Mod,
+                // A crafting grid is `CraftingMenu`'s: its slots over the
+                // grid container, its result over the result container.
+                let crafting = t.crafting;
+                grid_size = crafting.map_or(0, |c| c.size);
+                slots.extend((0..t.slots).map(|index| match crafting {
+                    Some(c) if c.grid_slots().contains(&index) => Slot {
+                        container: GRID,
+                        index: index - c.grid,
+                        role: Role::Mod,
+                    },
+                    Some(c) if c.result == index => Slot {
+                        container: RESULT,
+                        index: 0,
+                        role: Role::CraftResult,
+                    },
+                    _ => Slot {
+                        container: MAIN,
+                        index,
+                        role: match t.results.contains(&index) {
+                            true => Role::ModResult,
+                            false => Role::Mod,
+                        },
                     },
                 }));
                 player(&mut slots);
@@ -1286,7 +1342,7 @@ impl Menu {
     fn anvil_result(&mut self, env: &Env) {
         let hover = self.containers[MAIN][0]
             .as_ref()
-            .map(|i| crate::stations::hover_name(&|id| env.names.display_item(id), i))
+            .map(|i| crate::stations::hover_name(env.names, i))
             .unwrap_or_default();
         let out = crate::stations::anvil_result(
             env.enchantments,
@@ -1554,6 +1610,37 @@ impl Menu {
         self.put(env, i, stack);
     }
 
+    /// A mod menu type's crafting grid, if it has one.
+    pub fn mod_crafting(&self) -> Option<crate::containers::ModCrafting> {
+        match self.kind {
+            Kind::Mod(t) => t.crafting,
+            _ => None,
+        }
+    }
+
+    /// A mod menu's container slots from its block entity, in slot order. A
+    /// crafting grid's result is the menu's (`ResultContainer`), never the
+    /// block entity's: its slot there is passed by and the result follows the
+    /// grid.
+    pub fn load_container(&mut self, env: &Env, items: &[Option<ItemStack>]) {
+        let result = self.mod_crafting().map(|c| c.result);
+        for (k, stack) in items.iter().enumerate().take(self.slots.len() - 36) {
+            if Some(k) != result {
+                self.put(env, k, stack.clone());
+            }
+        }
+        self.recompute(env);
+    }
+
+    /// `load_container` back: the container slots the block entity keeps, a
+    /// crafting result's left empty.
+    pub fn container_items(&self) -> Vec<Option<ItemStack>> {
+        let result = self.mod_crafting().map(|c| c.result);
+        (0..self.slots.len() - 36)
+            .map(|k| (Some(k) != result).then(|| self.slot(k).cloned()).flatten())
+            .collect()
+    }
+
     pub fn player_item(&self, i: usize) -> Option<&ItemStack> {
         self.containers[PLAYER][i].as_ref()
     }
@@ -1654,10 +1741,7 @@ impl Menu {
                         .is_some_and(|m| m.contains(&*stack.item))
             }
             Role::Ingredient => env.brewing.is_reagent(stack),
-            Role::BrewFuel => env
-                .items
-                .get(&stack.item)
-                .is_some_and(|i| i.brewing_fuel.is_some()),
+            Role::BrewFuel => crate::brewing::brewing_fuel(env.items, stack).is_some(),
             Role::LoomBanner => Self::is_banner(stack),
             Role::LoomDye => env.banners.loom_dye(env.items, stack).is_some(),
             Role::LoomPattern => env.banners.is_pattern_item(env.items, stack),
@@ -2592,6 +2676,15 @@ impl Menu {
                     return None;
                 }
             }
+            // A crafting grid's result: CraftingMenu.quickMoveStack's.
+            Kind::Mod(t) if self.slots[index].role == Role::CraftResult => {
+                after_take = true;
+                Self::map_crafted(env.maps, &mut stack);
+                self.containers[RESULT][0] = Some(stack.clone());
+                if !self.move_to(env, &mut stack, t.slots, total, true) {
+                    return None;
+                }
+            }
             // ChestMenu.quickMoveStack over the mod's slots.
             Kind::Mod(t) => {
                 check_count = false;
@@ -2635,11 +2728,7 @@ impl Menu {
                     if !self.move_to(env, &mut stack, 5, 41, true) {
                         return None;
                     }
-                } else if env
-                    .items
-                    .get(&clicked.item)
-                    .is_some_and(|i| i.brewing_fuel.is_some())
-                {
+                } else if crate::brewing::brewing_fuel(env.items, &clicked).is_some() {
                     let moved = self.move_to(env, &mut stack, 4, 5, false);
                     if moved
                         || (env.brewing.is_reagent(&stack)
@@ -3082,6 +3171,7 @@ impl Menu {
         // What the result slot's move left over is dropped.
         if (index == 0 && matches!(self.kind, Kind::Inventory | Kind::Crafting))
             || (index == 1 && self.kind == Kind::Stonecutter)
+            || (matches!(self.kind, Kind::Mod(_)) && self.slots[index].role == Role::CraftResult)
         {
             self.drop_stack(&stack);
         }
@@ -3855,6 +3945,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "requires prepared resources"]
+    fn staged_slot_refusal_restores_contents_and_on_take_side_effects() {
+        let mut ran = false;
+        with_menu(Kind::Brewing, |env, menu| {
+            ran = true;
+            let potion = ItemStack::new("minecraft:potion", 1);
+            for take in [false, true] {
+                for accepted in [false, true] {
+                    *menu = Menu::new(Kind::Brewing);
+                    menu.brewed_potion_hook = true;
+                    if take {
+                        menu.set_slot(env, 0, Some(potion.clone()));
+                    }
+                    let committed = MenuSlotView { menu, env, slot: 0 }.with_staged(&mut |slot| {
+                        if take {
+                            assert_eq!(slot.safe_take(1, 1), Some(potion.clone()));
+                        } else {
+                            assert!(slot.safe_insert(Some(potion.clone()), 1).is_none());
+                        }
+                        accepted
+                    });
+                    assert_eq!(committed, accepted);
+                    assert_eq!(menu.slot(0), (take != accepted).then_some(&potion));
+                    assert_eq!(
+                        menu.brewed_potion_takes.as_slice(),
+                        if take && accepted {
+                            std::slice::from_ref(&potion)
+                        } else {
+                            &[]
+                        }
+                    );
+                    assert_eq!(
+                        menu.brewed.as_slice(),
+                        if take && accepted {
+                            std::slice::from_ref(&potion)
+                        } else {
+                            &[]
+                        }
+                    );
+                }
+            }
+        });
+        assert!(ran, "prepared menu fixture was not loaded");
+    }
+
+    #[test]
     fn menu_keeps_the_open_window_registry_identity() {
         let mut menu = Menu::new(Kind::Chest(3));
         assert_eq!(menu.registry_id(), None);
@@ -3905,6 +4041,48 @@ pub(crate) mod tests {
             assert_eq!(menu.slot(0).unwrap().count, 8);
             assert_eq!(menu.player_item(0).unwrap().count, 2);
         });
+    }
+
+    /// `BrewingStandMenu.FuelSlot` and `quickMoveStack` use the same component.
+    #[test]
+    fn brewing_fuel_slot_and_quick_move_use_stack_components() {
+        let items = Items::for_tests(Default::default());
+        let root = std::path::Path::new("");
+        let recipes = Recipes::empty();
+        let brewing = Brewing::load(root, &items, &PackOverlay::NONE);
+        let banners = Banners::default();
+        let station_recipes = crate::stations::StationRecipes::default();
+        let enchantments = crate::enchant::Enchantments::default();
+        let names = crate::creative::Names::default();
+        let env = Env {
+            player: None,
+            player_entity_id: None,
+            loop_context: &crate::test_resources::loop_context(LoopSide::Server),
+            items: &items,
+            recipes: &recipes,
+            brewing: &brewing,
+            banners: &banners,
+            station_recipes: &station_recipes,
+            enchantments: &enchantments,
+            names: &names,
+            trade: None,
+            maps: None,
+            limited_crafting: false,
+            known_recipes: None,
+        };
+        let mut fuel = ItemStack::new("minecraft:stone", 2);
+        fuel.data_mut().set_loot_component(
+            "minecraft:brewing_fuel",
+            &serde_json::json!({"uses": 7, "speed_multiplier": 2.5}),
+        );
+        let mut menu = Menu::new(Kind::Brewing);
+        assert!(menu.may_place(&env, 4, &fuel));
+        menu.set_slot(&env, 5, Some(fuel));
+        assert_eq!(menu.quick_move_landing(&env, 5), vec![4]);
+        let ordinary = ItemStack::new("minecraft:stone", 2);
+        assert!(!menu.may_place(&env, 4, &ordinary));
+        menu.set_slot(&env, 5, Some(ordinary));
+        assert!(!menu.quick_move_landing(&env, 5).contains(&4));
     }
 
     /// MerchantResultSlot's removal tally and quick-craft check reset before onTake.
@@ -4763,6 +4941,7 @@ pub(crate) mod tests {
             slots: 1,
             data_slots: 0,
             results: vec![],
+            crafting: None,
         })));
         let mut menu = Menu::new(kind);
         menu.set_registry_id(Some("test:rules"));
@@ -5051,6 +5230,7 @@ pub(crate) mod tests {
             slots: 4,
             data_slots: 0,
             results: vec![3],
+            crafting: None,
         })))
     }
 
@@ -5142,6 +5322,154 @@ pub(crate) mod tests {
             menu.click(env, 31, 0, Input::QuickMove).unwrap();
             assert_eq!((n(menu.slot(0)), n(menu.player_item(0))), (None, Some(3)));
         }
+    }
+
+    /// A mod menu type laid out as `CraftingMenu`: the result in slot 0, the
+    /// grid in 1 to 9, as many container slots as the table's.
+    fn mod_crafting_table() -> Kind {
+        Kind::Mod(Box::leak(Box::new(crate::containers::ModMenuType {
+            id: "test:station",
+            slots: 10,
+            data_slots: 0,
+            results: vec![],
+            crafting: Some(crate::containers::ModCrafting {
+                grid: 1,
+                size: 3,
+                result: 0,
+            }),
+        })))
+    }
+
+    /// Everything a click leaves: the slots, the cursor, the drops and the
+    /// recipes crafted.
+    type Seen = (
+        Vec<Option<ItemStack>>,
+        Option<ItemStack>,
+        Vec<ItemStack>,
+        Vec<(String, Vec<Option<ItemStack>>)>,
+    );
+    fn seen(menu: &mut Menu) -> Seen {
+        (
+            (0..menu.slot_count())
+                .map(|s| menu.slot(s).cloned())
+                .collect(),
+            menu.carried.clone(),
+            std::mem::take(&mut menu.dropped),
+            std::mem::take(&mut menu.crafted),
+        )
+    }
+
+    /// A mod menu type's crafting grid crafts as the crafting table does
+    /// (`CraftingMenu`, which `tools/test_menu_click_parity.py` pins to
+    /// vanilla): the same clicks on both leave the same slots, cursor, drops
+    /// and crafted recipes, remainders and shift-crafting included.
+    #[test]
+    fn a_mod_crafting_grid_crafts_as_the_crafting_table() {
+        type Step = (&'static [(usize, &'static str, u32)], i32, i32, Input);
+        let steps: [Step; 7] = [
+            // Planks over planks: sticks, taken one craft at a time.
+            (
+                &[(1, "oak_planks", 5), (4, "oak_planks", 3)],
+                0,
+                0,
+                Input::Pickup,
+            ),
+            (&[], 0, 1, Input::Pickup),
+            // A cursor of sticks takes one more craft; then shift-crafting
+            // makes as many as the grid allows.
+            (&[], 0, 0, Input::QuickMove),
+            // Cake: the milk buckets leave their buckets behind.
+            (
+                &[
+                    (1, "milk_bucket", 1),
+                    (2, "milk_bucket", 1),
+                    (3, "milk_bucket", 1),
+                    (4, "sugar", 1),
+                    (5, "egg", 1),
+                    (6, "sugar", 1),
+                    (7, "wheat", 1),
+                    (8, "wheat", 1),
+                    (9, "wheat", 1),
+                ],
+                0,
+                0,
+                Input::QuickMove,
+            ),
+            // Shift-clicks from the inventory fill the grid first.
+            (&[(9 + 10, "oak_log", 3)], 19, 0, Input::QuickMove),
+            (&[], 0, 0, Input::QuickMove),
+            // A number key takes the result into the hotbar.
+            (&[(1, "stone", 3), (4, "stick", 2)], 0, 5, Input::Swap),
+        ];
+        with_menu(Kind::Crafting, |env, table| {
+            let station = &mut Menu::new(mod_crafting_table());
+            assert_eq!(station.slot_count(), table.slot_count());
+            for (k, (put, slot, button, input)) in steps.into_iter().enumerate() {
+                for menu in [&mut *table, &mut *station] {
+                    for &(s, item, n) in put {
+                        menu.set_slot(env, s, stack(item, n));
+                    }
+                    menu.click(env, slot, button, input).unwrap();
+                }
+                let (expected, got) = (seen(table), seen(station));
+                assert_eq!(got, expected, "step {k}");
+                if k == 0 {
+                    assert!(got.1.is_some(), "the sticks were crafted");
+                }
+                if k == 3 {
+                    assert!(got.3.iter().any(|(id, _)| id.ends_with("cake")));
+                    assert!(
+                        got.0[1]
+                            .as_ref()
+                            .is_some_and(|b| &*b.item == "minecraft:bucket")
+                    );
+                }
+            }
+        });
+    }
+
+    /// The recipe book's placement (`ServerPlaceRecipe`) and the viewers'
+    /// transfer fill a mod crafting grid as the crafting table's, and a
+    /// placement without the items leaves the grid empty for a ghost.
+    #[test]
+    fn recipes_place_in_a_mod_crafting_grid_as_in_the_table() {
+        with_menu(Kind::Crafting, |env, table| {
+            let station = &mut Menu::new(mod_crafting_table());
+            for menu in [&mut *table, &mut *station] {
+                menu.set_player_item(0, stack("oak_planks", 10));
+                menu.set_player_item(5, stack("cobblestone", 3));
+                menu.set_slot(env, 5, stack("dirt", 1));
+            }
+            let mut places = Vec::new();
+            for menu in [&mut *table, &mut *station] {
+                let first = menu.place_recipe(env, "minecraft:crafting_table", false, false, None);
+                let again = menu.place_recipe(env, "minecraft:crafting_table", true, false, None);
+                let ghost = menu.place_recipe(env, "minecraft:furnace", false, false, None);
+                let transfer = menu.transfer_recipe(env, "minecraft:stick");
+                places.push((first, again, ghost, transfer, seen(menu)));
+            }
+            assert_eq!(places[1], places[0]);
+            let (.., transfer, (slots, ..)) = &places[1];
+            assert_eq!(*transfer, Ok(()));
+            assert_eq!(slots[0], stack("stick", 4));
+        });
+    }
+
+    /// The block entity holds a crafting grid but never its result: loading
+    /// its slots shows what they craft, and the slots it keeps leave the
+    /// result out.
+    #[test]
+    fn a_mod_crafting_result_is_the_menus_own() {
+        with_menu(mod_crafting_table(), |env, menu| {
+            let mut items = vec![None; 10];
+            items[0] = stack("diamond", 1);
+            items[1] = stack("oak_log", 1);
+            menu.load_container(env, &items);
+            assert_eq!(menu.slot(0), stack("oak_planks", 4).as_ref());
+            let kept = menu.container_items();
+            assert_eq!(kept[0], None);
+            assert_eq!(kept[1], stack("oak_log", 1));
+        });
     }
 
     #[test]
@@ -5507,33 +5835,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A server host that answers nothing: the hooks here don't call it.
-    struct NoHost;
-    impl mod_api::Host for NoHost {}
-    mod_api::impl_host_areas!(NoHost);
-    impl mod_api::ServerHost for NoHost {}
-    mod_api::impl_server_host_areas!(NoHost);
-
-    /// Records what `player_brewed_potion` told it.
-    struct BrewWatcher(std::sync::Arc<std::sync::Mutex<Vec<(u128, i32, ItemStack)>>>);
-
-    #[mod_api::__subscriptions]
-    impl mod_api::Hooks for BrewWatcher {
-        fn player_brewed_potion(
-            &self,
-            _host: &mut dyn mod_api::ServerHost,
-            event: &mut mod_api::PlayerBrewedPotionEvent<'_>,
-        ) {
-            let seen = (event.player, event.player_entity_id, event.stack.clone());
-            self.0.lock().unwrap().push(seen);
-        }
-    }
-
     /// `BrewingStandMenu.PotionSlot.onTake`: a pickup and a shift-click on a
-    /// bottle slot each tell a listening mod once, with the taken stack and
-    /// the player's UUID and entity id; with no listener nothing is kept.
+    /// bottle slot each queue the taken stack once for the game's hook adapter;
+    /// with no listener nothing is kept.
     #[test]
-    fn a_bottle_slot_take_tells_the_listener_once_with_the_player() {
+    fn a_bottle_slot_take_records_once_when_a_hook_listens() {
         let root = std::env::temp_dir().join(format!("horizon-brewed-{}", std::process::id()));
         std::fs::create_dir_all(root.join("data/minecraft/recipe")).unwrap();
         let items = horizon_items::items::Items::for_tests(Default::default());
@@ -5566,36 +5872,28 @@ pub(crate) mod tests {
             known_recipes: None,
         };
         let potion = ItemStack::new("minecraft:potion", 1);
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mods: Vec<mod_api::ModEntry> = vec![mod_api::ModEntry::new(
-            "brew-watcher",
-            Box::new(BrewWatcher(seen.clone())),
-        )];
-        let mut host = NoHost;
-        mod_api::testing::with_mods(mods.into(), || {
-            for input in [Input::Pickup, Input::QuickMove] {
-                let mut menu = Menu::new(Kind::Brewing);
-                menu.set_slot(env, 0, Some(potion.clone()));
-                menu.click(env, 0, 0, input).unwrap();
-                // Without a listener the take is only the advancement's.
-                assert!(menu.brewed_potion_takes.is_empty(), "{input:?}");
-                assert_eq!(menu.brewed, std::slice::from_ref(&potion), "{input:?}");
+        let mut seen = Vec::new();
+        for input in [Input::Pickup, Input::QuickMove] {
+            let mut menu = Menu::new(Kind::Brewing);
+            menu.set_slot(env, 0, Some(potion.clone()));
+            menu.click(env, 0, 0, input).unwrap();
+            // Without a listener the take is only the advancement's.
+            assert!(menu.brewed_potion_takes.is_empty(), "{input:?}");
+            assert_eq!(menu.brewed, std::slice::from_ref(&potion), "{input:?}");
 
-                let mut menu = Menu::new(Kind::Brewing);
-                menu.brewed_potion_hook = true;
-                menu.set_slot(env, 0, Some(potion.clone()));
-                menu.click(env, 0, 0, input).unwrap();
-                assert_eq!(
-                    menu.brewed_potion_takes,
-                    std::slice::from_ref(&potion),
-                    "{input:?}"
-                );
-                for stack in &menu.brewed_potion_takes {
-                    mod_api::dispatch_player_brewed_potion(&mut host, 7, 41, stack);
-                }
+            let mut menu = Menu::new(Kind::Brewing);
+            menu.brewed_potion_hook = true;
+            menu.set_slot(env, 0, Some(potion.clone()));
+            menu.click(env, 0, 0, input).unwrap();
+            assert_eq!(
+                menu.brewed_potion_takes,
+                std::slice::from_ref(&potion),
+                "{input:?}"
+            );
+            for stack in &menu.brewed_potion_takes {
+                seen.push(stack.clone());
             }
-        });
-        let told = (7, 41, potion);
-        assert_eq!(*seen.lock().unwrap(), [told.clone(), told]);
+        }
+        assert_eq!(seen, [potion.clone(), potion]);
     }
 }

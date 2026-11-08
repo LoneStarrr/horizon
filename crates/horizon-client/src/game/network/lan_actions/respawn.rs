@@ -19,6 +19,7 @@ impl Game<'_> {
         if !host.hub.guests[i].dead {
             return;
         }
+        let uuid = host.hub.guests[i].uuid;
         // PlayerList.respawn replaces the player, retaining only opted-in data.
         if let Some(attachments) = self
             .lan
@@ -28,6 +29,7 @@ impl Game<'_> {
         {
             attachments.replace_contents(copy);
         }
+        self.reinitialize_server_player(uuid, conn);
         // PlayerList.respawn removes the dead player (Player.remove).
         self.guest_drop_carried(i);
         // AbstractContainerScreen.tick / ServerPlayer.closeContainer: the dead

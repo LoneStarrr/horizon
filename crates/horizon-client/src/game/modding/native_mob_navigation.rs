@@ -39,9 +39,12 @@ impl Game<'_> {
         // The pathfinder reads terrain only. Take the mob list so its selected
         // mob can be mutably borrowed alongside the shared MobWorld, just as
         // the mob tick does. No mod hook fires during pathfinding.
-        let mut mobs = std::mem::take(&mut self.mobs);
+        let mut mobs = self.mobs.lift();
+        #[cfg(test)]
+        super::entity::taken_pass_tests::after_take(self);
         let moved = mobs[index].nav_move_to(&self.mob_world_base(&[]), at, speed);
-        self.mobs = mobs;
+        self.mobs
+            .restore(mobs, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
         moved
     }
 
@@ -149,7 +152,7 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources"]
     fn navigation_starts_a_real_path_and_refuses_stale_handles() {
-        with_game(|game| {
+        crate::game::entity::taken_pass_tests::in_both_dimensions(|game, balance| {
             game.world
                 .chunks
                 .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
@@ -176,7 +179,13 @@ mod tests {
             let entity = game.entity(99).unwrap();
             let mob = game.mob(entity).unwrap();
             assert_eq!(mob.is_done(game), Some(true));
-            assert!(mob.move_to(game, [10.5, 65.0, 3.5], 1.25));
+            crate::game::entity::taken_pass_tests::assert_mob_spawn_survives(
+                game,
+                balance,
+                |game| {
+                    assert!(mob.move_to(game, [10.5, 65.0, 3.5], 1.25));
+                },
+            );
             assert_eq!(mob.is_done(game), Some(false));
             assert_eq!(game.mobs[0].ai.nav.speed_modifier, 1.25);
             assert!(!mob.move_to(game, [f64::NAN, 65.0, 3.5], 1.0));
@@ -210,10 +219,13 @@ mod tests {
             assert!(!stale.move_to(game, [5.0, 65.0, 3.0], 1.0));
             assert!(!stale.stop(game));
             assert_eq!(stale.is_done(game), None);
-            let taken = std::mem::take(&mut game.mobs);
+            let taken = game.mobs.lift();
             assert_eq!(mob.is_done(game), None);
             assert!(!mob.stop(game));
-            game.mobs = taken;
+            game.mobs.restore(
+                taken,
+                horizon_client::join_seq::RestoreOrder::SurvivorsFirst,
+            );
             game.armor_stands
                 .push(horizon_client::entities::ArmorStand::new(
                     102,

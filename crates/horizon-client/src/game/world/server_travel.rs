@@ -147,7 +147,12 @@ fn drop_hook(host: &mut LanHost, conn: u32) {
     }
 }
 
-fn take_vehicle<T: Rideable + horizon_client::join_seq::Joined, const DIRECT: bool>(
+fn take_vehicle<
+    T: Rideable
+        + horizon_client::join_seq::Joined
+        + horizon_mod_runtime::attachments::HasAttachmentLifetime,
+    const DIRECT: bool,
+>(
     list: &mut horizon_client::join_seq::JoinList<T, DIRECT>,
     id: u32,
     at: Vec3,
@@ -155,7 +160,7 @@ fn take_vehicle<T: Rideable + horizon_client::join_seq::Joined, const DIRECT: bo
     motion: Vec3,
 ) -> Option<T> {
     let i = list.iter().position(|v| v.id() == id)?;
-    let mut v = list.remove(i);
+    let mut v = list.remove_for_transfer(i);
     v.arrive(at, yaw, motion);
     v.set_join_seq(horizon_client::join_seq::JoinSeq::UNJOINED);
     Some(v)
@@ -322,7 +327,7 @@ impl Game<'_> {
                         });
                         return true;
                     }
-                    self.start_server_trip(conn, plan.dim, Some(plan));
+                    self.start_server_trip(conn, plan.dim, Some(plan), false);
                 }
             }
             "end_portal" => {
@@ -330,7 +335,7 @@ impl Game<'_> {
                 // Entity.canTeleport: out of the End only after the credits.
                 if !from_end || seen_credits {
                     let target = if from_end { Dim::Overworld } else { Dim::End };
-                    self.start_server_trip(conn, target, None);
+                    self.start_server_trip(conn, target, None, false);
                 }
             }
             _ => self.start_gateway_trip(conn, pos),
@@ -411,7 +416,7 @@ impl Game<'_> {
                     let (uuid, name) = (g.uuid, g.name.clone());
                     self.native_player_clone(uuid, &name, false);
                 }
-                self.start_server_trip(conn, Dim::Overworld, None);
+                self.start_server_trip(conn, Dim::Overworld, None, true);
                 self.portals.player.cooldown = 10;
             }
             return;
@@ -447,7 +452,7 @@ impl Game<'_> {
                 if !self.server_player_portal_allowed(conn, target, "end_portal") {
                     return;
                 }
-                self.start_server_trip(conn, target, None);
+                self.start_server_trip(conn, target, None, false);
             }
             // Entity.setAsInsidePortal while cooling down restarts the cooldown.
             self.portals.player.cooldown = 10;
@@ -506,7 +511,7 @@ impl Game<'_> {
             self.portals.player.process = None;
             return;
         }
-        self.start_server_trip(conn, plan.dim, Some(plan));
+        self.start_server_trip(conn, plan.dim, Some(plan), false);
     }
 
     /// `Entity.handlePortal` of a vehicle server players ride, once through
@@ -545,7 +550,7 @@ impl Game<'_> {
             // point out of the End).
             let (target, plan) = (plan.dim, (!plan.end).then_some(plan));
             for conn in riders {
-                self.start_server_trip(conn, target, plan);
+                self.start_server_trip(conn, target, plan, false);
             }
         }
     }
@@ -570,7 +575,13 @@ impl Game<'_> {
     /// The player moves to `target`'s level (opened if nobody was there)
     /// and is told it is there, at the approximate exit, while it loads. The
     /// level whose tick is running is put back in place afterwards.
-    pub(super) fn start_server_trip(&mut self, conn: u32, target: Dim, plan: Option<Plan>) {
+    pub(super) fn start_server_trip(
+        &mut self,
+        conn: u32,
+        target: Dim,
+        plan: Option<Plan>,
+        credits_respawn: bool,
+    ) {
         let Some(host) = self.lan.as_mut() else {
             return;
         };
@@ -628,6 +639,12 @@ impl Game<'_> {
         if let Some(host) = self.lan.as_mut() {
             host.hub
                 .change_level(i, at, yaw, None, true, PLAYER_DELAY, &ctx);
+        }
+        if credits_respawn && let Some(host) = self.lan.as_mut() {
+            host.hub.guests.update(i, |g| {
+                g.load_timeout = horizon_client::lan::guest::CLIENT_LOADED_TIMEOUT;
+                g.loading = true;
+            });
         }
         self.bind_player_attachments(conn, false);
         self.as_guest(conn, |g| {
@@ -1014,11 +1031,14 @@ impl Game<'_> {
         let Some(parked) = self.levels.parked_mut(source) else {
             return;
         };
-        if let Some(b) = take_vehicle(&mut parked.boats, id, at, yaw, motion) {
+        if let Some(mut b) = take_vehicle(&mut parked.boats, id, at, yaw, motion) {
+            self.rebind_transferred_entity(source, id, &mut b);
             self.boats.push(b);
-        } else if let Some(c) = take_vehicle(&mut parked.carts, id, at, yaw, motion) {
+        } else if let Some(mut c) = take_vehicle(&mut parked.carts, id, at, yaw, motion) {
+            self.rebind_transferred_entity(source, id, &mut c);
             self.carts.push(c);
-        } else if let Some(m) = take_vehicle(&mut parked.mobs, id, at, yaw, motion) {
+        } else if let Some(mut m) = take_vehicle(&mut parked.mobs, id, at, yaw, motion) {
+            self.rebind_transferred_entity(source, id, &mut m);
             self.mobs.push(m);
         } else {
             return;
@@ -1269,5 +1289,307 @@ mod tests {
         assert!(carts.is_empty());
         assert!(take_vehicle(&mut mobs, 9, at, 0.0, Vec3::ZERO).is_none());
         assert!(mobs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transfer_lifetime_tests {
+    use super::*;
+    use horizon_client::join_seq::Joined;
+    use horizon_mod_runtime::attachments::{
+        AttachmentLifetime, AttachmentType, Attachments, HasAttachmentLifetime, Holder,
+        index::AttachmentIndex,
+    };
+    use std::sync::{Arc, Mutex};
+
+    static VALUE: AttachmentType<i32> = AttachmentType {
+        namespace: "test",
+        name: "transfer",
+        default: || 0,
+        codec: None,
+        copy_on_death: false,
+        sync: false,
+    };
+
+    fn removal<T: Rideable + horizon_client::join_seq::Joined + HasAttachmentLifetime>(
+        mut owner: T,
+    ) {
+        let index = Arc::new(Mutex::new(AttachmentIndex::default()));
+        let mut map = Attachments::default();
+        VALUE.set(&mut map, Holder::Entity(owner.id()), 17).unwrap();
+        owner.attachment_lifetime().bind(&mut map, &index, 42u32);
+        let mut list: horizon_client::join_seq::JoinList<T> = [owner].into_iter().collect();
+        let id = list[0].id();
+        let key = ("test".into(), "transfer".into());
+        let retained = index.lock().unwrap().snapshot(&key);
+        let moved = take_vehicle(&mut list, id, Vec3::ZERO, 0.0, Vec3::ZERO).unwrap();
+        assert!(list.is_empty());
+        assert!(index.lock().unwrap().snapshot(&key).is_empty());
+        VALUE.set(&mut map, Holder::Entity(id), 18).unwrap();
+        assert!(index.lock().unwrap().snapshot(&key).is_empty());
+        assert_eq!(retained[0].entry.read(&VALUE), Ok(&17));
+        drop(moved);
+    }
+
+    #[test]
+    fn transfer_removal_retires_before_returning_the_vehicle() {
+        removal(minecarts::Minecart::new(
+            71,
+            minecarts::CartKind::Rideable,
+            Vec3::ZERO,
+        ));
+        removal(boats::Boat::new(72, Arc::from("oak"), Vec3::ZERO, 0.0));
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources"]
+    fn transfer_arrival_rebinds_only_bound_owners_with_the_same_id() {
+        for kind in ["minecraft:minecart", "minecraft:oak_boat", "minecraft:pig"] {
+            for bound in [true, false] {
+                super::super::native_entity_refs::tests::with_game(|game| {
+                    game.tickets.update(None);
+                    let target = game
+                        .summon_with_nbt(kind, [0.5, 70.0, 0.5], "{}")
+                        .unwrap()
+                        .unwrap();
+                    let id = match target {
+                        super::super::commands::Target::Cart(id)
+                        | super::super::commands::Target::Boat(id)
+                        | super::super::commands::Target::Mob(id) => id,
+                        _ => panic!("unexpected vehicle target"),
+                    };
+                    let old_join = match kind {
+                        "minecraft:minecart" => game.carts[0].join_seq(),
+                        "minecraft:oak_boat" => game.boats[0].join_seq(),
+                        _ => game.mobs[0].join_seq(),
+                    };
+                    assert!(old_join.is_joined());
+                    let uuid = game.uuid_for(id);
+                    let source = game.dim;
+                    let source_ref = game.entity(id).unwrap();
+                    let source_index = game.attachment_indexes.entry(source).or_default().clone();
+                    let mut map = Attachments::default();
+                    VALUE.set(&mut map, Holder::Entity(id), 17).unwrap();
+                    let old = if bound {
+                        Some(map.bind_index(
+                            &source_index,
+                            mod_api::AttachmentHolder::Entity(source_ref),
+                        ))
+                    } else {
+                        None
+                    };
+                    macro_rules! slot {
+                        ($list:ident) => {
+                            game.$list.update(0, |entity| {
+                                if let Some(old) = &old {
+                                    *entity.attachment_lifetime() =
+                                        AttachmentLifetime::new(old.clone());
+                                }
+                            })
+                        };
+                    }
+                    match kind {
+                        "minecraft:minecart" => slot!(carts),
+                        "minecraft:oak_boat" => slot!(boats),
+                        _ => slot!(mobs),
+                    }
+                    let key = ("test".into(), "transfer".into());
+                    let retained = source_index.lock().unwrap().snapshot(&key);
+                    let mut stale_map = map.clone();
+                    game.entity_attachments.insert(uuid, map);
+                    game.enter_level(Dim::Nether).unwrap();
+                    let destination_ref =
+                        mod_api::EntityRef::new(game.level(game.dim.id()).unwrap().epoch(), id);
+                    assert_eq!(source_ref, destination_ref);
+                    game.arrive_vehicle(source, id, Vec3::ZERO, 0.0);
+                    macro_rules! transferred {
+                        ($list:ident) => {{
+                            let parked = game.levels.parked_mut(source).unwrap();
+                            assert!(
+                                !parked
+                                    .$list
+                                    .iter()
+                                    .any(|e| e.id == id || e.join_seq() == old_join)
+                            );
+                            let arrived = game.$list.iter().find(|e| e.id == id).unwrap();
+                            assert!(arrived.join_seq().is_joined());
+                            assert_ne!(arrived.join_seq(), old_join);
+                            assert!(!game.$list.iter().any(|e| e.join_seq() == old_join));
+                        }};
+                    }
+                    match kind {
+                        "minecraft:minecart" => transferred!(carts),
+                        "minecraft:oak_boat" => transferred!(boats),
+                        _ => transferred!(mobs),
+                    }
+                    assert!(source_index.lock().unwrap().snapshot(&key).is_empty());
+                    let destination_index =
+                        game.attachment_indexes.entry(game.dim).or_default().clone();
+                    let rows = destination_index.lock().unwrap().snapshot(&key);
+                    assert_eq!(rows.len(), usize::from(bound));
+                    if let Some(old) = old {
+                        let current = match kind {
+                            "minecraft:minecart" => game
+                                .carts
+                                .update(0, |e| e.attachment_lifetime().registration().unwrap()),
+                            "minecraft:oak_boat" => game
+                                .boats
+                                .update(0, |e| e.attachment_lifetime().registration().unwrap()),
+                            _ => game.mobs[0].attachment_lifetime.registration().unwrap(),
+                        };
+                        assert!(!old.same_registration(&current));
+                        assert_eq!(
+                            rows[0].holder,
+                            mod_api::AttachmentHolder::Entity(destination_ref)
+                        );
+                        assert_eq!(rows[0].entry.read(&VALUE), Ok(&17));
+                        assert!(!old.unregister());
+                        drop(AttachmentLifetime::new(old));
+                        VALUE.set(&mut stale_map, Holder::Entity(id), 99).unwrap();
+                        assert_eq!(
+                            destination_index.lock().unwrap().snapshot(&key)[0]
+                                .entry
+                                .read(&VALUE),
+                            Ok(&17)
+                        );
+                        assert_eq!(retained[0].entry.read(&VALUE), Ok(&17));
+                        for index in [&source_index, &destination_index] {
+                            assert_eq!(index.lock().unwrap().validate_row(&retained[0]),
+                                Err(horizon_mod_runtime::attachments::AttachmentRowError::StaleHolder));
+                        }
+                        assert_eq!(
+                            destination_index.lock().unwrap().validate_row(&rows[0]),
+                            Ok(())
+                        );
+                    }
+                    assert_eq!(game.persist.uuids.get(&id), Some(&uuid));
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod credits_respawn_tests {
+    use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
+    use horizon_client::lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig};
+    use horizon_protocol::packets::configuration::ClientInformation;
+    use std::sync::{Arc, atomic::AtomicI32, mpsc};
+
+    /// `ServerGamePacketListenerImpl.handleClientCommand(PERFORM_RESPAWN)` for a
+    /// player who won the game: `restartClientLoadTimerAfterRespawn`, so the
+    /// respawned player is not loaded (its actions wait, `isInvulnerableTo`
+    /// spares it) until the client says so or 60 ticks pass.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn the_credits_respawn_waits_for_the_client_to_load() {
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        let scratch = std::env::temp_dir().join(format!(
+            "horizon-credits-respawn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        game.world_root = scratch.clone();
+        game.level.world_spawn = Some([0, 100, 0]);
+        game.lan_host(
+            super::super::lan::LanSettings {
+                port: 0,
+                guest_commands: true,
+                force_game_mode: false,
+            },
+            NetConfig {
+                announce: false,
+                ..NetConfig::loopback(0, "credits-respawn-test".into(), 2)
+            },
+            HubConfig {
+                default_game_mode: 0,
+                guest_commands: true,
+                force_game_mode: false,
+                hardcore: false,
+                view_distance: 2,
+                simulation_distance: 2,
+                dimension: "minecraft:overworld".into(),
+                allow_flight: false,
+                seed: 0,
+                max_players: 2,
+                integrated: false,
+                levels: Default::default(),
+            },
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut guest = Guest::new(
+            Joined {
+                conn: 2,
+                uuid: 330,
+                name: "CreditsGuest".into(),
+                properties: Vec::new(),
+                info: ClientInformation::new(2),
+                brand: "test".into(),
+                sender: PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 100.0, 0.5],
+            2,
+        );
+        guest.dimension = "minecraft:overworld".into();
+        guest.placed = true;
+        guest.loaded = true;
+        guest.loading = false;
+        guest.load_timeout = 0;
+        let mut host = game.lan.take().unwrap();
+        host.hub.guests.push(guest);
+        let play = host.play.entry(2).or_default();
+        play.won_game = true;
+        play.respawn_requested = true;
+        assert!(host.hub.guests[0].client_loaded());
+
+        game.lan = Some(host);
+        game.handle_server_portal(2);
+        let host = game.lan.take().unwrap();
+        assert!(!host.play[&2].won_game, "the credits are over");
+        let guest = &host.hub.guests[0];
+        assert_eq!(guest.load_timeout, 60);
+        assert!(guest.loading);
+        assert!(!guest.client_loaded());
+        drop(host);
+        drop(game);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 }

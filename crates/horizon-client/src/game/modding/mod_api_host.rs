@@ -69,6 +69,7 @@ impl Game<'_> {
             .map(|(_, uuid)| *uuid)
             .collect();
         for uuid in gone {
+            self.forget_entity_initialization(uuid);
             self.entity_attachments.remove(&uuid);
         }
     }
@@ -85,14 +86,20 @@ impl Game<'_> {
         holder: mod_api::Holder,
         access: AttachmentAccess,
     ) -> Result<&mut mod_api::Attachments, mod_api::AttachmentError> {
+        if self.client_attachment_entity_exists(holder) {
+            self.initialize_entity_on_access(holder);
+        }
         if self.native_authoritative() {
             self.world.attachment_syncs.insert(holder);
             return self.attachment_map_quiet(holder, access);
         }
-        match self.remote.as_mut() {
-            Some(remote) => Ok(remote.attachments.entry(holder).or_default()),
-            None => Err(mod_api::AttachmentError::MissingHolder),
-        }
+        let Some(remote) = self.remote.as_mut() else {
+            return Err(mod_api::AttachmentError::MissingHolder);
+        };
+        remote.attachments.entry(holder).or_default();
+        self.bind_remote_attachment(holder);
+        let remote = self.remote.as_mut().unwrap();
+        Ok(remote.attachments.get_mut(&holder).unwrap())
     }
 
     /// `attachment_map` without recording the holder for the sync. Inside a transaction, the
@@ -118,9 +125,12 @@ impl Game<'_> {
     ) -> Result<&mut mod_api::Attachments, mod_api::AttachmentError> {
         use mod_api::AttachmentError;
         if let mod_api::Holder::Entity(id) = holder {
-            if !self.attachment_entity_exists(id) {
+            if self.entity_initialization.active != Some(holder)
+                && !self.attachment_entity_exists(id)
+            {
                 return Err(AttachmentError::MissingHolder);
             }
+            self.initialize_entity_on_access(holder);
             attachment_compound(
                 self.persist
                     .raw
@@ -159,6 +169,17 @@ impl Game<'_> {
             return Ok(map);
         }
         if let mod_api::Holder::Player(uuid) = holder {
+            if self.entity_initialization.active != Some(holder)
+                && self.lan_acting_uuid != Some(uuid)
+                && self
+                    .lan
+                    .as_ref()
+                    .and_then(|host| host.hub.holder_guest(uuid, self.dim.id()))
+                    .is_none()
+            {
+                return Err(AttachmentError::MissingHolder);
+            }
+            self.initialize_entity_on_access(holder);
             if self.lan_acting_uuid == Some(uuid) {
                 if access == AttachmentAccess::Store
                     && let Some(conn) = self.lan_acting
@@ -170,7 +191,13 @@ impl Game<'_> {
             let conn = self
                 .lan
                 .as_ref()
-                .and_then(|host| host.hub.holder_guest(uuid, self.dim.id()))
+                .and_then(|host| {
+                    if self.entity_initialization.active == Some(holder) {
+                        host.hub.guests.iter().find(|guest| guest.uuid == uuid)
+                    } else {
+                        host.hub.holder_guest(uuid, self.dim.id())
+                    }
+                })
                 .map(|guest| guest.conn)
                 .ok_or(AttachmentError::MissingHolder)?;
             if self.lan_guest_swaps.contains(&conn) {
@@ -227,9 +254,8 @@ impl mod_api::LevelHost for super::GameLevel<'_> {
         }
         super::native_world_read::block_in_tag(block, tag)
     }
-    fn item_stack_in_tag(&self, stack: &mod_api::ItemStack, tag: &str) -> Option<bool> {
-        self.native_authoritative
-            .then(|| super::native_world_read::stack_in_tag(self.items, stack, tag))
+    fn tags(&self) -> &dyn mod_api::Tags {
+        self
     }
     fn fluid_state(&self, pos: [i32; 3]) -> Option<mod_api::FluidState> {
         let [x, y, z] = pos;
@@ -325,6 +351,9 @@ impl mod_api::LevelHost for super::native_hooks::HitLevel<'_> {
         self.0.tags()?;
         super::native_world_read::block_in_tag(block, tag)
     }
+    fn tags(&self) -> &dyn mod_api::Tags {
+        self
+    }
     fn fluid_in_tag(&self, fluid: &str, tag: &str) -> Option<bool> {
         Some(super::native_world_read::fluid_in_tag(
             self.0.tags()?,
@@ -416,8 +445,8 @@ impl<'a: 'b, 'b, L: std::ops::Deref<Target = super::GameLevel<'a>>> mod_api::Lev
     fn block_in_tag(&self, block: mod_api::BlockKey, tag: &str) -> Option<bool> {
         mod_api::LevelHost::block_in_tag(&*self.level, block, tag)
     }
-    fn item_stack_in_tag(&self, stack: &mod_api::ItemStack, tag: &str) -> Option<bool> {
-        mod_api::LevelHost::item_stack_in_tag(&*self.level, stack, tag)
+    fn tags(&self) -> &dyn mod_api::Tags {
+        mod_api::LevelHost::tags(&*self.level)
     }
     fn fluid_state(&self, pos: [i32; 3]) -> Option<mod_api::FluidState> {
         mod_api::LevelHost::fluid_state(&*self.level, pos)
@@ -555,3 +584,10 @@ impl<'a: 'b, 'b> mod_api::LevelWriteHost for LevelTicks<'b, &mut super::GameLeve
         self.level.native_level_event(id, pos, data)
     }
 }
+
+super::native_tags::impl_tags!(
+    super::GameLevel<'_>,
+    level,
+    level.native_authoritative.then_some(level.items)
+);
+super::native_tags::impl_tags!(super::native_hooks::HitLevel<'_>, level, level.0.tags());

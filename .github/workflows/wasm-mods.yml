@@ -1,9 +1,10 @@
 name: wasm-mods
-# What dyna-checks used to run as its wasm-mods job: the wasm32 mod API, the real game's internals
+# What dyna-checks used to run as its wasm-mods job: the wasm32 mod API, the internals fixture's
 # bindings, mods built to mod.wasm and loaded by the runtime, and the mod API's generated WIT as an
 # artifact with its diff in the job summary. Main pushes and dispatches only, never pull requests.
-# Its own workflow so that dyna-checks (never cancelled on main) is not held up by it: a newer main
-# push supersedes this run, as with mixins-check.
+# Its own workflow so that dyna-checks (never cancelled on main) is not held up by it. A started run
+# is never cancelled (it takes long enough that every push used to cancel it and main got no verdict):
+# a newer main push replaces only the run still waiting, so each finished run judges a recent main.
 on:
   push:
     branches: [main]
@@ -19,7 +20,10 @@ permissions:
   actions: read
 concurrency:
   group: wasm-mods-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+env:
+  # sccache (shared per Dyna host) cannot cache incremental compiles, so every Rust job builds non-incremental.
+  CARGO_INCREMENTAL: 0
 jobs:
   # The same runner choice dyna-checks makes: Dyna's large runner while the pool is up, else GitHub's.
   runner:
@@ -56,10 +60,9 @@ jobs:
     # the mod API's generated WIT as an artifact, and its diff in the job summary (never a failure).
     needs: runner
     runs-on: ${{ inputs.runner != '' && inputs.runner != 'auto' && inputs.runner || (needs.runner.outputs.self_hosted == 'true' && 'dyna-large' || 'ubuntu-latest') }}
-    # The universal host and guest binding build alone takes about an hour on the OVH runners (36 minutes
-    # for the whole job on the desktop runner). This workflow has its own queue, so it never holds up the
-    # lint and verify of a newer main commit.
-    timeout-minutes: 150
+    # The full internals coverage (about an hour of host and guest binding builds) is wasm-coverage.yml, daily.
+    # This workflow has its own queue, so it never holds up the lint and verify of a newer main commit.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,19 +94,6 @@ jobs:
           # are cached once rather than in seven independent target directories.
           workspaces: .
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Unlike rust-cache, retain the staged workspace artifacts and source mtimes.
-      # Dyna's target symlink already persists these directories between jobs.
-      - uses: actions/cache/restore@v4
-        if: runner.environment == 'github-hosted'
-        id: coverage-cache
-        with:
-          path: |
-            target/internals-catalog-coverage
-            target/internals-catalog-check
-          key: internals-coverage-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            internals-coverage-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
-            internals-coverage-v1-${{ runner.os }}-
       - name: The mod API, points and internals crates build for wasm32
         run: cargo +1.99.1 check -p horizon-mod-api -p horizon-mod-points -p horizon-mod-internals --target wasm32-unknown-unknown
       - name: Generated internals copies, containers and functions compile for wasm32
@@ -111,25 +101,13 @@ jobs:
           HORIZON_MOD_INTERNALS_MANIFEST: ${{ github.workspace }}/crates/horizon-mod-wasm/tests/internals/coverage.toml
           HORIZON_MOD_INTERNALS_CATALOG: ${{ github.workspace }}/crates/horizon-mod-wasm/tests/internals/coverage.json
         run: cargo +1.99.1 check -p horizon-mod-internals --target wasm32-unknown-unknown
-      - name: Every crossable real internal has compiling host and guest bindings
-        run: |
-          export HORIZON_COVERAGE_WASM_CARGO="$(rustup which --toolchain 1.99.1 cargo)"
-          export HORIZON_COVERAGE_WASM_RUSTC="$(rustup which --toolchain 1.99.1 rustc)"
-          cargo +stable test -j4 -p horizon-mod-api-gen --lib guest_compiler_ignores_another_toolchains_driver -- --ignored --nocapture
-          cargo +stable test -j4 -p horizon-mod-api-gen --lib real_catalog_has_compiling_host_and_guest_bindings -- --ignored --nocapture
-      - uses: actions/cache/save@v4
-        if: runner.environment == 'github-hosted' && steps.coverage-cache.outputs.cache-hit != 'true'
-        with:
-          path: |
-            target/internals-catalog-coverage
-            target/internals-catalog-check
-          key: ${{ steps.coverage-cache.outputs.cache-primary-key }}
       - name: Build all wasm fixtures and the std member in one shared target
         run: |
           cargo +stable build -p cargo-horizon-mod -p xtask
-          for mod in docs/modding/examples/wasm-hello \
+          for mod in docs/modding/examples/wasm-hello docs/modding/examples/wasm-widgets \
             crates/horizon-mod-wasm/tests/groups/{counter_lib,alpha,beta,gamma} \
-            crates/horizon-mod-wasm/tests/points/{chat_tail,lib_tail}; do
+            crates/horizon-mod-wasm/tests/points/{chat_tail,lib_tail} \
+            crates/horizon-mod-wasm/tests/attachments/mod; do
             mkdir -p "$mod/target"
             ln -s "$GITHUB_WORKSPACE/target" "$mod/target/horizon-mod"
             (cd "$mod" && "$GITHUB_WORKSPACE/target/debug/cargo-horizon-mod" horizon-mod build --wasm)
@@ -155,6 +133,11 @@ jobs:
           HORIZON_WASM_SAMPLE: ${{ github.workspace }}/docs/modding/examples/wasm-hello/target/horizon-mod/hello_wasm.hmod
           HORIZON_WASM_STD: ${{ github.workspace }}/target/horizon-wasm-std.wasm
         run: '"$WASM_TEST_SAMPLE" --ignored'
+      - name: Attachment batches cross shared reads and explicit server writes
+        env:
+          HORIZON_WASM_ATTACHMENTS: ${{ github.workspace }}/crates/horizon-mod-wasm/tests/attachments/mod/target/horizon-mod/query_fixture.hmod
+          HORIZON_WASM_STD: ${{ github.workspace }}/target/horizon-wasm-std.wasm
+        run: '"$WASM_TEST_ATTACHMENTS" --ignored'
       - name: Mods sharing a library, linked in one group, and a mod of another group
         env:
           HORIZON_WASM_GROUPS: ${{ github.workspace }}/crates/horizon-mod-wasm/tests/groups

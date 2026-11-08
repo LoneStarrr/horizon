@@ -25,7 +25,12 @@ impl Game<'_> {
     /// packs' and native mods' changes included. Read from the item report's JSON, so a
     /// number is an `Int`, `Long` or `Double` and a boolean a `Byte`. None where the item
     /// hasn't the component, and for an unknown item.
-    pub(super) fn item_default_component(&self, item: &str, component: &str) -> Option<Tag> {
+    pub(super) fn item_default_component(
+        &self,
+        item: mod_api::ItemKey,
+        component: &str,
+    ) -> Option<Tag> {
+        let item = mod_api::__private::item_key_id(item)?;
         let prototype = self.pack.item_renderer.models.prototypes.get(item)?;
         Some(horizon_client::scoreboard::json_to_tag(
             prototype.get(component)?,
@@ -101,7 +106,9 @@ impl Game<'_> {
     }
     /// `ItemStack.isBarVisible`, `getBarWidth`, `getBarColor`, before client-only hooks.
     pub(in crate::game) fn item_resource_bar(&self, stack: &ItemStack) -> Option<mod_api::ItemBar> {
-        let resource = mod_api::ItemResource::of(stack);
+        use super::api_values::TryIntoApi;
+        let snapshot = stack.try_into_api().ok()?;
+        let resource = mod_api::ItemResource::of(&snapshot);
         let component = |id| {
             resource.value(
                 self,
@@ -137,6 +144,46 @@ impl Game<'_> {
     /// world's enchantment definitions. API @API:item_components@.
     pub(in crate::game) fn enchantments_compatible(&self, a: &str, b: &str) -> bool {
         world_stations!(self).enchantments.compatible(a, b)
+    }
+    /// Roll through the game's enchantment registry and the active level's random source.
+    pub(in crate::game) fn item_resource_enchant_randomly(
+        &mut self,
+        stack: &ItemStack,
+        level: mod_api::LevelRef,
+        power: i32,
+        pool: &mod_api::Identifier,
+    ) -> Result<Option<ItemStack>, mod_api::StackWriteError> {
+        if level.dimension() != self.dim.key() || self.native_level_world(level).is_none() {
+            return Ok(None);
+        }
+        let items = world_items!(self);
+        let enchantments = &world_stations!(self).enchantments;
+        let pool = enchantments.tag(&pool.to_string());
+        if pool.is_empty() {
+            return Ok(None);
+        }
+        let data = stack.data();
+        let value = if let Some(own) = data.and_then(|d| d.other("minecraft:enchantable")) {
+            own.get("value")
+                .and_then(horizon_items::properties::component_int)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default()
+        } else if data.is_some_and(|d| d.other("!minecraft:enchantable").is_some()) {
+            0
+        } else {
+            enchantments.enchantable(&stack.item)
+        };
+        let picked = enchantments.select_with_value(
+            items,
+            &mut self.world.random,
+            &stack.item,
+            power,
+            pool,
+            value,
+        );
+        Ok(horizon_client::stations::apply_enchantment_list(
+            stack, picked,
+        ))
     }
     /// Whether an enchantment on `stack` has effect component `effect`, by the world's
     /// enchantment definitions (`EnchantmentHelper.has`), behind
@@ -241,6 +288,75 @@ mod equippable_slot_tests {
 
 #[cfg(test)]
 mod enchantment_conflict_tests {
+    use super::ItemStack;
+    use crate::game::api_values::{stack_value, test_snapshot};
+    use crate::game::native_entity_refs::tests::with_game;
+    use horizon_core::random::RandomSource;
+    use mod_api::{Identifier, ItemResource, LevelRef, NativeWorldEpoch};
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn enchanting_a_resource_uses_the_active_levels_random_and_preserves_the_input() {
+        with_game(|game| {
+            let level = game.level("minecraft:overworld").unwrap();
+            let stale = LevelRef::new(
+                NativeWorldEpoch::new(level.epoch().get() + 1),
+                level.dimension(),
+            );
+            let stack = ItemStack::new("minecraft:book", 1);
+            let resource = ItemResource::of(&test_snapshot(&stack));
+            let pool = Identifier::parse("minecraft:in_enchanting_table").unwrap();
+            let missing = Identifier::parse("fixture:missing").unwrap();
+            let mut expected_random = game.world.random.clone();
+
+            assert!(
+                resource
+                    .enchant_randomly(game, stale, 30, &pool)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                resource
+                    .enchant_randomly(game, level, 30, &missing)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                game.world.random.clone().next_long(),
+                expected_random.clone().next_long()
+            );
+
+            // Vanilla still rolls enchantments and advances the RNG at zero power.
+            let power = 0;
+            let definitions = &game.stations().enchantments;
+            let expected = definitions.select(
+                game.items(),
+                &mut expected_random,
+                &stack.item,
+                power,
+                definitions.tag("minecraft:in_enchanting_table"),
+            );
+            assert!(!expected.is_empty());
+            let result = resource
+                .enchant_randomly(game, level, power, &pool)
+                .unwrap()
+                .unwrap();
+            let result = stack_value(result.as_stack()).unwrap();
+            assert_eq!(&*result.item, "minecraft:enchanted_book");
+            assert_eq!(result.stored_enchantments().len(), expected.len());
+            for (id, level) in expected {
+                assert!(result.stored_enchantments().contains(&(id, level)));
+            }
+            assert!(
+                stack_value(resource.as_stack())
+                    .unwrap()
+                    .all_enchantments()
+                    .is_empty()
+            );
+            assert_eq!(game.world.random.next_long(), expected_random.next_long());
+        });
+    }
+
     /// `Enchantment.areCompatible`: the same enchantment twice and the exclusive sets conflict,
     /// others and unknown ids do not.
     #[test]
@@ -257,6 +373,9 @@ mod enchantment_conflict_tests {
 
 #[cfg(test)]
 mod item_resource_property_tests {
+    fn engine(resource: &mod_api::ItemResource, count: u32) -> horizon_items::items::ItemStack {
+        super::super::api_values::stack_value(&resource.to_stack(count).unwrap()).unwrap()
+    }
     use serde_json::Value;
     mod support {
         include!(concat!(
@@ -307,7 +426,7 @@ mod item_resource_property_tests {
                     values,
                 } = support::evaluate(game, input);
                 assert_eq!(&values, expected, "{}", input["name"]);
-                let stack = item.to_stack(1);
+                let stack = engine(&item, 1);
                 let definitions = &game.items().enchantments;
                 let props = definitions.props(&stack.item);
                 assert_eq!(
@@ -334,7 +453,7 @@ mod item_resource_property_tests {
                         definitions,
                         game.items(),
                         &stack,
-                        &material.to_stack(1)
+                        &engine(&material, 1)
                     ),
                     item.repairable(game, &material)
                 );
@@ -393,14 +512,19 @@ mod item_resource_property_tests {
         crate::game::native_entity_refs::tests::with_game_at(root.clone(), |game| {
             game.session_lock =
                 Some(horizon_client::save::SessionLock::acquire(&game.save.root).unwrap());
-            let wood = ItemResource::of(&ItemStack::new("minecraft:wooden_sword", 1));
-            let plank = ItemResource::of(&ItemStack::new("minecraft:oak_planks", 1));
+            let wood = ItemResource::of(&super::super::api_values::test_snapshot(&ItemStack::new(
+                "minecraft:wooden_sword",
+                1,
+            )));
+            let plank = ItemResource::of(&super::super::api_values::test_snapshot(
+                &ItemStack::new("minecraft:oak_planks", 1),
+            ));
             assert!(wood.repairable(game, &plank));
             assert!(horizon_client::stations::is_valid_repair_item(
                 &game.items().enchantments,
                 game.items(),
-                &wood.to_stack(1),
-                &plank.to_stack(1)
+                &engine(&wood, 1),
+                &engine(&plank, 1)
             ));
             assert!(!horizon_items::enchant::Enchantments::item_in(
                 game.items(),
@@ -408,7 +532,7 @@ mod item_resource_property_tests {
                 "minecraft:iron_ingot"
             ));
             let stack = ItemStack::new("minecraft:iron_sword", 1);
-            let resource = ItemResource::of(&stack);
+            let resource = ItemResource::of(&super::super::api_values::test_snapshot(&stack));
             let bar = resource.bar(game).unwrap();
             // The independent oracle records the equivalent effective damage as a stack patch.
             let expected: Value = include_str!(concat!(
@@ -433,18 +557,20 @@ mod item_resource_property_tests {
                 Some((bar.width, bar.color))
             );
             let damage = ComponentId::new("minecraft:damage").unwrap();
-            let zero = resource.with_component(game, &damage, Tag::Int(0));
+            let zero = resource.with_component(game, &damage, Tag::Int(0)).unwrap();
             assert_eq!(zero.component(&damage), Some(Tag::Int(0)));
-            assert_eq!(zero.to_stack(1).effective_damage(info), 0);
+            assert_eq!(engine(&zero, 1).effective_damage(info), 0);
             assert!(zero.bar(game).is_none());
             let removed = resource.without_component(game, &damage);
-            assert_eq!(removed.to_stack(1).effective_damage(info), 0);
+            assert_eq!(engine(&removed, 1).effective_damage(info), 0);
             assert!(removed.bar(game).is_none());
-            let enchanted = resource.with_component(
-                game,
-                &ComponentId::new("minecraft:enchantments").unwrap(),
-                Tag::compound([("minecraft:sharpness", Tag::Int(1))]),
-            );
+            let enchanted = resource
+                .with_component(
+                    game,
+                    &ComponentId::new("minecraft:enchantments").unwrap(),
+                    Tag::compound([("minecraft:sharpness", Tag::Int(1))]),
+                )
+                .unwrap();
             let glint = game
                 .items()
                 .enchantments
@@ -452,32 +578,35 @@ mod item_resource_property_tests {
                 .and_then(|p| p.glint);
             assert_eq!(glint, Some(false));
             assert!(!enchanted.foil(game));
-            assert!(!enchanted.to_stack(1).has_foil(glint));
+            assert!(!engine(&enchanted, 1).has_foil(glint));
             let inherited = enchanted.without_component(
                 game,
                 &ComponentId::new("minecraft:enchantment_glint_override").unwrap(),
             );
             assert!(inherited.foil(game));
-            assert!(inherited.to_stack(1).has_foil(glint));
+            assert!(engine(&inherited, 1).has_foil(glint));
 
-            let base = ItemResource::of(&ItemStack::new("horizon:consumable_fixture", 2));
+            let base = ItemResource::of(&super::super::api_values::test_snapshot(&ItemStack::new(
+                "horizon:consumable_fixture",
+                2,
+            )));
             let consumable = ComponentId::new("minecraft:consumable").unwrap();
-            let patched = base.with_component(
-                game,
-                &consumable,
-                Tag::compound([
-                    ("consume_seconds", Tag::Float(0.1_f32.to_bits())),
-                    ("has_consume_particles", Tag::Byte(0)),
-                ]),
-            );
-            let stack = patched.to_stack(2);
+            let patched = base
+                .with_component(
+                    game,
+                    &consumable,
+                    Tag::compound([
+                        ("consume_seconds", Tag::Float(0.1_f32.to_bits())),
+                        ("has_consume_particles", Tag::Byte(0)),
+                    ]),
+                )
+                .unwrap();
+            let stack = engine(&patched, 2);
             let info = game.items().get(&stack.item).unwrap().clone();
             assert_eq!(game.use_duration(&stack), 2);
             assert!(!game.mod_use(&stack));
             assert!(
-                patched
-                    .without_component(game, &consumable)
-                    .to_stack(1)
+                engine(&patched.without_component(game, &consumable), 1)
                     .consumable(Some(&info))
                     .is_none()
             );

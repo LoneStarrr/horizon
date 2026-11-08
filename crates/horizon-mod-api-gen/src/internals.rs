@@ -1371,6 +1371,54 @@ mod tests {
     }
 
     #[test]
+    fn file_inner_conditions_filter_points_and_internals() {
+        let fixture = Fixture::new("mod test_only; mod optional; mod runtime;");
+        fixture.put(
+            "crates/horizon-client/src/game/test_only.rs",
+            "#![cfg(test)]\nmod missing; struct Hidden(u32); fn test_helper() {}",
+        );
+        fixture.put(
+            "crates/horizon-client/src/game/optional.rs",
+            "#![cfg(feature = \"extra\")]\nfn optional_helper() {}",
+        );
+        fixture.put("crates/horizon-client/src/game/runtime.rs", "fn live() {}");
+        let src = fixture.0.join("crates/horizon-client/src");
+        for every_build in [false, true] {
+            let files = crate::points::game_files(&src, every_build).unwrap();
+            assert!(
+                !files
+                    .iter()
+                    .any(|file| file.module.ends_with("::test_only"))
+            );
+            assert!(files.iter().any(|file| file.module.ends_with("::runtime")));
+            let optional = files
+                .iter()
+                .find(|file| file.module.ends_with("::optional"));
+            if every_build {
+                assert!(optional.is_none());
+            } else {
+                assert_eq!(optional.unwrap().cfg, ["feature = \"extra\""]);
+            }
+        }
+        let entries = widen_with(&fixture.0, &[]).unwrap().entries;
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path.contains("::test_only::"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.ends_with("::runtime::live"))
+        );
+        let optional = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("::optional::optional_helper"))
+            .unwrap();
+        assert_eq!(optional.cfg, "feature = \"extra\"");
+    }
+
+    #[test]
     fn game_area_moves_preserve_internals_and_points() {
         let source = "struct Game; mod feature;";
         let module = "use super::Game; impl Game { fn action(&self) -> u8 { 7 } }";
@@ -2117,7 +2165,7 @@ pub struct ItemStack { a: First, b: Second, c: second::Kind }
                 .collect::<Vec<_>>(),
         );
         assert_eq!(counts.types, 0);
-        assert_eq!(counts.skipped_types["conditional field or variant"], 2);
+        assert_eq!(counts.skipped_types["opaque type"], 2);
     }
 
     #[test]
@@ -2270,6 +2318,63 @@ const LABEL: &str = "é"; struct AfterUnicode;
                     .contains("pub fn run")
             );
         }
+    }
+
+    #[test]
+    fn guarded_game_keeps_slots_thunks_and_wasm_handles() {
+        use crate::crossing::{Crossing, Rule, Shape};
+        let fixture = Fixture::new(
+            "struct Game<'a> { large: [u64; 32], marker: &'a str, #[cfg(feature = \"x\")] extra: u8 }\nimpl Game<'_> { fn next_autosave_interval(&self) -> i64 { 42 } }\n",
+        );
+        let method = "horizon_client::game::Game<'_>::next_autosave_interval";
+        let field = "horizon_client::game::Game<'_>::large";
+        fixture.put(
+            "crates/horizon-mod-api-gen/slots/test.txt",
+            "horizon_client::game::Game::next_autosave_interval\n",
+        );
+        let result = widen_with(&fixture.0, &[]).unwrap();
+        let entries = &result.entries;
+        let method_entry = entries.iter().find(|i| i.path == method).unwrap();
+        // Discovered from 0af894a3a0^, before #1762 added Game's cfg field.
+        assert_eq!(method_entry.hash, "5829bc5b9f60aaca");
+        let rule = Rule::new(entries);
+        let shape = Shape::Named("horizon_client::game::Game".into(), 1);
+        assert_eq!(rule.crossing_of(&shape), Crossing::Handle);
+        let (code, counts) = crate::internals_table::table(entries, &[method.into(), field.into()]);
+        assert_eq!(counts.thunks, 1);
+        assert_eq!(counts.refused[field], "conditional field or variant");
+        crate::internals_table::tests::run_fixture(
+            &code,
+            "mod game { pub struct Game<'a> { pub large: [u64; 32], pub marker: &'a str } impl Game<'_> { pub fn next_autosave_interval(&self) -> i64 { 42 } } }",
+            "let _ = (std::mem::size_of::<Op>(), std::mem::size_of::<Reply>(), std::mem::size_of::<Value>()); let game = game::Game { large: [0; 32], marker: \"\" }; assert_eq!(game.large[0], 0); assert_eq!(game.marker, \"\");",
+        );
+        let declaration = |i: &Internal| crate::internals_view::Declaration {
+            path: i.path.clone(),
+            hash: i.hash.clone(),
+            kind: Some(i.kind.into()),
+        };
+        let owner = entries
+            .iter()
+            .find(|i| i.kind == "struct" && i.path == "horizon_client::game::Game")
+            .unwrap();
+        let view = crate::internals_view::generate(
+            entries,
+            &[declaration(method_entry), declaration(owner)],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let parsed = syn::parse_file(&view).unwrap();
+        let syn::Item::Mod(module) = &parsed.items[0] else {
+            panic!("view module")
+        };
+        let items = &module.content.as_ref().unwrap().1;
+        assert!(items.iter().any(|i| matches!(i, syn::Item::Struct(s) if s.ident.to_string().ends_with("Game") && matches!(s.fields, syn::Fields::Unnamed(_)))));
+        assert!(!view.contains("fn large"));
+        let field_entry = entries.iter().find(|i| i.path == field).unwrap();
+        let error = crate::internals_view::generate(entries, &[declaration(field_entry)], &[], &[])
+            .unwrap_err();
+        assert!(error.contains("conditional field or variant"), "{error}");
     }
 
     #[test]

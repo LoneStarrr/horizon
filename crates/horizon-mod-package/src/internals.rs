@@ -1,4 +1,9 @@
 //! The staged game's internals catalog, shared by the launcher and mod tools.
+#[cfg(feature = "prebuilt")]
+mod archive;
+#[cfg(feature = "prebuilt")]
+pub use archive::{CatalogError, cache_catalogs};
+
 use crate::manifest::Internal;
 use std::{fs, path::Path};
 

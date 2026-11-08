@@ -13,6 +13,15 @@ pub trait ClientViewHost {
 #[horizon_mod_api_macros::host_area]
 pub trait ClientViewClientHost {
     /// Side: client.
+    /// Read effective HUD visibility independently of first-person hands.
+    #[access(ClientSetup)]
+    fn hud_mode(&self) -> HudMode;
+    /// Side: client.
+    /// Select HUD and hand visibility, including after vanilla F1 input handling.
+    /// Other first-person hand restrictions and render cancellation still apply.
+    #[access(ClientSetup)]
+    fn set_hud_mode(&mut self, mode: HudMode);
+    /// Side: client.
     /// The window's camera type (`Options.getCameraType`), including its latest pending request.
     #[access(ClientSetup)]
     fn camera_type(&self) -> CameraType;

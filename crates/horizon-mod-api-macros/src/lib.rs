@@ -87,22 +87,22 @@ fn expand(mut implementation: ItemImpl, export: bool) -> TokenStream {
     let Some((_, trait_path, _)) = &implementation.trait_ else {
         return syn::Error::new_spanned(
             &implementation,
-            "expected an impl of Hooks or RenderHooks",
+            "expected an impl of Hooks or a Part trait",
         )
         .into_compile_error()
         .into();
     };
     let name = &trait_path.segments.last().unwrap().ident;
-    let (render, part) = match name.to_string().as_str() {
-        "Hooks" => (false, None),
-        "RenderHooks" => (true, None),
-        "BlockPart" => (false, Some("block_subscribed")),
-        "BlockEntityPart" => (false, Some("block_entity_subscribed")),
-        "ItemPart" => (false, Some("item_subscribed")),
-        "MenuPart" => (false, Some("menu_subscribed")),
+    let part = match name.to_string().as_str() {
+        "Hooks" => None,
+        "BlockPart" => Some("block_subscribed"),
+        "BlockEntityPart" => Some("block_entity_subscribed"),
+        "ItemPart" => Some("item_subscribed"),
+        "MenuPart" => Some("menu_subscribed"),
+        "FluidPart" => Some("fluid_subscribed"),
         // Entity parts carry no scoped hook yet (#1077): `register_goals` is
         // not one, so its subscriptions stay empty whatever it overrides.
-        "EntityPart" => (false, Some("entity_subscribed_empty")),
+        "EntityPart" => Some("entity_subscribed_empty"),
         _ => {
             return syn::Error::new_spanned(name, "expected a hook or part trait")
                 .into_compile_error()
@@ -128,16 +128,8 @@ fn expand(mut implementation: ItemImpl, export: bool) -> TokenStream {
             cfgs.push(cfg_attributes(method));
         }
     }
-    let id = if render {
-        format_ident!("RenderHookId")
-    } else {
-        format_ident!("HookId")
-    };
-    let ids = if render {
-        format_ident!("render_hook_ids")
-    } else {
-        format_ident!("hook_ids")
-    };
+    let id = format_ident!("HookId");
+    let ids = format_ident!("hook_ids");
     let subscribed_name = format_ident!("{}", part.unwrap_or("subscribed"));
     let subscribed = if subscribed_name == "entity_subscribed_empty" {
         // Entity parts (arismoko/horizon#1077): no scoped hook exists for them
@@ -155,7 +147,7 @@ fn expand(mut implementation: ItemImpl, export: bool) -> TokenStream {
         }
     };
     implementation.items.push(subscribed);
-    let export = if export && !render && part.is_none() {
+    let export = if export && part.is_none() {
         let ty = &implementation.self_ty;
         quote! {
             pub fn hooks() -> Box<dyn mod_api::Hooks> { Box::new(<#ty as Default>::default()) }
@@ -224,7 +216,7 @@ pub fn host_area(_attribute: TokenStream, input: TokenStream) -> TokenStream {
     quote!(#area).into()
 }
 
-/// Mark a trait mod or its renderer and derive its hook subscriptions.
+/// Mark a trait mod and derive its hook subscriptions.
 #[proc_macro_attribute]
 pub fn horizon_mod(_attribute: TokenStream, input: TokenStream) -> TokenStream {
     expand(parse_macro_input!(input as ItemImpl), true)
@@ -444,6 +436,9 @@ pub fn point(attribute: TokenStream, input: TokenStream) -> TokenStream {
                                 )
                             }
                         }
+                        mod_points::__private::RawKind::Indexed(__function, __index) => {
+                            unsafe { __function(mod_points::PointId::#variant as usize, __index, #erased_receiver, &mut #raw_record as *mut _ as *mut ()) };
+                        }
                         mod_points::__private::RawKind::Erased(__function) => {
                             // SAFETY: this slot supplies its exact receiver and raw record types.
                             unsafe {
@@ -536,6 +531,9 @@ pub fn point(attribute: TokenStream, input: TokenStream) -> TokenStream {
                                     #receiver #value
                                 )
                             }
+                        }
+                        mod_points::__private::RawKind::Indexed(__function, __index) => {
+                            unsafe { __function(mod_points::PointId::#variant as usize, __index, #erased_receiver, &mut __result as *mut _ as *mut ()) };
                         }
                         mod_points::__private::RawKind::Erased(__function) => {
                             // SAFETY: this slot supplies its exact receiver and return types.
@@ -638,8 +636,11 @@ impl syn::parse::Parse for IfInstalled {
 
 /// Declares how a plain-data type crosses the generated wasm interface.
 ///
-/// `#[wasm(via = Form)]` on a type or its re-export checks `From<&Type> for Form`
-/// and `TryFrom<Form> for Type`. `#[wasm(host_constructor = method)]` on an owned
+/// `#[wasm(via = Form)]` on a type or its re-export checks `TryFrom<&Type> for Form`
+/// and `TryFrom<Form> for Type`. Add `writeback = method` to apply a returned form
+/// through `Type::method(&mut self, Form)` instead of replacing the value. This keeps
+/// identity and native mutation bookkeeping under the type's control.
+/// `#[wasm(host_constructor = method)]` on an owned
 /// tuple struct makes incoming host lifts call that checked constructor with the
 /// lifted fields instead of constructing the tuple directly. It returns `Result<Self, E>`
 /// with a displayable refusal. Guest lifts remain structural: the host owns validation.
@@ -696,7 +697,7 @@ pub fn wasm(attribute: TokenStream, input: TokenStream) -> TokenStream {
         }
         .into();
     }
-    let WasmRule::Via(via) = rule else {
+    let WasmRule::Via(via, writeback) = rule else {
         unreachable!()
     };
     let ty = match &item {
@@ -716,12 +717,18 @@ pub fn wasm(attribute: TokenStream, input: TokenStream) -> TokenStream {
                 .into();
         }
     };
+    let writer = writeback.map(|method| {
+        quote! {
+            fn writes_its_form(value: &mut #ty, form: #via) { value.#method(form); }
+        }
+    });
     quote! {
         #item
         const _: () = {
+            #writer
             fn crosses_as_its_form()
             where
-                #via: for<'a> ::core::convert::From<&'a #ty>,
+                #via: for<'a> ::core::convert::TryFrom<&'a #ty>,
                 #ty: ::core::convert::TryFrom<#via>,
             {
             }
@@ -732,7 +739,7 @@ pub fn wasm(attribute: TokenStream, input: TokenStream) -> TokenStream {
 
 /// The single conversion rule on a type declaration.
 enum WasmRule {
-    Via(syn::Type),
+    Via(syn::Type, Option<syn::Ident>),
     HostConstructor(syn::Ident),
 }
 
@@ -741,7 +748,21 @@ impl syn::parse::Parse for WasmRule {
         let key: syn::Ident = input.parse()?;
         input.parse::<syn::Token![=]>()?;
         match key.to_string().as_str() {
-            "via" => Ok(Self::Via(input.parse()?)),
+            "via" => {
+                let form = input.parse()?;
+                let writeback = if input.is_empty() {
+                    None
+                } else {
+                    input.parse::<syn::Token![,]>()?;
+                    let key: syn::Ident = input.parse()?;
+                    if key != "writeback" {
+                        return Err(syn::Error::new(key.span(), "expected writeback"));
+                    }
+                    input.parse::<syn::Token![=]>()?;
+                    Some(input.parse()?)
+                };
+                Ok(Self::Via(form, writeback))
+            }
             "host_constructor" => Ok(Self::HostConstructor(input.parse()?)),
             _ => Err(syn::Error::new(
                 key.span(),

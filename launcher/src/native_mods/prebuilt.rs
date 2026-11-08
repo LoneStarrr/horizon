@@ -1,10 +1,10 @@
 //! The prebuilt game (#589): mods that need nothing but the mod API compile against a downloaded
 //! build of the game (`tools/prebuilt_game.py`, released daily by `prebuilt-game.yml`) with rustc
-//! alone, in seconds, instead of building the game from source. The route is chosen before
+//! alone instead of building the game from source. The route is chosen before
 //! anything runs: a mod set the prebuilt game can't serve, or a revision with no prebuilt
 //! release, builds from source, and the build log says why. A prebuilt build that fails is an
 //! error like any other build's, never retried from source.
-use super::{api, dependencies, internals, Profile, Target};
+use super::{api, dependencies, internals, Target};
 use crate::i18n::{tr, trf};
 use crate::rust_toolchain::{self, Toolchain};
 use horizon_mod_package::index::native;
@@ -24,9 +24,9 @@ const OPT_LEVEL: &str = "opt-level=3";
 const UNPACKED_LIMIT: u64 = 8 << 30;
 
 /// Why a build compiles the game from source instead of using the prebuilt game.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum SourceReason {
-    /// A mod has a helper `[[native.injection]]` or a module: they change the game's own code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceReason {
+    /// A mod has a checked private source point, legacy helper, or module changing game code.
     Injections { mod_id: String },
     /// A mod has a build script, which the prebuilt route doesn't run.
     BuildScript { mod_id: String },
@@ -34,8 +34,6 @@ pub(super) enum SourceReason {
     Features { mod_id: String },
     /// A mod depends on a crate other than the mod API and other mods.
     Crate { mod_id: String, krate: String },
-    /// The player chose a profile other than Optimized, the one the prebuilt game is built with.
-    Profile { profile: &'static str },
     /// No prebuilt game for this computer.
     Host,
     /// The prebuilt game's release couldn't be downloaded.
@@ -63,15 +61,11 @@ impl std::fmt::Display for SourceReason {
                 "{mod} depends on the crate {crate}, so the game builds from source",
                 &[("mod", mod_id), ("crate", krate)],
             ),
-            Self::Profile { profile } => trf(
-                "{profile} builds the game on this computer; only Optimized uses the prebuilt game",
-                &[("profile", profile)],
-            ),
             Self::Host => {
                 tr("no prebuilt game for this computer, so the game builds from source").into()
             }
             Self::Download { why } => trf(
-                "the prebuilt game couldn't be downloaded ({why}), so the game builds from source",
+                "The prebuilt game couldn't be downloaded ({why}). Try again.",
                 &[("why", why)],
             ),
             Self::NoRelease { revision } => trf(
@@ -83,17 +77,66 @@ impl std::fmt::Display for SourceReason {
     }
 }
 
-/// The first reason `projects` can't build against the prebuilt game with `profile`, or `None`
-/// when they can: the profile is `optimized`, the one the game is prebuilt with, and each mod is
-/// a crate that depends on the mod API (with its default features) and on other mods, with no
-/// injections, build script or features of its own.
-pub(super) fn refusal(projects: &[api::Project<'_>], profile: Profile) -> Option<SourceReason> {
-    if profile != Profile::Optimized {
-        return Some(SourceReason::Profile {
-            profile: profile.name(),
-        });
+impl SourceReason {
+    pub(super) fn forces_source(&self) -> bool {
+        !matches!(self, Self::Download { .. })
     }
+}
+
+/// The first structural reason these projects cannot use the prebuilt game.
+pub(super) fn refusal(projects: &[api::Project<'_>]) -> Option<SourceReason> {
     projects.iter().find_map(project_refusal)
+}
+
+/// Checked private-source routes require an install-time game build, never a prebuilt retry.
+pub(super) fn source_refusal(
+    game: &Path,
+    projects: &[api::Project<'_>],
+) -> Result<Option<SourceReason>, String> {
+    let catalog = internals::Catalog::read(game)?;
+    for (_, route) in slot_routes(&catalog, projects) {
+        match route {
+            super::Route::Game { reason } => return Ok(Some(reason)),
+            super::Route::Invalid { reason } => return Err(reason),
+            super::Route::Prebuilt => {}
+        }
+    }
+    Ok(None)
+}
+
+/// One slot/source decision per project, including named refusals. Cargo restrictions are
+/// reported separately by `project_refusal`; both consumers use the same slot router here.
+pub(super) fn slot_routes(
+    catalog: &internals::Catalog,
+    projects: &[api::Project<'_>],
+) -> Vec<(String, super::Route)> {
+    projects
+        .iter()
+        .map(|project| {
+            let manifest = &project.bundle.manifest;
+            let route = match super::slots::routes(catalog, manifest) {
+                Ok(routes)
+                    if routes.iter().any(|route| {
+                        matches!(
+                            route,
+                            horizon_mod_package::manifest::inject::Route::Source(_)
+                        )
+                    }) =>
+                {
+                    super::Route::Game {
+                        reason: SourceReason::Injections {
+                            mod_id: manifest.id.clone(),
+                        },
+                    }
+                }
+                Ok(_) => super::Route::Prebuilt,
+                Err(error) => super::Route::Invalid {
+                    reason: error.to_string(),
+                },
+            };
+            (manifest.id.clone(), route)
+        })
+        .collect()
 }
 
 /// Why `project` alone can't build against the prebuilt game, or `None` when it can.
@@ -161,36 +204,15 @@ pub(super) fn fetch(
         return Ok(Err(SourceReason::Host));
     };
     let name = native::prebuilt_archive(host.target, matches!(target, Target::Server));
-    let dir = super::root()
-        .join("prebuilt")
-        .join(format!("{revision}-{}", name.trim_end_matches(".tar.gz")));
+    let dir = cache_dir(revision, &name);
     if dir.join(IDENTITY).is_file() {
         return Ok(Ok(dir));
     }
-    let release = format!(
-        "https://github.com/{}/releases/download/{}{revision}",
-        native::PREBUILT_REPO,
-        native::PREBUILT_TAG
-    );
-    // A download that fails builds from source, saying why; a file that arrives wrong is refused.
+    let release = release_url(revision);
     let download = |why: String| Ok(Err(SourceReason::Download { why }));
-    let sums = match crate::backend::get_unless_missing(&format!("{release}/{SUMS}")) {
-        Ok(Some(sums)) => sums,
-        Ok(None) => {
-            return Ok(Err(SourceReason::NoRelease {
-                revision: revision.to_owned(),
-            }))
-        }
-        Err(why) => return download(why),
-    };
-    let mut text = String::new();
-    if let Err(e) = sums.into_reader().read_to_string(&mut text) {
-        return download(e.to_string());
-    }
-    let Some(expected) = expected_sum(&text, &name) else {
-        return Ok(Err(SourceReason::NoRelease {
-            revision: revision.to_owned(),
-        }));
+    let expected = match release_sum(revision, &name) {
+        Ok(sum) => sum,
+        Err(reason) => return Ok(Err(reason)),
     };
     let parent = dir.parent().expect("under prebuilt/");
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -249,6 +271,117 @@ pub(super) fn fetch(
     fs::rename(&unpacked, &dir).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(&partial);
     Ok(Ok(dir))
+}
+
+/// Keep retryable failures distinct from structural reasons to compile the game locally.
+pub(super) fn or_source(game: Result<PathBuf, SourceReason>) -> Result<Option<PathBuf>, String> {
+    match game {
+        Ok(game) => Ok(Some(game)),
+        Err(reason) if reason.forces_source() => {
+            super::log_warning(&reason.to_string());
+            Ok(None)
+        }
+        Err(reason) => Err(reason.to_string()),
+    }
+}
+
+fn release_url(revision: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/{}{revision}",
+        native::PREBUILT_REPO,
+        native::PREBUILT_TAG
+    )
+}
+
+fn release_sum(revision: &str, name: &str) -> Result<String, SourceReason> {
+    let missing = || SourceReason::NoRelease {
+        revision: revision.to_owned(),
+    };
+    let download = |why: String| SourceReason::Download { why };
+    let sums = crate::backend::get_unless_missing(&format!("{}/{SUMS}", release_url(revision)))
+        .map_err(download)?
+        .ok_or_else(missing)?;
+    let mut text = String::new();
+    sums.into_reader()
+        .read_to_string(&mut text)
+        .map_err(|error| download(error.to_string()))?;
+    expected_sum(&text, name).ok_or_else(missing)
+}
+
+/// Checks release metadata without downloading the prebuilt game. Run only on a worker.
+/// Download failures are retryable, never permission to rebuild the game from source.
+pub fn prebuilt_availability(revision: &str, target: Target) -> Option<SourceReason> {
+    let Some(host) = rust_toolchain::host() else {
+        return Some(SourceReason::Host);
+    };
+    let name = native::prebuilt_archive(host.target, matches!(target, Target::Server));
+    let cached = cache_dir(revision, &name);
+    if cached.join(IDENTITY).is_file() {
+        return None;
+    }
+    release_sum(revision, &name).err()
+}
+
+fn cache_dir(revision: &str, name: &str) -> PathBuf {
+    super::root()
+        .join("prebuilt")
+        .join(format!("{revision}-{}", name.trim_end_matches(".tar.gz")))
+}
+
+/// Read checked SDK metadata; the caller owns consent and the native-cache lease.
+pub(super) fn planning_catalog(
+    lease: &crate::native_cache::Cache,
+    revision: &str,
+) -> Result<internals::Catalog, SourceReason> {
+    let host = rust_toolchain::host().ok_or(SourceReason::Host)?;
+    let name = native::prebuilt_archive(host.target, false);
+    let game = cache_dir(revision, &name);
+    if game.join(IDENTITY).is_file() {
+        if let Ok(catalog) = internals::Catalog::read(&game) {
+            return Ok(catalog);
+        }
+    }
+    let expected = release_sum(revision, &name)?;
+    let download = |why| SourceReason::Download { why };
+    let unit = format!("catalog-{revision}-{}", host.target);
+    let cache = super::root().join("internals-sync").join(&unit);
+    let directory = lease
+        .directory(&["internals-sync", &unit])
+        .map_err(|error| download(super::cache_error(error)))?;
+    catalog_pair(&directory, &cache, &name, &expected, || {
+        crate::backend::get(&format!("{}/{name}", release_url(revision)))
+            .map_err(download)
+            .map(|response| response.into_reader())
+    })
+}
+
+fn catalog_pair<R: Read>(
+    directory: &cap_std::fs::Dir,
+    path: &Path,
+    name: &str,
+    expected: &str,
+    fetch: impl FnOnce() -> Result<R, SourceReason>,
+) -> Result<internals::Catalog, SourceReason> {
+    let download = |why| SourceReason::Download { why };
+    if directory.read_to_string("archive.sha256").ok().as_deref() == Some(expected) {
+        if let Ok(catalog) = internals::Catalog::read(path) {
+            return Ok(catalog);
+        }
+    }
+    let reader = fetch()?;
+    // A failed second rename must never leave an old marker authorizing a mixed pair.
+    match directory.remove_file("archive.sha256") {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(download(error.to_string())),
+    }
+    horizon_mod_package::internals::cache_catalogs(directory, name, reader, expected)
+        .map_err(|error| download(error.to_string()))?;
+    let catalog = internals::Catalog::read(path).map_err(download)?;
+    directory
+        .write("archive.sha256", expected)
+        .map_err(|error| download(error.to_string()))?;
+    Ok(catalog)
 }
 
 /// `name`'s sum in a `sha256sum` listing.
@@ -546,6 +679,152 @@ pub(super) fn compile(
 mod tests {
     use super::*;
 
+    #[test]
+    fn plans_all_private_sources_and_keeps_named_refusals_invalid() {
+        use serde_json::json;
+        let root = super::super::tests::dir("slot-planning");
+        let mut bundles = Vec::new();
+        for (id, mut entry) in [
+            (
+                "slotted",
+                json!({"at":"Example::slotted","kind":"head","access":"internals"}),
+            ),
+            (
+                "private_head",
+                json!({"at":"Example::private","kind":"head","access":"internals"}),
+            ),
+            (
+                "unlisted_call",
+                json!({"at":"Example::calls","kind":"before_call","access":"internals","call":"unlisted","nth":0,"ctx":"context"}),
+            ),
+            (
+                "api_refusal",
+                json!({"at":"Example::private","kind":"head","access":"api"}),
+            ),
+            (
+                "argument",
+                json!({"at":"Example::calls","kind":"modify_call_arg","access":"internals"}),
+            ),
+        ] {
+            let dir = root.join(id);
+            super::super::tests::write_bundle(&dir, id, "");
+            fs::write(
+                dir.join("Cargo.toml"),
+                "[package]\nname='mod_project'\n[dependencies]\nhorizon-mod-api='0.1'\n",
+            )
+            .unwrap();
+            let mut bundle = super::super::bundle_in(&dir).unwrap().unwrap();
+            entry["id"] = json!("probe");
+            entry["hash"] = json!("signature");
+            entry["with"] = json!("handler");
+            bundle.manifest.inject = vec![serde_json::from_value(entry).unwrap()];
+            bundles.push(bundle);
+        }
+        let catalog = internals::Catalog {
+            internals: ["Example::slotted", "Example::private", "Example::calls"].into_iter().map(|path| serde_json::from_value(json!({"path":path,"kind":"method","signature":"fn tick()","hash":"signature"})).unwrap()).collect(),
+            points: serde_json::from_value(json!([{"name":"tick","target":"Example::slotted","raw":true,"at_return":true,"listener":"Head","return_listener":"Return"}])).unwrap(),
+            ..Default::default()
+        };
+        let projects: Vec<_> = bundles
+            .iter()
+            .map(|bundle| api::Project::read(bundle).unwrap())
+            .collect();
+        let routes = slot_routes(&catalog, &projects);
+        let classes: Vec<_> = routes
+            .iter()
+            .map(|(_, route)| match route {
+                super::super::Route::Prebuilt => "prebuilt",
+                super::super::Route::Game { .. } => "source",
+                super::super::Route::Invalid { .. } => "invalid",
+            })
+            .collect();
+        assert_eq!(
+            classes,
+            ["prebuilt", "source", "source", "invalid", "invalid"]
+        );
+        let causes: Vec<_> = routes
+            .iter()
+            .filter(|(_, route)| matches!(route, super::super::Route::Game { .. }))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(causes, ["private_head", "unlisted_call"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_partial_catalog_pair_cannot_reuse_its_previous_marker() {
+        use super::super::{inject::POINTS, internals::INTERNALS};
+        fn packed(internals: &str, points: &str) -> Vec<u8> {
+            let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            for (name, text) in [("internals.json", internals), ("points.json", points)] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(text.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, name, text.as_bytes()).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        }
+        let root = super::super::tests::dir("catalog-pair");
+        let lease = crate::native_cache::Cache::acquire(&root).unwrap();
+        let directory = lease.directory(&["internals-sync", "catalog"]).unwrap();
+        let path = root.join("native/internals-sync/catalog");
+        let old = packed("[]", r#"{"points":[],"sites":[]}"#);
+        let old_hash = format!("{:x}", Sha256::digest(&old));
+        catalog_pair(&directory, &path, "game", &old_hash, || Ok(old.as_slice())).unwrap();
+        directory.remove_file(POINTS).unwrap();
+        let requests = std::cell::Cell::new(0);
+        catalog_pair(&directory, &path, "game", &old_hash, || {
+            requests.set(requests.get() + 1);
+            Ok(old.as_slice())
+        })
+        .unwrap();
+        assert_eq!(requests.get(), 1);
+        directory.remove_file(POINTS).unwrap();
+        directory.create_dir(POINTS).unwrap();
+        let new = packed(
+            r#"[{"path":"Changed","kind":"struct","signature":"struct Changed","hash":"new"}]"#,
+            r#"{"points":[],"sites":[]}"#,
+        );
+        let new_hash = format!("{:x}", Sha256::digest(&new));
+        assert!(catalog_pair(&directory, &path, "game", &new_hash, || Ok(new.as_slice())).is_err());
+        assert!(!directory.try_exists("archive.sha256").unwrap());
+        assert!(directory
+            .read_to_string(INTERNALS)
+            .unwrap()
+            .contains("Changed"));
+        directory.remove_dir(POINTS).unwrap();
+        directory
+            .write(POINTS, r#"{"points":[],"sites":[]}"#)
+            .unwrap();
+        assert!(
+            catalog_pair(&directory, &path, "game", &old_hash, || Ok(old.as_slice()))
+                .unwrap()
+                .internals
+                .is_empty()
+        );
+        let invalid = packed("[]", r#"{"points":"not a list","sites":[]}"#);
+        let invalid_hash = format!("{:x}", Sha256::digest(&invalid));
+        assert!(catalog_pair(&directory, &path, "game", &invalid_hash, || {
+            Ok(invalid.as_slice())
+        })
+        .is_err());
+        assert!(!directory.try_exists("archive.sha256").unwrap());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("internals-sync/catalog", root.join("native/redirect"))
+                .unwrap();
+            assert!(lease.directory(&["redirect", "child"]).is_err());
+            assert!(!path.join("child").exists());
+        }
+        drop(directory);
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// What [`refusal`] says of one mod whose Cargo.toml is `cargo`.
     fn refusal_of(cargo: &str) -> Option<SourceReason> {
         let name = std::thread::current().name().unwrap().replace(':', "-");
@@ -557,7 +836,7 @@ mod tests {
         )
         .unwrap();
         let bundle = super::super::bundle_in(&dir).unwrap().unwrap();
-        refusal(&[api::Project::read(&bundle).unwrap()], Profile::Optimized)
+        refusal(&[api::Project::read(&bundle).unwrap()])
     }
 
     #[test]
@@ -605,16 +884,28 @@ mod tests {
     }
 
     #[test]
-    fn only_the_optimized_profile_takes_the_prebuilt_game() {
-        for profile in [Profile::Developer, Profile::Balanced] {
-            assert_eq!(
-                refusal(&[], profile),
-                Some(SourceReason::Profile {
-                    profile: profile.name()
-                })
-            );
+    fn failed_download_never_selects_a_source_build() {
+        assert!(or_source(Err(SourceReason::Download {
+            why: "offline".into()
+        }))
+        .is_err());
+        assert_eq!(
+            or_source(Ok(PathBuf::from("cached-game"))).unwrap(),
+            Some(PathBuf::from("cached-game"))
+        );
+    }
+
+    #[test]
+    fn missing_host_or_release_still_allows_an_explicit_source_build() {
+        let _guard = super::super::TEST_STATE.lock().unwrap();
+        for reason in [
+            SourceReason::Host,
+            SourceReason::NoRelease {
+                revision: "deadbeef".into(),
+            },
+        ] {
+            assert!(or_source(Err(reason)).unwrap().is_none());
         }
-        assert_eq!(refusal(&[], Profile::Optimized), None);
     }
 
     #[test]

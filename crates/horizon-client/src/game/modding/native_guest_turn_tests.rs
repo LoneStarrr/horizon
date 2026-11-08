@@ -114,7 +114,8 @@ fn refused_wire_reload_preserves_hub_and_engine_generation() {
             &[],
         );
         let prepared = game.prepare_world_reload(&stack, &good, false).unwrap();
-        game.reload_world_tables(prepared);
+        game.install_world_tables(prepared);
+        game.run_native_advancement_grants();
         assert!(!Arc::ptr_eq(
             &before,
             &game.lan.as_ref().unwrap().hub.lan.shared.sync()
@@ -229,7 +230,10 @@ fn another_guests_menu_and_push_work_during_a_turn() {
             assert_eq!(a_menu.slot_count(game), None);
             assert_eq!(game.player_container_menu(b), Some(b_menu));
             assert_eq!(b_menu.slot_count(game), Some(46));
-            assert_eq!(b_menu.slot(game, 36), Some(Some(stone.clone())));
+            assert_eq!(
+                b_menu.slot(game, 36),
+                Some(Some(crate::game::api_values::test_snapshot(&stone)))
+            );
             assert!(game.entity_set_rotation(b.entity(), 90.0, 10.0));
             assert!(game.entity_set_head_yaw(b.entity(), 45.0));
             assert_eq!(game.entity_head_yaw(b.entity()), Some(45.0));
@@ -252,7 +256,10 @@ fn another_guests_menu_and_push_work_during_a_turn() {
             );
         })
         .unwrap();
-        assert_eq!(b_menu.slot(game, 36), Some(Some(stone)));
+        assert_eq!(
+            b_menu.slot(game, 36),
+            Some(Some(crate::game::api_values::test_snapshot(&stone)))
+        );
         assert_eq!(
             game.lan
                 .as_ref()
@@ -512,7 +519,10 @@ fn another_guests_live_merchant_session_is_visible_during_a_turn() {
             },
         );
         game.as_guest(12, |game| {
-            assert_eq!(villager.offers(game), Some(vec![live]));
+            assert_eq!(
+                villager.offers(game),
+                Some(vec![crate::game::api_values::test_snapshot(&live)])
+            );
             assert_eq!(villager.xp(game), Some(17));
             assert_eq!(villager.level(game), Some(2));
             assert_eq!(villager.trading_player(game).map(|p| p.uuid()), Some(13));
@@ -976,4 +986,77 @@ fn tick_advancement_notice_precedes_recipe_reward() {
         assert_eq!(*observed.lock().unwrap(), vec![Some(false), Some(false)]);
     });
     std::fs::remove_dir_all(scratch).unwrap();
+}
+
+/// `PlayerRef::set_selected_slot` from inside the guest's own turn: their state is in place, so
+/// the slot is written there, and their client is still told (`leave_guest` sends nothing).
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn set_selected_slot_tells_an_acting_guests_client() {
+    with_guests(|game| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let host = game.lan.as_mut().unwrap();
+        let index = host.hub.guests.iter().position(|g| g.conn == 13).unwrap();
+        host.hub.guests.update(index, |guest| {
+            guest.sender = PlayerSender::new(tx, Arc::default())
+        });
+        game.as_guest(13, |game| {
+            let player = game.player(13).unwrap();
+            while rx.try_recv().is_ok() {}
+            assert!(player.set_selected_slot(game, 8));
+            assert!(
+                rx.try_recv().is_ok(),
+                "SetHeldSlot reaches the acting guest's client"
+            );
+            assert!(!player.set_selected_slot(game, 9));
+        })
+        .unwrap();
+        assert_eq!(game.lan.as_ref().unwrap().hub.guests[index].selected, 8);
+        // Parked again: the write goes to the guest record and is sent the same way.
+        let player = game.player(13).unwrap();
+        while rx.try_recv().is_ok() {}
+        assert!(player.set_selected_slot(game, 0));
+        assert!(
+            rx.try_recv().is_ok(),
+            "SetHeldSlot reaches a parked guest's client"
+        );
+        assert_eq!(game.lan.as_ref().unwrap().hub.guests[index].selected, 0);
+    });
+}
+
+/// `PlayerRef::drop_stack` hands a refused stack back: an empty one, and one a mod's `item_toss`
+/// vetoes, which the game itself would discard.
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn a_vetoed_drop_gives_the_stack_back() {
+    use super::api_values::TryIntoApi;
+    use horizon_client::items::ItemStack;
+    use mod_api::{Flow, Hooks, ItemTossEvent, ModEntry, ServerHost, testing::with_mods};
+
+    struct Veto;
+    #[mod_api::__subscriptions]
+    impl Hooks for Veto {
+        fn item_toss(&self, _: &mut dyn ServerHost, _: &mut ItemTossEvent<'_>) -> Flow {
+            Flow::Cancel
+        }
+    }
+    let mods = vec![ModEntry::new("veto", Box::new(Veto))];
+    with_mods(mods.into(), || {
+        with_guests(|game| {
+            let player = game.player(13).unwrap();
+            let stone = ItemStack::new("minecraft:stone", 3);
+            let before = game.dropped.len();
+            assert_eq!(
+                player.drop_stack(game, stone.try_into_api().unwrap(), true),
+                Ok(Some(stone.try_into_api().unwrap())),
+                "a vetoed toss comes back whole"
+            );
+            assert_eq!(game.dropped.len(), before, "and makes no item entity");
+            let empty = ItemStack::new("minecraft:stone", 0);
+            assert_eq!(
+                game.player_drop_stack(player, empty.clone(), false),
+                Some(empty)
+            );
+        });
+    });
 }

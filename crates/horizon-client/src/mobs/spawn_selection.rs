@@ -314,6 +314,11 @@ pub fn max_cluster_size(s: Species) -> u32 {
         _ => 4,
     }
 }
+/// Whether a group of `size` mobs has reached its limit: `parts`, the limit the new mob's
+/// entity parts answered, else `Mob.getMaxSpawnClusterSize` of its species.
+fn cluster_full(size: u32, parts: Option<u32>, species: Species) -> bool {
+    size >= parts.unwrap_or_else(|| max_cluster_size(species))
+}
 /// `EntityType.canSpawnFarFromPlayer`: creatures, misc, pillagers, shulkers.
 fn spawns_far_from_player(s: Species, category: Category) -> bool {
     matches!(category, Category::Creature | Category::Misc)
@@ -600,7 +605,7 @@ pub fn position_ok<L: NaturalLevel>(
 /// `checkSpawnObstruction` of a freshly created mob with the given box, with
 /// the mobs already `spawned` in the way; None in a generation region, which
 /// has no entities (`WorldGenRegion.getEntities`).
-pub(crate) fn spawn_obstruction<L: NaturalLevel>(
+pub fn spawn_obstruction<L: NaturalLevel>(
     s: Species,
     l: &L,
     bounds: Aabb,
@@ -1081,6 +1086,9 @@ pub struct Spawned {
     pub bounds: Aabb,
     /// `TropicalFish.isSchool`.
     pub school: bool,
+    /// The group's size limit the new mob's entity parts answered; `None` leaves
+    /// `Mob.getMaxSpawnClusterSize` of its species.
+    pub cluster_size: Option<u32>,
 }
 
 /// `NaturalSpawner.spawnForChunk` for the categories already filtered.
@@ -1115,7 +1123,7 @@ pub fn spawn_category_for_chunk<L: NaturalLevel, R: RandomSource>(
 ) {
     let x = chunk.0 * 16 + random.next_int_bound(16).unwrap_or(0);
     let z = chunk.1 * 16 + random.next_int_bound(16).unwrap_or(0);
-    let top = l.heightmap(Heightmap::WorldSurface, x, z) + 1;
+    let top = l.heightmap(Heightmap::WorldSurface, x, z);
     let min = l.min_y();
     let y = min + random.next_int_bound(top - min + 1).unwrap_or(0);
     trace(Event::Start(category, [x, y, z]));
@@ -1241,7 +1249,7 @@ pub fn spawn_category_for_position<L: NaturalLevel, R: RandomSource>(
                 [xx, f64::from(y), zz],
                 yaw,
             ));
-            if cluster >= max_cluster_size(species) {
+            if cluster_full(cluster, result.cluster_size, species) {
                 return;
             }
             // TropicalFish.isMaxGroupSizeReached.
@@ -1518,6 +1526,27 @@ fn top_non_colliding<L: NaturalLevel>(l: &L, entity: &str, x: i32, z: i32) -> [i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vanilla's limits stand until a part answers; an answer replaces them, higher or lower,
+    /// and a group stops growing at the size the answer names.
+    #[test]
+    fn a_parts_answer_moves_where_a_group_stops_growing() {
+        let stops_at = |parts: Option<u32>, species| {
+            (1..=64)
+                .find(|&size| cluster_full(size, parts, species))
+                .unwrap()
+        };
+        // `Mob.getMaxSpawnClusterSize`: 4 by default, 8 for wolves, 1 for ghasts.
+        assert_eq!(stops_at(None, Species::Zombie), 4);
+        assert_eq!(stops_at(None, Species::Wolf), 8);
+        assert_eq!(stops_at(None, Species::Ghast), 1);
+        assert_eq!(stops_at(Some(2), Species::Zombie), 2);
+        assert_eq!(stops_at(Some(7), Species::Zombie), 7);
+        assert_eq!(stops_at(Some(3), Species::Wolf), 3);
+        assert_eq!(stops_at(Some(5), Species::Ghast), 5);
+        // A limit of 0 ends the group with the mob just spawned, as vanilla's would.
+        assert!(cluster_full(1, Some(0), Species::Zombie));
+    }
 
     /// The grid finds the players whose chunk is within 8 of a chunk on both
     /// axes, in their order, as a look at every player does.

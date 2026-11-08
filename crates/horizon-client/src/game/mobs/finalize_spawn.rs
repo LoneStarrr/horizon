@@ -154,10 +154,12 @@ impl Game<'_> {
     /// the level decides, and the game carries it out.
     pub(super) fn finalize_spawn_event_result(
         &self,
-        mob: &Mob,
+        mob: &mut Mob,
         reason: Reason,
     ) -> finalize::SpawnEvent {
-        let (outcome, _) = self.finalize_spawn_event(mob, reason, None);
+        // A mob finalization makes starts without group data, and the
+        // finalization that follows reads none.
+        let (outcome, _) = self.finalize_spawn_event(mob, reason, None, &mut None);
         match outcome {
             super::creatures::Finalized::Cancelled => finalize::SpawnEvent::Cancelled,
             super::creatures::Finalized::Skipped => finalize::SpawnEvent::Skip,
@@ -174,6 +176,17 @@ impl Game<'_> {
         difficulty: &spawning::LocalDifficulty,
         reason: Reason,
     ) {
+        self.finalize_grouped(mob, difficulty, reason, None);
+    }
+    /// [`Game::finalize_plain`] with the pack's group data, as a listener of
+    /// `finalize_spawn` left it.
+    pub(super) fn finalize_grouped(
+        &mut self,
+        mob: &mut Mob,
+        difficulty: &spawning::LocalDifficulty,
+        reason: Reason,
+        group: Option<finalize::Group>,
+    ) {
         let mut random = self.world.random.clone();
         let mut level = FinalizeGame { game: self };
         let mut cx = finalize::Ctx {
@@ -183,7 +196,7 @@ impl Game<'_> {
             created: Vec::new(),
             jockey_rider: None,
         };
-        finalize::finalize(&mut cx, mob, reason, None);
+        finalize::finalize(&mut cx, mob, reason, group);
         let created = std::mem::take(&mut cx.created);
         let game = level.game;
         game.world.random = random;

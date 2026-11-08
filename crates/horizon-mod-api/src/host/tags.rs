@@ -4,21 +4,21 @@ use crate::*;
 /// The host's methods both sides share of the `tags` area, implemented by the game and reached through [`Host`].
 #[horizon_mod_api_macros::host_area]
 pub trait TagsHost {
+    /// The merged-tag service, using load-resolved item and tag keys.
+    /// Not on wasm: a frame resource; its methods are the imports.
+    #[access(Metadata)]
+    #[service]
+    fn tags(&self) -> &dyn Tags;
     /// Side: both.
     /// The saved name for an engine-issued unresolved fluid.
     #[access(WorldOnly)]
     fn unresolved_fluid_id(&self, fluid: UnresolvedFluid) -> String;
     /// Side: both.
-    /// Whether the resolved block is in the world's merged block tag. Unknown tags return false;
-    /// unavailable authoritative tags or owning-thread block mappings return None.
+    /// Whether the resolved block is in the world's merged block tag, on a client the tag its
+    /// server sent. Unknown tags return false; unavailable tags or owning-thread block mappings
+    /// return None.
     #[access(Metadata)]
     fn block_in_tag(&self, block: BlockKey, tag: &str) -> Option<bool>;
-    /// Side: both.
-    /// The members of a tag in vanilla's order (`HolderSet.Named` iteration: file order, nested
-    /// tags in place, first occurrence kept), over the merged tags. Empty for an unknown tag.
-    /// None as for `native_block_in_tag`.
-    #[access(Metadata)]
-    fn tag_members(&self, registry: TagRegistry, tag: &str) -> Option<Vec<String>>;
     /// Side: both.
     /// The outline of `state` as `BlockState.getShape` answers it with an empty getter at the
     /// origin (`EmptyBlockGetter.INSTANCE`, `BlockPos.ZERO`): its boxes, each `[min x, y, z,
@@ -34,8 +34,8 @@ pub trait TagsHost {
     fn state_fluid_state(&self, state: BlockStateId) -> Option<FluidState>;
     /// Side: both.
     /// Whether `fluid` is in the fluid tag `tag` (`FluidState.is(TagKey)`, `minecraft:water` or
-    /// `water`), over the merged fluid tags. An unknown tag is false. None as for
-    /// `native_block_in_tag`.
+    /// `water`), over the merged fluid tags, on a client those its server sent. An unknown tag
+    /// is false. None as for `native_block_in_tag`.
     #[access(Metadata)]
     fn fluid_in_tag(&self, fluid: &str, tag: &str) -> Option<bool>;
     /// Side: both.

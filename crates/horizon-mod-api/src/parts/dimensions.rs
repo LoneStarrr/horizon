@@ -175,6 +175,8 @@ pub mod tests {
     #[cfg(test)]
     use super::*;
     #[cfg(test)]
+    use crate::parts::tests::install_parts_fixture as install_parts;
+    #[cfg(test)]
     use crate::*;
 
     /// A name that is no safe folder of the world refuses the mods at startup, before any world

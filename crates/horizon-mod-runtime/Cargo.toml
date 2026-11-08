@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish = false
 description = "Engine-independent mod storage, attachment indexes and registry slot tables"
 
+[features]
+# Internal proof instrumentation; absent from normal game and mod builds.
+test-work-count = []
+
 [dependencies]
 horizon-core = { path = "../horizon-core" }
 

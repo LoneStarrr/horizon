@@ -225,6 +225,7 @@ pub(super) struct GuestSwap {
     cooldown_events: Vec<(std::sync::Arc<str>, i32)>,
     /// The player-source sounds queued for that guest.
     player_sounds: Vec<(String, [f64; 3], f32, f32)>,
+    block_sounds: Vec<(String, [f64; 3], f32, f32)>,
     /// The host's count of swings started, kept while the guest acts.
     swings: u32,
     /// How many projectiles there were: those added since are the guest's.
@@ -463,17 +464,28 @@ mod tests {
                 _: &dyn mod_api::LoopContext,
                 event: &mut MenuSlotRulesEvent<'_>,
             ) {
-                if &*event.stack.item == "minecraft:granite" && event.stack.count < 8 {
+                if mod_api::__private::item_key_id(event.stack.item()).unwrap()
+                    == "minecraft:granite"
+                    && event.stack.count() < 8
+                {
                     event.may_place = false;
                 }
                 if event.slot == 0 {
-                    if &*event.stack.item == "minecraft:diorite" && event.stack.count >= 8 {
+                    if mod_api::__private::item_key_id(event.stack.item()).unwrap()
+                        == "minecraft:diorite"
+                        && event.stack.count() >= 8
+                    {
                         event.max_stack = 3;
                     }
-                    if matches!(&*event.stack.item, "minecraft:andesite" | "minecraft:stone") {
+                    if matches!(
+                        mod_api::__private::item_key_id(event.stack.item()).unwrap(),
+                        "minecraft:andesite" | "minecraft:stone"
+                    ) {
                         event.max_stack = 3;
                     }
-                    if &*event.stack.item == "minecraft:dirt" {
+                    if mod_api::__private::item_key_id(event.stack.item()).unwrap()
+                        == "minecraft:dirt"
+                    {
                         event.may_place = false;
                     }
                 }
@@ -488,7 +500,7 @@ mod tests {
             }
         }
         let mods: Mods = vec![ModEntry::new("menu_rules", Box::new(Mod))].into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         crate::entry::install_client_hooks();
         mod_api::testing::with_mods(mods, || {
             super::super::native_guest_turn_tests::with_guests(|game| {
@@ -508,6 +520,7 @@ mod tests {
                     slots: 27,
                     data_slots: 0,
                     results: Vec::new(),
+                    crafting: None,
                 }));
                 for is_mod in [false, true] {
                     game.world.block_entities.insert(
@@ -622,10 +635,12 @@ mod tests {
                         }));
                         prediction.load_slot(0, slots[0].clone());
                         prediction.load_slot(1, slots[1].clone());
-                        prediction.carried = Some(ItemStack::new(item, carried));
+                        prediction.carried =
+                            Some(horizon_client::items::ItemStack::new(item, carried));
                         prediction.creative = creative;
                         game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
-                            guest.carried = Some(ItemStack::new(item, carried));
+                            guest.carried =
+                                Some(horizon_client::items::ItemStack::new(item, carried));
                             guest.game_mode = if creative {
                                 horizon_client::lan::guest::CREATIVE
                             } else {
@@ -679,7 +694,7 @@ mod tests {
                         .guests
                         .update(0, |guest| guest.game_mode = 0);
                     game.world.block_entities.get_mut(&pos).unwrap().slots_mut()[0] =
-                        Some(ItemStack::new("minecraft:dirt", 2));
+                        Some(horizon_client::items::ItemStack::new("minecraft:dirt", 2));
                     let mut prediction = Menu::new(if is_mod {
                         Kind::Mod(menu_type)
                     } else {
@@ -690,13 +705,20 @@ mod tests {
                     } else {
                         "minecraft:generic_9x3"
                     }));
-                    prediction.load_slot(0, Some(ItemStack::new("minecraft:dirt", 2)));
-                    prediction.set_player_item(9, Some(ItemStack::new("minecraft:dirt", 4)));
+                    prediction.load_slot(
+                        0,
+                        Some(horizon_client::items::ItemStack::new("minecraft:dirt", 2)),
+                    );
+                    prediction.set_player_item(
+                        9,
+                        Some(horizon_client::items::ItemStack::new("minecraft:dirt", 4)),
+                    );
                     prediction
                         .click(&game.menu_env(), 27, 0, Input::QuickMove)
                         .unwrap();
                     game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
-                        guest.inventory[9] = Some(ItemStack::new("minecraft:dirt", 4))
+                        guest.inventory[9] =
+                            Some(horizon_client::items::ItemStack::new("minecraft:dirt", 4))
                     });
                     game.lan_guest_packet(
                         12,
@@ -720,7 +742,8 @@ mod tests {
                     assert_eq!(prediction.slot(0).unwrap().count, 2);
                     game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
                         guest.inventory.fill(None);
-                        guest.inventory[0] = Some(ItemStack::new("minecraft:stone", 8));
+                        guest.inventory[0] =
+                            Some(horizon_client::items::ItemStack::new("minecraft:stone", 8));
                     });
                     game.lan_guest_packet(
                         12,
@@ -738,10 +761,11 @@ mod tests {
                     assert_eq!(guest.inventory[0].as_ref().unwrap().count, 8);
                     assert_eq!(guest.inventory.iter().flatten().count(), 1);
                     game.world.block_entities.get_mut(&pos).unwrap().slots_mut()[0] =
-                        Some(ItemStack::new("minecraft:dirt", 2));
+                        Some(horizon_client::items::ItemStack::new("minecraft:dirt", 2));
                     game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
                         guest.inventory.fill(None);
-                        guest.inventory[0] = Some(ItemStack::new("minecraft:stone", 8));
+                        guest.inventory[0] =
+                            Some(horizon_client::items::ItemStack::new("minecraft:stone", 8));
                     });
                     game.lan_guest_packet(
                         12,
@@ -778,7 +802,8 @@ mod tests {
                         guest.inventory.fill(None);
                         guest.inventory[1] = Some(limited);
                         guest.selected = 1;
-                        guest.inventory[0] = Some(ItemStack::new("minecraft:stone", 8));
+                        guest.inventory[0] =
+                            Some(horizon_client::items::ItemStack::new("minecraft:stone", 8));
                     });
                     game.lan_guest_packet(
                         12,
@@ -813,7 +838,7 @@ mod tests {
     #[test]
     #[ignore = "requires prepared game resources"]
     fn crafting_guest_self_swap_keeps_eight_items() {
-        use horizon_client::{chunk::Chunk, items::ItemStack};
+        use horizon_client::chunk::Chunk;
         use horizon_protocol::packets::play::{ContainerClick, Serverbound};
         use std::sync::Arc;
         super::super::native_guest_turn_tests::with_guests(|game| {
@@ -828,7 +853,8 @@ mod tests {
                 .unwrap();
             game.world.set(1, 64, 1, table).unwrap();
             game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
-                guest.inventory[0] = Some(ItemStack::new("minecraft:stone", 8));
+                guest.inventory[0] =
+                    Some(horizon_client::items::ItemStack::new("minecraft:stone", 8));
             });
             game.lan_open_crafting(12, [1, 64, 1]);
             let window = game
@@ -1044,9 +1070,13 @@ mod tests {
                 event: &mut CloneItemStackEvent<'_>,
             ) -> Option<ItemStack> {
                 self.0.lock().unwrap().push(event.include_data);
-                event
-                    .include_data
-                    .then(|| ItemStack::new("minecraft:diamond", 1))
+                event.include_data.then(|| {
+                    mod_api::ItemStack::new(
+                        mod_api::__private::item_key("minecraft:diamond").unwrap(),
+                        1,
+                    )
+                    .unwrap()
+                })
             }
         }
         #[derive(Clone)]
@@ -1161,7 +1191,7 @@ mod tests {
             }),
         )]
         .into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
@@ -1239,7 +1269,8 @@ mod tests {
                     inside: false,
                 };
                 game.world.set(0, 64, 4, lever).unwrap();
-                game.inventory[game.selected] = Some(ItemStack::new("minecraft:stick", 1));
+                game.inventory[game.selected] =
+                    Some(horizon_client::items::ItemStack::new("minecraft:stick", 1));
                 for (answer, item_uses, powered, swings) in [
                     (Answer::Success, 0, false, 1),
                     (Answer::SuccessServer, 0, false, 1),
@@ -1297,8 +1328,10 @@ mod tests {
                     (Some(Answer::Pass), cauldron, "minecraft:water_bucket", 4),
                 ] {
                     game.world.set(5, 64, 4, cauldron).unwrap();
-                    game.inventory[game.selected] =
-                        Some(ItemStack::new("minecraft:water_bucket", 1));
+                    game.inventory[game.selected] = Some(horizon_client::items::ItemStack::new(
+                        "minecraft:water_bucket",
+                        1,
+                    ));
                     *user.answer.lock().unwrap() = answer;
                     assert!(game.use_hand(Some(&cauldron_hit)).unwrap());
                     assert_eq!(game.world.block(5, 64, 4), expected);
@@ -1324,9 +1357,13 @@ mod tests {
                     (6, 64, 4),
                     horizon_client::containers::BlockEntity::Jukebox(
                         horizon_client::containers::Jukebox {
-                            items: [Some(ItemStack::new("minecraft:music_disc_13", 1))],
+                            items: [Some(horizon_client::items::ItemStack::new(
+                                "minecraft:music_disc_13",
+                                1,
+                            ))],
                             ticks: 0,
                             playing: false,
+                            song_clock_present: false,
                         },
                     ),
                 );
@@ -1428,7 +1465,7 @@ mod tests {
                 assert_eq!(game.world.block(8, 64, 4), floor_lever);
                 *user.answer.lock().unwrap() = Some(Answer::TryWithEmptyHand);
                 game.hand = Hand::Off;
-                game.offhand = Some(ItemStack::new("minecraft:stick", 1));
+                game.offhand = Some(horizon_client::items::ItemStack::new("minecraft:stick", 1));
                 let calls = user.empty_clicks.lock().unwrap().len();
                 assert!(game.use_hand(Some(&replaced_hit)).unwrap());
                 assert_eq!(user.empty_clicks.lock().unwrap().len(), calls);
@@ -1445,7 +1482,8 @@ mod tests {
                     .default_state("minecraft:redstone_ore")
                     .unwrap();
                 game.world.set(11, 64, 4, ore).unwrap();
-                game.inventory[game.selected] = Some(ItemStack::new("minecraft:stone", 1));
+                game.inventory[game.selected] =
+                    Some(horizon_client::items::ItemStack::new("minecraft:stone", 1));
                 let ore_hit = super::super::Hit {
                     pos: [11, 64, 4],
                     point: [11.5, 65.0, 4.5],
@@ -1462,7 +1500,8 @@ mod tests {
                     game.with_props(ore, &[("lit", "true")]).unwrap()
                 );
                 *user.answer.lock().unwrap() = Some(Answer::TryWithEmptyHand);
-                game.inventory[game.selected] = Some(ItemStack::new("minecraft:stick", 1));
+                game.inventory[game.selected] =
+                    Some(horizon_client::items::ItemStack::new("minecraft:stick", 1));
 
                 // The hook precedes the pot's wobble and the bookshelf's removal.
                 let pot = game
@@ -1494,7 +1533,7 @@ mod tests {
                     .unwrap();
                 game.world.set(9, 64, 4, shelf).unwrap();
                 let mut books = Box::<horizon_client::containers::ChiseledBookshelf>::default();
-                books.items[0] = Some(ItemStack::new("minecraft:book", 1));
+                books.items[0] = Some(horizon_client::items::ItemStack::new("minecraft:book", 1));
                 game.world.block_entities.insert(
                     (9, 64, 4),
                     horizon_client::containers::BlockEntity::ChiseledBookshelf(books),
@@ -1521,7 +1560,7 @@ mod tests {
                 // The real guest packet reaches empty use with the guest's UUID.
                 game.world.set(0, 64, 4, lever).unwrap();
                 {
-                    let value = Some(ItemStack::new("minecraft:stick", 1));
+                    let value = Some(horizon_client::items::ItemStack::new("minecraft:stick", 1));
                     game.lan
                         .as_mut()
                         .unwrap()
@@ -1722,7 +1761,7 @@ mod tests {
             Box::new(BlockUse(calls.clone())),
         )]
         .into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
@@ -1791,7 +1830,7 @@ mod tests {
             Box::new(Replacement(replace.clone())),
         )]
         .into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
@@ -1871,6 +1910,7 @@ mod tests {
             mining: Some(Mining {
                 pos,
                 progress: 0.5,
+                per_tick: 0.0,
                 ticks: 8,
             }),
             destroy_pos: Some(pos),
@@ -2727,5 +2767,74 @@ mod swing_echo_tests {
         // BedBlock.useWithoutItem: SUCCESS_SERVER, the server's swing only.
         game.lan_guest_packet(2, use_on([6, 200, 4], [0.5, 0.5625, 0.5], 2));
         assert_eq!(swings_back(), 1, "a bed's use is swung back");
+    }
+}
+
+/// `Entity.touchingUnloadedChunk`: the box at `at` inflated by one block
+/// reaches a chunk that is not loaded (`Level.hasChunksAt` over the floor of
+/// its minimum and the ceiling of its maximum, as section coordinates).
+fn touching_unloaded_chunk(
+    at: [f64; 3],
+    body: Dimensions,
+    loaded: impl Fn(i32, i32) -> bool,
+) -> bool {
+    let half = f64::from(body.width) / 2.0 + 1.0;
+    let section = |v: f64| (v as i32) >> 4;
+    let (x0, x1) = (
+        section((at[0] - half).floor()),
+        section((at[0] + half).ceil()),
+    );
+    let (z0, z1) = (
+        section((at[2] - half).floor()),
+        section((at[2] + half).ceil()),
+    );
+    !(x0..=x1).all(|x| (z0..=z1).all(|z| loaded(x, z)))
+}
+
+#[cfg(test)]
+mod unloaded_chunk_tests {
+    use super::touching_unloaded_chunk;
+    use horizon_client::pose::Dimensions;
+
+    /// `Entity.touchingUnloadedChunk` (#11312): the box inflated by one block
+    /// is checked chunk by chunk; a player in the middle of a loaded chunk
+    /// touches none, one within a block of its edge touches the neighbour.
+    #[test]
+    fn a_box_within_a_block_of_a_chunk_edge_touches_the_next_chunk() {
+        let body = Dimensions {
+            width: 0.6,
+            height: 1.8,
+            eye_height: 1.62,
+        };
+        let only_origin = |x: i32, z: i32| (x, z) == (0, 0);
+        assert!(!touching_unloaded_chunk(
+            [8.0, 64.0, 8.0],
+            body,
+            only_origin
+        ));
+        // 15.5 + 0.3 + 1 reaches 16.8, in chunk 1.
+        assert!(touching_unloaded_chunk(
+            [15.5, 64.0, 8.0],
+            body,
+            only_origin
+        ));
+        // 14.0 + 1.3 = 15.3: Mth.ceil gives 16, the first block of chunk 1.
+        assert!(touching_unloaded_chunk(
+            [14.0, 64.0, 8.0],
+            body,
+            only_origin
+        ));
+        // 13.5 + 1.3 = 14.8: ceil 15, still chunk 0.
+        assert!(!touching_unloaded_chunk(
+            [13.5, 64.0, 8.0],
+            body,
+            only_origin
+        ));
+        // Everything loaded: nothing is touched anywhere.
+        assert!(!touching_unloaded_chunk(
+            [15.9, 64.0, -0.5],
+            body,
+            |_, _| true
+        ));
     }
 }

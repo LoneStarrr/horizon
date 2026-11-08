@@ -15,7 +15,9 @@ use horizon_core::{
     position::BlockPos,
     random::{LegacyRandom, RandomSource},
 };
-use mod_api::{NativeBlockInteraction, NativeExplosionStart, NativeItemDrop};
+#[cfg(test)]
+use mod_api::NativeItemDrop;
+use mod_api::{NativeBlockInteraction, NativeExplosionStart};
 use std::{cmp::Ordering, io};
 use {
     horizon_core::java_hash_map::{JavaHashMap, JavaKey},
@@ -148,6 +150,18 @@ pub(super) enum BlockInteraction {
     Keep,
     Destroy,
     DestroyWithDecay,
+}
+
+/// Properties of the direct entity passed to `ServerLevel.explode`.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ExplosionSource {
+    silent: bool,
+}
+impl ExplosionSource {
+    pub(super) fn with_silence(mut self, silent: bool) -> Self {
+        self.silent = silent;
+        self
+    }
 }
 
 /// `ServerExplosion.hurtEntities`: an entity is hurt when its position is
@@ -302,6 +316,7 @@ impl Game<'_> {
             context: CollisionContext::for_entity(
                 CollisionEntity {
                     identity: EntityIdentity(0),
+                    kind: horizon_world::collision_context::EntityContextKind::None,
                     y: min[1],
                     descending: false,
                     main_hand: Some(CollisionItem::EMPTY),
@@ -702,6 +717,7 @@ impl Game<'_> {
         let (items_len, orbs_len) = (self.dropped.len(), self.orbs.len());
         let (mut items_kept, mut orbs_kept) = (0, 0);
         let (mut boats_gone, mut carts_gone) = (0, 0);
+        let mut destroyed_contents = Vec::new();
         for handle in self.entity_handles() {
             let handle = match handle {
                 EntityHandle::Boat(i) => EntityHandle::Boat(i - boats_gone),
@@ -747,6 +763,11 @@ impl Game<'_> {
                             cause,
                             (amount, source),
                         );
+                        // Enderman.hurtServer teleports inside the hurt, before
+                        // the push (the mob order stays as it was).
+                        if let Err(e) = self.settle_hurt_teleports() {
+                            log::warn!("Horizon: explosion: enderman teleport: {e}");
+                        }
                     }
                     // `ItemEntity.hurtServer`: the damage comes off `Health`
                     // (5 to start) in f32 and the item is destroyed at zero, so
@@ -759,6 +780,17 @@ impl Game<'_> {
                         if &*item.stack.item != "minecraft:nether_star" {
                             item.health = (item.health as f32 - amount) as i32;
                             destroyed = item.health <= 0;
+                            if destroyed {
+                                let at = item.position;
+                                // Health was already reduced above. Run the shared
+                                // onDestroyed path without applying damage twice.
+                                destroyed_contents.extend(
+                                    item.hurt(0)
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .map(|stack| (stack, at)),
+                                );
+                            }
                         }
                     }
                     // `ExperienceOrb.hurtServer` takes the damage off their 5 health.
@@ -821,6 +853,9 @@ impl Game<'_> {
         }
         self.dropped.drain(items_kept..items_len);
         self.orbs.drain(orbs_kept..orbs_len);
+        // The original target walk is finished: released contents cannot be
+        // hurt or pushed by the explosion that destroyed their container.
+        self.spawn_destroyed_contents(destroyed_contents);
         self.native_leaves_flush();
         // Frames, paintings, cushions and armour stands last: vanilla lists
         // the entities in reach before hurting any, so the items they drop
@@ -960,11 +995,29 @@ impl Game<'_> {
         interaction: BlockInteraction,
         fire: bool,
     ) -> Result<()> {
+        self.server_explode_from(
+            center,
+            radius,
+            interaction,
+            fire,
+            ExplosionSource::default(),
+        )
+    }
+    /// `ServerLevel.explode`: only the direct source's `isSilent` suppresses
+    /// the sound; terrain, entity damage and the visual packet are unchanged.
+    pub(super) fn server_explode_from(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        interaction: BlockInteraction,
+        fire: bool,
+        source: ExplosionSource,
+    ) -> Result<()> {
         let damage_type = super::creatures::damage_type(
             horizon_client::mobs::DamageKind::Explosion,
             self.blast_attacker().is_some(),
         );
-        self.server_explode_as(center, radius, interaction, fire, damage_type, None)
+        self.server_explode_as_source(center, radius, interaction, fire, damage_type, None, source)
     }
     /// `server_explode` with the damage type the player takes and a block
     /// whose explosion resistance the damage calculator overrides.
@@ -976,6 +1029,26 @@ impl Game<'_> {
         fire: bool,
         damage_type: &str,
         resists: Option<([i32; 3], f32)>,
+    ) -> Result<()> {
+        self.server_explode_as_source(
+            center,
+            radius,
+            interaction,
+            fire,
+            damage_type,
+            resists,
+            ExplosionSource::default(),
+        )
+    }
+    fn server_explode_as_source(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        interaction: BlockInteraction,
+        fire: bool,
+        damage_type: &str,
+        resists: Option<([i32; 3], f32)>,
+        source: ExplosionSource,
     ) -> Result<()> {
         if self.serving.is_some() || self.options.dedicated.is_some() {
             let start =
@@ -1052,9 +1125,11 @@ impl Game<'_> {
                 }
             }
         }
-        let pitch = (1.0 + (client_float() - client_float()) * 0.2) * 0.7;
-        self.audio
-            .play("minecraft:entity.generic.explode", Some(center), 4.0, pitch);
+        if !source.silent {
+            let pitch = (1.0 + (client_float() - client_float()) * 0.2) * 0.7;
+            self.audio
+                .play("minecraft:entity.generic.explode", Some(center), 4.0, pitch);
+        }
         // ServerLevel.explode sends toBlow.size() whatever the interaction, and
         // `ServerExplosion.isSmall` also covers an explosion that keeps blocks.
         let block_count = targets.len();
@@ -1121,17 +1196,18 @@ impl Game<'_> {
                 pos.map(|v| f64::from(v) + 0.5),
                 self.loot_block_entity(pos, &name),
             );
+            // `Explosion.getDirectSourceEntity`.
+            let entity = self
+                .combat
+                .explosion_direct
+                .or(self.combat.explosion_source);
             let mut drops = horizon_world::loot::with_native_loot_place(place, || {
-                world_items!(self).block_drops_exploded(
-                    self.pack.assets.registry,
-                    state,
-                    None,
-                    &dynamic,
-                    &mut self.world.random,
-                    Some((&mut self.rand_sequences, self.level.seed)),
-                    decay,
-                    false,
-                )
+                let roll = horizon_client::items::BlockLootRoll {
+                    dynamic: &dynamic,
+                    explosion: decay,
+                    ..Default::default()
+                };
+                self.roll_block_loot(pos, state, entity, roll)
             });
             self.native_block_loot(pos, state, None, None, Some(radius), &mut drops);
             let mut pieces: Vec<ExplosionDropPiece> = Vec::new();
@@ -1216,7 +1292,7 @@ impl Game<'_> {
                 .map(|(pos, stack)| level.block_drop_item(pos, stack))
                 .collect()
         });
-        let mut merged: Vec<Option<NativeItemDrop>> = vec![None; items.len()];
+        let mut merged: Vec<Option<super::spill::BlockItemDrop>> = vec![None; items.len()];
         let mut edited = Vec::new();
         for block in drops.blocks {
             let mut originals: Vec<_> = block
@@ -1260,6 +1336,70 @@ impl Game<'_> {
         for item in merged.into_iter().flatten().chain(edited) {
             self.spawn_item(item.stack, item.position, item.velocity, item.pickup_delay);
         }
+    }
+}
+
+#[cfg(test)]
+impl Game<'_> {
+    /// Exercise the real explosion entity walk on an empty, headless world.
+    pub(super) fn run_explosion_items_fixture(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            stack: String,
+            health: i32,
+            distances: Vec<f64>,
+            #[serde(default)]
+            sibling: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(&std::fs::read_to_string(directory.join("inputs.json"))?)?;
+        let mut output = Vec::new();
+        for case in cases {
+            self.dropped.clear();
+            let stack = horizon_client::item_data::parse_stack(&case.stack)?
+                .ok_or("empty fixture stack")?;
+            self.spawn_item(stack, [0.0, 100.0, 0.0], [0.0; 3], 0);
+            self.dropped[0].health = case.health;
+            let original = self.dropped[0].id;
+            if case.sibling {
+                self.spawn_item(
+                    ItemStack::new("minecraft:dirt", 1),
+                    [0.0, 100.0, 0.0],
+                    [0.0; 3],
+                    0,
+                );
+            }
+            let mut steps = Vec::new();
+            for distance in case.distances {
+                for item in &mut self.dropped {
+                    item.position = Vec3::new(distance, 100.0, 0.0);
+                }
+                self.explosion_hurt_entities(
+                    [0.0, 100.0, 0.0],
+                    1.0,
+                    "minecraft:explosion",
+                    BlockInteraction::Destroy,
+                    &[],
+                );
+                let mut remaining: Vec<_> = self
+                    .dropped
+                    .iter()
+                    .map(|item| (item.stack.item.to_string(), item.stack.count, item.health))
+                    .collect();
+                remaining.sort();
+                steps.push(serde_json::json!(remaining));
+                if !self.dropped.iter().any(|item| item.id == original) {
+                    break;
+                }
+            }
+            output.push(serde_json::json!({"name": case.name, "steps": steps}));
+        }
+        std::fs::write(directory.join("rust.json"), serde_json::to_vec(&output)?)?;
+        Ok(())
     }
 }
 
@@ -1322,7 +1462,13 @@ mod tests {
             event: &mut mod_api::LootDropsEvent<'_>,
         ) {
             if self.edit {
-                *event.drops = vec![ItemStack::new("minecraft:diamond", 1)];
+                *event.drops = vec![
+                    mod_api::ItemStack::new(
+                        mod_api::__private::item_key("minecraft:diamond").unwrap(),
+                        1,
+                    )
+                    .unwrap(),
+                ];
             }
         }
         fn block_drops(
@@ -1335,12 +1481,14 @@ mod tests {
             assert!(event.breaker.is_none() && event.tool.is_none());
             assert_eq!(event.drops.len(), 1);
             assert_eq!(
-                event.drops[0].stack.count, 1,
+                event.drops[0].stack.count(),
+                1,
                 "only this block's contribution"
             );
             if self.edit {
                 assert_eq!(
-                    &*event.drops[0].stack.item, "minecraft:diamond",
+                    mod_api::__private::item_key_id(event.drops[0].stack.item()).unwrap(),
+                    "minecraft:diamond",
                     "loot modifiers ran first"
                 );
                 event.experience = 5;
@@ -1348,7 +1496,11 @@ mod tests {
                     return mod_api::Flow::Cancel;
                 }
                 *event.drops = vec![NativeItemDrop::new(
-                    ItemStack::new("minecraft:emerald", 3),
+                    mod_api::ItemStack::new(
+                        mod_api::__private::item_key("minecraft:emerald").unwrap(),
+                        3,
+                    )
+                    .unwrap(),
                     [7.0, 80.0, 7.0],
                     [0.1, 0.2, 0.3],
                     42,
@@ -1448,6 +1600,7 @@ mod tests {
                         pos: [x, 64, 1],
                         drop: true,
                         by: None,
+                        breaker: None,
                     }])
                     .unwrap();
                     if x == 3 {
@@ -1466,6 +1619,7 @@ mod tests {
                     pos: [5, 64, 1],
                     drop: true,
                     by: None,
+                    breaker: None,
                 }])
                 .unwrap();
                 assert!(game.dropped.is_empty() && game.orbs.is_empty());
@@ -1474,6 +1628,22 @@ mod tests {
                 *seen.lock().unwrap(),
                 [[1, 64, 1], [2, 64, 1], [3, 64, 1], [4, 64, 1], [5, 64, 1]]
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires prepared resources; tools/test_explosion_items_parity.py"]
+    fn explosion_items_parity_fixture() {
+        let directory = std::env::var_os("HORIZON_EXPLOSION_ITEMS_FIXTURE")
+            .expect("set HORIZON_EXPLOSION_ITEMS_FIXTURE to the fixture directory");
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            game.run_explosion_items_fixture(std::path::Path::new(&directory))
+                .unwrap();
         });
     }
 

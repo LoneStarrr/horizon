@@ -6,16 +6,23 @@ use quote::{format_ident, quote};
 /// The list directory and each listed crate's source: build-script inputs.
 pub fn tracked(root: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut paths = vec![root.join(DIRECTORY)];
-    paths.extend(files(root)?.into_iter().map(|file| file.path));
+    paths.extend(
+        files(root, &slots(&root.join(DIRECTORY))?.calls)?
+            .into_iter()
+            .map(|file| file.path),
+    );
+    let private = root.join(super::source::FILE);
+    if private.exists() {
+        paths.push(private);
+    }
     Ok(paths)
 }
 
-fn files(root: &Path) -> Result<Vec<points::GameFile>, Error> {
+fn files(root: &Path, declarations: &[Declaration]) -> Result<Vec<points::GameFile>, Error> {
     let mut files =
         points::game_files(&root.join("crates/horizon-client/src"), true).map_err(Cause::Source)?;
-    let crates: std::collections::BTreeSet<_> = slots(&root.join(DIRECTORY))?
-        .calls
-        .into_iter()
+    let crates: std::collections::BTreeSet<_> = declarations
+        .iter()
         .filter_map(|d| d.target.split("::").next().map(str::to_owned))
         .collect();
     for krate in crates.into_iter().filter(|k| k != "horizon_client") {
@@ -23,15 +30,14 @@ fn files(root: &Path) -> Result<Vec<points::GameFile>, Error> {
             .map_err(Cause::Source)?
             .contains(&krate)
         {
-            let declaration = slots(&root.join(DIRECTORY))?
-                .calls
-                .into_iter()
+            let declaration = declarations
+                .iter()
                 .find(|d| d.target.starts_with(&format!("{krate}::")))
                 .expect("listed crate");
             return Err(Error::from(Cause::Signature(
                 "site crate is built under the points' own crate",
             ))
-            .at(declaration.origin));
+            .at(declaration.origin.clone()));
         }
         let (_, lib) = points::crate_root(root, &krate).map_err(Cause::Source)?;
         let dir = lib.parent().expect("source parent").to_owned();
@@ -43,10 +49,16 @@ fn files(root: &Path) -> Result<Vec<points::GameFile>, Error> {
 /// Generate site IDs independently of the raw types, keeping the points crate below gameplay.
 pub fn ids(root: &Path) -> Result<String, Error> {
     let declarations = slots(&root.join(DIRECTORY))?.calls;
-    let names = declarations
+    let mut names = declarations
         .iter()
         .map(|d| format_ident!("{}", super::rewrite::name(d, d.ordinal.unwrap_or(0))))
         .collect::<Vec<_>>();
+    names.extend(
+        super::source::read(root)
+            .map_err(Cause::Source)?
+            .iter()
+            .map(|site| format_ident!("{}", site.name)),
+    );
     Ok(quote! {
         #[doc(hidden)] #[repr(usize)] #[derive(Clone, Copy, Debug, PartialEq, Eq)] #[non_exhaustive]
         pub enum SiteId { #(#names,)* __Count }
@@ -58,21 +70,42 @@ pub fn ids(root: &Path) -> Result<String, Error> {
 /// Validate the entire union before writing any expression rewrite. Widening precedes this pass.
 pub fn stage(root: &Path, entries: &[Internal]) -> Result<Vec<Site>, Error> {
     let declarations = slots(&root.join(DIRECTORY))?.calls;
+    stage_declarations(root, entries, &declarations, false)
+}
+
+pub(super) fn stage_declarations(
+    root: &Path,
+    entries: &[Internal],
+    declarations: &[Declaration],
+    private: bool,
+) -> Result<Vec<Site>, Error> {
     if declarations.is_empty() {
         return Ok(Vec::new());
     }
+    let rule = crate::crossing::Rule::new(entries);
+    let targets = declarations
+        .iter()
+        .map(|d| {
+            super::identity::enclosing(&d.target, entries, &rule)
+                .map(|entry| (d, entry))
+                .map_err(|error| error.at(format!("{}: {}", d.origin, d.target)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut changes = Vec::new();
     let mut sites = Vec::new();
     let mut packages = std::collections::BTreeSet::new();
-    for file in files(root)? {
-        if !declarations
+    for file in files(root, declarations)? {
+        let selected = targets
             .iter()
-            .any(|d| d.target.starts_with(&format!("{}::", file.module)))
-        {
+            .filter(|(_, entry)| entry.path.starts_with(&format!("{}::", file.module)))
+            .map(|(declaration, _)| (*declaration).clone())
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
             continue;
         }
         let source = fs::read_to_string(&file.path)?;
-        let (rewritten, found) = rewrite(&source, &file.module, entries, &declarations)?;
+        let source = crate::game_modules::expand(&file.path, &source).map_err(Cause::Source)?;
+        let (rewritten, found) = rewrite(&source, &file.module, entries, &selected, private)?;
         if found.is_empty() {
             continue;
         }
@@ -135,6 +168,81 @@ pub fn stage(root: &Path, entries: &[Internal]) -> Result<Vec<Site>, Error> {
 mod tests {
     use super::*;
     use crate::crossing::tests::internal;
+
+    #[test]
+    fn site_stage_follows_nominal_owner_and_keeps_physical_writes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("site-area-{}", std::process::id()));
+        let game = root.join("crates/horizon-client/src/game.rs");
+        let area = root.join("crates/horizon-client/src/game/runtime");
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join(".game-area"), "").unwrap();
+        let directory = root.join(DIRECTORY);
+        fs::create_dir_all(&directory).unwrap();
+        let declaration = directory.join("test.txt");
+        fs::write(
+            &declaration,
+            "horizon_client::game::Machine::run | self.helper | 0 |\n",
+        )
+        .unwrap();
+        let base = "struct Machine;\n";
+        let method = "impl Machine { fn helper(&self, value: u32) -> u32 { value + 1 } fn run(&self) -> u32 { self.helper(2) } }";
+        let signature = "impl Machine { fn run(&self) -> u32 }";
+        let mut entries = vec![
+            internal("horizon_client::game::Machine", "struct", "struct Machine;"),
+            internal(
+                "horizon_client::game::Machine::helper",
+                "method",
+                "impl Machine { fn helper(&self, value: u32) -> u32 }",
+            ),
+            internal("horizon_client::game::Machine::run", "method", signature),
+        ];
+        fs::write(&game, format!("{base}{method}")).unwrap();
+        let before = stage(&root, &entries).unwrap().remove(0);
+        let root_source = format!("{base}{}\n", crate::game_modules::INCLUDE);
+        fs::write(&game, &root_source).unwrap();
+        let moved = area.join("feature.rs");
+        let source = format!("use super::*; {method}");
+        fs::write(&moved, &source).unwrap();
+        entries[1].path = "horizon_client::game::feature::Machine::helper".into();
+        entries[2].path = "horizon_client::game::feature::Machine::run".into();
+        for entry in &mut entries[1..] {
+            entry
+                .refs
+                .insert("Machine".into(), "horizon_client::game::Machine".into());
+        }
+        let after = stage(&root, &entries).unwrap().remove(0);
+        assert_eq!(
+            (after.name.as_str(), after.ctx.as_str(), after.hash.as_str()),
+            (
+                before.name.as_str(),
+                before.ctx.as_str(),
+                before.hash.as_str()
+            )
+        );
+        assert_eq!(after.target, "horizon_client::game::Machine::run");
+        assert_eq!(after.call, before.call);
+        assert_eq!(after.call, "horizon_client::game::Machine::helper");
+        assert_eq!(fs::read_to_string(&game).unwrap(), root_source);
+        let rewritten = fs::read_to_string(&moved).unwrap();
+        syn::parse_file(&rewritten).unwrap();
+        assert!(rewritten.contains(&after.name), "{rewritten}");
+        // A genuine missing call remains Lost, even though its nominal owner still matches.
+        fs::write(&moved, source.replace("self.helper(2)", "2")).unwrap();
+        fs::write(
+            &declaration,
+            format!(
+                "horizon_client::game::Machine::run | self.helper | 0 | {}\n",
+                before.ctx
+            ),
+        )
+        .unwrap();
+        let error = stage(&root, &entries).unwrap_err().to_string();
+        assert!(error.contains("E_INJECT_LOST"), "{error}");
+        assert!(!fs::read_to_string(&moved).unwrap().contains(&after.name));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn site_stage_validates_all_targets_before_writing() {

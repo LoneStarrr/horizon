@@ -591,10 +591,13 @@ mod tests {
         use super::{CauldronFluids, FluidAt, FluidStack, game_holds};
         mod_api::__private::part_tests::game_thread();
         let potion = |fluid| {
-            let mut components = horizon_client::item_data::StackData::default();
-            components.potion = Some(Arc::from("minecraft:healing"));
+            use horizon_core::nbt::{Compound, Tag};
+            let mut potion = Compound::new();
+            potion.insert("potion".into(), Tag::String("minecraft:healing".into()));
+            let mut components = Compound::new();
+            components.insert("minecraft:potion_contents".into(), Tag::Compound(potion));
             FluidStack {
-                components: Some(Box::new(components)),
+                components: Some(Box::new(components.into())),
                 ..FluidStack::new(mod_api::__private::fluid_key(fluid).unwrap(), 1000)
             }
         };
@@ -800,7 +803,7 @@ mod tests {
             }
         }
         let mods: Mods = vec![ModEntry::new("fluid_filter_test", Box::new(WaterTanks))].into();
-        mod_api::__private::install_parts(&mods).unwrap();
+        crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::testing::with_mods(mods, || {
             let base =
                 std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());

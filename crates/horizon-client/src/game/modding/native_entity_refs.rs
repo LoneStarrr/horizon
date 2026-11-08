@@ -14,12 +14,49 @@ use super::{
     entity::{Entity as _, entity_lists_of, for_each_entity},
 };
 use horizon_core::geometry::{Aabb, Vec3};
+use horizon_items::items::ItemStack;
 use horizon_world::registry::BlockStateId;
 use mod_api::{
-    DimensionKey, EntityRef, ItemStack, LevelRef, NativeBlockFace, NativeBlockShapeKind,
+    DimensionKey, EntityRayHit, EntityRef, LevelRef, NativeBlockFace, NativeBlockShapeKind,
     NativeBlockUpdateFlags, NativeClipBlock, NativeClipFluid, NativeClipHit, NativeSupportType,
     NeighbourUpdate,
 };
+
+/// `ProjectileUtil.getEntityHitResult`'s test on each candidate: its box grown by `margin`
+/// and clipped against the segment. Every hit, nearest first; a segment that starts inside a
+/// box does not hit it (`AABB.clip`).
+fn entity_ray_hits(
+    from: [f64; 3],
+    to: [f64; 3],
+    margin: f64,
+    candidates: impl IntoIterator<Item = (EntityRef, [[f64; 3]; 2])>,
+) -> Vec<EntityRayHit> {
+    let start = Vec3::new(from[0], from[1], from[2]);
+    let end = Vec3::new(to[0], to[1], to[2]);
+    let mut hits: Vec<EntityRayHit> = candidates
+        .into_iter()
+        .filter_map(|(entity, [lo, hi])| {
+            let grown = Aabb::new(
+                Vec3::new(lo[0], lo[1], lo[2]),
+                Vec3::new(hi[0], hi[1], hi[2]),
+            )
+            .inflate(Vec3::new(margin, margin, margin));
+            let at = grown.clip(start, end)?;
+            let location = [at.x, at.y, at.z];
+            let distance = (0..3)
+                .map(|i| (location[i] - from[i]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            Some(EntityRayHit {
+                entity,
+                location,
+                distance,
+            })
+        })
+        .collect();
+    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    hits
+}
 
 impl Game<'_> {
     /// An entity tracked by the remote client but absent from local entity lists.
@@ -74,11 +111,13 @@ impl Game<'_> {
             // An outer guest in a nested swap has a displaced record.
             return (!self.lan_guest_swaps.contains(&g.conn)).then_some(Target::Guest(g.conn));
         }
+        // Not in `level_entity`: packets and cameras never reach a hook.
+        if self.fishing_hook_by_id(entity.id()).is_some() {
+            return (!self.persist.removals.contains(&Target::Hook(entity.id())))
+                .then_some(Target::Hook(entity.id()));
+        }
         match self.level_entity(id)? {
             Target::Mob(id) if !self.mobs.iter().any(|m| m.id == id && !m.removed) => None,
-            // Removed by a mod and waiting for the sweep: `isRemoved` is
-            // true from the call on.
-            t if self.persist.removals.contains(&t) => None,
             t => Some(t),
         }
     }
@@ -188,6 +227,11 @@ impl Game<'_> {
                 ids.push(entity.id());
             }
         });
+        ids.extend(
+            self.fishing_hooks_here()
+                .filter(|(hook, _)| bounds.intersects(hook.bounds()))
+                .map(|(hook, _)| hook.id()),
+        );
         for guest in self.lan.iter().flat_map(|h| &h.hub.guests) {
             if !guest.participates_in_player_simulation()
                 || !guest.placed
@@ -220,6 +264,56 @@ impl Game<'_> {
                 .filter(|handle| self.native_entity_target(*handle).is_some())
                 .collect(),
         )
+    }
+    /// Every entity the segment `from`..`to` passes through, nearest first, each box grown by
+    /// `margin` (`ProjectileUtil.getEntityHitResult`'s test, without its filter: the caller
+    /// takes the first hit it accepts). `exclude` is skipped. None for a bad margin or point,
+    /// and where `level_entities_in` is None.
+    pub(super) fn level_ray_trace_entities(
+        &self,
+        level: LevelRef,
+        from: [f64; 3],
+        to: [f64; 3],
+        margin: f64,
+        exclude: Option<EntityRef>,
+    ) -> Option<Vec<EntityRayHit>> {
+        if !(margin.is_finite() && margin >= 0.0 && from.iter().chain(&to).all(|v| v.is_finite())) {
+            return None;
+        }
+        // Every box the grown test can hit meets the segment's own box grown the same way.
+        let min = std::array::from_fn(|i| from[i].min(to[i]) - margin);
+        let max = std::array::from_fn(|i| from[i].max(to[i]) + margin);
+        let candidates = self.level_entities_in(level, min, max)?;
+        Some(entity_ray_hits(
+            from,
+            to,
+            margin,
+            candidates
+                .into_iter()
+                .filter(|entity| Some(*entity) != exclude)
+                .filter_map(|entity| Some((entity, self.entity_bounding_box(entity)?))),
+        ))
+    }
+    /// What the block at `pos` would drop (`Block.getDrops`) with `tool` and `entity` as the
+    /// breaker, without breaking it: the level's `block_drops_of`, which draws from the random
+    /// as vanilla's roll does. None for a refused write, a stale or parked handle, a client, an
+    /// unloaded or out-of-height position, and an `entity` that names nothing.
+    pub(super) fn level_block_drops(
+        &mut self,
+        level: LevelRef,
+        pos: [i32; 3],
+        tool: Option<&ItemStack>,
+        entity: Option<EntityRef>,
+    ) -> Option<Vec<ItemStack>> {
+        if !self.native_level_write_allowed(level, pos) || self.dim.key() != level.dimension() {
+            return None;
+        }
+        if let Some(entity) = entity {
+            self.native_entity_target(entity)?;
+        }
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
+        Some(self.with_level(|_, level, _| level.block_drops_of(at, state, tool, entity)))
     }
     /// Set a block in the level in place (`Level.setBlock`). Parked levels,
     /// stale handles, clients and unloaded or out-of-height positions return
@@ -320,7 +414,7 @@ impl Game<'_> {
         }
         let at = horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]);
         let (changed, drops) = self.with_level(|b, level, ticks| {
-            level.drop_tool = tool.cloned();
+            level.drop_tool = Some(((pos[0], pos[1], pos[2]), tool.cloned()));
             level.drop_into = collect.then(Vec::new);
             let changed = b.destroy_block(level, ticks, at, drop);
             (changed, level.drop_into.take().unwrap_or_default())
@@ -624,6 +718,60 @@ fn uuid_from_words(words: [i32; 4]) -> u128 {
 }
 
 #[cfg(test)]
+mod ray_tests {
+    use super::*;
+
+    fn entity(id: u32) -> EntityRef {
+        EntityRef::new(mod_api::NativeWorldEpoch::new(1), id)
+    }
+
+    /// A unit box with its lowest corner at `x` on the x axis, around the ray along x.
+    fn at(x: f64) -> [[f64; 3]; 2] {
+        [[x, -0.5, -0.5], [x + 1.0, 0.5, 0.5]]
+    }
+
+    #[test]
+    fn hits_come_nearest_first_where_the_ray_enters_each_box() {
+        let hits = entity_ray_hits(
+            [0.0; 3],
+            [10.0, 0.0, 0.0],
+            0.0,
+            [
+                (entity(1), at(6.0)),
+                (entity(2), at(2.0)),
+                (entity(3), at(20.0)),
+            ],
+        );
+        let order: Vec<_> = hits.iter().map(|h| h.entity).collect();
+        assert_eq!(
+            order,
+            [entity(2), entity(1)],
+            "the box past the segment's end is not hit"
+        );
+        for (hit, x) in hits.iter().zip([2.0, 6.0]) {
+            assert!((hit.location[0] - x).abs() < 1e-9 && hit.location[1] == 0.0);
+            assert!((hit.distance - x).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_margin_grows_every_box_and_a_start_inside_one_misses_it() {
+        // 0.3 above the ray: missed without a margin, hit with one.
+        let above = [[3.0, 0.8, -0.5], [4.0, 1.8, 0.5]];
+        let to = [10.0, 0.0, 0.0];
+        assert!(entity_ray_hits([0.0; 3], to, 0.0, [(entity(1), above)]).is_empty());
+        let grown = entity_ray_hits([0.0; 3], to, 1.0, [(entity(1), above)]);
+        assert_eq!(grown.len(), 1);
+        assert!(
+            (grown[0].location[0] - 2.0).abs() < 1e-9,
+            "entered at the grown box's face"
+        );
+        // `AABB.clip` from inside finds no entry, as for a projectile still in its shooter.
+        assert!(entity_ray_hits([0.5, 0.0, 0.0], to, 0.0, [(entity(1), at(0.0))]).is_empty());
+    }
+}
+
+#[cfg(test)]
 pub(super) mod tests {
     use mod_api::__private::game::*;
     /// Isolate declarations and frozen registries without changing another test's resources.
@@ -771,7 +919,9 @@ pub(super) mod tests {
                     .clone()
             })
             .collect();
-        mod_api::__private::part_tests::register_game_keys(ids);
+        crate::game::api_values::register_game_keys(ids);
+        mod_api::__private::resolve_items(game.items().registry_order.iter().map(|id| &**id))
+            .expect("fixture item keys resolve against its loaded catalog");
 
         // A game that opened its world resolves its parts; the harness stops
         // short of the open, so do it here for the by-state part table.
@@ -1656,7 +1806,9 @@ pub(super) mod tests {
             let player = game.player(12).unwrap();
             assert_eq!(
                 player.inventory(game),
-                Some(vec![ItemStack::new("minecraft:stone", 1)])
+                Some(vec![crate::game::api_values::test_snapshot(
+                    &ItemStack::new("minecraft:stone", 1)
+                )])
             );
             let guest_living = game.living(player.fields().entity).unwrap();
             let host: &dyn mod_api::Host = game;
@@ -1756,8 +1908,8 @@ pub(super) mod tests {
                     living
                         .equipment(game, EquipmentSlot::MainHand)
                         .unwrap()
-                        .item
-                        .as_ref(),
+                        .item()
+                        .id(game),
                     "minecraft:stone"
                 );
                 assert_eq!(game.player.as_ref().unwrap().health.health(), 20.0);
@@ -1829,8 +1981,8 @@ pub(super) mod tests {
                 living
                     .equipment(game, EquipmentSlot::MainHand)
                     .unwrap()
-                    .item
-                    .as_ref(),
+                    .item()
+                    .id(game),
                 "minecraft:stone"
             );
             let player = game.player(13).unwrap();
@@ -2227,9 +2379,8 @@ pub(super) mod tests {
                 player: 2345,
                 slot: 0,
             };
-            let sticks = mod_api::ItemResource::of(&horizon_client::items::ItemStack::new(
-                "minecraft:stick",
-                1,
+            let sticks = mod_api::ItemResource::of(&crate::game::api_values::test_snapshot(
+                &horizon_client::items::ItemStack::new("minecraft:stick", 1),
             ));
             let host: &mut dyn mod_api::ServerHost = game;
             let rolled_back: Result<(), ()> = host.transaction(|host, tx| {
@@ -2255,7 +2406,7 @@ pub(super) mod tests {
                 host.transaction(|host, tx| Ok::<_, ()>(place.insert(host, tx, &sticks, 1))),
                 Ok(1)
             );
-            assert_eq!(place.stack(game).unwrap().count, 1);
+            assert_eq!(place.stack(game).unwrap().count(), 1);
             assert_eq!(game.fake_player(nether, 2345, "parked"), Some(nether_actor));
             assert!(game.player_set_experience_levels(nether_actor, 8));
             assert!(game.player_set_experience_levels(overworld_actor, 3));

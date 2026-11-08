@@ -138,6 +138,29 @@ impl LifecycleFixture {
         crate::game::native_entity_refs::tests::with_game(|game| {
             let mut ids = |game: &mut Game<'_>| {
                 observe(game);
+                use horizon_client::join_seq::Joined;
+                let mut unique = std::collections::HashSet::new();
+                macro_rules! lookup {
+                    ($list:expr) => {
+                        for (index, entity) in $list.iter().enumerate() {
+                            let join = entity.join_seq();
+                            assert!(join.is_joined());
+                            assert!(join < horizon_client::join_seq::JoinSeq::upcoming());
+                            assert!(unique.insert(join), "duplicate owner join");
+                            assert_eq!($list.locate(join), Some(index));
+                        }
+                    };
+                }
+                lookup!(game.others);
+                lookup!(game.fangs.list);
+                lookup!(game.ominous_spawners);
+                lookup!(game.breath_clouds);
+                if let Some(dragon) = game.dragon.as_ref() {
+                    assert!(dragon.join.is_joined());
+                    assert!(dragon.join < horizon_client::join_seq::JoinSeq::upcoming());
+                    assert!(unique.insert(dragon.join));
+                    assert_eq!(game.dragon.locate(dragon.join), Some(0));
+                }
                 (self.ids)(game)
             };
             let root = ScratchDirectory(std::env::temp_dir().join(format!(
@@ -252,4 +275,325 @@ fn lifecycle_fixture_walks_fangs_owners() {
         remote: None,
     }
     .run();
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn lifecycle_fixture_walks_other_owners() {
+    LifecycleFixture {
+        seed: |game, entries| {
+            game.others.clear();
+            for &(id, at) in entries {
+                game.others.push(crate::game::commands::OtherEntity {
+                    knot_check: None,
+                    join: Default::default(),
+                    id,
+                    kind: "minecraft:marker".into(),
+                    position: horizon_core::geometry::Vec3::new(at[0], at[1], at[2]),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    item_transformation: None,
+                });
+            }
+        },
+        ids: |game| game.others.iter().map(|entity| entity.id).collect(),
+        target: crate::game::commands::Target::Other,
+        unloads_with_chunk: true,
+        remote: None,
+    }
+    .run();
+}
+
+/// Run each fixture's complete setup and actual action in both dimensions.
+pub(in crate::game) fn in_both_dimensions(mut test: impl FnMut(&mut Game<'_>, &PassBalance)) {
+    for dimension in [crate::game::Dim::Overworld, crate::game::Dim::Nether] {
+        // with_game isolates the initial SaveDir; newly opened dimensions use
+        // world_root instead. Keep that root alive until the Game is dropped.
+        let root = ScratchDirectory(std::env::temp_dir().join(format!(
+            "horizon-caller-balance-{}-{:?}-{dimension:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.world_root = root.0.clone();
+            game.enter_level(dimension).unwrap();
+            use horizon_client::join_seq::residency::{Kind, Owner};
+            let balance = PassBalance::bind(
+                &mut game.mobs,
+                Owner {
+                    dimension: game.dim.key(),
+                    kind: Kind::Mob,
+                },
+                |mob| (mob.id, mob.join),
+            );
+            test(game, &balance);
+            balance.assert_parked(game);
+            assert_eq!(
+                game.dim, dimension,
+                "fixture changed the selected dimension"
+            );
+        });
+    }
+}
+
+pub(in crate::game) struct PassBalance {
+    journal: horizon_client::join_seq::residency::Journal,
+    owner: horizon_client::join_seq::residency::Owner,
+}
+impl PassBalance {
+    fn bind<T: horizon_client::join_seq::Joined, const DIRECT: bool>(
+        list: &mut JoinList<T, DIRECT>,
+        owner: horizon_client::join_seq::residency::Owner,
+        identity: fn(&T) -> (u32, horizon_client::join_seq::JoinSeq),
+    ) -> Self {
+        let journal = horizon_client::join_seq::residency::Journal::default();
+        list.bind_residency(&journal, owner, identity);
+        Self { journal, owner }
+    }
+    pub(in crate::game) fn drain_balanced(&self) -> usize {
+        use horizon_client::join_seq::residency::Change;
+        let mut events = Vec::new();
+        self.journal.drain_into(&mut events);
+        let mut depth = 0usize;
+        let mut lifts = 0;
+        for event in events {
+            assert_eq!(event.owner, self.owner);
+            match event.change {
+                Change::Lifted => {
+                    depth += 1;
+                    lifts += 1;
+                }
+                Change::Restored => depth = depth.checked_sub(1).expect("restore without lift"),
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "actual caller abandoned a lifted pass");
+        lifts
+    }
+    fn assert_parked(&self, game: &mut Game<'_>) {
+        let home = game.dim;
+        let away = match home {
+            crate::game::Dim::Overworld => crate::game::Dim::Nether,
+            _ => crate::game::Dim::Overworld,
+        };
+        game.enter_level(away).unwrap();
+        self.drain_balanced();
+        game.enter_level(home).unwrap();
+    }
+}
+
+/// Inject a nested spawn into an actual lifted mob operation, then exercise the
+/// next real entity pass with just that new owner so the caller's other state
+/// remains available for its own assertions.
+pub(in crate::game) fn assert_mob_spawn_survives(
+    game: &mut Game<'_>,
+    balance: &PassBalance,
+    action: impl FnOnce(&mut Game<'_>),
+) {
+    const SPAWNED: u32 = 1_900_000_000;
+    fn spawn(game: &mut Game<'_>) {
+        let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
+        let mut mob = horizon_client::mobs::Mob::new(
+            SPAWNED,
+            kind,
+            horizon_core::geometry::Vec3::new(0.5, 80.0, 0.5),
+            0.0,
+        );
+        mob.no_ai = true;
+        game.mobs.push(mob);
+    }
+    balance.drain_balanced();
+    let mut expected: Vec<_> = game.mobs.iter().map(|mob| (mob.id, mob.join)).collect();
+    with_spawn(spawn, || action(game));
+    assert!(
+        balance.drain_balanced() > 0,
+        "actual caller did not emit its lift"
+    );
+    let index = game
+        .mobs
+        .iter()
+        .position(|m| m.id == SPAWNED)
+        .expect("nested spawn was dropped");
+    assert_eq!(game.mobs[index].age, 0, "spawn ticked in the current pass");
+    let join = game.mobs[index].join;
+    expected.push((SPAWNED, join));
+    assert_eq!(
+        game.mobs
+            .iter()
+            .map(|mob| (mob.id, mob.join))
+            .collect::<Vec<_>>(),
+        expected,
+        "caller changed survivor identity or spawn admission order"
+    );
+    let mut original = game.mobs.lift();
+    let spawned = original.extract(join).unwrap();
+    game.mobs.push(spawned);
+    if !game.world.chunks.contains_key(&(0, 0)) {
+        game.world.chunks.insert(
+            (0, 0),
+            std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+        );
+    }
+    game.tick_creature_entities().unwrap();
+    assert_eq!(game.mobs[0].id, SPAWNED);
+    assert_eq!(game.mobs[0].join, join);
+    assert_eq!(game.mobs[0].age, 1, "spawn missed the next entity pass");
+    game.mobs.clear();
+    game.mobs.restore(
+        original,
+        horizon_client::join_seq::RestoreOrder::SurvivorsFirst,
+    );
+    balance.assert_parked(game);
+}
+
+/// Check a real player/guest projectile pickup pass and the next server flight pass.
+pub(in crate::game) fn assert_projectile_spawn_survives(
+    game: &mut Game<'_>,
+    action: impl FnOnce(&mut Game<'_>),
+) {
+    const ID: u32 = 1_900_000_002;
+    fn spawn(game: &mut Game<'_>) {
+        let mut p = horizon_client::projectiles::Projectile::new(
+            horizon_client::projectiles::ProjectileKind::Egg,
+            horizon_core::geometry::Vec3::new(3.5, 80.0, 3.5),
+            None,
+        );
+        p.id = ID;
+        game.creatures.projectiles.push(p);
+    }
+    let mut expected: Vec<_> = game
+        .creatures
+        .projectiles
+        .iter()
+        .filter(|p| p.id != 72)
+        .map(|p| (p.id, p.join))
+        .collect();
+    with_spawn(spawn, || action(game));
+    let p = game
+        .creatures
+        .projectiles
+        .iter()
+        .find(|p| p.id == ID)
+        .expect("pickup dropped a nested projectile");
+    assert_eq!(p.age, 0);
+    let join = p.join;
+    expected.push((ID, join));
+    assert_eq!(
+        game.creatures
+            .projectiles
+            .iter()
+            .map(|p| (p.id, p.join))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let mut original = game.creatures.projectiles.lift();
+    game.creatures
+        .projectiles
+        .push(original.extract(join).unwrap());
+    game.tick_projectiles().unwrap();
+    assert_eq!(game.creatures.projectiles[0].age, 1);
+    assert_eq!(game.creatures.projectiles[0].join, join);
+    game.creatures.projectiles.clear();
+    game.creatures.projectiles.restore(
+        original,
+        horizon_client::join_seq::RestoreOrder::SurvivorsFirst,
+    );
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn data_merge_preserves_two_distinct_other_joins_for_every_runtime_kind() {
+    crate::game::native_entity_refs::tests::with_game(|game| {
+        game.build_registries();
+        game.set_allow_commands(true);
+        for kind in [
+            "marker",
+            "block_display",
+            "item_display",
+            "text_display",
+            "interaction",
+        ] {
+            game.others.clear();
+            for (tag, x) in [("first", 1), ("second", 8)] {
+                assert!(game.run_command(&format!("summon {kind} {x} 80 1 {{Tags:[\"{tag}\"]}}")));
+            }
+            let expected: Vec<_> = game.others.iter().map(|e| (e.id, e.join)).collect();
+            assert_eq!(expected.len(), 2, "{kind}");
+            assert_ne!(expected[0].1, expected[1].1);
+            assert_ne!(expected[0].1, horizon_client::join_seq::JoinSeq::UNJOINED);
+            for tag in ["first", "second"] {
+                assert!(game.run_command(&format!(
+                    "data merge entity @e[tag={tag},limit=1] {{Rotation:[45.0f,10.0f]}}"
+                )));
+            }
+            assert_eq!(
+                game.others
+                    .iter()
+                    .map(|e| (e.id, e.join))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{kind}"
+            );
+            for (id, join) in expected {
+                assert_eq!(game.others[game.others.locate(join).unwrap()].id, id);
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn mob_tick_restores_spawn_buffer_before_multiple_survivors_without_renumbering() {
+    fn seed(game: &mut Game<'_>, ids: std::ops::RangeInclusive<u32>, x: f64) {
+        for (index, id) in ids.enumerate() {
+            let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
+            let mut mob = horizon_client::mobs::Mob::new(
+                id,
+                kind,
+                horizon_core::geometry::Vec3::new(x + index as f64 * 2.0, 80.0, 1.5),
+                0.0,
+            );
+            mob.no_ai = true;
+            game.mobs.push(mob);
+        }
+    }
+    crate::game::native_entity_refs::tests::with_game(|game| {
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+        seed(game, 71..=73, 1.5);
+        let original: Vec<_> = game.mobs.iter().map(|m| (m.id, m.join)).collect();
+        // Synthetic additions at the actual lift, then the complete production
+        // tick (not a reconstructed restore or a helper replacing that tick).
+        with_spawn(
+            |g| seed(g, 81..=82, 9.5),
+            || game.tick_creature_entities().unwrap(),
+        );
+        assert_eq!(
+            game.mobs.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [81, 82, 71, 72, 73]
+        );
+        assert_eq!(
+            game.mobs
+                .iter()
+                .skip(2)
+                .map(|m| (m.id, m.join))
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert_eq!(
+            game.mobs.iter().map(|m| m.age).collect::<Vec<_>>(),
+            [0, 0, 1, 1, 1]
+        );
+        let all: Vec<_> = game.mobs.iter().map(|m| (m.id, m.join)).collect();
+        game.tick_creature_entities().unwrap();
+        assert_eq!(
+            game.mobs.iter().map(|m| (m.id, m.join)).collect::<Vec<_>>(),
+            all
+        );
+        assert_eq!(
+            game.mobs.iter().map(|m| m.age).collect::<Vec<_>>(),
+            [1, 1, 2, 2, 2]
+        );
+    });
 }

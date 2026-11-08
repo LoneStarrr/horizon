@@ -241,6 +241,7 @@ impl Game<'_> {
         // Still queued when the frame wasn't drawn, or when the PNG is to be taken
         // again smaller (out of memory): not this sequence's frame.
         let queued = last && renderer.screenshot.take().is_some();
+        let failed = drawn.is_err();
         let done = match drawn {
             Ok(false) => return Ok(false),
             Err(e) => Err(e.to_string()),
@@ -248,7 +249,7 @@ impl Game<'_> {
         };
         if let Err(e) = done {
             self.end_screenshot_sequence(Err(e.into()));
-            return Ok(true);
+            return Ok(!failed);
         }
         let sequence = self
             .screenshot_sequence

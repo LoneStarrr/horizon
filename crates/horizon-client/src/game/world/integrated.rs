@@ -98,6 +98,7 @@ pub(super) struct Integrated {
     tasks: Sender<Task>,
     /// The world's name (`level.dat`'s `LevelName`), for the pause menu.
     pub world_name: String,
+    pub save_folder: String,
     pub rule_registry: Arc<horizon_client::gamerules::RuleRegistry>,
 }
 impl Integrated {
@@ -411,7 +412,7 @@ impl Game<'_> {
             .map_or_else(|| self.options.player_name(), |a| a.name.clone());
         let new_world = create.is_some();
         let rule_registry = create.map_or_else(
-            || Arc::new(mod_api::__private::game_rule_registry()),
+            || Arc::new(crate::game::api_values::game_rule_registry()),
             |options| options.rules.registry().clone(),
         );
         let launch = Launch {
@@ -511,6 +512,7 @@ impl Game<'_> {
             thread: Some(thread),
             tasks,
             world_name: String::new(),
+            save_folder: folder.to_owned(),
             rule_registry,
         };
         self.integrated_starting = Some(Starting {
@@ -871,10 +873,11 @@ impl Game<'_> {
             pending: None,
             load: LoadPhase::default(),
         });
-        // MinecraftServer.prepareLevels: no forced chunks to load, so the
-        // stage is over at once; the player's chunks come after.
+        // MinecraftServer.prepareLevels: the saved tickets' chunks load; the
+        // player's chunks come after.
         let view = &flags.load;
         view.start(Stage::LoadInitialChunks, 0);
+        startup::time("server.prepare_levels", || self.prepare_levels())?;
         view.finish(Stage::LoadInitialChunks);
         let _ = ready.send(Ok((pipe, self.level.name.clone())));
         startup::time("server.settle_spawn", || self.settle_spawn())
@@ -1366,6 +1369,7 @@ pub(super) mod tests {
                 thread: None,
                 tasks,
                 world_name: "test".into(),
+                save_folder: "test".into(),
                 rule_registry: registry.clone(),
             });
             assert!(Arc::ptr_eq(
@@ -1393,12 +1397,14 @@ pub(super) mod tests {
                 thread: None,
                 tasks,
                 world_name: "First world".into(),
+                save_folder: "first_world".into(),
                 rule_registry: Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
             });
             let local = game.client_session().client_server().unwrap();
             assert!(local.integrated_local);
             assert_eq!(local.name.as_deref(), Some("First world"));
             assert_eq!(local.address, None);
+            assert_eq!(local.save_folder.as_deref(), Some("first_world"));
             game.integrated.as_mut().unwrap().world_name = "Renamed world".into();
             assert_eq!(
                 game.client_session()
@@ -1408,10 +1414,13 @@ pub(super) mod tests {
                     .as_deref(),
                 Some("Renamed world")
             );
+            let renamed = game.client_session().client_server().unwrap();
+            assert_eq!(renamed.save_folder, local.save_folder);
             game.integrated.take();
             let guest = game.client_session().client_server().unwrap();
             assert!(!guest.integrated_local);
             assert_eq!(guest.name, None);
+            assert_eq!(guest.save_folder, None);
             assert_eq!(guest.address, None);
         });
     }
@@ -1424,6 +1433,7 @@ pub(super) mod tests {
             thread: None,
             tasks,
             world_name: String::new(),
+            save_folder: String::new(),
             rule_registry: Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
         };
         // The receiver deliberately does not run either task between the updates. In particular,
@@ -1474,6 +1484,7 @@ pub(super) mod tests {
             thread: Some(std::thread::spawn(move || wait.recv().unwrap())),
             tasks,
             world_name: String::new(),
+            save_folder: String::new(),
             rule_registry: Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
         };
         server.request_stop();
@@ -1495,6 +1506,7 @@ pub(super) mod tests {
             })),
             tasks,
             world_name: String::new(),
+            save_folder: String::new(),
             rule_registry: Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
         };
         assert_eq!(server.stop().unwrap_err().to_string(), "disk write failed");

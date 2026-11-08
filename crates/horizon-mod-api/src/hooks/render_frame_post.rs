@@ -2,8 +2,9 @@
 
 pub trait Hooks {
     /// Once a frame, in a world or not, right after the frame was rendered
-    /// (NeoForge's `RenderFrameEvent.Post`). `elapsed` is the frame's time.
-    /// Client-side.
+    /// (NeoForge's `RenderFrameEvent.Post`). `elapsed` is the frame's time. It
+    /// fires for a frame that was skipped too; `flip_frame` is the moment a
+    /// frame was presented. Client-side.
     #[hook(
         side = "client",
         contract = "listen",

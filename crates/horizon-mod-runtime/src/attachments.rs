@@ -1,6 +1,10 @@
 //! Typed native-mod data attached to server-owned holders.
+mod form;
 #[doc(hidden)]
 pub mod index;
+#[doc(hidden)]
+pub use form::AttachmentEntryForm;
+mod index_key;
 mod lifetime;
 #[doc(hidden)]
 pub mod observer;
@@ -751,6 +755,36 @@ impl Attachments {
         result.raw = (!raw.is_empty()).then(|| Arc::new(raw));
         result
     }
+    /// `Entity.load` on an entity whose constructing listeners already set values: each saved
+    /// attachment replaces the value there and the others stay, so saved data wins. Unknown
+    /// saved data is kept as `from_nbt` keeps it.
+    #[doc(hidden)]
+    pub fn read_saved_over(&mut self, raw: Compound) {
+        let saved = Self::from_nbt(raw);
+        for (key, entry) in &saved.entries {
+            self.write_entry(key, Some(entry.clone()));
+        }
+        let Some(saved_raw) = saved.raw else {
+            return;
+        };
+        let Some(own) = &mut self.raw else {
+            self.raw = Some(saved_raw);
+            return;
+        };
+        let own = Arc::make_mut(own);
+        for (namespace, tag) in saved_raw.iter() {
+            match (own.get_mut(namespace), tag) {
+                (Some(Tag::Compound(names)), Tag::Compound(saved_names)) => {
+                    for (name, value) in saved_names {
+                        names.insert(name.clone(), value.clone());
+                    }
+                }
+                _ => {
+                    own.insert(namespace.clone(), tag.clone());
+                }
+            }
+        }
+    }
     /// Encode changed values, preserving raw entries and unrecognized tags.
     pub fn to_nbt(&self) -> Compound {
         let mut raw = self.raw.as_deref().cloned().unwrap_or_default();
@@ -1273,6 +1307,31 @@ mod tests {
         loaded.bind_index(index, 1);
         assert_eq!(indexed_values(index, &key), [(1, 6)]);
         assert_eq!(key.get_existing(&mut loaded, Holder::Level), Ok(Some(6)));
+    }
+
+    #[test]
+    fn saved_values_read_over_a_map_replace_only_their_own_keys() {
+        let mut source = Attachments::from_nbt([("unknown".into(), Tag::Int(5))].into());
+        COUNTER.set(&mut source, Holder::Level, 42).unwrap();
+        let saved = source.to_nbt();
+        // What the constructing listeners set before the load.
+        let mut map = Attachments::default();
+        COUNTER.set(&mut map, Holder::Level, 1).unwrap();
+        SYNCED.set(&mut map, Holder::Level, 9).unwrap();
+        map.read_saved_over(saved);
+        assert_eq!(COUNTER.get(&mut map, Holder::Level), Ok(42));
+        assert_eq!(SYNCED.get(&mut map, Holder::Level), Ok(9));
+        let mut reloaded = Attachments::from_nbt(map.to_nbt());
+        assert_eq!(COUNTER.get(&mut reloaded, Holder::Level), Ok(42));
+        assert_eq!(SYNCED.get(&mut reloaded, Holder::Level), Ok(9));
+        assert_eq!(reloaded.to_nbt().get(&"unknown".into()), Some(&Tag::Int(5)));
+
+        // A map with saved data of its own keeps it beside what is read over it.
+        let mut own = Attachments::from_nbt([("kept".into(), Tag::Int(1))].into());
+        own.read_saved_over([("unknown".into(), Tag::Int(5))].into());
+        let nbt = own.to_nbt();
+        assert_eq!(nbt.get(&"kept".into()), Some(&Tag::Int(1)));
+        assert_eq!(nbt.get(&"unknown".into()), Some(&Tag::Int(5)));
     }
 
     #[test]

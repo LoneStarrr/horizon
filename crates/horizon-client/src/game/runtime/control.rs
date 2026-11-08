@@ -242,7 +242,7 @@ impl Game<'_> {
                     self.world_options_text(None);
                     return Ok(());
                 }
-                Screen::Inventory if self.mod_browser_typing() => {
+                Screen::Inventory | Screen::Creative if self.mod_browser_typing() => {
                     self.mod_browser_text(None, true);
                     return Ok(());
                 }
@@ -286,7 +286,7 @@ impl Game<'_> {
             Screen::Options => self.ui.options.type_text(&self.gui.atlas, text),
             // The port, or the game rules' search and number boxes.
             Screen::WorldOptions => self.world_options_text(Some(text)),
-            Screen::Inventory if self.mod_browser_typing() => {
+            Screen::Inventory | Screen::Creative if self.mod_browser_typing() => {
                 self.mod_browser_text(Some(text), false)
             }
             Screen::Inventory if self.recipe_search_focused() => {
@@ -535,16 +535,30 @@ impl Game<'_> {
                 let r = self.renderer.as_mut().ok_or("no renderer")?;
                 match words.get(1).copied() {
                     None => {}
-                    Some(mode @ ("on" | "off")) => {
+                    Some(mode @ ("on" | "off" | "auto")) => {
                         // Refused, with the reason, where it isn't offered.
+                        if let Some(why) = r.gpu_culling_offer().reason() {
+                            return Err(why.into());
+                        }
+                        // Auto starts from off and decides from the frames that follow.
+                        self.gpu_culling_auto.reset();
                         r.set_gpu_culling(mode == "on")?;
                         // The setting, as its switch sets it; not saved here (as
                         // `lod-distance`): settings changes and new renderers keep it.
-                        self.settings.horizon.gpu_culling = mode == "on";
+                        self.settings.horizon.gpu_culling = match mode {
+                            "on" => horizon_client::graphics::GpuCullingMode::On,
+                            "auto" => horizon_client::graphics::GpuCullingMode::Auto,
+                            _ => horizon_client::graphics::GpuCullingMode::Off,
+                        };
                     }
                     Some(other) => return Err(format!("unknown GPU culling mode {other}").into()),
                 }
-                Ok(Some(json!({ "ok": true, "gpu_culling": r.gpu_culling() })))
+                Ok(Some(json!({
+                    "ok": true,
+                    "gpu_culling": r.gpu_culling(),
+                    "mode": self.settings.horizon.gpu_culling.name(),
+                    "auto": self.gpu_culling_auto.state(),
+                })))
             }
             "sculk" => Ok(Some(self.sculk_command(&words)?)),
             "hello" => Ok(Some(hello())),
@@ -600,6 +614,9 @@ impl Game<'_> {
                         "key action must be down, up, tap or repeat, not {action}"
                     )
                     .into());
+                }
+                if arg(2)? != "up" {
+                    self.pad.keyboard_took_over = true;
                 }
                 // The command confirmation takes the keys; none go past it.
                 if self.command_prompt.is_some() {
@@ -1021,15 +1038,17 @@ impl Game<'_> {
                 // key event fires it. A cancelled character is dropped, so
                 // `type` types the survivors only.
                 // `\b` is the socket's backspace sentinel, not two characters.
-                let typed = if text == "\\b" {
-                    text.to_owned()
-                } else {
-                    let Some(typed) = self.screen_text_typed(text) else {
-                        return ok();
-                    };
-                    typed
-                };
-                self.type_into_screen(&typed)?;
+                if text == "\\b" {
+                    self.type_into_screen(text)?;
+                    return ok();
+                }
+                let mut typed = Ok(());
+                self.screen_text_each(text, |game, c| {
+                    if typed.is_ok() {
+                        typed = game.type_into_screen(c);
+                    }
+                });
+                typed?;
                 ok()
             }
             "options" => {
@@ -1104,6 +1123,10 @@ impl Game<'_> {
             }
             "bench" => {
                 let seconds: f64 = arg(1)?.parse()?;
+                // `Duration::from_secs_f64` panics on a negative, NaN or huge number.
+                if !(seconds.is_finite() && (0.0..=86_400.0).contains(&seconds)) {
+                    return Err("bench takes 0 to 86400 seconds".into());
+                }
                 if self.pending_bench.is_some() {
                     return Err("a benchmark is already running".into());
                 }
@@ -1412,6 +1435,8 @@ impl Game<'_> {
                 "section_draw_calls": r.section_draw_calls,
                 "culled_sections": r.culled_sections(),
                 "gpu_culling": r.gpu_culling(),
+                "gpu_culling_mode": self.settings.horizon.gpu_culling.name(),
+                "gpu_culling_auto": self.gpu_culling_auto.state(),
                 "gpu_frame": r.gpu_frame(),
                 "gpu_fading": r.gpu_fading(),
                 "gpu_culling_offer": format!("{:?}", r.gpu_culling_offer()),
@@ -1421,6 +1446,8 @@ impl Game<'_> {
                 "resident_sections": r.resident_sections(),
                 "arena_bytes": arena_bytes,
                 "section_vertex_bytes": section_vertex_bytes,
+                "packed_layout": r.packed_layout(),
+                "vertex_bytes_split": r.vertex_bytes_split(),
                 "gpu_allocated_bytes": memory.as_ref().map(|m| m.total_allocated_bytes),
                 "gpu_reserved_bytes": memory.as_ref().map(|m| m.total_reserved_bytes),
             })

@@ -15,13 +15,19 @@ ROOT = Path(__file__).resolve().parents[1]
 class ScreenMouseDraggedHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_drag_lifecycle_delta_and_cancelled_cursor(self):
-        source = (ROOT / "crates/horizon-client/src/game.rs").read_text(encoding="utf-8")
+        source = (ROOT / "crates/horizon-client/src/game/runtime/window_handler.rs").read_text(encoding="utf-8")
         hooks = native_hook_sources()
         hooks = hooks.replace("pub(super) fn", "fn").replace("super::glfw_", "glfw_")
         track = method(hooks, "track_drag_button")
         dispatch = method(hooks, "screen_mouse_dragged")
         start = source.index("                        let previous = self.cursor;", source.index("WindowEvent::CursorMoved { position"))
-        cursor = source[start:source.index("                        if self.dialog_open()", start)]
+        cursor_end = source.index("                        if self.dialog_open()", start)
+        cursor = source[start:cursor_end]
+        # The extracted fixture only models the mouse-drag hook. Keep the
+        # replay timeline's independent drag handler out of this focused slice.
+        studio_drag = cursor.index("                        if self.screen == Screen::Playing")
+        hook_dispatch = cursor.index("                        match self.screen_mouse_dragged(previous)", studio_drag)
+        cursor = cursor[:studio_drag] + cursor[hook_dispatch:]
         start = source.index("        if let WindowEvent::Focused(false)")
         focus = source[start:source.index("        if let WindowEvent::ModifiersChanged", start)]
         fixture = r"""

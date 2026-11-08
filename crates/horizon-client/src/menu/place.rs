@@ -14,7 +14,6 @@ use crate::{
     crafting::{Ingredient, Placement},
     items::ItemStack,
 };
-use mod_api::__private::game::IngredientTest;
 use std::{collections::HashMap, sync::Arc};
 
 /// `StackedContents<Holder<Item>>`: item counts in an iteration order.
@@ -337,6 +336,13 @@ impl Menu {
                 inputs: vec![0],
                 clear: vec![0, 2],
             }),
+            // A mod menu type's crafting grid places as a crafting table's.
+            Kind::Mod(t) => t.crafting.map(|c| Grid {
+                width: c.size,
+                height: c.size,
+                inputs: c.grid_slots().collect(),
+                clear: c.grid_slots().collect(),
+            }),
             _ => None,
         }
     }
@@ -408,7 +414,9 @@ impl Menu {
     /// Move one set of ingredients from the player's real inventory and grid.
     /// The viewer leaves both alone on failure, including in creative mode.
     pub fn transfer_recipe(&mut self, env: &Env, id: &str) -> Result<(), TransferError> {
-        if !matches!(self.kind, Kind::Inventory | Kind::Crafting) || self.carried.is_some() {
+        if !(matches!(self.kind, Kind::Inventory | Kind::Crafting) || self.mod_crafting().is_some())
+            || self.carried.is_some()
+        {
             return Err(TransferError::Unavailable);
         }
         let grid = self.place_grid().ok_or(TransferError::Unavailable)?;

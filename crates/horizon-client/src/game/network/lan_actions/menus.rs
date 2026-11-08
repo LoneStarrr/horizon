@@ -109,12 +109,13 @@ impl Game<'_> {
         };
         // The menu provider's getDisplayName: a container's custom name
         // (BaseContainerBlockEntity.getName) or its default name.
-        let custom = |k: (i32, i32, i32)| self.world.block_names.get(&k).map(String::as_str);
+        let custom = |k: (i32, i32, i32)| self.block_name_plain(k);
         let title = match slots {
             Slots::Ender => horizon_protocol::text::translatable("container.enderchest", &[]),
-            Slots::Double(first, second) => {
-                horizon_client::containers::double_chest_name(custom(first), custom(second))
-            }
+            Slots::Double(first, second) => horizon_client::containers::double_chest_name(
+                custom(first).as_deref(),
+                custom(second).as_deref(),
+            ),
             Slots::Block(k) => {
                 // A mod block's container is named after its block
                 // (`Block.getDescriptionId`).
@@ -125,7 +126,7 @@ impl Game<'_> {
                     }
                     None => return MenuOpen::Refused,
                 };
-                horizon_client::containers::display_name(custom(k), &key)
+                horizon_client::containers::display_name(custom(k).as_deref(), &key)
             }
             // Opened by a mod (`open_menu`), never here.
             Slots::Native => return MenuOpen::Refused,
@@ -656,6 +657,13 @@ impl Game<'_> {
         if self.guest_menu_still_valid(conn) {
             return;
         }
+        self.guest_close_menus_and_tell(conn);
+    }
+
+    /// `ServerPlayer.closeContainer`: every menu the guest has open closes through
+    /// `guest_close_all` (the lid, stand-ins, the cursor stack back to the inventory,
+    /// `PlayerContainerEvent.Close`), once, and then the client is told to close each window.
+    pub(in crate::game) fn guest_close_menus_and_tell(&mut self, conn: u32) {
         let Some(host) = self.lan.as_ref() else {
             return;
         };

@@ -6,9 +6,24 @@ use std::time::Duration;
 #[derive(Default)]
 struct ItemStack {
     item: Arc<str>,
+    count: u32,
 }
-struct StackView {
-    count: i32,
+// Dispatch tests isolate the runtime key table: the fixture key retains its name.
+// Production key resolution and slot stability are tested in mod-runtime.
+#[derive(Clone, Copy)]
+struct ItemKey<'a>(&'a str);
+impl ItemStack {
+    fn count(&self) -> u32 {
+        self.count
+    }
+    fn item(&self) -> ItemKey<'_> {
+        ItemKey(&self.item)
+    }
+}
+mod registry_keys {
+    pub(super) fn item_id(key: super::ItemKey<'_>) -> Option<&str> {
+        Some(key.0)
+    }
 }
 struct BlockEntityDraw(Vec<u32>);
 use serde_json::{Map, Value};
@@ -66,13 +81,6 @@ impl LevelSide<'_> {
         }
     }
 }
-trait RenderHooks {
-    fn subscribed(&self) -> &'static [Option<mod_api::RenderHookId>];
-    #[allow(dead_code)]
-    fn mob_render(&self, _: &dyn Host, _: &mut NativeMobRender<'_>) {}
-    #[allow(dead_code)]
-    fn block_entity_draw(&self, _: &dyn Host, _: &mut BlockEntityDraw) {}
-}
 struct TestHost;
 struct TestLevel;
 impl LevelHost for TestLevel {}
@@ -89,18 +97,9 @@ mod generated {
         }
     }
     pub(super) mod mod_api {
+        pub(super) use super::super::ItemStack;
+        pub struct FluidModel;
         include!(concat!(env!("OUT_DIR"), "/dispatch_fixtures_api.rs"));
-    }
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum RenderHookId {
-        MobRender,
-        BlockEntityDraw,
-    }
-    #[allow(non_upper_case_globals)]
-    pub mod render_hook_ids {
-        use super::RenderHookId;
-        pub const mob_render: Option<RenderHookId> = Some(RenderHookId::MobRender);
-        pub const block_entity_draw: Option<RenderHookId> = Some(RenderHookId::BlockEntityDraw);
     }
     include!(concat!(env!("OUT_DIR"), "/mod_api_generated.rs"));
     pub use horizon_mod_api_macros::__subscriptions;
@@ -174,12 +173,14 @@ struct Parts {
     block_entities: Vec<&'static dyn BlockEntityPart>,
     items: Vec<&'static dyn ItemPart>,
     menus: Vec<&'static dyn MenuPart>,
+    fluids: Vec<&'static dyn FluidPart>,
 }
 static NO_PARTS: Parts = Parts {
     blocks: Vec::new(),
     block_entities: Vec::new(),
     items: Vec::new(),
     menus: Vec::new(),
+    fluids: Vec::new(),
 };
 thread_local! {
     static PARTS: std::cell::Cell<&'static Parts> = const { std::cell::Cell::new(&NO_PARTS) };
@@ -222,6 +223,9 @@ impl Parts {
     fn menu<'k>(&self, _: impl FnOnce() -> Option<&'k str>) -> &[&'static dyn MenuPart] {
         &self.menus
     }
+    fn fluid<'k>(&self, _: impl FnOnce() -> Option<&'k str>) -> &[&'static dyn FluidPart] {
+        &self.fluids
+    }
 }
 fn entered_parts<'a, P: ?Sized>(
     parts: &'a [&'a P],
@@ -259,21 +263,6 @@ fn cfg_disabled_hooks_are_not_subscribed_and_cfg_attr_stays() {
     );
 }
 
-#[test]
-fn cfg_disabled_render_hooks_are_not_subscribed_and_cfg_attr_stays() {
-    struct Renderer;
-    #[mod_api::__subscriptions]
-    impl RenderHooks for Renderer {
-        #[cfg(any())]
-        fn mob_render(&self, _: &dyn Host, _: &mut NativeMobRender<'_>) {}
-        #[cfg_attr(test, inline)]
-        fn block_entity_draw(&self, _: &dyn Host, _: &mut BlockEntityDraw) {}
-    }
-    assert_eq!(
-        Renderer.subscribed(),
-        &[mod_api::render_hook_ids::block_entity_draw]
-    );
-}
 struct Mod {
     id: u32,
     calls: Arc<Mutex<Vec<u32>>>,
@@ -296,6 +285,7 @@ impl BlockEntityPart for Mod {
         event.entity.data.push(9);
         *event.carried = Some(ItemStack {
             item: "bucket".into(),
+            count: 1,
         });
     }
     fn block_entity_submit(&self, _: &dyn ClientHost, event: &mut BlockEntitySubmitEvent<'_>) {
@@ -607,6 +597,9 @@ mod api {
     pub mod first_person {
         #[derive(Clone, Copy)]
         pub struct Hand;
+    }
+    pub mod widgets {
+        pub struct TextEdit;
     }
     pub mod hud_layout {
         pub struct HealthInputs;

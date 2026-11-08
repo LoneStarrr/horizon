@@ -8,7 +8,7 @@ use horizon_client::{
     blocks::Fluid,
     hud::HudBatch,
     items::ItemStack,
-    mobs::{MobEvent, Species, Who, equine},
+    mobs::{Mob, MobEvent, Species, Who, equine},
     motion::{MotionWorld, PlayerMotion},
     pose::{Dimensions, Pose},
     sprint::Keys,
@@ -57,7 +57,7 @@ impl MountState {
 }
 /// `AbstractHorse.isFood` and `handleEating`: what a mount eats, and what that
 /// mouthful does — `(heal, age up seconds, temper, falls in love)`. The temper
-/// is the `u8` the mob stores it in.
+/// increment is kept separate from its signed saved counter.
 ///
 /// `AbstractHorse.isFood` is the `#minecraft:horse_food` tag, `ZombieHorse`
 /// overrides it with `#minecraft:zombie_horse_food` (a red mushroom and
@@ -125,12 +125,28 @@ impl Game<'_> {
         let id = self.riding?;
         self.mobs.iter().position(|m| m.id == id)
     }
-    /// `Entity.interact` / `Mob.canShearEquipment` / `Mob.shearItem`:
-    /// the pig's ordinary saddle comes off before Pig.mobInteract can ride it.
-    /// An occupied pig consumes no equipment interaction and cannot be mounted.
-    pub(super) fn shear_pig_saddle(&mut self, index: usize, item: &str) -> Option<bool> {
+    /// `Entity.interact` / `Mob.canShearEquipment` / `Mob.attemptToShearEquipment`
+    /// / `Mob.shearItem`: the saddle of a `#can_equip_saddle` mob comes off
+    /// before its mobInteract can ride it, with the saddle's shearing sound.
+    /// An occupied mount is not sheared: its mobInteract runs instead.
+    pub(super) fn shear_saddle(&mut self, index: usize, item: &str) -> Option<bool> {
         let m = &self.mobs[index];
-        if item != "minecraft:shears" || m.species() != Species::Pig || m.is_baby() || !m.alive() {
+        // EntityTypeTags.CAN_EQUIP_SADDLE.
+        let saddleable = matches!(
+            m.species(),
+            Species::Horse
+                | Species::SkeletonHorse
+                | Species::ZombieHorse
+                | Species::Donkey
+                | Species::Mule
+                | Species::Pig
+                | Species::Strider
+                | Species::Camel
+                | Species::CamelHusk
+                | Species::Nautilus
+                | Species::ZombieNautilus
+        );
+        if item != "minecraft:shears" || !saddleable || m.is_baby() || !m.alive() {
             return None;
         }
         let id = m.id;
@@ -142,24 +158,46 @@ impl Game<'_> {
                 .iter()
                 .any(|r| r.alive() && !r.removed && r.extra.mount == Some(id))
         {
-            return Some(false);
+            // !canShearEquipment (isVehicle): the click goes on to mobInteract. A
+            // ridden pig or strider has nothing more to give, but a camel takes a
+            // second rider and a horse or nautilus opens its inventory.
+            return matches!(m.species(), Species::Pig | Species::Strider).then_some(false);
         }
         if self.keys.held(Action::Sneak) {
+            return None;
+        }
+        // attemptToShearEquipment takes the body slot before the saddle: horse
+        // and nautilus armor come off first (not modelled here).
+        if m.extra
+            .body_id()
+            .is_some_and(|b| b.ends_with("_horse_armor") || b.ends_with("_nautilus_armor"))
+        {
             return None;
         }
         let saddle = m.saddle_item()?;
         if &*saddle.item != "minecraft:saddle" {
             return None;
         }
+        let silent = m.silent;
         let at = m.position;
         let offset = horizon_client::mobs::riders::passenger_attachment(m)[1];
         self.damage_held_tool();
         self.mobs[index].set_saddle(None);
         let context = self.who_context(Some(Who::Player), None);
         self.post_game_event("minecraft:shear", [at.x, at.y, at.z], context);
+        self.mob_equip_event(id, [at.x, at.y, at.z], false);
         self.spawn_at_location(at, offset, saddle.clone());
         let target = self.mob_entity(&self.mobs[index]);
         self.trigger_item_entity("minecraft:player_sheared_equipment", &saddle, &target);
+        // attemptToShearEquipment: playSound(equippable.shearingSound()).
+        if !silent {
+            self.audio.play(
+                "minecraft:item.saddle.unequip",
+                Some([at.x, at.y, at.z]),
+                1.0,
+                1.0,
+            );
+        }
         Some(true)
     }
     /// `Pig` / `Strider.mobInteract`: saddle an adult, or ride a saddled one.
@@ -177,8 +215,11 @@ impl Game<'_> {
             } else {
                 "minecraft:entity.pig.saddle"
             };
-            self.audio.play(sound, Some(at), 0.5, 1.0);
+            self.audio.play(sound, Some(at), 1.0, 1.0);
             self.consume_held();
+            let id = self.mobs[index].id;
+            let pos = self.mobs[index].position;
+            self.mob_equip_event(id, [pos.x, pos.y, pos.z], true);
             self.world
                 .modified
                 .insert((at[0].floor() as i32 >> 4, at[2].floor() as i32 >> 4));
@@ -336,8 +377,15 @@ impl Game<'_> {
         if let Some(sound) = sound {
             let pitch =
                 (self.world.random.next_float() - self.world.random.next_float()) * 0.2 + 1.0;
-            self.audio.play(sound, Some(at), 0.5, pitch);
+            let chest = item == "minecraft:chest";
+            self.audio
+                .play(sound, Some(at), if chest { 0.5 } else { 1.0 }, pitch);
             self.consume_held();
+            if !chest {
+                let id = self.mobs[index].id;
+                let pos = self.mobs[index].position;
+                self.mob_equip_event(id, [pos.x, pos.y, pos.z], true);
+            }
             self.world
                 .modified
                 .insert((at[0].floor() as i32 >> 4, at[2].floor() as i32 >> 4));
@@ -379,8 +427,8 @@ impl Game<'_> {
             m.extra.age = (m.extra.age + age_up * 20).min(0);
             used = true;
         }
-        if temper > 0 && (used || !m.extra.tame) && m.extra.variant3 < 100 {
-            m.extra.variant3 = (m.extra.variant3 + temper).min(100);
+        if temper > 0 && (used || !m.extra.tame) && equine::temper(m) < 100 {
+            equine::modify_temper(m, i32::from(temper));
             used = true;
         }
         if !used {
@@ -539,7 +587,16 @@ impl Game<'_> {
         };
         let m = &self.mobs[i];
         let mut at = Vec3::new(m.position.x, m.position.y + seat(m.species()), m.position.z);
-        if horizon_client::mobs::camel::is_camel(m.species()) {
+        if &*m.kind.id == "minecraft:player" || &*m.kind.id == "minecraft:mannequin" {
+            // Avatar attachments follow pose and minecraft:scale, just as for
+            // remote avatars riding other avatars. Do not guess a standing height.
+            at = horizon_client::mobs::riders::seat(
+                horizon_client::mobs::riders::passenger_attachment(m),
+                f64::from(0.6_f32),
+                m.position,
+                m.yaw,
+            );
+        } else if horizon_client::mobs::camel::is_camel(m.species()) {
             // Camel.getPassengerAttachmentPoint: the driver half a block
             // forward, at the body anchor (lower while sitting), turned with
             // the camel.
@@ -615,23 +672,14 @@ impl Game<'_> {
             self.dismount_happy_ghast(id);
             return;
         }
-        let mount = Mount {
-            species: m.species(),
-            position: m.position,
-            bounds: m.bounds(),
-            width: m.width(),
-            height: m.height(),
-            yaw: m.yaw,
-        };
+        let mount = Mount::of(m);
+        if self.dismount_in_portal(mount.position) {
+            return;
+        }
         let Some(p) = self.player.as_ref() else {
             return;
         };
-        let rider = Rider {
-            yaw: self.yaw,
-            width: p.dimensions.width,
-            poses: rider_poses(p),
-        };
-        let (spot, pose) = dismount_location(&mount, &rider, &GameDismountWorld(self));
+        let (spot, pose) = self.mount_player_dismount(&mount, self.yaw, p);
         if let Some(p) = self.player.as_mut() {
             p.position = spot;
             p.velocity = Vec3::ZERO;
@@ -642,6 +690,40 @@ impl Game<'_> {
                 log::warn!("dismount pose: {e}");
             }
         }
+    }
+    /// Where `mount` lets a player in `p` facing `yaw` off, and the pose they take there.
+    fn mount_player_dismount(
+        &self,
+        mount: &Mount,
+        yaw: f32,
+        p: &PlayerMotion,
+    ) -> (Vec3, Option<Pose>) {
+        let rider = Rider {
+            yaw,
+            width: p.dimensions.width,
+            poses: rider_poses(p),
+        };
+        dismount_location(mount, &rider, &GameDismountWorld(self))
+    }
+    /// Where `stop_riding` sets a player in `p` facing `yaw` down off `vehicle`: None when
+    /// `vehicle` is no boat, cart or mob.
+    pub(in crate::game) fn player_dismount_point(
+        &self,
+        vehicle: u32,
+        yaw: f32,
+        p: &PlayerMotion,
+    ) -> Option<Vec3> {
+        if let Some(i) = self.boats.iter().position(|b| b.id == vehicle) {
+            return Some(self.boat_player_dismount_target(i, yaw));
+        }
+        if let Some(i) = self.carts.iter().position(|c| c.id == vehicle) {
+            return Some(self.cart_player_dismount_target(i));
+        }
+        let mount = self.mobs.iter().find(|m| m.id == vehicle)?;
+        if mount.species() == Species::HappyGhast {
+            return Some(on_top(mount));
+        }
+        Some(self.mount_player_dismount(&Mount::of(mount), yaw, p).0)
     }
     /// `AbstractHorse.tameWithName`: the acting player owns `mob`, then gets
     /// the `tame_animal` trigger.
@@ -725,6 +807,43 @@ impl Game<'_> {
                 }
                 // RunAroundLikeCrazyGoal.tick: entity event 6, smoke.
                 self.mob_event_particles(mob, 6);
+            }
+            // `Entity.ejectPassengers` before the mob moved off `from`: each
+            // rider's `dismountVehicle` reads the vehicle where it stood.
+            MobEvent::EjectPassengers { mob, from } => {
+                let Some(i) = self.mobs.iter().position(|m| m.id == mob) else {
+                    return;
+                };
+                let moved = (self.mobs[i].position, self.mobs[i].previous);
+                self.mobs[i].position = from;
+                self.mobs[i].previous = from;
+                if self.riding == Some(mob) {
+                    self.stop_riding();
+                }
+                let guests: Vec<u32> = self.lan.as_ref().map_or_else(Vec::new, |h| {
+                    h.hub
+                        .guests
+                        .iter()
+                        .filter(|g| g.vehicle == Some(mob))
+                        .map(|g| g.conn)
+                        .collect()
+                });
+                for conn in guests {
+                    self.as_guest(conn, |g| g.stop_riding());
+                }
+                let riders: Vec<u32> = self
+                    .mobs
+                    .iter()
+                    .filter(|m| m.extra.mount == Some(mob))
+                    .map(|m| m.id)
+                    .collect();
+                for rider in riders {
+                    self.dismount_mob(rider);
+                }
+                if let Some(m) = self.mobs.iter_mut().find(|m| m.id == mob) {
+                    (m.position, m.previous) = moved;
+                    m.extra.rider = None;
+                }
             }
             // `LivingEntity.stabAttack`: `target.stopRiding()`.
             MobEvent::StabDismount { target } => match target {
@@ -853,6 +972,26 @@ struct Mount {
     width: f32,
     height: f32,
     yaw: f32,
+}
+impl Mount {
+    fn of(m: &Mob) -> Self {
+        Self {
+            species: m.species(),
+            position: m.position,
+            bounds: m.bounds(),
+            width: m.width(),
+            height: m.height(),
+            yaw: m.yaw,
+        }
+    }
+}
+/// On top of `m`, where it lets off a rider it has no other rule for.
+pub(super) fn on_top(m: &Mob) -> Vec3 {
+    Vec3::new(
+        m.position.x,
+        m.position.y + f64::from(m.height()),
+        m.position.z,
+    )
 }
 /// The rider getting off: `getYRot`, `getBbWidth`, and
 /// `getLocalBoundsForPose` for each of `Player.getDismountPoses`.

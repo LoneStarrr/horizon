@@ -1,5 +1,5 @@
 //! A wasm mod's declared game internals, generated at build time from its manifest and the
-//! target game's catalog. Add this crate only when using `[native] internals` in a wasm mod.
+//! target game's catalog. Add this crate when a wasm mod declares top-level `internals`.
 //! `cargo horizon-mod build --wasm` supplies the manifest and catalog to the generator.
 include!(concat!(env!("OUT_DIR"), "/view.rs"));
 

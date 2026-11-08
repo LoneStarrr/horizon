@@ -31,7 +31,9 @@ impl Hooks for Probe {
         event: &mut LivingKnockbackEvent<'_>,
     ) -> mod_api::Flow {
         let mut heard = self.0.lock().unwrap();
-        let id = |s: Option<&ItemStack>| s.map(|s| s.item.to_string());
+        let id = |s: Option<&mod_api::ItemStack>| {
+            s.and_then(|s| mod_api::__private::item_key_id(s.item()).map(str::to_owned))
+        };
         heard.knocks.push((
             event.attacker,
             id(event.attacker_main),
@@ -123,6 +125,7 @@ fn the_bridge_names_the_attacker_and_what_it_holds() {
         let by_seven = Attack {
             attacker: 7,
             projectile: None,
+            direct: None,
             player_uuid: None,
             held: Default::default(),
         };
@@ -149,6 +152,7 @@ fn the_bridge_names_the_attacker_and_what_it_holds() {
         let sword = Attack {
             attacker: 7,
             projectile: None,
+            direct: None,
             player_uuid: None,
             held: [Some(ItemStack::new("minecraft:iron_sword", 1)), None],
         };
@@ -295,6 +299,7 @@ fn the_attack_scope_nests_restores_and_a_guest_swap_hides_it() {
                         let inner = Attack {
                             attacker: 9,
                             projectile: None,
+                            direct: None,
                             player_uuid: None,
                             held: Default::default(),
                         };

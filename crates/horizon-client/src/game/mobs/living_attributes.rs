@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// the map holds swaps the old stack's attribute modifiers for the new one's,
 /// full stacks with their components compared, as the tick's pass and a write
 /// both run it. The map is taken out so the seed can read the mob.
-fn collect_equipment(catalog: &Arc<Catalog>, items: &Items, m: &mut Mob) {
+pub(in crate::game) fn collect_equipment(catalog: &Arc<Catalog>, items: &Items, m: &mut Mob) {
     horizon_client::mobs::armor::prepare(m, catalog);
     let mut live = std::mem::take(&mut m.extra.live);
     let seed = || {
@@ -32,6 +32,42 @@ fn collect_equipment(catalog: &Arc<Catalog>, items: &Items, m: &mut Mob) {
         live.collect_equipment_changes(catalog, &m.kind.id, &m.extra.equipment, items, seed);
     warn_failed(m.id, &m.kind.id, changed);
     m.extra.live = live;
+}
+
+/// The attribute `name` when it is one a mob keeps itself: `finalize`'s store,
+/// which its gameplay reads and its save writes, for the attributes its type has.
+fn own_attribute(m: &Mob, name: &str) -> Option<Attr> {
+    let short = name.strip_prefix("minecraft:").unwrap_or(name);
+    finalize::command_attr(short).filter(|a| finalize::default_value(m, *a).is_some())
+}
+
+/// `write` on one of the mob's own attributes; a lower max health cuts its
+/// health (`LivingEntity.onAttributeUpdated`).
+fn write_own_attribute(m: &mut Mob, a: Attr, write: AttributeWrite) -> bool {
+    let done = write.apply_to_mob(m, a);
+    if a == Attr::MaxHealth && m.health > m.attrs.max_health {
+        m.health = m.attrs.max_health;
+        m.needs_sync = true;
+    }
+    done
+}
+
+/// An attribute write on a mob that is in no level yet (`finalize_spawn`'s
+/// lent mob), then its equipment's modifiers collected again, as
+/// `Game::write_attribute` does for a joined one. Only the attributes the mob
+/// keeps itself take it: the rest live in maps the level keeps per joined
+/// entity. None for another attribute, `Some(false)` when an add finds the id
+/// taken or a remove finds none.
+pub(in crate::game) fn write_unspawned_attribute(
+    catalog: &Arc<Catalog>,
+    items: &Items,
+    m: &mut Mob,
+    name: &str,
+    write: AttributeWrite,
+) -> Option<bool> {
+    let done = write_own_attribute(m, own_attribute(m, name)?, write);
+    collect_equipment(catalog, items, m);
+    Some(done)
 }
 
 impl Game<'_> {
@@ -304,16 +340,8 @@ impl Game<'_> {
                 .flatten(),
             Target::Mob(mob) => {
                 let m = self.mobs.iter_mut().find(|m| m.id == mob && !m.removed)?;
-                let short = name.strip_prefix("minecraft:").unwrap_or(name);
-                if let Some(a) = finalize::command_attr(short)
-                    .filter(|a| finalize::default_value(m, *a).is_some())
-                {
-                    let done = write.apply_to_mob(m, a);
-                    if a == Attr::MaxHealth && m.health > m.attrs.max_health {
-                        m.health = m.attrs.max_health;
-                        m.needs_sync = true;
-                    }
-                    return Some(done);
+                if let Some(a) = own_attribute(m, name) {
+                    return Some(write_own_attribute(m, a, write));
                 }
                 self.write_generic_attribute(t, name, id, write, default)
             }
@@ -1122,7 +1150,10 @@ mod tests {
     #[mod_api::__subscriptions]
     impl mod_api::Hooks for Plated {
         fn item_attribute_modifier(&self, event: &mut mod_api::ItemAttributeModifierEvent<'_>) {
-            if !event.stack.item.ends_with("_chestplate") {
+            if !mod_api::__private::item_key_id(event.stack.item())
+                .unwrap()
+                .ends_with("_chestplate")
+            {
                 return;
             }
             let id = |text: &str| Identifier::parse(text).unwrap();

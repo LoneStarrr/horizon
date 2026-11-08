@@ -68,3 +68,9 @@ pub mod at_a_point {
     impl Hooks for Mod {}
     // ANCHOR_END: points
 }
+
+/// A mod screen built from `mod_api::widgets`.
+pub mod widget_screen;
+
+/// Reload-stable custom recipe definitions.
+pub mod reload_recipes;

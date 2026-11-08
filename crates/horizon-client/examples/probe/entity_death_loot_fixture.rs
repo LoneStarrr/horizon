@@ -287,6 +287,7 @@ pub fn main() -> horizon_client::Result<()> {
                 loot: &loot,
                 damage: Some(source),
                 player: player.filter(|_| pkill),
+                player_killed: pkill,
                 luck: get("luck", "0").parse()?,
                 vehicle: c.get("vehicle").map(|v| LootEntity::new(v)),
                 mob_drops: true,
@@ -301,14 +302,18 @@ pub fn main() -> horizon_client::Result<()> {
                     // The fixture's mobs keep no whole stacks.
                     drops::Drop::Stack(s) => writeln!(out, "drop {} {}", s.item, s.count),
                     drops::Drop::CarriedBlock(state) => {
-                        let stacks = enderman::carried_block_drops(
-                            &block_items,
+                        let tool = enderman::carried_block_tool();
+                        let stacks = block_items.block_drops(
                             registry,
                             state,
+                            enderman::carried_block_roll(&tool),
                             &mut level_random,
                             Some((&mut sequences, world_seed)),
                         );
-                        for s in stacks {
+                        for s in stacks
+                            .iter()
+                            .filter(|s| enderman::carried_block_drop_kept(s))
+                        {
                             let _ = write!(out, "drop {} {}", s.item, s.count);
                             if s.damage != 0 {
                                 let _ = write!(out, " damage={}", s.damage);

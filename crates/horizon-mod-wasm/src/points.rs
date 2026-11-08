@@ -5,7 +5,7 @@
 //! checked export indices, as hook calls within its group's limits.
 use crate::Refusal;
 use horizon_mod_package::manifest::{
-    InjectionKind, Manifest,
+    Manifest,
     inject::{Access, Inject, Kind},
 };
 use mod_api::__private::wasm_host::{CallHost, Exports, LoadError};
@@ -64,8 +64,8 @@ impl Forward for Listeners {
 /// Resolve the API function slots currently supported by the guest export path.
 fn declared_place(inject: &Inject) -> Result<usize, Refusal> {
     let kind = match (inject.access, inject.kind) {
-        (Access::Api, Kind::Head) => InjectionKind::Head,
-        (Access::Api, Kind::Return) => InjectionKind::Return,
+        (Access::Api, Kind::Head) => Kind::Head,
+        (Access::Api, Kind::Return) => Kind::Return,
         _ => {
             return Err(Refusal::Points(format!(
                 "{}: wasm injects currently require API head/return",
@@ -83,7 +83,7 @@ fn declared_place(inject: &Inject) -> Result<usize, Refusal> {
 }
 
 /// The point at a target's head or return, shared by API and raw listener validation.
-pub(crate) fn target_place(target: &str, kind: InjectionKind) -> Result<usize, Refusal> {
+pub(crate) fn target_place(target: &str, kind: Kind) -> Result<usize, Refusal> {
     let missing = || Refusal::NoSuchPoint {
         point: target.into(),
     };
@@ -92,10 +92,11 @@ pub(crate) fn target_place(target: &str, kind: InjectionKind) -> Result<usize, R
         .position(|t| *t == target)
         .ok_or_else(missing)?;
     match kind {
-        InjectionKind::Return => Some(head + 1)
+        Kind::Return => Some(head + 1)
             .filter(|&back| TARGETS.get(back) == Some(&target))
             .ok_or_else(missing),
-        _ => Ok(head),
+        Kind::Head => Ok(head),
+        _ => Err(Refusal::Points(format!("{target}: expected head/return"))),
     }
 }
 
@@ -144,7 +145,7 @@ impl Listening {
     }
 }
 
-fn export_refusal(error: LoadError, point: &str) -> Refusal {
+pub(crate) fn export_refusal(error: LoadError, point: &str) -> Refusal {
     match error {
         LoadError::MissingExport(_) => Refusal::UnfilledPoint {
             point: point.into(),
@@ -160,7 +161,7 @@ pub(crate) fn listen(manifest: &Manifest, exports: &Exports) -> Result<Option<Li
         return Ok(None);
     }
     let raw = crate::raw::listen(manifest, exports)?;
-    if manifest.inject.is_empty() {
+    if !manifest.inject.iter().any(|i| i.access == Access::Api) {
         return Ok(raw.map(|raw| Listening {
             exports: exports.clone(),
             fire: None,
@@ -169,7 +170,7 @@ pub(crate) fn listen(manifest: &Manifest, exports: &Exports) -> Result<Option<Li
         }));
     }
     let mut declared = BTreeMap::new();
-    for inject in &manifest.inject {
+    for inject in manifest.inject.iter().filter(|i| i.access == Access::Api) {
         declared.insert(inject.id.as_str(), (declared_place(inject)?, inject));
     }
     let interface = format!(
@@ -287,6 +288,10 @@ mod tests {
             ctx: None,
         };
         assert_eq!(NAMES[declared_place(&inject).unwrap()], "tick");
+        assert!(matches!(
+            target_place(TICK, Kind::WrapCall),
+            Err(Refusal::Points(_))
+        ));
         inject.priority = 10;
         inject.kind = Kind::Return;
         assert_eq!(NAMES[declared_place(&inject).unwrap()], "tick_return");
