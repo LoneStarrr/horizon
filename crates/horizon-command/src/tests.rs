@@ -1454,3 +1454,35 @@ fn h149_oblique_local_offsets_are_grouped_before_the_origin() {
         "exact oblique local-coordinate bit mismatches: {failures:#?}"
     );
 }
+
+#[test]
+fn execute_in_suggests_every_level_the_server_has() {
+    // DimensionArgument.listSuggestions: SharedSuggestionProvider.levels(), the
+    // level keys of the login packet, data-pack and mod dimensions included.
+    let mut reg = reg();
+    reg.dimensions = vec![
+        "minecraft:overworld".into(),
+        "minecraft:the_end".into(),
+        "minecraft:the_nether".into(),
+        "arconia:arconia".into(),
+    ];
+    let d = vanilla::dispatcher();
+    let input = "execute in ";
+    let parse = d.parse(input, &reg);
+    let mut got: Vec<String> = d
+        .suggestions(&parse, input.len(), &reg)
+        .1
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "arconia:arconia",
+            "minecraft:overworld",
+            "minecraft:the_end",
+            "minecraft:the_nether"
+        ]
+    );
+}
