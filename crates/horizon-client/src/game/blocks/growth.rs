@@ -11,7 +11,7 @@ impl Game<'_> {
     /// Load the configured/placed feature registry used by saplings, fungi
     /// and bone meal (once per process; shares the generator's bundle).
     pub(super) fn install_live_features(&self) {
-        install_live_features(&self.res, &self.pack, &self.options);
+        install_live_features(&self.res, &self.pack, &self.options, &Default::default());
     }
     /// `BonemealEvent` for the acting hand's bone meal `stack` on `pos`:
     /// the event's answer, and the stack as the mods left it, which goes
@@ -122,25 +122,40 @@ impl Game<'_> {
     }
 }
 
-/// Shared by the initialization worker and fixture setup.
+/// The feature registry over `overrides`: the world's data packs' and the
+/// mods' worldgen entries, which a sapling's or a mod's feature may be one of.
+/// `Ok(None)` when the bundle has no features.
+fn build_live_features(
+    resources: &std::path::Path,
+    registry: &'static horizon_world::registry::BlockRegistry,
+    source: &horizon_assets::resource_source::ResourceSource,
+    overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
+) -> std::result::Result<Option<LiveFeatures>, String> {
+    let data =
+        vanillagen::shared_data_from(&resources.join("worldgen"), overrides, registry, source)
+            .map_err(|e| e.to_string())?;
+    LiveFeatures::new(&data).map_err(|e| e.to_string())
+}
+
+/// Shared by the initialization worker and fixture setup. `overrides` are the
+/// world's: with the plain bundle only, a data pack's configured feature
+/// (a mod sapling's tree) is unknown here and its growth is dropped.
 pub(super) fn install_live_features(
     res: &super::Resources,
     pack: &super::PackResources,
     options: &super::Options,
+    overrides: &horizon_world::worldgen::overrides::WorldgenOverrides,
 ) {
     if res.behaviours().live_features().is_some() {
         return;
     }
-    let dir = options.resources.join("worldgen");
     let started = std::time::Instant::now();
-    let features = vanillagen::shared_data_from(
-        &dir,
-        &Default::default(),
+    let features = build_live_features(
+        &options.resources,
         pack.assets.registry,
         &pack.data_changes,
-    )
-    .map_err(|e| e.to_string())
-    .and_then(|data| LiveFeatures::new(&data).map_err(|e| e.to_string()));
+        overrides,
+    );
     match features {
         Ok(Some(features)) => {
             res.behaviours().set_live_features(Arc::new(features));
@@ -155,6 +170,7 @@ pub(super) fn install_live_features(
 
 #[cfg(test)]
 mod tests {
+    use super::build_live_features;
     use horizon_client::items::ItemStack;
     use horizon_core::{geometry::Direction, position::BlockPos};
     use mod_api::{self, BonemealEvent, BonemealSource, Flow, Hooks, HostSide};
@@ -308,5 +324,37 @@ mod tests {
                 assert_eq!(game.held().map(|s| s.count), Some(3));
             });
         });
+    }
+
+    /// A data pack's configured feature (a mod sapling's tree) is in the live
+    /// registry when the world's worldgen entries are given, and a vanilla one
+    /// stays; without them the pack's feature is unknown and its growth dropped.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_data_packs_feature_is_in_the_live_registry() {
+        use horizon_world::worldgen::overrides::WorldgenOverrides;
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let registry = horizon_client::assets::Assets::load(&root)
+            .unwrap()
+            .registry;
+        let source = horizon_assets::resource_source::ResourceSource::directory(root.clone());
+        let mut overrides = WorldgenOverrides::default();
+        let file = "data/mymod/worldgen/feature/tree.json";
+        overrides.add_file("mymod", file, || {
+            Some(r#"{"type":"minecraft:no_op","config":{}}"#.to_owned())
+        });
+        let live = |overrides| {
+            build_live_features(&root, registry, &source, overrides)
+                .unwrap()
+                .unwrap()
+        };
+        let with = live(&overrides);
+        assert!(with.configured("mymod:tree").is_some());
+        assert!(with.configured("minecraft:oak").is_some());
+        assert!(
+            live(&WorldgenOverrides::default())
+                .configured("mymod:tree")
+                .is_none()
+        );
     }
 }
