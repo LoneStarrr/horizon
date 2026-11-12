@@ -6,11 +6,15 @@ use super::Game;
 use horizon_client::{Result, cauldron, items::ItemStack, mobs::Who};
 use horizon_core::{position::BlockPos, random::RandomSource};
 
+/// The two ordered float draws of `Entity.playEntityOnFireExtinguishedSound`.
+pub(super) fn extinguish_pitch(random: &mut impl RandomSource) -> f32 {
+    1.6 + (random.next_float() - random.next_float()) * 0.4
+}
+
 impl Game<'_> {
     /// Entity.playEntityOnFireExtinguishedSound
     pub(super) fn extinguish_sound(&mut self, at: [f64; 3]) {
-        let r = self.particles.random();
-        let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
+        let pitch = extinguish_pitch(self.particles.random());
         self.audio.play(
             "minecraft:entity.generic.extinguish_fire",
             Some(at),
@@ -35,11 +39,11 @@ impl Game<'_> {
         self.extinguish_sound([at.x, at.y, at.z]);
     }
     /// `PowderSnowBlock.entityInside` (runBefore EXTINGUISH) for a burning
-    /// player: `Level.destroyBlock(pos, false)`. A client of a remote server
-    /// leaves it to the server.
+    /// player: `Level.destroyBlock(pos, false)`, which needs `mayInteract`.
+    /// A client of a remote server leaves it to the server.
     pub(super) fn powder_snow_melt(&mut self, pos: BlockPos) {
         let at = [pos.x, pos.y, pos.z];
-        if self.remote.is_some() || !self.is_powder_snow(at) {
+        if self.remote.is_some() || !self.is_powder_snow(at) || !self.may_interact_at(pos) {
             return;
         }
         self.with_level(|b, level, ticks| b.destroy_block(level, ticks, pos, false));

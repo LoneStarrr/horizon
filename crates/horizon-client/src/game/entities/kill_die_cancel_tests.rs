@@ -4,7 +4,8 @@ use super::kill_die_vibration_tests::{PIG, deaths, run};
 use super::*;
 use horizon_client::chunk::Chunk;
 use horizon_core::position::ChunkPos;
-use mod_api::{Hooks, LivingDeathEvent, ModEntry, ServerHost, testing::with_mods};
+use mod_api::{Hooks, LivingDeathEvent, ModEntry, ServerHost};
+use mod_platform::testing::with_mods;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -42,6 +43,13 @@ fn porkchops(game: &Game<'_>) -> usize {
 #[test]
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once() {
+    crate::game::in_own_process(
+        "game::kill_die_cancel_tests::a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once",
+        a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once_isolated,
+    );
+}
+
+fn a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once_isolated() {
     let probe = Arc::new(Probe::default());
     let mods: mod_api::Mods = vec![ModEntry::new(
         "kill-death-probe",
@@ -51,6 +59,7 @@ fn a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once() {
     with_mods(mods, || {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.build_registries();
+            game.load_server_loot();
             game.set_allow_commands(true);
             game.world
                 .chunks

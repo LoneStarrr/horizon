@@ -23,14 +23,11 @@ impl Game<'_> {
 
     /// `ItemEntity.getItem`: the complete stack, or None if unavailable.
     pub(super) fn item_entity_stack(&self, item: ItemEntityRef) -> Option<ItemStack> {
-        Some(
-            self.dropped
-                .get(self.native_item_entity_index(item)?)?
-                .stack
-                .clone(),
-        )
+        if self.block_entity_tick_items.is_some() {
+            return self.scoped_item_entity_stack(item);
+        }
+        self.unscoped_item_entity_stack(item)
     }
-
     /// Writes a nonempty complete stack using `ItemEntity.setItem`. Empty
     /// stacks are refused: vanilla discards the item on its next tick. To
     /// remove an item entity, use the removal handle. False also for an
@@ -127,6 +124,8 @@ impl Game<'_> {
     }
 }
 
+include!("native_item_entity_refs/tick_item_read.rs");
+
 #[cfg(test)]
 mod tests {
     use super::super::native_entity_refs::tests::with_game;
@@ -134,7 +133,7 @@ mod tests {
     use crate::game::api_values::test_snapshot;
     use horizon_client::{entities::ArmorStand, mobs::Mob};
     use horizon_core::geometry::Vec3;
-    use mod_api::NativeWorldEpoch;
+    use mod_api::WorldEpoch;
 
     #[test]
     #[ignore = "needs prepared resources"]
@@ -197,7 +196,7 @@ mod tests {
                 .push(ArmorStand::new(100, Vec3::ZERO, 0.0));
             assert!(game.item_entity(game.entity(100).unwrap()).is_none());
             let stale = ItemEntityRef::new(EntityRef::new(
-                NativeWorldEpoch::new(entity.epoch().get() + 1),
+                WorldEpoch::new(entity.epoch().get() + 1),
                 entity.id(),
             ));
             assert_eq!(stale.age(game), None);

@@ -10,8 +10,6 @@ pub(super) enum MenuOpen {
 /// Per-guest state of the gameplay code that lives outside `Guest`.
 #[derive(Default)]
 pub(super) struct GuestPlay {
-    /// The sign this guest may write on (`SignBlockEntity.playerWhoMayEdit`).
-    pub(super) sign_editing: Option<[i32; 3]>,
     mining: Option<Mining>,
     destroy_delay: u32,
     using: Option<(usize, u32)>,
@@ -27,6 +25,9 @@ pub(super) struct GuestPlay {
     pub(super) chat_spam: u32,
     /// `commandSpamThrottler`: 20 for each command, one less each tick.
     pub(super) command_spam: u32,
+    /// The recipe viewer's transfer checks (`horizon:recipe_check`): 20 for
+    /// each, one less each tick; one from 200 goes unanswered.
+    pub(super) recipe_checks: u32,
     /// `ServerCommandSuggestionsProvider`: the latest suggestion request not answered yet (a
     /// newer one replaces it, which then never gets an answer), and whether this tick's one
     /// answer is still free.
@@ -61,7 +62,7 @@ pub(super) struct GuestPlay {
     /// The inventory menu and the crafting table the guest crafts in.
     pub(super) crafting: super::lan_crafting::GuestCrafting,
     /// The workstation menu the guest has open (game/network/lan_stations.rs).
-    pub(super) station: Option<super::lan_stations::GuestStation>,
+    pub(super) station: MenuOwner<Option<super::lan_stations::GuestStation>>,
     /// The mount inventory the guest has open (game/network/lan_mount_menu.rs).
     pub(super) mount_window: Option<super::lan_mount_menu::GuestMount>,
     /// The lectern the guest reads (game/network/lan_stations.rs).
@@ -71,6 +72,9 @@ pub(super) struct GuestPlay {
     /// The equipment the mods last heard this guest wear (`native_players_equipment`), by
     /// `EquipmentSlot`: main hand, off hand, feet, legs, chest, head.
     pub(super) equipment_heard: Option<Box<[Option<crate::items::ItemStack>; 6]>>,
+    /// The slots of the guest's inventories the mods last heard (`native_players_inventory_changes`),
+    /// by `NativeInventoryKind`: Player, Ender, Cursor, Crafting.
+    pub(super) inventory_heard: Option<Box<[Vec<Option<crate::items::ItemStack>>; 4]>>,
     /// What the guest's body was given for its effects and enchantments.
     potions: super::potions::BodyPotions,
     /// `ServerPlayer.getStats` and the inventory `inventory_changed` last saw.
@@ -101,8 +105,9 @@ pub(super) struct GuestPlay {
     /// (`LivingEntity.collectEquipmentChanges`).
     modifiers: Vec<(String, String)>,
     equipped: Option<Vec<Option<ItemStack>>>,
+    craft_grid: Vec<Option<ItemStack>>,
     /// The guest's cast fishing hook (`Player.fishing`).
-    pub(super) hook: Option<super::fishing::Hook>,
+    pub(super) hook: horizon_client::join_seq::ResidentSlot<super::fishing::Hook>,
     sculk: super::sculk::PlayerEvents,
     /// What `ServerPlayer` last recorded for the guest's scoreboard criteria
     /// (`lastRecordedHealthAndAbsorption` and the others).
@@ -237,6 +242,14 @@ pub(super) struct GuestSwap {
 }
 
 impl GuestPlay {
+    /// The guest's `Player.attackStrengthTicker` outside its turn.
+    pub(in crate::game) fn attack_ticks(&self) -> u32 {
+        self.attack_ticks
+    }
+    /// The main-hand item of the guest's last tick (`Game.attack_item`).
+    pub(in crate::game) fn attack_item(&self) -> Option<&str> {
+        self.attack_item.as_deref()
+    }
     /// The item in use: its slot and for how many ticks.
     pub(super) fn using(&self) -> Option<(usize, u32)> {
         self.using
@@ -283,15 +296,6 @@ impl Rules for ItemRules<'_> {
     fn max_stack(&self, item: &str) -> u32 {
         self.0.get(item).map_or(64, |i| i.max_stack)
     }
-    fn armor_index(&self, item: &str) -> Option<usize> {
-        match self.0.get(item)?.equip_slot.as_deref()? {
-            "head" => Some(0),
-            "chest" => Some(1),
-            "legs" => Some(2),
-            "feet" => Some(3),
-            _ => None,
-        }
-    }
 }
 
 /// `Player.isWithinEntityInteractionRange(entity, buffer)` for a guest: the
@@ -323,24 +327,71 @@ fn direction(face: i32) -> [i32; 3] {
     }
 }
 
+fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
+    BuildingPlayer {
+        conn: Some(g.conn),
+        dimension: Dim::from_id(&g.dimension),
+        bounds: (g.participates_in_player_simulation()
+            && g.placed
+            && g.loaded
+            && !g.dead
+            && !g.spectator())
+        .then(|| g.bounds()),
+        borrowed: false,
+    }
+}
+
+thread_local! {
+    /// The hub's bodies for the turns of one `tick_guests`, built once instead
+    /// of for every turn (players x turns a tick). A guest's entry is refreshed
+    /// when its turn ends ([`refresh_building_player`]), so the turns after it
+    /// see it where it went (a pearl, a death, spectator mode).
+    static BUILDING_CACHE: std::cell::RefCell<Option<HubBodies>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The hub's current bodies, across dimensions. A borrowed ancestor's
 /// live body takes precedence over this saved state until its turn returns.
-fn building_players(host: &LanHost) -> Vec<BuildingPlayer> {
-    host.hub
-        .guests
-        .simulation_iter()
-        .map(|g| BuildingPlayer {
-            conn: Some(g.conn),
-            dimension: Dim::from_id(&g.dimension),
-            bounds: (g.participates_in_player_simulation()
-                && g.placed
-                && g.loaded
-                && !g.dead
-                && !g.spectator())
-            .then(|| g.bounds()),
-            borrowed: false,
-        })
-        .collect()
+fn building_players(host: &LanHost) -> HubBodies {
+    let guests: Vec<_> = host.hub.guests.simulation_iter().collect();
+    let kept = BUILDING_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|list| {
+                list.len() == guests.len()
+                    && list
+                        .iter()
+                        .zip(&guests)
+                        .all(|(p, g)| p.get().conn == Some(g.conn))
+            })
+            .cloned()
+    });
+    kept.unwrap_or_else(|| shared(guests.into_iter().map(building_player)))
+}
+
+/// Builds the hub's bodies once for the turns to come (`Some`), or drops them.
+pub(super) fn building_cache(host: Option<&LanHost>) {
+    let bodies = host.map(|host| shared(host.hub.guests.simulation_iter().map(building_player)));
+    BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
+}
+
+/// The cached bodies as they are now in the hub, after `conn`'s turn (or its
+/// death step). Every entry, not only the actor's: a turn can move, kill or
+/// change another guest too (`/tp`, an attack, an explosion), and the turns
+/// after it must see that guest where it is now, as a list built afresh would.
+/// Copies into the shared cells, no allocation.
+fn refresh_building_player(host: &LanHost, _conn: u32) {
+    BUILDING_CACHE.with(|c| {
+        if let Some(list) = c.borrow().as_ref()
+            && list.len() == host.hub.guests.simulation_iter().count()
+        {
+            for (p, g) in list.iter().zip(host.hub.guests.simulation_iter()) {
+                if p.get().conn == Some(g.conn) {
+                    p.set(building_player(g));
+                }
+            }
+        }
+    });
 }
 
 /// Kept at LAN action scope to preserve its derived internals point identity.
@@ -434,6 +485,26 @@ mod tests {
     use crate::game::api_values::TryIntoApi;
     use horizon_client::pose::Pose;
     #[test]
+    fn a_block_break_suppresses_its_positional_duplicate_but_not_an_entity_sound() {
+        let mut sound = horizon_client::audio::CapturedSound {
+            event: "minecraft:block.stone.break".into(),
+            position: [1.5, 64.5, -2.5],
+            volume: 1.0,
+            pitch: 1.0,
+            source: 4,
+            entity: None,
+            except_entity: None,
+        };
+        let broken = [[1.0, 64.0, -3.0]];
+        assert!(super::captured_block_break(&sound, &broken));
+        sound.entity = Some(37);
+        assert!(!super::captured_block_break(&sound, &broken));
+        sound.entity = None;
+        sound.position[0] += 0.25;
+        assert!(!super::captured_block_break(&sound, &broken));
+    }
+
+    #[test]
     fn use_swing_resets_attack_charge_only_when_started() {
         let mut ticker = 20;
         reset_use_attack_strength(&mut ticker, 3, 4);
@@ -505,7 +576,7 @@ mod tests {
         let mods: Mods = vec![ModEntry::new("menu_rules", Box::new(Mod))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
         crate::entry::install_client_hooks();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_guest_turn_tests::with_guests(|game| {
                 game.world
                     .chunks
@@ -903,7 +974,7 @@ mod tests {
     #[ignore = "requires prepared game resources"]
     fn block_menu_handle_and_use_each_count_the_guest_once() {
         use horizon_client::chunk::Chunk;
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
         use std::sync::Arc;
         super::super::native_guest_turn_tests::with_guests(|game| {
             game.options.dedicated = Some(Vec::new());
@@ -923,7 +994,7 @@ mod tests {
                     level,
                     [pos.0, pos.1, pos.2],
                     chest,
-                    NativeBlockUpdateFlags::NEIGHBORS
+                    BlockUpdateFlags::NEIGHBORS
                 ),
                 Ok(true)
             );
@@ -954,7 +1025,7 @@ mod tests {
                     mod_api::Flow::Cancel
                 }
             }
-            mod_api::testing::with_mods(
+            mod_platform::testing::with_mods(
                 vec![mod_api::ModEntry::new("stop_menu", Box::new(StopMenu))].into(),
                 || {
                     assert!(
@@ -997,7 +1068,7 @@ mod tests {
                 .unwrap();
             let at = [pos.0, pos.1, pos.2];
             assert_eq!(
-                game.level_set_block(level, at, shulker, NativeBlockUpdateFlags::NEIGHBORS),
+                game.level_set_block(level, at, shulker, BlockUpdateFlags::NEIGHBORS),
                 Ok(true)
             );
             assert!(
@@ -1018,7 +1089,7 @@ mod tests {
     #[ignore = "requires prepared game resources"]
     fn block_menu_click_keeps_spent_action_on_cancellation() {
         use horizon_client::{chunk::Chunk, lan::guest::GuestKind};
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
         use std::sync::Arc;
         super::super::native_guest_turn_tests::with_guests(|game| {
             game.options.dedicated = Some(Vec::new());
@@ -1033,7 +1104,7 @@ mod tests {
                 .default_state("minecraft:chest")
                 .unwrap();
             assert_eq!(
-                game.level_set_block(level, [0, 64, 0], chest, NativeBlockUpdateFlags::NEIGHBORS),
+                game.level_set_block(level, [0, 64, 0], chest, BlockUpdateFlags::NEIGHBORS),
                 Ok(true)
             );
             assert!(!game.lan_open_container(12, (2, 64, 0)));
@@ -1059,10 +1130,10 @@ mod tests {
             lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig},
         };
         use horizon_protocol::packets::{configuration::ClientInformation, play};
+        use mod_api::InteractionResult as Answer;
         use mod_api::{
             self, BlockPart, CloneItemStackEvent, Flow, Hooks, Host, ItemPart, ItemStack,
-            NativeInteractionResult as Answer, Registrar, ServerHost, UseItemOnEvent, UseOnEvent,
-            UseWithoutItemEvent,
+            Registrar, ServerHost, UseItemOnEvent, UseOnEvent, UseWithoutItemEvent,
         };
         use std::sync::{
             Arc, Mutex,
@@ -1094,7 +1165,7 @@ mod tests {
             empty_answer: Arc<Mutex<Option<Answer>>>,
             empty_food: Arc<Mutex<Option<i32>>>,
             empty_clicks: Arc<Mutex<Vec<(horizon_world::registry::BlockStateId, u128)>>>,
-            clicks: Arc<Mutex<Vec<(u128, mod_api::first_person::Hand)>>>,
+            clicks: Arc<Mutex<Vec<(u128, mod_api::client::first_person::Hand)>>>,
             item_uses: Arc<AtomicUsize>,
         }
         #[mod_api::horizon_part]
@@ -1112,7 +1183,7 @@ mod tests {
                             host,
                             event.click.pos,
                             state.try_into_api().unwrap(),
-                            mod_api::NativeBlockUpdateFlags::KNOWN_SHAPE,
+                            mod_api::BlockUpdateFlags::KNOWN_SHAPE,
                         ),
                         Ok(true)
                     );
@@ -1128,7 +1199,7 @@ mod tests {
                 host: &mut dyn ServerHost,
                 event: &mut UseWithoutItemEvent<'_>,
             ) -> Option<Answer> {
-                assert_eq!(event.click.hand, mod_api::first_person::Hand::Main);
+                assert_eq!(event.click.hand, mod_api::client::first_person::Hand::Main);
                 if let Some(level) = self.empty_food.lock().unwrap().take() {
                     let player = host.player(event.click.player).unwrap();
                     assert!(player.set_food_level(host, level));
@@ -1204,7 +1275,7 @@ mod tests {
         )]
         .into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
                 game.world
@@ -1266,7 +1337,7 @@ mod tests {
 
                 // BlockState.useItemOn replaces the template. Only TryWithEmptyHand
                 // reaches useWithoutItem, which toggles this lever on the main hand.
-                use mod_api::first_person::Hand;
+                use mod_api::client::first_person::Hand;
                 use std::sync::atomic::Ordering::SeqCst;
                 let lever = game
                     .pack
@@ -1738,10 +1809,8 @@ mod tests {
     fn block_part_use_item_on_consumes_once() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
-        use mod_api::{
-            self, BlockPart, Hooks, NativeInteractionResult as Answer, Registrar, ServerHost,
-            UseItemOnEvent,
-        };
+        use mod_api::InteractionResult as Answer;
+        use mod_api::{self, BlockPart, Hooks, Registrar, ServerHost, UseItemOnEvent};
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering::SeqCst},
@@ -1774,7 +1843,7 @@ mod tests {
         )]
         .into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
                 game.world
@@ -1808,10 +1877,8 @@ mod tests {
     fn replacing_empty_note_block_use_does_not_award_vanilla_stats() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
-        use mod_api::{
-            self, BlockPart, Hooks, NativeInteractionResult as Answer, Registrar, ServerHost,
-            UseWithoutItemEvent,
-        };
+        use mod_api::InteractionResult as Answer;
+        use mod_api::{self, BlockPart, Hooks, Registrar, ServerHost, UseWithoutItemEvent};
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering::SeqCst},
@@ -1843,7 +1910,7 @@ mod tests {
         )]
         .into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
                 game.world
@@ -1982,23 +2049,6 @@ fn bundle_inventory_slot(slot: usize, own: Option<usize>) -> Option<usize> {
     }
 }
 
-#[cfg(test)]
-mod bundle_slot_tests {
-    use super::bundle_inventory_slot;
-
-    /// A crafting table (10 slots of its own) and an enchanting table (2): the first
-    /// inventory slot and the last hotbar slot map to 9 and 44; their own slots to none.
-    #[test]
-    fn station_menus_map_to_the_inventory_menu() {
-        assert_eq!(bundle_inventory_slot(10, Some(10)), Some(9));
-        assert_eq!(bundle_inventory_slot(45, Some(10)), Some(44));
-        assert_eq!(bundle_inventory_slot(2, Some(2)), Some(9));
-        assert_eq!(bundle_inventory_slot(5, Some(10)), None);
-        assert_eq!(bundle_inventory_slot(46, Some(10)), None);
-        assert_eq!(bundle_inventory_slot(45, None), Some(45));
-    }
-}
-
 /// Where the server aims a guest's attack or interact on a mob. The packet names only the
 /// entity, so the server picked the mob's centre; a slab, trapdoor, stair or fence between the
 /// eyes and that centre then hid a mob the guest's own crosshair hit through the gap (#5772).
@@ -2048,94 +2098,6 @@ fn visible_aim_point(
         .unwrap_or(centre)
 }
 
-#[cfg(test)]
-mod aim_point_tests {
-    use super::visible_aim_point;
-
-    const EYE: [f64; 3] = [-760.7, 70.27, -450.4];
-    // A zombie one block behind a top slab: its centre is above the 0.5 gap under the slab.
-    const LO: [f64; 3] = [-763.0, 70.0, -450.9];
-    const HI: [f64; 3] = [-762.4, 71.95, -450.3];
-
-    /// A top slab filling x in [-762, -761] with its underside at y 70.5: a point is hidden when
-    /// the line from the eyes is above 70.5 anywhere inside that column.
-    fn behind_top_slab(p: [f64; 3]) -> bool {
-        let y_at = |x: f64| EYE[1] + (p[1] - EYE[1]) * (x - EYE[0]) / (p[0] - EYE[0]);
-        p[0] < -762.0 && (y_at(-761.0) > 70.5 || y_at(-762.0) > 70.5)
-    }
-
-    #[test]
-    fn a_visible_centre_is_kept() {
-        let centre = [
-            (LO[0] + HI[0]) / 2.0,
-            (LO[1] + HI[1]) / 2.0,
-            (LO[2] + HI[2]) / 2.0,
-        ];
-        assert_eq!(visible_aim_point(EYE, LO, HI, |_| false), centre);
-    }
-
-    /// A bottom slab hides everything under y 70.9: the aim goes above it, through the gap over the slab.
-    #[test]
-    fn a_mob_behind_a_bottom_slab_is_aimed_at_above_the_slab() {
-        let centre = [
-            (LO[0] + HI[0]) / 2.0,
-            (LO[1] + HI[1]) / 2.0,
-            (LO[2] + HI[2]) / 2.0,
-        ];
-        let p = visible_aim_point(EYE, LO, HI, |pt| pt[1] < 70.9);
-        assert!(p[1] >= 70.9, "{p:?} is still under the slab");
-        assert!(p[1] > centre[1] - 0.5, "{p:?} is far from the centre");
-    }
-
-    /// With only the centre hidden, two equally near candidates go to the one nearer the eyes.
-    #[test]
-    fn an_equally_near_point_on_the_side_of_the_eyes_wins() {
-        let eye = [5.0, 70.5, 0.0];
-        let (lo, hi) = ([-0.3, 70.0, -0.3], [0.3, 71.9, 0.3]);
-        let centre = [
-            (lo[0] + hi[0]) / 2.0,
-            (lo[1] + hi[1]) / 2.0,
-            (lo[2] + hi[2]) / 2.0,
-        ];
-        let p = visible_aim_point(eye, lo, hi, |pt| pt == centre);
-        assert!(p[0] > centre[0], "{p:?} is on the far side from the eyes");
-    }
-
-    #[test]
-    fn a_mob_seen_only_through_a_gap_is_aimed_at_through_the_gap() {
-        let centre = [
-            (LO[0] + HI[0]) / 2.0,
-            (LO[1] + HI[1]) / 2.0,
-            (LO[2] + HI[2]) / 2.0,
-        ];
-        assert!(behind_top_slab(centre), "the slab hides the centre");
-        let p = visible_aim_point(EYE, LO, HI, behind_top_slab);
-        assert!(!behind_top_slab(p), "{p:?} is still hidden");
-        for k in 0..3 {
-            assert!(LO[k] <= p[k] && p[k] <= HI[k], "{p:?} is outside the mob");
-        }
-        assert!(p[1] < centre[1], "{p:?} is not lower than the centre");
-    }
-
-    #[test]
-    fn a_fully_hidden_mob_keeps_the_centre() {
-        let centre = [
-            (LO[0] + HI[0]) / 2.0,
-            (LO[1] + HI[1]) / 2.0,
-            (LO[2] + HI[2]) / 2.0,
-        ];
-        assert_eq!(visible_aim_point(EYE, LO, HI, |_| true), centre);
-    }
-
-    #[test]
-    fn the_choice_is_deterministic() {
-        assert_eq!(
-            visible_aim_point(EYE, LO, HI, behind_top_slab),
-            visible_aim_point(EYE, LO, HI, behind_top_slab)
-        );
-    }
-}
-
 /// The first target `(id, removed, bounds)` whose box meets the swept box,
 /// skipping removed ones and the vehicle the player rides.
 fn first_spin_target(
@@ -2144,41 +2106,6 @@ fn first_spin_target(
     mut targets: impl Iterator<Item = (u32, bool, Aabb)>,
 ) -> Option<usize> {
     targets.position(|(id, removed, b)| !removed && Some(id) != riding && b.intersects(swept))
-}
-
-#[cfg(test)]
-mod spin_target_tests {
-    use super::first_spin_target;
-    use horizon_core::geometry::{Aabb, Vec3};
-
-    fn cube(x: f64) -> Aabb {
-        Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0))
-    }
-
-    /// The spin hits the first mob in the swept box, not a removed one, the
-    /// vehicle, or one out of reach.
-    #[test]
-    fn the_spin_picks_the_first_live_mob_in_the_sweep() {
-        let swept = Aabb::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(3.0, 1.0, 1.0));
-        let targets = [
-            (1, false, cube(10.0)),
-            (2, true, cube(1.0)),
-            (3, false, cube(1.5)),
-            (4, false, cube(2.0)),
-        ];
-        assert_eq!(
-            first_spin_target(swept, None, targets.iter().copied()),
-            Some(2)
-        );
-        assert_eq!(
-            first_spin_target(swept, Some(3), targets.iter().copied()),
-            Some(3)
-        );
-        assert_eq!(
-            first_spin_target(swept, None, targets[..2].iter().copied()),
-            None
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2230,7 +2157,7 @@ mod hotbar_tests {
     fn a_hotbar_switch_fires_pre_then_post_and_pre_can_keep_the_slot() {
         let heard = Heard::default();
         let mods = vec![ModEntry::new("hotbar", Box::new(Hotbar(heard.clone())))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 open_to_lan(game);
                 game.lan.as_mut().unwrap().hub.guests.push(guest(1));
@@ -2301,7 +2228,7 @@ mod respawn_position_tests {
     fn a_mod_moves_a_respawn_and_drops_the_point() {
         let heard = Heard::default();
         let mods = vec![ModEntry::new("east", Box::new(East(heard.clone())))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 open_to_lan(game);
                 game.options.dedicated = Some(Vec::new());
@@ -2355,7 +2282,7 @@ mod respawn_position_tests {
             Box::new(Listen(Arc::clone(&heard))),
         )]
         .into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 open_to_lan(game);
                 game.options.dedicated = Some(Vec::new());
@@ -2431,9 +2358,11 @@ mod pickup_xp_tests {
                 on_ground: true,
                 count: 1,
                 ticks: 0,
+                air: 300,
                 health: 5,
                 no_gravity: true,
                 following: None,
+                fall_distance: 0.0,
             });
             game.guest_orbs(0);
             let left = game.orbs.iter().any(|o| o.id == 40);
@@ -2450,9 +2379,9 @@ mod pickup_xp_tests {
         let none = take_orb();
         assert_eq!(none, (false, 7));
         let mods = vec![mod_api::ModEntry::new("listen", Box::new(Listen(false)))].into();
-        mod_api::testing::with_mods(mods, || assert_eq!(take_orb(), none));
+        mod_platform::testing::with_mods(mods, || assert_eq!(take_orb(), none));
         let mods = vec![mod_api::ModEntry::new("cancel", Box::new(Listen(true)))].into();
-        mod_api::testing::with_mods(mods, || assert_eq!(take_orb(), (true, 0)));
+        mod_platform::testing::with_mods(mods, || assert_eq!(take_orb(), (true, 0)));
     }
 }
 
@@ -2805,49 +2734,602 @@ fn touching_unloaded_chunk(
 }
 
 #[cfg(test)]
-mod unloaded_chunk_tests {
-    use super::touching_unloaded_chunk;
-    use horizon_client::pose::Dimensions;
+mod guest_close_listener_tests {
+    use super::*;
+    use crate::game::{Audio, Options, Progress, Settings, load_resources};
+    use horizon_client::{
+        chunk::Chunk,
+        containers::BlockEntity,
+        lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig},
+        sculk::Info,
+    };
+    use horizon_core::position::ChunkPos;
+    use horizon_protocol::packets::configuration::ClientInformation;
+    use std::sync::{Arc, atomic::AtomicI32, mpsc};
 
-    /// `Entity.touchingUnloadedChunk` (#11312): the box inflated by one block
-    /// is checked chunk by chunk; a player in the middle of a loaded chunk
-    /// touches none, one within a block of its edge touches the neighbour.
-    #[test]
-    fn a_box_within_a_block_of_a_chunk_edge_touches_the_next_chunk() {
-        let body = Dimensions {
-            width: 0.6,
-            height: 1.8,
-            eye_height: 1.62,
+    fn selected(game: &Game<'_>) -> Option<Info> {
+        let Some(BlockEntity::Sculk(sensor)) = game.world.block_entities.get(&(9, 100, 4)) else {
+            panic!("actual command-created sensor must exist");
         };
-        let only_origin = |x: i32, z: i32| (x, z) == (0, 0);
-        assert!(!touching_unloaded_chunk(
-            [8.0, 64.0, 8.0],
-            body,
-            only_origin
-        ));
-        // 15.5 + 0.3 + 1 reaches 16.8, in chunk 1.
-        assert!(touching_unloaded_chunk(
-            [15.5, 64.0, 8.0],
-            body,
-            only_origin
-        ));
-        // 14.0 + 1.3 = 15.3: Mth.ceil gives 16, the first block of chunk 1.
-        assert!(touching_unloaded_chunk(
-            [14.0, 64.0, 8.0],
-            body,
-            only_origin
-        ));
-        // 13.5 + 1.3 = 14.8: ceil 15, still chunk 0.
-        assert!(!touching_unloaded_chunk(
-            [13.5, 64.0, 8.0],
-            body,
-            only_origin
-        ));
-        // Everything loaded: nothing is touched anywhere.
-        assert!(!touching_unloaded_chunk(
-            [15.9, 64.0, -0.5],
-            body,
-            |_, _| true
-        ));
+        sensor.vibration.selector.current.map(|(info, _)| info)
+    }
+    fn reset_listener(game: &mut Game<'_>) {
+        assert!(game.run_command("setblock 9 100 4 air strict"));
+        assert!(game.run_command("setblock 9 100 4 sculk_sensor strict"));
+        game.sculk_prepare();
+        game.sculk_sync_index();
+        assert!(selected(game).is_none());
+    }
+    fn open(game: &mut Game<'_>, conn: u32, sequence: i32) -> i32 {
+        game.lan_guest_packet(
+            conn,
+            S::UseItemOn(play::UseItemOn {
+                hand: 0,
+                pos: [6, 100, 4],
+                face: 1,
+                cursor: [0.5, 1.0, 0.5],
+                inside: false,
+                world_border: false,
+                sequence,
+            }),
+        );
+        let guest = game.lan.as_mut().unwrap().hub.guest(conn).unwrap();
+        assert!(guest.ack_up_to.get() >= sequence);
+        assert_eq!(guest.health, 20.0);
+        assert_eq!(guest.position, [4.5, 100.0, 4.5]);
+        let menu = guest
+            .menu
+            .as_ref()
+            .expect("actual packet must open the chest menu");
+        assert_eq!(menu.pos, Some((6, 100, 4)));
+        assert_eq!(menu.size, 27);
+        menu.window
+    }
+    fn close(game: &mut Game<'_>, conn: u32, window: i32) {
+        game.lan_guest_packet(
+            conn,
+            S::ContainerClose(play::ContainerClose { container: window }),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    fn ordinary_guest_final_close_posts_to_actual_listener() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert!(game.run_command("forceload add 0 0 15 15"));
+        assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
+        assert!(game.run_command("setblock 6 100 4 chest"));
+        assert!(game.run_command("setblock 9 100 4 sculk_sensor strict"));
+        game.sculk_prepare();
+        game.sculk_sync_index();
+        assert!(selected(&game).is_none());
+        game.lan_host(
+            super::super::lan::LanSettings {
+                port: 0,
+                guest_commands: true,
+                force_game_mode: false,
+            },
+            NetConfig {
+                announce: false,
+                ..NetConfig::loopback(0, "guest-close-test".into(), 4)
+            },
+            HubConfig {
+                default_game_mode: 0,
+                guest_commands: true,
+                force_game_mode: false,
+                hardcore: false,
+                view_distance: 2,
+                simulation_distance: 2,
+                dimension: "minecraft:overworld".into(),
+                allow_flight: false,
+                seed: 0,
+                max_players: 4,
+                integrated: false,
+                levels: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let mut receivers = Vec::new();
+        for conn in 1..=3 {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx);
+            let mut guest = Guest::new(
+                Joined {
+                    conn,
+                    uuid: u128::from(conn) + 11200,
+                    name: format!("CloseGuest{conn}"),
+                    properties: Vec::new(),
+                    info: ClientInformation::new(2),
+                    brand: "test".into(),
+                    sender: PlayerSender::new(tx, Arc::default()),
+                    latency: Arc::new(AtomicI32::new(0)),
+                    address: "127.0.0.1:25565".parse().unwrap(),
+                    expected: false,
+                },
+                conn as i32 + 100,
+                [4.5, 100.0, 4.5],
+                2,
+            );
+            guest.dimension = "minecraft:overworld".into();
+            guest.placed = true;
+            guest.loaded = true;
+            guest.game_mode = if conn == 3 { 3 } else { 0 };
+            guest.on_ground = true;
+            assert_eq!(guest.health, 20.0);
+            game.lan.as_mut().unwrap().hub.guests.push(guest);
+        }
+        let clock = game.world.game_time;
+        let mut missing = Vec::new();
+        let window = open(&mut game, 1, 1);
+        assert_eq!(game.lid_openers.get(&(6, 100, 4)), Some(&1));
+        assert_eq!(selected(&game).unwrap().event, "minecraft:container_open");
+        reset_listener(&mut game);
+        close(&mut game, 1, window + 20);
+        assert_eq!(
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guest(1)
+                .unwrap()
+                .menu
+                .as_ref()
+                .unwrap()
+                .window,
+            window
+        );
+        assert_eq!(game.lid_openers.get(&(6, 100, 4)), Some(&1));
+        assert!(selected(&game).is_none());
+        close(&mut game, 1, window);
+        assert!(
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guest(1)
+                .unwrap()
+                .menu
+                .is_none()
+        );
+        assert!(!game.lid_openers.contains_key(&(6, 100, 4)));
+        match selected(&game) {
+            Some(info) => {
+                assert_eq!(info.event, "minecraft:container_close");
+                assert_eq!(info.pos, [6.5, 100.5, 4.5]);
+            }
+            None => missing.push("single final close"),
+        }
+        reset_listener(&mut game);
+        let first = open(&mut game, 1, 2);
+        assert_eq!(selected(&game).unwrap().event, "minecraft:container_open");
+        reset_listener(&mut game);
+        let last = open(&mut game, 2, 1);
+        assert_eq!(game.lid_openers.get(&(6, 100, 4)), Some(&2));
+        assert!(selected(&game).is_none());
+        close(&mut game, 1, first);
+        assert!(
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guest(2)
+                .unwrap()
+                .menu
+                .is_some()
+        );
+        assert_eq!(game.lid_openers.get(&(6, 100, 4)), Some(&1));
+        assert!(selected(&game).is_none());
+        close(&mut game, 2, last);
+        assert!(!game.lid_openers.contains_key(&(6, 100, 4)));
+        match selected(&game) {
+            Some(info) => {
+                assert_eq!(info.event, "minecraft:container_close");
+                assert_eq!(info.pos, [6.5, 100.5, 4.5]);
+            }
+            None => missing.push("shared final close"),
+        }
+        reset_listener(&mut game);
+        let spectator = open(&mut game, 3, 1);
+        assert!(!game.lid_openers.contains_key(&(6, 100, 4)));
+        assert!(selected(&game).is_none());
+        close(&mut game, 3, spectator);
+        assert!(
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guest(3)
+                .unwrap()
+                .menu
+                .is_none()
+        );
+        assert!(selected(&game).is_none());
+        assert!(game.run_command("setblock 6 100 4 air strict"));
+        assert!(
+            game.run_command("summon oak_chest_boat 6.5 100 4.5 {UUID:[I;112,0,0,9],NoGravity:1b}")
+        );
+        let boat = game.boats.last().unwrap().id;
+        // Chest boats open for a sneaking guest; a plain empty-hand click boards.
+        game.lan
+            .as_mut()
+            .unwrap()
+            .hub
+            .update_guest(1, |g| g.sneaking = true);
+        game.lan_guest_packet(
+            1,
+            S::Interact(play::Interact {
+                id: boat as i32,
+                hand: 0,
+                location: [0.0; 3],
+                secondary: true,
+            }),
+        );
+        let vehicle_window = game
+            .lan
+            .as_ref()
+            .unwrap()
+            .hub
+            .guest(1)
+            .unwrap()
+            .menu
+            .as_ref()
+            .expect("actual vehicle interaction must open menu")
+            .window;
+        reset_listener(&mut game);
+        close(&mut game, 1, vehicle_window);
+        assert!(
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guest(1)
+                .unwrap()
+                .menu
+                .is_none()
+        );
+        assert_eq!(selected(&game).unwrap().event, "minecraft:container_close");
+        assert_eq!(selected(&game).unwrap().pos, [6.5, 100.0, 4.5]);
+        for guest in &game.lan.as_mut().unwrap().hub.guests {
+            assert_eq!(guest.uuid, u128::from(guest.conn) + 11200);
+            assert_eq!(guest.health, 20.0);
+            assert_eq!(guest.position, [4.5, 100.0, 4.5]);
+        }
+        assert_eq!(game.world.game_time, clock);
+        assert!(
+            missing.is_empty(),
+            "actual ordinary guest final close must be heard: {missing:?}"
+        );
+        drop(receivers);
     }
 }
+
+#[cfg(test)]
+mod item_on_block_cooldown_tests {
+    use super::ItemStack;
+    use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
+    use horizon_client::chunk::Chunk;
+    use horizon_client::lan::{Joined, NetConfig, Out, PlayerSender, guest::Guest, hub::HubConfig};
+    use horizon_core::position::ChunkPos;
+    use horizon_protocol::packets::{
+        configuration::ClientInformation,
+        play::{self, Clientbound, Serverbound},
+    };
+    use std::sync::{Arc, atomic::AtomicI32, mpsc};
+
+    // Actual registered guest packet route, with real loaded block facts.
+    fn placement_control(check_start: Option<bool>) {
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.game_dir = Some(
+            std::env::temp_dir().join(format!("horizon-use-cooldown-unit-{}", std::process::id())),
+        );
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        let stone = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:stone")
+            .unwrap()
+            .0;
+        let mut chunk = Chunk::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk.set(x, 199, z, stone);
+            }
+        }
+        game.world.chunks.insert((0, 0), Arc::new(chunk));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert!(game.run_command("forceload add 0 0"));
+        game.lan_host(
+            super::super::lan::LanSettings {
+                port: 0,
+                guest_commands: true,
+                force_game_mode: false,
+            },
+            NetConfig {
+                announce: false,
+                ..NetConfig::loopback(0, "use-cooldown-test".into(), 2)
+            },
+            HubConfig {
+                default_game_mode: 0,
+                guest_commands: true,
+                force_game_mode: false,
+                hardcore: false,
+                view_distance: 2,
+                simulation_distance: 2,
+                dimension: "minecraft:overworld".into(),
+                allow_flight: false,
+                seed: 0,
+                max_players: 2,
+                integrated: false,
+                levels: Default::default(),
+            },
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut guest = Guest::new(
+            Joined {
+                conn: 2,
+                uuid: 331,
+                name: "SwingGuest".into(),
+                properties: Vec::new(),
+                info: ClientInformation::new(2),
+                brand: "test".into(),
+                sender: PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [4.5, 200.0, 4.5],
+            2,
+        );
+        guest.dimension = "minecraft:overworld".into();
+        guest.placed = true;
+        guest.loaded = true;
+        guest.inventory[0] = Some(ItemStack::new("minecraft:stone", 16));
+        guest.selected = 0;
+
+        game.lan.as_mut().unwrap().hub.guests.push(guest);
+        assert_eq!(game.lan.as_mut().unwrap().hub.guests[0].uuid, 331);
+        assert!(
+            game.lan.as_mut().unwrap().hub.guests[0].placed
+                && game.lan.as_mut().unwrap().hub.guests[0].loaded
+        );
+        assert_eq!(game.lan.as_mut().unwrap().hub.guests[0].game_mode, 0);
+        let mut planks = ItemStack::new("minecraft:oak_planks", 5);
+        planks.data_mut().set_other(
+            "minecraft:use_cooldown",
+            Some(horizon_core::nbt::Tag::compound([
+                ("seconds", horizon_core::nbt::Tag::Float(30.0f32.to_bits())),
+                (
+                    "cooldown_group",
+                    horizon_core::nbt::Tag::String("probe:group".into()),
+                ),
+            ])),
+        );
+        game.lan
+            .as_mut()
+            .unwrap()
+            .hub
+            .guests
+            .update(0, |guest| guest.inventory[0] = Some(planks));
+        let use_on = |x, sequence| {
+            Serverbound::UseItemOn(play::UseItemOn {
+                hand: 0,
+                pos: [x, 199, 6],
+                face: 1,
+                cursor: [0.5, 1.0, 0.5],
+                inside: false,
+                world_border: false,
+                sequence,
+            })
+        };
+        assert!(game.world.is_air(game.world.block(5, 200, 6)));
+        if check_start.is_none() {
+            let mut stick = game.lan.as_mut().unwrap().hub.guests[0].inventory[0]
+                .as_ref()
+                .unwrap()
+                .clone();
+            stick.item = "minecraft:stick".into();
+            stick.count = 1;
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guests
+                .update(0, |guest| guest.inventory[0] = Some(stick));
+            game.lan_guest_packet(2, use_on(5, 1));
+            assert!(
+                game.world.is_air(game.world.block(5, 200, 6)),
+                "failed stick use"
+            );
+            assert!(
+                !game.lan.as_mut().unwrap().play[&2]
+                    .cooldowns
+                    .is_on_cooldown("probe:group")
+            );
+            let mut planks = game.lan.as_mut().unwrap().hub.guests[0].inventory[0]
+                .as_ref()
+                .unwrap()
+                .clone();
+            planks.item = "minecraft:oak_planks".into();
+            planks.count = 5;
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .guests
+                .update(0, |guest| guest.inventory[0] = Some(planks));
+        }
+        game.lan_guest_packet(2, use_on(5, 2));
+        let oak = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:oak_planks")
+            .unwrap();
+        assert_eq!(game.world.block(5, 200, 6), oak, "actual first placement");
+        assert_eq!(
+            game.lan.as_mut().unwrap().hub.guests[0].inventory[0]
+                .as_ref()
+                .unwrap()
+                .count,
+            4
+        );
+        assert!(
+            game.lan.as_mut().unwrap().play.contains_key(&2),
+            "real acting guest context installed"
+        );
+        if check_start == Some(true) {
+            assert!(
+                game.lan.as_mut().unwrap().play[&2]
+                    .cooldowns
+                    .is_on_cooldown("probe:group"),
+                "successful use starts the actual guest's group"
+            );
+            assert!(rx.try_iter().any(|out| {
+                let bodies = match out { Out::Packet(body) => vec![body], Out::Packets(bodies) => bodies, Out::Disconnect(_) => panic!("disconnect") };
+                bodies.iter().any(|body| {
+                    let mut r = horizon_protocol::buf::Reader::new(body);
+                    matches!(Clientbound::decode(r.varint().unwrap(),r.rest()), Ok(Clientbound::Cooldown(p)) if p.group == "probe:group" && p.duration == 600)
+                })
+            }), "existing helper's actual cooldown packet");
+        } else if check_start == Some(false) {
+            game.lan_guest_packet(2, use_on(6, 2));
+            assert!(
+                game.world.is_air(game.world.block(6, 200, 6)),
+                "same-group second placement is rejected"
+            );
+            assert_eq!(
+                game.lan.as_mut().unwrap().hub.guests[0].inventory[0]
+                    .as_ref()
+                    .unwrap()
+                    .count,
+                4
+            );
+        }
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn failed_stick_use_keeps_group_available_for_placement() {
+        placement_control(None);
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn actual_guest_placement_starts_its_cooldown() {
+        placement_control(Some(true));
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn actual_guest_second_placement_is_rejected() {
+        placement_control(Some(false));
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/aim_point_tests.rs"]
+mod aim_point_tests;
+
+#[cfg(test)]
+#[path = "tests/boat_holder_movement_tests.rs"]
+mod boat_holder_movement_tests;
+
+#[cfg(test)]
+#[path = "tests/bundle_slot_tests.rs"]
+mod bundle_slot_tests;
+
+#[cfg(test)]
+#[path = "tests/crack_feedback_tests.rs"]
+mod crack_feedback_tests;
+
+#[cfg(test)]
+#[path = "tests/menu_still_valid_tests.rs"]
+mod menu_still_valid_tests;
+
+#[cfg(test)]
+#[path = "tests/projectile_lifecycle_tests.rs"]
+mod projectile_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "tests/spin_target_tests.rs"]
+mod spin_target_tests;
+
+#[cfg(test)]
+#[path = "tests/spawn_protection_tests.rs"]
+mod spawn_protection_tests;
+
+#[cfg(test)]
+#[path = "tests/unloaded_chunk_tests.rs"]
+mod unloaded_chunk_tests;

@@ -190,7 +190,7 @@ fn reload_command_uses_applied_listener_state_and_preserves_tables_on_refusal() 
         }
     }
     let state = Arc::new(AtomicUsize::new(0));
-    mod_api::testing::with_mods(
+    mod_platform::testing::with_mods(
         vec![ModEntry::new(
             "reload_order",
             Box::new(Listener(state.clone())),
@@ -201,12 +201,26 @@ fn reload_command_uses_applied_listener_state_and_preserves_tables_on_refusal() 
                 let root =
                     std::env::temp_dir().join(format!("reload-order-{}", std::process::id()));
                 game.load_world(request(&root)).unwrap();
+                let class =
+                    mod_api::__private::tag_key(&Identifier::parse("horizon:class/fence").unwrap())
+                        .unwrap();
+                let fence = mod_api::__private::block_key("minecraft:oak_fence").unwrap();
+                assert!(mod_api::Tags::blocks(game, class).unwrap().contains(&fence));
+                assert!(
+                    game.items()
+                        .block_in_tag("horizon:class/fence", "minecraft:oak_fence")
+                );
+                assert_eq!(game.block_in_tag(fence, "horizon:class/fence"), Some(true));
                 state.store(0, Ordering::SeqCst);
                 assert!(game.run_command("reload"));
                 assert_eq!(state.load(Ordering::SeqCst), 1);
                 assert!(
                     game.items().block_tags["reload_order:derived"].contains("minecraft:stone")
                 );
+                assert!(mod_api::Tags::blocks(game, class).unwrap().contains(&fence));
+                let old_bound = crate::game::native_world_read::installed_block_tag_snapshot();
+                let old_order = game.items().block_tag_order.clone();
+                let old_sets = game.items().block_tags.clone();
                 let old = game.world_tables.as_ref().map(|tables| tables as *const _);
                 crate::game::api_values::install_parts(&[ModEntry::new(
                     "reload_order",
@@ -222,6 +236,12 @@ fn reload_command_uses_applied_listener_state_and_preserves_tables_on_refusal() 
                 assert!(
                     game.items().block_tags["reload_order:derived"].contains("minecraft:stone")
                 );
+                assert_eq!(
+                    crate::game::native_world_read::installed_block_tag_snapshot(),
+                    old_bound
+                );
+                assert_eq!(game.items().block_tag_order, old_order);
+                assert_eq!(game.items().block_tags, old_sets);
                 let _ = std::fs::remove_dir_all(root);
             });
         },
@@ -318,7 +338,10 @@ fn missing_original_at_reload_preserves_the_published_data_and_reports_its_owner
     );
     let world = root.join("world");
     let function = world.join("datapacks/test/data/reload_test/function/keep.mcfunction");
-    write(&world.join("datapacks/test/pack.mcmeta"), "{}");
+    write(
+        &world.join("datapacks/test/pack.mcmeta"),
+        r#"{"pack":{"description":"Reload fixture"}}"#,
+    );
     write(&function, "say old");
     write(
         &world.join("datapacks.json"),
@@ -397,7 +420,10 @@ fn server_reload_delivers_mod_files_overrides_and_preserves_all_data_on_failure(
     );
     let world = root.join("world");
     let pack = world.join("datapacks/test");
-    write(&pack.join("pack.mcmeta"), "{}");
+    write(
+        &pack.join("pack.mcmeta"),
+        r#"{"pack":{"description":"Reload fixture"}}"#,
+    );
     let data = pack.join("data/reload_test/machines/value.json");
     write(&data, "2");
     // Other namespaces and subdirectories join the same directory listener.
@@ -419,7 +445,7 @@ fn server_reload_delivers_mod_files_overrides_and_preserves_all_data_on_failure(
         }),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_game(|game| {
             install_mod_resources(game, &resources, &package);
             game.load_world(request(&world)).unwrap();
@@ -576,7 +602,10 @@ fn server_reload_skips_unparsable_files_and_delivers_the_rest() {
     );
     let world = root.join("world");
     let pack = world.join("datapacks/test");
-    write(&pack.join("pack.mcmeta"), "{}");
+    write(
+        &pack.join("pack.mcmeta"),
+        r#"{"pack":{"description":"Reload fixture"}}"#,
+    );
     let malformed = pack.join("data/reload_test/machines/foo.json");
     write(&malformed, "{bad json");
     write(
@@ -588,7 +617,7 @@ fn server_reload_skips_unparsable_files_and_delivers_the_rest() {
         r#"{"enabled":["file/test"],"disabled":[]}"#,
     );
     let live = Arc::new(Mutex::new(Vec::new()));
-    mod_api::testing::with_mods(
+    mod_platform::testing::with_mods(
         vec![ModEntry::new(
             "reload_test",
             Box::new(SkipHooks(live.clone())),
@@ -654,7 +683,7 @@ fn server_reload_registration_failure_stops_world_open_and_quiet_mods_never_list
         .join("target")
         .join(format!("server-reload-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    mod_api::testing::with_mods(vec![ModEntry::new("quiet", Box::new(Quiet))].into(), || {
+    mod_platform::testing::with_mods(vec![ModEntry::new("quiet", Box::new(Quiet))].into(), || {
         with_game(|game| {
             // A mod that doesn't implement the hook is never subscribed, so
             // world open and `/reload` skip the registration graph.
@@ -672,7 +701,7 @@ fn server_reload_registration_failure_stops_world_open_and_quiet_mods_never_list
         })
     });
     std::fs::remove_dir_all(&root).unwrap();
-    mod_api::testing::with_mods(
+    mod_platform::testing::with_mods(
         vec![ModEntry::new("broken_mod", Box::new(Broken))].into(),
         || {
             with_game(|game| {
@@ -777,7 +806,10 @@ fn server_reload_retains_listeners_for_other_hooks() {
     );
     let world = root.join("world");
     let pack = world.join("datapacks/test");
-    write(&pack.join("pack.mcmeta"), "{}");
+    write(
+        &pack.join("pack.mcmeta"),
+        r#"{"pack":{"description":"Reload fixture"}}"#,
+    );
     let data = pack.join("data/reload_test/machines/value.json");
     write(&data, "2");
     write(
@@ -797,7 +829,7 @@ fn server_reload_retains_listeners_for_other_hooks() {
     let key = ListenerKey::<RetainedData>::new(Identifier::parse("reload_test:kept").unwrap());
     let wrong_type =
         ListenerKey::<CheckListener>::new(Identifier::parse("reload_test:kept").unwrap());
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_game(|game| {
             assert!(game.reload_resources().listener(&key).is_none());
             install_mod_resources(game, &resources, &package);
@@ -865,7 +897,7 @@ fn server_completion_reads_published_data_without_world_access_on_first_open() {
         Box::new(Probe(seen.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_game(|game| {
             game.mod_phase = PhaseOwner::new(ModPhase::Setup);
             let root = std::env::current_dir().unwrap().join("published-world");
@@ -886,65 +918,122 @@ fn server_completion_reads_published_data_without_world_access_on_first_open() {
 }
 
 /// `DataMapsUpdatedEvent`: once for each registry with a type on a world's
-/// first open and after every `/reload`, with the reloaded values readable.
+/// first open and after every `/reload`, with the reloaded values readable
+/// through the handles: a newer file's override, a tag's members, a removal
+/// and an entry with no value, typed.
 #[test]
 #[ignore = "needs prepared resources"]
 fn data_maps_updated_fires_for_each_registry_on_first_open_and_every_reload() {
     use mod_api::{
-        DataMapTypesEvent, DataMapsUpdateCause, DataMapsUpdatedEvent, DataPackFilesEvent, HostSide,
-        NativeDataMapType, ServerHost,
+        BlockKey, DataMap, DataMapError, DataMapTypesEvent, DataMapsUpdateCause,
+        DataMapsUpdatedEvent, DataPackFilesEvent, HostSide, ItemKey, ServerHost, Tag,
     };
     use std::sync::atomic::AtomicUsize;
+
+    fn number(value: &Tag) -> Option<i64> {
+        match value {
+            Tag::Int(value) => Some(i64::from(*value)),
+            Tag::Long(value) => Some(*value),
+            _ => None,
+        }
+    }
+    struct Fuel(&'static str);
+    impl DataMap for Fuel {
+        type Entry = ItemKey;
+        type Value = i64;
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn decode(&self, value: &Tag) -> Option<i64> {
+            number(value)
+        }
+    }
+    struct Hardness;
+    impl DataMap for Hardness {
+        type Entry = BlockKey;
+        type Value = i64;
+        fn id(&self) -> &str {
+            "probe:hardness"
+        }
+        fn decode(&self, value: &Tag) -> Option<i64> {
+            number(value)
+        }
+    }
+    const FUEL: Fuel = Fuel("probe:fuel");
+    /// What one load's listener read: coal, an oak log (through `#minecraft:logs`),
+    /// stone (no entry), coal in a map no mod registered, and stone's hardness.
+    type Reads = [Result<Option<i64>, DataMapError>; 5];
 
     struct Probe {
         loads: Arc<AtomicUsize>,
         seen: Arc<Mutex<Vec<(String, DataMapsUpdateCause)>>>,
+        reads: Arc<Mutex<Vec<Reads>>>,
     }
     #[mod_api::__subscriptions]
     impl Hooks for Probe {
         fn data_map_types(&self, _: &mut dyn ServerHost, event: &mut DataMapTypesEvent<'_>) {
-            for (id, registry) in [
-                ("probe:fuel", "minecraft:item"),
-                ("probe:hardness", "minecraft:block"),
-            ] {
-                event.types.push(NativeDataMapType {
-                    id: id.into(),
-                    registry: registry.into(),
-                });
-            }
+            event.types.push(FUEL.ty());
+            event.types.push(Hardness.ty());
         }
         fn data_pack_files(&self, _: &mut dyn ServerHost, event: &mut DataPackFilesEvent<'_>) {
-            // Each load contributes a value one higher than the last.
-            let burn = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
-            event.files.push((
-                "data_maps/probe:item/fuel".into(),
-                format!(r#"{{"values":{{"minecraft:coal":{burn}}}}}"#).into_bytes(),
-            ));
+            let load = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut push = |key: &str, file: &str| {
+                event.files.push((key.into(), file.as_bytes().to_vec()));
+            };
+            push(
+                "data_maps/probe:item/fuel",
+                r##"{"values":{"minecraft:coal":10,"#minecraft:logs":5}}"##,
+            );
+            push(
+                "data_maps/probe:block/hardness",
+                r#"{"values":{"minecraft:stone":3}}"#,
+            );
+            // The reload adds a newer file over the first: it overrides coal and
+            // takes the logs away.
+            if load > 1 {
+                push(
+                    "data_maps/probe:item/fuel",
+                    r##"{"values":{"minecraft:coal":25},"remove":["#minecraft:logs"]}"##,
+                );
+            }
         }
         fn data_maps_updated(&self, host: HostSide<'_>, event: &mut DataMapsUpdatedEvent<'_>) {
-            assert!(matches!(host, HostSide::Server(_)), "the server's reload");
+            let HostSide::Server(host) = host else {
+                panic!("the server's reload");
+            };
             self.seen
                 .lock()
                 .unwrap()
                 .push((event.registry.to_owned(), event.cause));
+            if event.registry != "minecraft:item" {
+                return;
+            }
+            let host: &dyn Host = &*host;
+            let item = |id: &str| host.item_key(&Identifier::parse(id).unwrap()).unwrap();
+            let stone = mod_api::__private::block_key("minecraft:stone").unwrap();
+            self.reads.lock().unwrap().push([
+                item("minecraft:coal").data(host, &FUEL),
+                item("minecraft:oak_log").data(host, &FUEL),
+                item("minecraft:stone").data(host, &FUEL),
+                item("minecraft:coal").data(host, &Fuel("probe:unregistered")),
+                stone.data(host, &Hardness),
+            ]);
         }
     }
     let loads = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(Mutex::new(Vec::new()));
     let probe = Probe {
         loads: loads.clone(),
         seen: seen.clone(),
+        reads: reads.clone(),
     };
-    mod_api::testing::with_mods(vec![ModEntry::new("probe", Box::new(probe))].into(), || {
+    mod_platform::testing::with_mods(vec![ModEntry::new("probe", Box::new(probe))].into(), || {
         with_game(|game| {
             game.options.dedicated = Some(Vec::new());
             let root =
                 std::env::temp_dir().join(format!("data-maps-updated-{}", std::process::id()));
             game.load_world(request(&root)).unwrap();
-            let reloaded = |game: &crate::game::Game<'_>| {
-                game.native_data_map("minecraft:item", "probe:fuel", "minecraft:coal")
-                    .cloned()
-            };
             let both = |count: usize| -> Vec<(String, DataMapsUpdateCause)> {
                 ["minecraft:item", "minecraft:block"]
                     .into_iter()
@@ -953,12 +1042,33 @@ fn data_maps_updated_fires_for_each_registry_on_first_open_and_every_reload() {
                     .map(|registry| (registry.to_owned(), DataMapsUpdateCause::ServerReload))
                     .collect()
             };
+            let unknown = Err(DataMapError::UnknownType);
             assert_eq!(*seen.lock().unwrap(), both(2));
-            assert_eq!(reloaded(game), Some(serde_json::json!(1)));
+            assert_eq!(
+                *reads.lock().unwrap(),
+                [[Ok(Some(10)), Ok(Some(5)), Ok(None), unknown, Ok(Some(3))]]
+            );
             assert!(game.run_command("reload"));
             assert_eq!(*seen.lock().unwrap(), both(4));
-            assert_eq!(reloaded(game), Some(serde_json::json!(2)));
+            assert_eq!(
+                reads.lock().unwrap()[1],
+                [Ok(Some(25)), Ok(None), Ok(None), unknown, Ok(Some(3))]
+            );
+            // A game that isn't a server holds no maps it may answer, even with
+            // tables built.
+            game.options.dedicated = None;
+            let coal = mod_api::__private::item_key("minecraft:coal").unwrap();
+            assert_eq!(
+                game.item_data_map_value(coal, "probe:fuel"),
+                Err(DataMapError::Unavailable)
+            );
             let _ = std::fs::remove_dir_all(root);
         });
     });
 }
+
+#[path = "villager_secondary_reload_tests.rs"]
+mod villager_secondary_reload_tests;
+
+#[path = "datapack_publication_tests.rs"]
+mod datapack_publication_tests;

@@ -399,6 +399,46 @@ mod knockback_sync_tests {
         assert!(m.velocity.x < 0.0, "velocity {:?}", m.velocity);
         assert!(m.needs_sync);
     }
+    /// `TemptGoal` scales its range by the player's visibility: an invisible
+    /// player five blocks away does not tempt a sulfur cube.
+    #[test]
+    fn an_invisible_player_tempts_a_sulfur_cube_only_within_two_blocks() {
+        use crate::mobs::goals::Cx;
+        use crate::mobs::world::{test_player, with_test_world};
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, _| {
+            for invisible in [false, true] {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(5.5, 64.0, 0.5));
+                p.main_hand = Some("minecraft:iron_ingot".into());
+                p.invisible = invisible;
+                world.player = Some(p);
+                let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+                kind.species = Species::SulfurCube;
+                kind.tempt = Arc::from(vec!["minecraft:iron_ingot".to_string()]);
+                let mut m = Mob::new(1, Arc::new(kind), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                m.ai.goals.add(1, SulfurTempt { player: None });
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("SulfurTempt"));
+                m.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a visible player tempts at five; an invisible one does not"
+        );
+    }
 }
 /// Added controls (H192): the attribute part of `collectEquipmentChanges` on
 /// the cube's own map, with the amounts and ids of the pinned 26.3
@@ -566,6 +606,15 @@ pub(crate) mod adopt_body_tests {
 pub fn archetype(m: &Mob) -> Option<&'static Archetype> {
     m.extra.body_id().and_then(archetype_of)
 }
+/// The explosion data `SulfurCube.explosionData` caches: the adopted body's,
+/// as `collectEquipmentChanges` last took it.
+pub fn adopted_explosion(m: &Mob) -> Option<(i32, f32, bool)> {
+    m.extra
+        .adopted_body
+        .as_deref()
+        .and_then(archetype_of)
+        .and_then(|a| a.explosion)
+}
 /// The archetype whose bounciness, friction and air drag attributes a
 /// sulfur cube's physics use (no other mob has those modifiers).
 pub fn physics(m: &Mob) -> Option<&'static Archetype> {
@@ -580,6 +629,16 @@ pub fn fuse(m: &Mob) -> i32 {
 }
 pub fn primed(m: &Mob) -> bool {
     fuse(m) >= 0
+}
+/// `SulfurCube.tick`: tickFuse removes the cube before super.tick can handle
+/// its portal. This happens even when the TNT explosion gamerule is off.
+pub fn removes_before_portal_tick(m: &Mob) -> bool {
+    if m.species() != super::Species::SulfurCube {
+        return false;
+    }
+    let fuse = fuse(m);
+    let next_fuse = if fuse > 0 { fuse - 1 } else { fuse };
+    next_fuse == 0 && archetype(m).is_some_and(|a| a.explosion.is_some())
 }
 /// `hurtServer`'s priming by a hit whose direct entity is a burning
 /// `AbstractArrow` (an arrow or a trident): a cube with a block that can
@@ -650,6 +709,44 @@ mod burning_arrow_tests {
             .collect();
         let hit = archetype_of("minecraft:tnt").unwrap().hit_sound;
         assert_eq!(sounds, ["entity.tnt.primed", hit]);
+    }
+
+    /// `SulfurCube.ageBoundaryReached` runs only where `AgeableMob.setAge`
+    /// crosses the baby boundary: a loaded adult of size 1 and a big baby
+    /// keep their size, and only a baby growing up becomes size 2 (#14916).
+    #[test]
+    fn only_growing_up_makes_a_cube_size_2() {
+        let mut events = Vec::new();
+        let ran = crate::mobs::world::with_test_world(&[], |w, _| {
+            // `/summon sulfur_cube` without Size or Age: an adult of size 1.
+            let mut adult = cube(None);
+            from_nbt(
+                &mut adult,
+                &horizon_core::nbt::Tag::Compound(Default::default()),
+            );
+            // A split of a size-4 cube: a baby of size 2.
+            let mut baby = cube(None);
+            baby.extra.age = -24000;
+            set_size(&mut baby, 2, true);
+            for tick in 1..=40 {
+                adult.age = tick;
+                baby.age = tick;
+                ai_step(&mut adult, w, &mut events);
+                ai_step(&mut baby, w, &mut events);
+            }
+            assert_eq!((adult.extra.size, adult.attrs.max_health), (1, 4.0));
+            assert!(!adult.is_baby());
+            assert_eq!((baby.extra.size, baby.attrs.max_health), (2, 8.0));
+            // The baby boundary: a cub of size 1 that grows up is size 2.
+            let mut cub = cube(None);
+            cub.extra.age = -1;
+            set_size(&mut cub, 1, true);
+            crate::mobs::finalize::set_age(&mut cub, 0, Some(w));
+            assert_eq!((cub.extra.size, cub.health), (2, 8.0));
+        });
+        if !ran {
+            eprintln!("skipped: needs the prepared 26.3 data");
+        }
     }
 }
 /// Client copy of `tickFuse`: count the fuse down for the renderer. The
@@ -760,13 +857,19 @@ pub fn register(m: &mut Mob) {
     set_size(m, 1, false);
     m.health = m.attrs.max_health;
 }
-/// `setSize`: health 4 per size, speed 0.2 + 0.1 * size; size 1 makes an
-/// adult a baby.
+/// `setSize`: the max health (`setCubeMobHealth`, 4 per size) and movement
+/// speed (0.2 + 0.1 * size, in floats) bases, which the save then holds;
+/// size 1 makes an adult a baby.
 pub fn set_size(m: &mut Mob, size: i32, update_health: bool) {
+    use super::finalize::{Attr, set_base};
     let size = size.clamp(1, 127);
     m.extra.size = size;
-    m.attrs.max_health = (4 * size) as f32;
-    m.attrs.speed = f64::from(0.2f32 + 0.1f32 * size as f32);
+    set_base(m, Attr::MaxHealth, f64::from(4 * size));
+    set_base(
+        m,
+        Attr::MovementSpeed,
+        f64::from(0.2f32 + 0.1f32 * size as f32),
+    );
     if update_health {
         m.health = m.attrs.max_health;
         if size == 1 && !m.is_baby() {
@@ -820,6 +923,10 @@ thread_local! {
     /// a rule change).
     static TNT_EXPLODES: Cell<bool> = const { Cell::new(true) };
 }
+/// The `tnt_explodes` rule this thread's sulfur cubes read.
+pub fn tnt_explodes() -> bool {
+    TNT_EXPLODES.get()
+}
 /// Share the `tnt_explodes` rule with this thread's sulfur cubes.
 pub fn set_tnt_explodes(on: bool) {
     TNT_EXPLODES.set(on);
@@ -830,6 +937,12 @@ pub fn prime(m: &mut Mob, imminent: bool) -> bool {
     let Some((fuse, _, _)) = archetype(m).and_then(|a| a.explosion) else {
         return false;
     };
+    prime_with_fuse(m, imminent, fuse)
+}
+/// `primeTime` with the fuse of the cached `explosionData` (the body
+/// `collectEquipmentChanges` last adopted), which is not the live body's
+/// when the body changed since.
+pub fn prime_with_fuse(m: &mut Mob, imminent: bool, fuse: i32) -> bool {
     if !m.alive() || !TNT_EXPLODES.get() || primed(m) {
         return false;
     }
@@ -1049,7 +1162,7 @@ fn deal_default_knockback(m: &mut Mob, level: &mut DamageLevel<'_>, source: &Dam
     if source.attacker.is_some() {
         knockback(m, (xd, zd), source.from, damage, None);
     } else {
-        m.knockback(level, f64::from(0.4_f32), xd, zd, source);
+        m.knockback(level, f64::from(0.4_f32), xd, zd, source, damage);
     }
 }
 /// `SulfurCube.knockback` with a block and a causing entity: the archetype's powers, turned by
@@ -1145,13 +1258,8 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     if m.extra.scratch[2] > 0 {
         m.extra.scratch[2] -= 1;
     }
-    // ageBoundaryReached: a grown baby is size 2 (and a baby made by
-    // feeding, summoning or the egg is size 1, as `getBreedOffspring` makes it).
-    if !m.is_baby() && m.extra.size == 1 && m.extra.age == 0 && m.age > 1 {
-        set_size(m, 2, true);
-    } else if m.is_baby() && m.extra.size > 1 {
-        set_size(m, 1, true);
-    }
+    // Growing to size 2 is `ageBoundaryReached`, run only where `setAge` crosses
+    // the baby boundary (`finalize::set_age`), never by the tick (#14916).
     let body = has_body(m);
     // collectEquipmentChanges: a swallowed block takes every goal away.
     if body {
@@ -1177,8 +1285,8 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
             m.velocity.y += immersion.min(1.0) * f64::from(0.04f32);
         }
     }
-    if body && let Some(p) = &w.player {
-        player_push(m, p, events);
+    if body && let Some(p) = w.selected_player() {
+        player_push(m, p, w, events);
     }
 }
 /// `SulfurCube.doPush` / `applyContactDamage`, for ordinary mob targets.
@@ -1198,7 +1306,7 @@ pub fn mob_contacts(m: &Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
             && other.bounds.intersects(bounds)
             && crate::scoreboard::pushable_by(own_team, w.teams.of(super::Who::Mob(other.id)), true)
         {
-            events.push(MobEvent::AttackMob {
+            events.push(MobEvent::DamageMob {
                 target: other.id,
                 amount,
                 source: Damage::of(DamageKind::SulfurCubeHot),
@@ -1209,7 +1317,7 @@ pub fn mob_contacts(m: &Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
 
 /// `playerTouch` / `playerPush`: a cube holding a block is shoved by a
 /// player walking into it (and burns them when hot).
-fn player_push(m: &mut Mob, p: &super::PlayerView, events: &mut Vec<MobEvent>) {
+fn player_push(m: &mut Mob, p: &super::PlayerView, w: &MobWorld, events: &mut Vec<MobEvent>) {
     if !p.alive || p.spectator {
         return;
     }
@@ -1246,11 +1354,11 @@ fn player_push(m: &mut Mob, p: &super::PlayerView, events: &mut Vec<MobEvent>) {
     }
     m.velocity = m.velocity.add_vector(push);
     if let Some(amount) = a.and_then(|a| a.contact_damage) {
-        events.push(MobEvent::DamagePlayer {
+        events.push(w.route_player_event(MobEvent::DamagePlayer {
             amount,
             from: [m.position.x, m.position.y, m.position.z],
             kind: "minecraft:sulfur_cube_hot",
-        });
+        }));
     }
 }
 /// `SulfurCubeRenderer.scale` (after the cube's size and squish, flat when
@@ -1321,7 +1429,9 @@ impl Goal for SulfurTempt {
         LOOK
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        let Some(p) = &cx.w.player else { return false };
+        let Some(p) = cx.w.selected_player() else {
+            return false;
+        };
         let wants = |i: &Option<std::sync::Arc<str>>| {
             i.as_deref().is_some_and(|i| {
                 if m.is_baby() {
@@ -1331,16 +1441,19 @@ impl Goal for SulfurTempt {
                 }
             })
         };
-        // Attributes.TEMPT_RANGE 8.
+        // Attributes.TEMPT_RANGE 8, scaled by visibility (floor 2).
+        let range = (8.0 * p.visibility_percent(m.species())).max(2.0);
         let ok = p.alive
             && !p.spectator
             && (wants(&p.main_hand) || wants(&p.off_hand))
-            && m.distance_sqr(p.position) <= 64.0;
+            && m.distance_sqr(p.position) <= range * range;
         self.player = ok.then_some(p.eye);
         ok
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        let Some(p) = &cx.w.player else { return };
+        let Some(p) = cx.w.selected_player() else {
+            return;
+        };
         if m.distance_sqr(p.position) < 1.0 {
             super::cube::set_wanted(m, 0.0);
             return;
@@ -1401,13 +1514,24 @@ pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
     };
     m.extra.age = int("Age").unwrap_or(0);
     m.extra.age_locked = int("AgeLocked").unwrap_or(0) != 0;
-    let health = m.health;
     set_size(m, int("Size").unwrap_or(0) + 1, false);
-    m.health = if tag.get("Health").is_some() {
-        health
-    } else {
-        m.attrs.max_health
-    };
+    // LivingEntity's load applies the saved bases after the size, so they win.
+    if let Some(Tag::List(saved)) = tag.get("attributes") {
+        use super::finalize::{Attr, set_base};
+        for a in saved {
+            let attr = match crate::save::text(a.get("id")).as_deref() {
+                Some("minecraft:max_health") => Attr::MaxHealth,
+                Some("minecraft:movement_speed") => Attr::MovementSpeed,
+                _ => continue,
+            };
+            if let Some(base) = crate::save::float(a.get("base")) {
+                set_base(m, attr, base);
+            }
+        }
+    }
+    // The saved Health, not the one the living load's Health Boost clamp cut
+    // to the unsized maximum: vanilla sizes the cube before `setHealth`.
+    m.health = crate::save::float(tag.get("Health")).map_or(m.attrs.max_health, |h| h as f32);
     m.extra.flag2 = int("wasOnGround").unwrap_or(0) != 0;
     m.extra.ints[3] = int("pickup_timer").unwrap_or(0);
     m.extra.scratch[3] = int("from_bucket").unwrap_or(0);
@@ -1805,7 +1929,7 @@ mod mob_contact_tests {
                     let hits: Vec<_> = events
                         .iter()
                         .filter_map(|event| match event {
-                            MobEvent::AttackMob {
+                            MobEvent::DamageMob {
                                 target,
                                 amount,
                                 source,

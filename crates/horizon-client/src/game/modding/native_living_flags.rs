@@ -335,12 +335,27 @@ impl Game<'_> {
         };
         let mut world = FlagClimbing {
             world: &self.world,
+            context: &self.loop_context,
+            entity: living.id(),
             position: BlockPos::containing(position),
             spectator,
             gliding,
         };
         Some(climbing::on_climbable(&mut world, &self.motion.climbing).unwrap_or(false))
     }
+    /// The climbing decision for a mob currently lent out of the game's list.
+    pub(super) fn native_mob_is_climbing(&self, mob: &horizon_client::mobs::Mob) -> bool {
+        let mut world = FlagClimbing {
+            world: &self.world,
+            context: &self.loop_context,
+            entity: mob.id,
+            position: BlockPos::containing(mob.position),
+            spectator: false,
+            gliding: mob.extra.fall_flying,
+        };
+        climbing::on_climbable(&mut world, &self.motion.climbing).unwrap_or(false)
+    }
+
     /// Whether the entity is a baby (`LivingEntity.isBaby`): a mob answers
     /// from its age, negative until it grows up. A player, an armor stand
     /// and the dragon are never babies.
@@ -364,6 +379,8 @@ impl Game<'_> {
 /// walks the level the flag's entity stands in, at its feet.
 struct FlagClimbing<'a> {
     world: &'a horizon_client::world::World,
+    context: &'a horizon_world::native_load_context::LoopContext,
+    entity: u32,
     position: BlockPos,
     spectator: bool,
     gliding: bool,
@@ -387,15 +404,26 @@ impl ClimbingWorld for FlagClimbing<'_> {
         Ok(self.world.block(p.x, p.y, p.z))
     }
     fn set_last_climbable_position(&mut self, _: BlockPos) {}
+    fn adjust_ladder(&mut self, position: BlockPos, state: BlockStateId, tagged: bool) -> bool {
+        let mut ladder = tagged;
+        horizon_client::motion::native_is_ladder(
+            self.context,
+            self.entity,
+            position,
+            state,
+            &mut ladder,
+        );
+        ladder
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::game) mod tests {
     use super::super::Game;
     use super::super::native_entity_refs::tests::with_game;
     use horizon_client::mobs::{Mob, villager};
     use horizon_core::geometry::Vec3;
-    use mod_api::{EntityRef, LivingRef, NativeWorldEpoch};
+    use mod_api::{EntityRef, LivingRef, WorldEpoch};
 
     /// A live cow `id` at `(5.5, 64, 5.5)`, with its handle.
     fn cow(game: &mut Game<'_>, id: u32) -> LivingRef {
@@ -493,7 +521,7 @@ mod tests {
             assert_eq!(game.living_baby(mob), Some(false));
             // A stale handle reads None and writes false.
             let stale = LivingRef::new(EntityRef::new(
-                NativeWorldEpoch::new(mob.entity().epoch().get() + 1),
+                WorldEpoch::new(mob.entity().epoch().get() + 1),
                 12,
             ));
             assert!(game.mob(stale.entity()).is_none());
@@ -524,7 +552,7 @@ mod tests {
                 Flow::Continue
             }
         }
-        mod_api::testing::with_mods(
+        mod_platform::testing::with_mods(
             vec![ModEntry::new("join_persist", Box::new(Joiner))].into(),
             || {
                 with_game(|game| {
@@ -559,7 +587,7 @@ mod tests {
         });
     }
 
-    fn guest_server(game: &mut Game<'_>, dedicated: bool, owner: bool) {
+    pub(in crate::game) fn guest_server(game: &mut Game<'_>, dedicated: bool, owner: bool) {
         use super::super::{execution_role::ExecutionRole, lan::LanSettings};
         use horizon_client::lan::{NetConfig, hub::HubConfig};
         game.options.execution_role = if dedicated {
@@ -601,7 +629,7 @@ mod tests {
         );
     }
 
-    fn guest(
+    pub(in crate::game) fn guest(
         game: &mut Game<'_>,
         conn: u32,
     ) -> (
@@ -667,7 +695,7 @@ mod tests {
         }
     }
 
-    fn sync_guests(game: &mut Game<'_>) {
+    pub(in crate::game) fn sync_guests(game: &mut Game<'_>) {
         use horizon_client::lan::hub::TickCtx;
         let mut ctx = TickCtx {
             world: &mut game.world,
@@ -675,6 +703,7 @@ mod tests {
             next_entity: &mut game.next_entity,
             spawn: [0.0, 64.0, 0.0],
             spawn_angle: [0.0; 2],
+            sea_level: 63,
             difficulty: 1,
             difficulty_locked: false,
             clock_rate: 1.0,
@@ -688,7 +717,7 @@ mod tests {
         game.lan.as_mut().unwrap().hub.tick_level(&mut ctx);
     }
 
-    fn packets(
+    pub(in crate::game) fn packets(
         rx: &std::sync::mpsc::Receiver<horizon_client::lan::Out>,
     ) -> Vec<horizon_protocol::packets::play::Clientbound> {
         use horizon_client::lan::Out;
@@ -1239,6 +1268,95 @@ mod tests {
                     .map(String::as_str),
                 Some("false")
             );
+        });
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_block_part_decides_what_a_living_entity_climbs() {
+        use horizon_client::motion::{MotionWorld, PlayerMotion};
+        use horizon_core::position::BlockPos;
+
+        // The fixture's parts: glass is a ladder to even entity ids, a vine to none.
+        mod_platform::__private::part_tests::ladder_game_thread();
+        // The client library asks the mods through the executable's callbacks.
+        crate::entry::install_client_hooks();
+        with_game(|game| {
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            let registry = game.pack.assets.registry;
+            let state = |name: &str| registry.default_state(name).unwrap();
+            let (glass, vine, ladder, stone) = (
+                state("minecraft:glass"),
+                state("minecraft:vine"),
+                state("minecraft:ladder"),
+                state("minecraft:stone"),
+            );
+            let at = |game: &Game<'_>, id: u32| {
+                let mob = game.mobs.iter().find(|m| m.id == id).unwrap();
+                mob.on_climbable(&game.mob_world_base(&[]))
+            };
+            let even = cow(game, 20);
+            let odd = cow(game, 21);
+            // The cows stand in air: no tag, no part, so neither climbs.
+            for mob in [even, odd] {
+                assert_eq!(game.living_is_climbing(mob), Some(false));
+            }
+            assert!(!at(game, 20) && !at(game, 21));
+
+            // Allow: the part makes glass climbable for the even id only, as the flag a mod reads
+            // and as the mob's own climbing decide.
+            game.world.set(5, 64, 5, glass).unwrap();
+            assert_eq!(game.living_is_climbing(even), Some(true));
+            assert_eq!(game.living_is_climbing(odd), Some(false));
+            assert!(at(game, 20) && !at(game, 21));
+
+            // Deny: the vine is tagged `climbable`, and its part says no.
+            game.world.set(5, 64, 5, vine).unwrap();
+            for mob in [even, odd] {
+                assert_eq!(game.living_is_climbing(mob), Some(false));
+            }
+            assert!(!at(game, 20) && !at(game, 21));
+
+            // Default: a block with no part keeps vanilla's answer, either way.
+            game.world.set(5, 64, 5, ladder).unwrap();
+            for mob in [even, odd] {
+                assert_eq!(game.living_is_climbing(mob), Some(true));
+            }
+            assert!(at(game, 20) && at(game, 21));
+            game.world.set(5, 64, 5, stone).unwrap();
+            for mob in [even, odd] {
+                assert_eq!(game.living_is_climbing(mob), Some(false));
+            }
+
+            // The player's own motion asks the same parts, with the player's entity id.
+            let climbs = |game: &mut Game<'_>, id: i32| {
+                let mut player = PlayerMotion::new(game.motion, Vec3::new(5.5, 64.0, 5.5)).unwrap();
+                player.entity_id = id;
+                let mut world = MotionWorld {
+                    entities: &[],
+                    player: &mut player,
+                    scene: &mut game.world,
+                    assets: &game.pack.assets,
+                    collision_binding: game.collision,
+                    resources: game.motion,
+                    health: &game.health_resources,
+                    tag_items: Some(game.res.items()),
+                    loop_context: &game.loop_context,
+                    damage_hooks: &game.damage_hooks,
+                    block_registries: Some(&game.ui.registries),
+                };
+                let climbing = world.climbable().unwrap();
+                (climbing, player.last_climbable)
+            };
+            game.world.set(5, 64, 5, glass).unwrap();
+            assert_eq!(climbs(game, 30), (true, Some(BlockPos::new(5, 64, 5))));
+            assert_eq!(climbs(game, 31), (false, None));
+            game.world.set(5, 64, 5, vine).unwrap();
+            assert_eq!(climbs(game, 30), (false, None));
+            game.world.set(5, 64, 5, ladder).unwrap();
+            assert_eq!(climbs(game, 31), (true, Some(BlockPos::new(5, 64, 5))));
         });
     }
 }

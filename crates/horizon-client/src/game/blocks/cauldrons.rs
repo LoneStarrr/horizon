@@ -11,18 +11,7 @@ impl Game<'_> {
         pos: [i32; 3],
         held: Option<&ItemStack>,
     ) -> horizon_client::cauldron::Outcome {
-        use horizon_client::cauldron::{self, Outcome};
-        let Some(held) = held else {
-            return Outcome::Pass;
-        };
-        if self.keys.held(Mapping::Sneak) {
-            return Outcome::Pass;
-        }
-        let Some((state, under_water)) = self.cauldron_at(pos) else {
-            return Outcome::Pass;
-        };
-        let removes_dye = cauldron::removes_dye(self.items(), &held.item);
-        cauldron::outcome(&state, under_water, removes_dye, held)
+        self.client_cauldron_prediction(pos, held).0
     }
     /// `CauldronInteractions` for the held item aimed at a cauldron.
     pub(super) fn use_on_cauldron(&mut self, pos: [i32; 3]) -> Result<bool> {
@@ -35,6 +24,12 @@ impl Game<'_> {
             return Ok(false);
         };
         let removes_dye = cauldron::removes_dye(self.items(), &held.item);
+        let table = cauldron_interactions::snapshot();
+        let entry = table.select(&state.name, &held.item, removes_dye);
+        if let Some(cauldron::interactions::Entry::Mod(callback)) = &entry {
+            return Ok(self.use_mod_cauldron(pos, under_water, callback, &table));
+        }
+
         let slot = self.held_slot();
         let player = self.native_acting_id();
         if self.transactions.is_empty() {
@@ -44,7 +39,8 @@ impl Game<'_> {
                 slot,
                 dropper: None,
             };
-            let result = cauldron::interact(&state, under_water, removes_dye, &mut hand);
+            let result =
+                cauldron::interact_selected(&state, under_water, entry.as_ref(), &mut hand);
             if result.outcome == Outcome::Pass {
                 return Ok(false);
             }
@@ -71,6 +67,9 @@ impl Game<'_> {
                     pitch: 1.0,
                 });
             }
+            if let Some(event) = result.fluid_event {
+                self.post_block_game_event(event, pos, None, None);
+            }
             return Ok(true);
         }
         let outcome = mod_api::run_transaction(self, |game, _| {
@@ -81,7 +80,8 @@ impl Game<'_> {
                 slot,
                 dropper: Some(player),
             };
-            let result = cauldron::interact(&state, under_water, removes_dye, &mut hand);
+            let result =
+                cauldron::interact_selected(&state, under_water, entry.as_ref(), &mut hand);
             if result.outcome == Outcome::Pass {
                 return Err(());
             }
@@ -108,6 +108,9 @@ impl Game<'_> {
                     volume: 1.0,
                     pitch: 1.0,
                 });
+            }
+            if let Some(event) = result.fluid_event {
+                game.post_block_game_event(event, pos, None, None);
             }
             Ok(())
         });

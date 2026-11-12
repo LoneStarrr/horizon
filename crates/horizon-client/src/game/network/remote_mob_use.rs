@@ -146,6 +146,15 @@ impl Game<'_> {
             | Species::TropicalFish
             | Species::Pufferfish
             | Species::Axolotl => item == "minecraft:water_bucket",
+            // SulfurCube.mobInteract ends in Bucketable.bucketMobPickup, which
+            // also runs on a client: an empty bucket on an unprimed adult
+            // (its swallowable items and shears are answered before that).
+            Species::SulfurCube => {
+                item == "minecraft:bucket"
+                    && !baby
+                    && !horizon_client::mobs::sulfur_cube::primed(m)
+                    && !horizon_client::mobs::sulfur_cube::swallowable(m, item)
+            }
             // Tadpole.mobInteract: frog food (not while age locked), else the bucket.
             Species::Tadpole => {
                 item == "minecraft:water_bucket"
@@ -160,15 +169,15 @@ impl Game<'_> {
             Species::Creeper => {
                 matches!(item, "minecraft:flint_and_steel" | "minecraft:fire_charge")
             }
-            // PiglinAi.mobInteract: an adult admires what it loves.
+            // Piglin.mobInteract on a client: PiglinAi.canAdmire (an adult and
+            // barter currency; the client's brain holds no admiring memories),
+            // unless getArmPose is ADMIRING_ITEM (a loved off-hand item, and
+            // not dancing).
             Species::Piglin => {
                 !baby
-                    && self
-                        .res
-                        .items()
-                        .item_tags
-                        .get("minecraft:piglin_loved")
-                        .is_some_and(|tag| tag.contains(item))
+                    && stack.is_some_and(|s| self.piglin_currency(s))
+                    && (m.extra.scratch[0] > 0
+                        || !m.extra.off_hand_id().is_some_and(|o| self.piglin_loved(o)))
             }
             _ => false,
         }

@@ -1,134 +1,5 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
 use super::*;
-#[derive(Clone)]
-pub(crate) struct PlaceProviderPart {
-    pub(crate) mod_id: &'static str,
-    pub(crate) mod_index: usize,
-    pub(crate) provider: Arc<dyn PlaceProvider>,
-}
-
-/// A tooltip appender a mod registered, as the game reads it ([`tooltip_appenders`]).
-#[derive(Clone)]
-// exhaustive: its fields are private, so mods cannot build or destructure it
-pub struct TooltipAppenderPart {
-    pub(crate) mod_id: &'static str,
-    pub(crate) mod_index: usize,
-    pub(crate) component: Box<str>,
-    pub(crate) placement: crate::TooltipPlacement,
-    pub(crate) appender: Arc<dyn crate::TooltipAppender>,
-}
-
-impl TooltipAppenderPart {
-    /// The data component whose stacks it is asked about.
-    pub fn component(&self) -> &str {
-        &self.component
-    }
-    /// Where its lines go among the other components' lines.
-    pub fn placement(&self) -> &crate::TooltipPlacement {
-        &self.placement
-    }
-    /// The appender that adds the lines.
-    pub fn appender(&self) -> &dyn crate::TooltipAppender {
-        self
-    }
-    /// Whether its mod is enabled.
-    pub fn enabled(&self) -> bool {
-        crate::mod_index_on(self.mod_index)
-    }
-}
-
-impl crate::TooltipAppender for TooltipAppenderPart {
-    fn append(
-        &self,
-        host: &dyn crate::ClientHost,
-        stack: &crate::ItemStack,
-        context: &crate::TooltipAppendContext,
-        lines: &mut Vec<(crate::Text, u32)>,
-    ) {
-        let _guard = crate::crash::enter_native_mod(crate::crash::NativeModCall {
-            id: self.mod_id,
-            hook: "tooltip_appender",
-            part: Some(std::any::type_name_of_val(&*self.appender)),
-        });
-        self.appender.append(host, stack, context, lines);
-    }
-}
-
-/// The tooltip appenders the mods registered, in registration order.
-pub fn tooltip_appenders() -> &'static [TooltipAppenderPart] {
-    installed().map_or(&[], |installed| &installed.keys.tooltip_appenders)
-}
-/// What answers an item capability for one item: given where the stack lives, its handler, or
-/// none to leave it to the next provider. A closure is one.
-pub trait ItemCapabilityProvider<T: ?Sized>: Send + Sync {
-    /// The handler for the stack at `at`, or none.
-    fn provide(&self, host: &mut dyn ServerHost, at: &ItemPlace) -> Option<Box<T>>;
-}
-impl<T: ?Sized, F> ItemCapabilityProvider<T> for F
-where
-    F: Fn(&mut dyn ServerHost, &ItemPlace) -> Option<Box<T>> + Send + Sync,
-{
-    fn provide(&self, host: &mut dyn ServerHost, at: &ItemPlace) -> Option<Box<T>> {
-        self(host, at)
-    }
-}
-/// An item capability provider, as the registrar keeps it.
-pub type ItemProvider<T> = dyn ItemCapabilityProvider<T>;
-
-/// An item registration request that the loaded item registry cannot resolve.
-#[derive(Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ItemKeyError {
-    /// The requesting mod.
-    pub mod_id: &'static str,
-    /// The canonical requested item id.
-    pub id: String,
-}
-
-impl HookParts {
-    pub(crate) fn item<'k>(
-        &self,
-        id: impl FnOnce() -> Option<&'k str>,
-    ) -> &[Attached<dyn ItemPart>] {
-        attached(&self.items, id)
-    }
-}
-
-impl dyn Registrar + '_ {
-    /// Attach `part` to every item in tag `tag` (`minecraft:axes`, without `#`).
-    pub fn item_part_tag<P: ItemPart>(&mut self, tag: &str, part: P) {
-        self.attach_item_part_tag(tag, type_name::<P>(), Arc::new(part));
-    }
-    /// Attach `part` to item `item` (`mymod:wrench`).
-    pub fn item_part<P: ItemPart>(&mut self, item: crate::ItemKey, part: P) {
-        self.attach_item_part(item, type_name::<P>(), Arc::new(part));
-    }
-    /// Answer item capability `key` for item `item` (`mymod:backpack`) with `provider`, which
-    /// gives a handler for the stack at one place, or none: `r.item_capability(&ITEM_ITEMS,
-    /// "mymod:backpack", |_, _| Some(Box::new(Backpack)))`. Asked as
-    /// `block_entity_capability`'s are.
-    pub fn item_capability<T: ?Sized + 'static>(
-        &mut self,
-        key: &ItemCapabilityKey<T>,
-        item: &str,
-        provider: impl Fn(&mut dyn ServerHost, &ItemPlace) -> Option<Box<T>> + Send + Sync + 'static,
-    ) {
-        self.provide_item_capability(
-            key.name,
-            item,
-            false,
-            ItemProviderOf::of(Arc::new(provider)),
-        );
-    }
-    /// `item_capability`, asked ahead of the game's own provider.
-    pub fn item_capability_before_game<T: ?Sized + 'static>(
-        &mut self,
-        key: &ItemCapabilityKey<T>,
-        item: &str,
-        provider: impl Fn(&mut dyn ServerHost, &ItemPlace) -> Option<Box<T>> + Send + Sync + 'static,
-    ) {
-        self.provide_item_capability(key.name, item, true, ItemProviderOf::of(Arc::new(provider)));
-    }
-}
 
 /// Fixtures that tests of other crates use to install Parts.
 #[cfg(any(test, feature = "testing"))]
@@ -146,9 +17,11 @@ pub mod tests {
     /// Two three-slot game chests, `FROM`, holding `from`, and an empty `INTO`.
     pub(crate) fn two_chests(from: [Option<ItemStack>; 3]) -> FakeHost {
         let mut host = FakeHost::new();
-        host.level.block_entity(FROM).items = Some(FakeContainer {
-            slots: from.into(),
-            limit: 64,
+        host.level.block_entity(FROM).items = Some({
+            let mut value = FakeContainer::new(0);
+            value.slots = from.into();
+            value.limit = 64;
+            value
         });
         host.level.block_entity(INTO).with_items(3);
         host
@@ -190,7 +63,7 @@ pub mod tests {
         player.slots.extend(main_hand.map(|stack| (5, stack)));
         host.level.entity(2, "minecraft:pig");
         host.level.entity(3, "test:robot");
-        let nether = LevelRef::new(NativeWorldEpoch::new(1), crate::DimensionKey::NETHER);
+        let nether = LevelRef::new(WorldEpoch::new(1), crate::DimensionKey::NETHER);
         host.players.join(4, 4, nether);
         let head = [("slot".into(), Tag::String("head".into()))];
         host.registries
@@ -209,7 +82,6 @@ pub mod tests {
 
     use super::*;
     use crate::parts::tests::*;
-    use crate::*;
 
     #[test]
     pub(crate) fn item_keys_validate_forward_references_and_reused_slots() {
@@ -221,14 +93,24 @@ pub mod tests {
                 let vanilla = r.item_key("stick");
                 assert_eq!(vanilla, r.item_key("minecraft:stick"));
                 let later = r.item_key("later:widget");
-                assert_eq!(crate::ItemKey::from_slot(vanilla.0), Ok(vanilla));
-                assert!(crate::ItemKey::from_slot(later.0 + 1).is_err());
+                assert_eq!(
+                    mod_vocab::__private::parts_installation::validate_item_key(
+                        mod_vocab::__private::parts_installation::item_key_slot(vanilla)
+                    ),
+                    Ok(vanilla)
+                );
+                assert!(
+                    mod_vocab::__private::parts_installation::validate_item_key(
+                        mod_vocab::__private::parts_installation::item_key_slot(later) + 1
+                    )
+                    .is_err()
+                );
                 *self.0.lock().unwrap() = vec![vanilla, later];
             }
         }
         let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mods: Mods = vec![ModEntry::new("requester", Box::new(Keys(keys.clone())))].into();
-        crate::install(mods.clone());
+        crate::__private::install(mods.clone());
         install_parts(&mods, &crate::parts::tests::rule_schema(), |_| false).unwrap();
         let check = |known: &dyn Fn(&str) -> bool| {
             resolve_parts(
@@ -243,10 +125,13 @@ pub mod tests {
         check(&|id| ["minecraft:stick", "later:widget"].contains(&id)).unwrap();
         let keys = keys.lock().unwrap();
         assert_eq!(
-            crate::registry_keys::item_id(keys[0]),
+            mod_vocab::__private::parts_installation::item_id(keys[0]),
             Some("minecraft:stick")
         );
-        assert_eq!(crate::registry_keys::item_id(keys[1]), Some("later:widget"));
+        assert_eq!(
+            mod_vocab::__private::parts_installation::item_id(keys[1]),
+            Some("later:widget")
+        );
         let super::ResolvePartsError::ItemKeys(errors) =
             check(&|id| id == "minecraft:stick").unwrap_err()
         else {
@@ -254,59 +139,11 @@ pub mod tests {
         };
         assert_eq!(
             errors,
-            [super::ItemKeyError {
-                mod_id: "requester",
-                id: "later:widget".into()
-            }]
+            [mod_vocab::__private::parts_installation::item_key_error(
+                "requester",
+                "later:widget".into()
+            )]
         );
-    }
-
-    #[test]
-    pub(crate) fn tooltip_appender_restores_owner_even_on_panic() {
-        install_parts(&[], &crate::parts::tests::rule_schema(), |_| false).unwrap();
-        struct Check(bool);
-        impl TooltipAppender for Check {
-            fn append(
-                &self,
-                _: &dyn ClientHost,
-                _: &ItemStack,
-                _: &TooltipAppendContext,
-                _: &mut Vec<(Text, u32)>,
-            ) {
-                assert_eq!(crate::crash::current_native_mod(), Some("inner"));
-                assert!(!self.0, "test unwind");
-            }
-        }
-        let context = TooltipAppendContext {
-            player: 0,
-            player_entity_id: 0,
-            advanced: false,
-            creative: false,
-            nested: false,
-        };
-        let stack = stick();
-        let outer = crate::crash::enter_native_mod(crate::crash::NativeModCall {
-            id: "outer",
-            hook: "outer",
-            part: None,
-        });
-        for panic in [false, true] {
-            let part = super::TooltipAppenderPart {
-                mod_id: "inner",
-                mod_index: 0,
-                component: "test:item".into(),
-                placement: TooltipPlacement::AfterAll,
-                appender: std::sync::Arc::new(Check(panic)),
-            };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                part.appender()
-                    .append(&NoHost, &stack, &context, &mut Vec::new())
-            }));
-            assert_eq!(result.is_err(), panic);
-            assert_eq!(crate::crash::current_native_mod(), Some("outer"));
-        }
-        drop(outer);
-        assert_eq!(crate::crash::current_native_mod(), None);
     }
 
     /// A pipe's item capability, reached through `.0`: one slot from every side but its top,
@@ -404,10 +241,10 @@ pub mod tests {
     }
 
     pub(crate) fn fixture_item_key(id: &str) -> ItemKey {
-        if super::super::installed().is_none() {
+        if !mod_vocab::__private::parts_installation::parts_installed() {
             install_parts(&[], &crate::parts::tests::rule_schema(), |_| false).unwrap();
         }
-        crate::registry_keys::resolve_items([
+        mod_vocab::__private::resolve_items([
             "minecraft:stick",
             "minecraft:iron_helmet",
             "minecraft:iron_sword",
@@ -435,7 +272,7 @@ pub mod tests {
             "test:robot",
         ])
         .unwrap();
-        crate::registry_keys::item_key(id).expect("explicit fixture item")
+        mod_vocab::__private::item_key(id).expect("explicit fixture item")
     }
 
     pub(crate) fn stack(item: &str, count: u32, damage: u32) -> ItemStack {
@@ -711,7 +548,7 @@ pub mod tests {
     pub(crate) fn a_players_items_are_their_inventory_and_each_index_takes_only_what_fits_there() {
         install_parts(&[], &crate::parts::tests::rule_schema(), |_| false).unwrap();
         game_thread();
-        let entity = |id| EntityRef::new(NativeWorldEpoch::new(1), id);
+        let entity = |id| EntityRef::new(WorldEpoch::new(1), id);
         let helmet = || stack("minecraft:iron_helmet", 1, 0);
         let mut player = player_world(Some(stack("minecraft:stick", 60, 0)));
         player_mut(&mut player)
@@ -773,7 +610,7 @@ pub mod tests {
      {
         install_parts(&[], &crate::parts::tests::rule_schema(), |_| false).unwrap();
         game_thread();
-        let entity = |id| EntityRef::new(NativeWorldEpoch::new(1), id);
+        let entity = |id| EntityRef::new(WorldEpoch::new(1), id);
         let mut player = player_world(None);
         let host: &mut dyn ServerHost = &mut player;
         // A pig has no items; a mod's robot has its provider's; a player in a parked level
@@ -789,10 +626,12 @@ pub mod tests {
     pub(crate) fn items(stacks: impl IntoIterator<Item = ItemStack>) -> u32 {
         stacks
             .into_iter()
-            .map(|s| match crate::registry_keys::item_id(s.item()).unwrap() {
-                "test:pouch" | "test:bag" => s.count() * (1 + s.damage()),
-                _ => s.count(),
-            })
+            .map(
+                |s| match mod_vocab::__private::parts_installation::item_id(s.item()).unwrap() {
+                    "test:pouch" | "test:bag" => s.count() * (1 + s.damage()),
+                    _ => s.count(),
+                },
+            )
             .sum()
     }
     #[cfg(test)]
@@ -836,6 +675,10 @@ pub mod tests {
     impl mod_api::prelude::LevelsBackend for Shelf {
         fn level_in_place(&self, level: LevelRef) -> bool {
             level == here()
+        }
+        /// The shelf stands in no named block, so no block's providers answer for it.
+        fn level_block(&self, _: LevelRef, _: [i32; 3]) -> Option<crate::BlockKey> {
+            None
         }
     }
     #[cfg(test)]
@@ -938,7 +781,7 @@ pub mod tests {
     #[cfg(test)]
     impl Host for Shelf {
         fn backend(&self) -> Option<BackendRef<'_>> {
-            Some(BackendRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_ref(self))
         }
     }
     #[cfg(test)]
@@ -946,18 +789,20 @@ pub mod tests {
     #[cfg(test)]
     impl ServerHost for Shelf {
         fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {
-            Some(BackendMutRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_mut_ref(
+                self,
+            ))
         }
     }
     #[cfg(test)]
     mod_api::impl_server_host_areas!(Shelf, except(mod_state));
     #[cfg(test)]
     impl crate::prelude::ModStateServerHost for Shelf {
-        fn transaction_open(&mut self, _: TransactionSeal) {
-            self.journal.open(self.slots.clone());
+        fn transaction_open(&mut self) -> TransactionSeal {
+            self.journal.open(self.slots.clone())
         }
-        fn transaction_close(&mut self, _: TransactionSeal, commit: bool) {
-            if let Some(slots) = self.journal.close(commit) {
+        fn transaction_close(&mut self, seal: &TransactionSeal, commit: bool) {
+            if let Some(slots) = self.journal.close(seal, commit) {
                 self.slots = slots;
             }
         }
@@ -1264,19 +1109,25 @@ pub mod tests {
         let mut world = two_chests([Some(stack("minecraft:stick", 5, 0)), None, None]);
         let host: &mut dyn ServerHost = &mut world;
         let from = here().capability(host, &ITEMS, FROM, None).unwrap();
-        let liar: Capability<dyn ResourceHandler<ItemResource>> = Capability {
-            handler: Box::new(TakesMore),
-            owner: Some("doubler"),
-        };
+        let liar: Capability<dyn ResourceHandler<ItemResource>> =
+            mod_vocab::__private::parts_installation::test_capability(
+                Box::new(TakesMore),
+                Some("doubler"),
+            );
         let moved =
             host.transaction(|host, tx| move_resources(host, &from, &liar, |_| true, 64, tx));
         let owner = "doubler".to_owned();
-        assert_eq!(moved, Err(Overanswered { owner }));
+        assert_eq!(
+            moved,
+            Err(mod_vocab::__private::parts_installation::overanswered(
+                owner
+            ))
+        );
         assert_eq!(
             chest(&mut world, FROM).slots[0],
             Some(stack("minecraft:stick", 5, 0))
         );
-        assert!(crate::item_place::warned_about("doubler"));
+        assert!(crate::parts::warned_about("doubler"));
     }
 
     #[test]
@@ -1524,7 +1375,7 @@ pub mod tests {
         let bread = stack("minecraft:bread", 3, 0);
         assert_eq!(exchange(&mut shelf_, &shelf_slot(0), bread.clone()), 3);
         assert_eq!(shelf_.slots, [Some(bread), None, None]);
-        assert!(!crate::item_place::warned_about("the game"));
+        assert!(!crate::parts::warned_about("the game"));
 
         // A transfer amount is not a resident stack: 128 offered, one accepted,
         // and a 127-item remainder are valid even though this slot's maximum is 64.
@@ -1565,7 +1416,7 @@ pub mod tests {
         // Offered 2 apples, it keeps none and answers 7 taken: undone, and the slot stays empty.
         assert_eq!(insert(&mut shelf_, &shelf_slot(1), apples(2)), 0);
         assert_eq!(shelf_.slots, [Some(apples(10)), None, None]);
-        assert!(crate::item_place::warned_about("doubler"));
+        assert!(crate::parts::warned_about("doubler"));
     }
 
     #[test]
@@ -1820,7 +1671,7 @@ pub mod tests {
             })
             .unwrap();
             assert!(player_of(&p).given.is_empty());
-            assert!(crate::item_place::warned_about("doubler"));
+            assert!(crate::parts::warned_about("doubler"));
         }
     }
 
@@ -1858,13 +1709,13 @@ pub mod tests {
             insert(&mut player, &charm, stack("minecraft:stick", 3, 0)),
             3
         );
-        assert!(crate::set_mod_enabled("chemist", false));
+        assert!(crate::__private::set_mod_enabled("chemist", false));
         assert_eq!(
             charm.amount(&mut player),
             3,
             "another mod's flag is independent"
         );
-        assert!(crate::set_mod_enabled("doubler", false));
+        assert!(crate::__private::set_mod_enabled("doubler", false));
         assert!(charm.stack(&mut player).is_none());
         assert_eq!(insert(&mut player, &charm, stick()), 0);
         let resource = ItemResource::of(&stick());
@@ -1877,7 +1728,7 @@ pub mod tests {
             3,
             "disabled writes leave the place unchanged"
         );
-        assert!(crate::set_mod_enabled("doubler", true));
+        assert!(crate::__private::set_mod_enabled("doubler", true));
         assert_eq!(charm.amount(&mut player), 3);
         assert_eq!(insert(&mut player, &charm, stick()), 1);
         assert_eq!(
@@ -1914,7 +1765,7 @@ pub mod tests {
     #[cfg(test)]
     impl Host for HeldItem {
         fn backend(&self) -> Option<BackendRef<'_>> {
-            Some(BackendRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_ref(self))
         }
     }
     #[cfg(test)]
@@ -1922,55 +1773,13 @@ pub mod tests {
     #[cfg(test)]
     impl ServerHost for HeldItem {
         fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {
-            Some(BackendMutRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_mut_ref(
+                self,
+            ))
         }
     }
     #[cfg(test)]
     mod_api::impl_server_host_areas!(HeldItem);
-}
-
-/// Registrar operations for items.
-pub trait ItemsRegistrar {
-    /// Request an item by registry id, validated after all declarations.
-    fn item_key(&mut self, id: &str) -> crate::ItemKey;
-
-    /// Attach `part`, of kind `kind`, to item `item`.
-    fn attach_item_part(
-        &mut self,
-        item: crate::ItemKey,
-        kind: &'static str,
-        part: Arc<dyn ItemPart>,
-    );
-
-    /// Attach `part`, of kind `kind`, to every item in tag `tag`.
-    fn attach_item_part_tag(&mut self, tag: &str, kind: &'static str, part: Arc<dyn ItemPart>);
-
-    /// Answer item capability `name` for item `item` with `provider`; mods reach it through
-    /// `item_capability`.
-    fn provide_item_capability(
-        &mut self,
-        name: &'static str,
-        item: &str,
-        before_game: bool,
-        provider: ItemProviderOf,
-    );
-
-    /// Read and write the item places `ItemPlace::Mod { provider: name, .. }` with `provider`,
-    /// as an accessory mod exposes its slots. One provider a name.
-    fn place_provider(&mut self, name: &'static str, provider: Arc<dyn PlaceProvider>);
-
-    /// Register `appender` as the lines data component `component` (`mymod:charge`) adds to a
-    /// stack's tooltip, where `placement` puts them (NeoForge's `RegisterTooltipAppendersEvent`).
-    /// Only this mod's appender is asked, for a stack that carries the component and whose
-    /// tooltip shows it, and only while the mod is enabled. A component id that isn't namespaced,
-    /// or a `Before`/`After` anchor the game doesn't list as a component detail, refuses the mods
-    /// at startup, naming the mod.
-    fn register_tooltip_appender(
-        &mut self,
-        component: &str,
-        placement: crate::TooltipPlacement,
-        appender: Arc<dyn crate::TooltipAppender>,
-    );
 }
 
 impl ItemsRegistrar for PartRegistrar {
@@ -1981,10 +1790,10 @@ impl ItemsRegistrar for PartRegistrar {
             .items
             .request(self.mod_id, id)
         {
-            Ok(slot) => crate::ItemKey(slot),
+            Ok(slot) => mod_vocab::__private::parts_installation::item_key(slot),
             Err(error) => {
                 self.refused.push(error);
-                crate::ItemKey(u32::MAX)
+                mod_vocab::__private::parts_installation::item_key(u32::MAX)
             }
         }
     }
@@ -1999,12 +1808,15 @@ impl ItemsRegistrar for PartRegistrar {
             .registry_keys
             .borrow()
             .items
-            .id(item.0)
+            .id(mod_vocab::__private::parts_installation::item_key_slot(
+                item,
+            ))
             .map(str::to_owned);
         let Some(id) = id else {
             self.refused.push(format!(
                 "mod {}: invalid item key slot {}",
-                self.mod_id, item.0
+                self.mod_id,
+                mod_vocab::__private::parts_installation::item_key_slot(item)
             ));
             return;
         };
@@ -2025,11 +1837,13 @@ impl ItemsRegistrar for PartRegistrar {
     ) {
         self.capability(
             |p| &mut p.item_capabilities,
+            None,
             name,
             ProviderTarget::Id(item),
             before_game,
             {
-                let handler = provider.handler();
+                let handler =
+                    mod_vocab::__private::parts_installation::item_provider_handler(&provider);
                 (provider, handler)
             },
         );
@@ -2077,7 +1891,7 @@ impl ItemsRegistrar for PartRegistrar {
             match &placement {
                 crate::TooltipPlacement::Before(anchor)
                 | crate::TooltipPlacement::After(anchor)
-                    if !crate::TOOLTIP_DETAILS.contains(&anchor.as_str()) =>
+                    if !TOOLTIP_DETAILS.contains(&anchor.as_str()) =>
                 {
                     Some(format!(
                         "{} anchors a tooltip appender for {component:?} to {anchor:?}, which is not a component detail Horizon lists",
@@ -2101,35 +1915,30 @@ impl ItemsRegistrar for PartRegistrar {
     }
 }
 
-/// CapabilityProviders operations for items.
-// hidden: per-kind lookup implementation, exposed for generated provider bindings
-#[doc(hidden)]
-pub trait ItemsCapabilityProviders {
-    /// The next enabled provider of item capability `name` for item `item`, advancing `index`.
-    fn item_provider(
-        &self,
-        name: &str,
-        item: crate::ItemKey,
-        index: &mut u32,
-    ) -> Option<(ItemProviderOf, &'static str, bool)>;
-
-    /// The enabled provider of the item places named `name`, with its mod.
-    fn place_provider(&self, name: &str) -> Option<(Arc<dyn PlaceProvider>, &'static str)>;
-}
-
-impl ItemsCapabilityProviders for InstalledProviders {
-    fn item_provider(
-        &self,
-        name: &str,
-        item: crate::ItemKey,
-        index: &mut u32,
-    ) -> Option<(ItemProviderOf, &'static str, bool)> {
-        let item = crate::registry_keys::item_id(item)?;
-        next(&installed()?.keys.item_capabilities, name, item, index)
-    }
-
-    fn place_provider(&self, name: &str) -> Option<(Arc<dyn PlaceProvider>, &'static str)> {
-        let part = installed()?.keys.place_providers.get(name)?;
-        crate::mod_index_on(part.mod_index).then(|| (part.provider.clone(), part.mod_id))
-    }
-}
+/// The component details a tooltip lists, in the order the game lists them after the item's own
+/// lines. `TooltipPlacement::Before` and `After` name one of these.
+pub(crate) const TOOLTIP_DETAILS: &[&str] = &[
+    "minecraft:tropical_fish/pattern",
+    "minecraft:instrument",
+    "minecraft:map_id",
+    "minecraft:bees",
+    "minecraft:container",
+    "minecraft:banner_patterns",
+    "minecraft:written_book_content",
+    "minecraft:charged_projectiles",
+    "minecraft:fireworks",
+    "minecraft:potion_contents",
+    "minecraft:jukebox_playable",
+    "minecraft:trim",
+    "minecraft:stored_enchantments",
+    "minecraft:enchantments",
+    "minecraft:dyed_color",
+    "minecraft:lore",
+    "minecraft:attribute_modifiers",
+    "minecraft:unbreakable",
+    "minecraft:ominous_bottle_amplifier",
+    "minecraft:suspicious_stew_effects",
+    "minecraft:block_state",
+    "minecraft:entity_data",
+    "minecraft:block_entity_data",
+];

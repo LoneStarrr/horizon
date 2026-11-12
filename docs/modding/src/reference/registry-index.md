@@ -19,7 +19,7 @@ Level: preview ([API stability](../../../api/stability.md)). Schema 1.
   "projects": [{
     "id": "coords_hud", "kind": "mod", "name": "Coordinates HUD", "summary": "One line.",
     "description": "Markdown.", "authors": ["Horizon"], "owners": ["ludovic111"],
-    "license": "MIT", "source": "https://github.com/...", "icon": "https://...png", "key": "RWT...", "downloads": 1234, "stars": 56,
+    "license": "MIT", "source": "https://github.com/...", "icon": "https://...png", "key": "RWT...", "downloads": 1234, "stars": 56, "updated": "2026-10-24",
     "categories": ["utility"], "tags": ["hud"], "screenshots": ["https://...png"],
     "versions": [{
       "version": "0.1.0", "published": "2026-10-24", "changelog": "",
@@ -48,6 +48,7 @@ Level: preview ([API stability](../../../api/stability.md)). Schema 1.
 | `versions` | Newest first, at least one. |
 | `downloads` | How many times its files were downloaded, every version together: GitHub's count of each release asset, summed by the publish job, which runs every hour. Absent until a file is downloaded. Read-only: never in an entry. |
 | `stars` | GitHub stars of the project's source repository, refreshed by the publish job every hour. Absent when zero or the source is not on GitHub. Read-only: never in an entry. The launcher shows the count and a button that opens the repository. |
+| `updated` | Its newest version's `published` (the latest of `versions[].published`), set by the publish job, so a reader can sort by it beside `downloads` without walking every version. Absent when no version has a date. Read-only: never in an entry. |
 | `api` | A mod's API line (its manifest's `api`); a native mod's pinned revisions (`native-1/<horizon>/<mixins>`); a modpack's manifest format (`1`). |
 | `side`, `capabilities` | A mod's, read from its manifest by CI, never typed by hand. |
 | `game` | The Minecraft version it is for. |
@@ -57,6 +58,17 @@ Level: preview ([API stability](../../../api/stability.md)). Schema 1.
 
 Readers ignore fields they don't know, so an optional field can be added to schema 1. Renaming or removing a field, or
 changing what one means, makes schema 2.
+
+Each version may list `native_binaries`, an array of records with `build` (the
+exact game build ID, at most 128 bytes with no ASCII control characters), `target` (the canonical Rust target triple), and `file`.
+The file uses the index's existing name, URL, size, SHA-256 and minisign signature
+fields; the signature is required. Records live only in the registry, never in
+`horizon-mod.toml`. Duplicate build/target pairs are rejected. Lookup returns a
+typed absence when the exact pair is unavailable, so source preparation can
+handle it without selecting another build or architecture. These signatures are
+registry-produced metadata, independent of project package keys. The launcher
+builds native mods locally with its pinned Rust toolchain against the prebuilt
+game; registry-built native binaries are not used.
 
 ## Before a file is installed
 
@@ -201,9 +213,10 @@ Rust build scripts and procedural macros run with your rights, but the game does
 a separate per-pin source and check cache in the launcher's `native/internals-sync/<commit>/` folder,
 never in the normal game or prebuilt target directories. The pin's source must be cached or
 downloadable; an unavailable source is `E_INTERNAL_SOURCE_UNAVAILABLE`, not a fallback to another
-pin. Compiler or catalog errors leave the manifest untouched. Raw listeners retain their generated
-typed constructors; source-routed listeners and support modules are explicitly refused, so their
-manually declared internals cannot be accidentally removed. Use `internals add` for those mods.
+pin. Compiler or catalog errors leave the manifest untouched. Discovery may prepare source and
+metadata-check game dependencies; it does not compile or link a game executable. This separate
+check cache is not a native mod build route. `[[native.state]]` is refused with
+`E_MIXIN_STATE_LAYOUT`; use attachments for per-object mod data.
 
 `internals add` and `update` download the same prebuilt archive layout as the launcher, check its `SHA256SUMS`, and
 read only `internals.json`; no game or mod code is run. Catalogs are kept by commit in
@@ -217,9 +230,6 @@ cargo horizon-mod internals add 'horizon_client::game::Game' "horizon_client::ga
 cargo horizon-mod internals sync
 cargo horizon-mod update
 ```
-
-[Declared internals and raw listeners](../injections.md#raw-listeners-and-declared-internals)
-explain when to use this escape hatch instead of the typed mod API.
 
 How the repository runs (its workflows are in `.github/workflows/`):
 
@@ -243,6 +253,9 @@ API line are its facts. A new kind gets its own check before it opens.
 
 ## Changelog
 
+- 2026-11-11: `projects[].updated`, the date of a project's newest version, set by the publish job. The index's schema is unchanged: readers from before ignore it.
+
+- 2026-11-08: per-version `native_binaries` records index native mod files by exact game build and Rust target triple.
 - 2026-11-05: `projects[].stars` adds the GitHub source repository's star count without changing schema 1.
 - 2026-11-05: every listed project needs a description of 50 characters or more, 1 to 3 categories and an icon kept in the registry (`icons/<id>.png`); screenshots are kept in the registry too (`registry build` refuses https:// images in entries).
 - 2026-10-30: an entry names its GitHub repository (`repo`) and its versions are the repository's releases, read by the registry's CI; `file.url` may be a release asset of that repository. The index's schema is unchanged.

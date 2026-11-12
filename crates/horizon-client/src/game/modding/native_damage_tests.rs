@@ -105,7 +105,7 @@ fn heard(test: impl FnOnce(&mut super::Game<'_>)) -> Heard {
         Box::new(Probe(log.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || with_game(test));
+    mod_platform::testing::with_mods(mods, || with_game(test));
     std::mem::take(&mut *log.lock().unwrap())
 }
 
@@ -137,7 +137,7 @@ fn pre_sets_the_health_lost_and_the_last_hurt_the_cooldown_compares() {
         let mut pig = mob(game, 225003, "minecraft:pig");
         assert!(pig.damage(damage_level_of!(game), 6.0, Damage::of(DamageKind::Generic)));
         assert_eq!(pig.health, 8.0);
-        // NeoForge bubbles the inflicted damage up to `lastHurt`.
+        // The inflicted damage reaches `lastHurt`.
         assert_eq!(pig.last_hurt, 2.0);
     });
     assert_eq!(heard.pre, [(225003, 6.0, 2.0, 0.0)]);
@@ -269,6 +269,8 @@ fn arrow_hits_name_the_projectile_on_players_mobs_and_the_dragon() {
             game.mobs.push(mob(game, 42, "minecraft:skeleton"));
             game.mobs.push(mob(game, 43, "minecraft:pig"));
             let mut dragon = Dragon::new(Vec3::ZERO, 0.0, 0);
+            // Hover is a sitting phase and correctly shrugs off arrows.
+            dragon.set_native_phase(mod_api::DragonPhase::HoldingPattern);
             dragon.id = 44;
             game.dragon.replace(dragon);
             let mut arrow = Projectile::new(
@@ -341,7 +343,7 @@ fn snapshot_crosses_the_real_damage_hook_with_reductions() {
 #[test]
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn unsubscribed_damage_does_not_convert() {
-    mod_api::testing::with_mods(Vec::<mod_api::ModEntry>::new().into(), || {
+    mod_platform::testing::with_mods(Vec::<mod_api::ModEntry>::new().into(), || {
         with_game(|game| {
             super::api_values::damage::CONVERSIONS.with(|count| count.set(0));
             let mut container = horizon_world::living_damage::DamageContainer::new(10.0);

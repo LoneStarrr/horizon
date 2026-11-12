@@ -1,5 +1,5 @@
 //! Disposable launcher storage. Player-owned files are never accepted as cleanup targets.
-use crate::cache_cleanup::Plan;
+use crate::cache_cleanup::{Access, Plan};
 pub use crate::native_cache::Error;
 use crate::native_cache::{checked, linked, Cache};
 use cap_fs_ext::DirExt;
@@ -8,8 +8,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod eviction;
 mod inventory;
+pub mod policy;
 pub use inventory::{Report, Row};
+
+/// Shared with the launcher's existing server storage display.
+pub fn format_bytes(n: u64) -> String {
+    match n {
+        0..1_000_000 => format!("{} kB", n.div_ceil(1000)),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", n as f64 / 1e6),
+        _ => format!("{:.2} GB", n as f64 / 1e9),
+    }
+}
 
 /// The five rows on the Storage page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, clap::ValueEnum)]
@@ -22,13 +33,64 @@ pub enum Category {
     OtherCaches,
 }
 
+/// Stamp a used cache unit through no-follow capabilities, not a path-following write.
+pub(crate) fn mark_used(path: &Path) -> Result<(), Error> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    let Some(meta) = checked(path, path.is_dir())? else {
+        return Ok(());
+    };
+    #[cfg(not(windows))]
+    if path.canonicalize()? != path {
+        return Err(Error::Unsafe(path.to_owned()));
+    }
+    #[cfg(windows)]
+    for ancestor in path
+        .ancestors()
+        .skip(1)
+        .filter(|path| path.parent().is_some())
+    {
+        checked(ancestor, true)?;
+    }
+    let (folder, stamp) = if meta.is_dir() {
+        (path, std::ffi::OsString::from(".last-used"))
+    } else {
+        let name = path
+            .file_name()
+            .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
+        let mut stamp = std::ffi::OsString::from(".");
+        stamp.push(name);
+        stamp.push(".last-used");
+        (
+            path.parent()
+                .ok_or_else(|| Error::Unsafe(path.to_owned()))?,
+            stamp,
+        )
+    };
+    let anchor = folder
+        .ancestors()
+        .last()
+        .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
+    let mut directory = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
+    for part in folder
+        .strip_prefix(anchor)
+        .map_err(|_| Error::Unsafe(path.to_owned()))?
+        .components()
+    {
+        directory = directory.open_dir_nofollow(part.as_os_str())?;
+    }
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .follow(FollowSymlinks::No);
+    directory.open_with(stamp, &options)?;
+    Ok(())
+}
+
 /// Fixed build-home caches. Instance and version inventory adds its protected entries separately.
 #[derive(Clone, Copy, Debug)]
 pub enum BuildCache {
-    Stage,
-    PendingStage,
-    NewStage,
-    Patched,
     Source,
     Tools,
     PrebuiltOutput,
@@ -43,10 +105,6 @@ pub enum BuildCache {
 impl BuildCache {
     fn relative(self) -> &'static str {
         match self {
-            Self::Stage => "native/stage",
-            Self::PendingStage => "native/stage.pending",
-            Self::NewStage => "native/stage.new",
-            Self::Patched => "native/patched",
             Self::Source => "native/source",
             Self::Tools => "native/tools",
             Self::PrebuiltOutput => "native/prebuilt-build",
@@ -56,6 +114,13 @@ impl BuildCache {
             Self::Rust => "rust",
             Self::Cargo => "cargo",
             Self::Scratch => "tmp",
+        }
+    }
+
+    fn access(self, path: &Path) -> Result<Access, Error> {
+        match self {
+            Self::Rust | Self::Cargo | Self::Scratch => Ok(Access::BuildTools),
+            _ => Access::for_unit(path),
         }
     }
 
@@ -114,7 +179,8 @@ impl Storage {
 
     /// Detach on the same volume before removal. Failed removals remain for the next sweep.
     pub fn clear(&self, cache: BuildCache) -> Result<u64, Error> {
-        self.trash(&self.path(cache)?)
+        let path = self.path(cache)?;
+        self.trash(&path, cache.access(&path)?)
     }
 
     pub fn clear_targets(&self) -> Result<u64, Error> {
@@ -134,12 +200,17 @@ impl Storage {
         Ok(())
     }
 
-    fn trash(&self, path: &Path) -> Result<u64, Error> {
+    fn trash(&self, path: &Path, access: Access) -> Result<u64, Error> {
         self.validate_root()?;
         let bytes = allocated_bytes(path)?;
         if !path.try_exists()? {
             return Ok(0);
         }
+        if matches!(access, Access::LeasedGame) {
+            crate::cache_cleanup::delete_game_unit(path)?;
+            return Ok(bytes.saturating_sub(allocated_bytes(path)?));
+        }
+        access.check()?;
         let relative = path
             .strip_prefix(&self.root)
             .map_err(|_| Error::Unsafe(path.to_owned()))?;
@@ -170,11 +241,8 @@ impl Storage {
         for entry in self.directory.entries()? {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with(".trash-") {
-                Self::clear_entry(
-                    &self.directory,
-                    &self.directory,
-                    Path::new(&entry.file_name()),
-                )?;
+                // Detached leftovers still need capability proof and exclusive ownership.
+                crate::cache_cleanup::delete_game_unit(&self.root.join(entry.file_name()))?;
             }
         }
         Ok(())
@@ -255,3 +323,12 @@ fn allocation(path: &Path, _meta: &fs::Metadata) -> Result<((u64, u64), u64), Er
 #[cfg(test)]
 #[path = "storage/tests.rs"]
 mod tests;
+
+// Turning native mods off is the Storage page's last row.
+impl crate::backend::Settings {
+    /// Revoke consent before attempting to disable installed native packages.
+    pub fn revoke_native_mods(&mut self) -> Result<(), String> {
+        self.native_mods_allowed_at = None;
+        self.save()
+    }
+}

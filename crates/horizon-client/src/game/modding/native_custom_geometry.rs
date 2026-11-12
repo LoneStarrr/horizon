@@ -6,8 +6,8 @@ use horizon_client::mesher::Vertex;
 use horizon_client::screen_effects::{CameraQuads, sampling};
 use horizon_client::world_geometry::{self, ModelBatch, WorldGeometry};
 use mod_api::{
-    DrawError, InstanceError, ModelInstance, ModelRef, RenderLevelStage, WorldDrawUsage, WorldLine,
-    WorldQuad,
+    DrawError, InstanceError, ModelInstance, ModelRef, PipelineDrawError, PipelineQuad,
+    RenderLevelStage, RenderPipelineRef, WorldDrawUsage, WorldLine, WorldQuad,
 };
 
 impl Game<'_> {
@@ -75,6 +75,8 @@ impl Game<'_> {
             return;
         }
         draw.set_model_cut(entities.len() as u32);
+        // Seconds of game time, wrapping every hour (72,000 ticks) so f32 keeps sub-tick steps.
+        draw.set_time(((self.world.game_time.rem_euclid(72_000) as f64 + alpha) / 20.0) as f32);
         let view = mod_api::WorldRenderView::new(camera, alpha as f32, self.world.game_time);
         // RenderLevelStageEvent's stages in frame order, so each one's output follows the
         // last's; custom geometry and the debug renderers draw with the last, AfterLevel.
@@ -108,6 +110,22 @@ impl Game<'_> {
         quads: &[WorldQuad],
     ) -> Result<(), DrawError> {
         draw.quads(quads)
+    }
+    /// Submit quads drawn by a mod pipeline atomically: the handle is checked against the
+    /// published pipelines once, then the batch is validated and queued or refused whole.
+    pub(super) fn native_world_draw_pipeline_quads(
+        &self,
+        draw: &mut WorldGeometry,
+        pipeline: RenderPipelineRef,
+        quads: &[PipelineQuad],
+    ) -> Result<(), PipelineDrawError> {
+        let slot = self
+            .pack
+            .render
+            .mod_pipelines
+            .slot(pipeline)
+            .map_err(PipelineDrawError::Pipeline)?;
+        draw.pipeline_quads(slot, quads)
     }
     /// Queued counts and fixed capacities, shared by both depth modes and all listeners.
     /// Capacity is allocated during setup, never grown during submission.
@@ -388,77 +406,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual real-GPU CPU submission benchmark"]
-    fn persistent_group_cpu_bench() {
-        use mod_api::InstanceGroups;
-        let _fixture =
-            horizon_client::models::standalone_fixture(vec!["minecraft:block/grass_block".into()]);
-        super::super::native_entity_refs::tests::with_client_game(|game| {
-            let _restore = Restore;
-            let model = grass(game);
-            horizon_client::gfx::cap_prepared_instance_slots(16_384);
-            let copies = [ModelInstance::at([0.0; 3], 0xFFFF_FFFF); 128];
-            let groups: Vec<_> = (0..128)
-                .map(|_| {
-                    let group = game.create_group(model, 128).unwrap();
-                    group.write(game, 0, &copies).unwrap();
-                    group
-                })
-                .collect();
-            let mut draw = WorldGeometry::default();
-            for mode in ["uncached_before", "static", "one_write", "transform"] {
-                let mut elapsed = std::time::Duration::ZERO;
-                for frame in 0..240 {
-                    draw.reset([0.0; 3], Mat4::IDENTITY, [0.0; 2]);
-                    game.prepared_model_draws.borrow_mut().clear();
-                    let start = std::time::Instant::now();
-                    for &group in &groups {
-                        if mode == "one_write" {
-                            group
-                                .write(game, (frame % 128) as u32, &copies[..1])
-                                .unwrap();
-                        }
-                        if mode == "transform" {
-                            group
-                                .set_group_transform(
-                                    game,
-                                    [
-                                        1.0,
-                                        0.0,
-                                        0.0,
-                                        (frame % 2) as f32 * 0.1,
-                                        0.0,
-                                        1.0,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        1.0,
-                                        0.0,
-                                    ],
-                                )
-                                .unwrap();
-                        }
-                        if mode == "uncached_before" {
-                            game.draw_validated_model_instances(&mut draw, model, &copies)
-                                .unwrap();
-                        } else {
-                            context(game, &mut draw).draw_instance_group(group).unwrap();
-                        }
-                    }
-                    if frame >= 40 {
-                        elapsed += start.elapsed();
-                    }
-                }
-                println!(
-                    "R2c CPU submission {mode}: {:.6} ms/frame",
-                    elapsed.as_secs_f64() * 1000.0 / 200.0
-                );
-            }
-        });
-    }
-
-    #[test]
     #[ignore = "needs software Vulkan"]
     fn persistent_groups_match_batch() {
         use mod_api::{GroupError, InstanceGroups};
@@ -470,11 +417,12 @@ mod tests {
             let _restore = Restore;
             let model = grass(game);
             horizon_client::gfx::cap_prepared_instance_slots(16_384);
-            let _owner = mod_api::crash::enter_native_mod(mod_api::crash::NativeModCall {
-                id: "a",
-                hook: "test",
-                part: None,
-            });
+            let _owner =
+                mod_platform::content::crash::enter_native_mod(mod_api::content::crash::ModCall {
+                    id: "a",
+                    hook: "test",
+                    part: None,
+                });
             assert_eq!(
                 game.create_group(model, 16_385),
                 Err(GroupError::CapacityExceeded)
@@ -505,11 +453,13 @@ mod tests {
             ]));
             let mut draw = WorldGeometry::default();
             {
-                let _other = mod_api::crash::enter_native_mod(mod_api::crash::NativeModCall {
-                    id: "b",
-                    hook: "test",
-                    part: None,
-                });
+                let _other = mod_platform::content::crash::enter_native_mod(
+                    mod_api::content::crash::ModCall {
+                        id: "b",
+                        hook: "test",
+                        part: None,
+                    },
+                );
                 assert_eq!(group.write(game, 0, &[near]), Err(GroupError::Stale));
                 assert_eq!(group.set_len(game, 0), Err(GroupError::Stale));
                 assert_eq!(
@@ -693,7 +643,9 @@ mod tests {
             }
             assert_ne!(
                 game.standalone_geometry.generation(),
-                model.fields().generation
+                model.fields().generation,
+                "reload error: {:?}",
+                game.ui.options.resource_error
             );
             assert_eq!(fresh.set_len(game, 1), Err(GroupError::Stale));
             let after_reload: Vec<_> = (0..4)
@@ -716,11 +668,12 @@ mod tests {
         super::super::native_entity_refs::tests::with_client_game(|game| {
             let _restore = Restore;
             let model = grass(game);
-            let _owner = mod_api::crash::enter_native_mod(mod_api::crash::NativeModCall {
-                id: "group-owner",
-                hook: "test",
-                part: None,
-            });
+            let _owner =
+                mod_platform::content::crash::enter_native_mod(mod_api::content::crash::ModCall {
+                    id: "group-owner",
+                    hook: "test",
+                    part: None,
+                });
             let camera = DVec3::new(8_000_000.0, 70.0, -4_000_000.0);
             let mut copy = ModelInstance::at(camera.to_array(), 0xFF80_C040);
             copy.light = LightCoords::new(3, 12).unwrap();
@@ -855,11 +808,13 @@ mod tests {
                 Err(GroupError::CapacityExceeded)
             );
             let other_group = {
-                let _other = mod_api::crash::enter_native_mod(mod_api::crash::NativeModCall {
-                    id: "unaffected-owner",
-                    hook: "test",
-                    part: None,
-                });
+                let _other = mod_platform::content::crash::enter_native_mod(
+                    mod_api::content::crash::ModCall {
+                        id: "unaffected-owner",
+                        hook: "test",
+                        part: None,
+                    },
+                );
                 assert_eq!(released.set_len(game, 1), Err(GroupError::Stale));
                 game.create_group(model, 1).unwrap()
             };
@@ -872,11 +827,13 @@ mod tests {
             );
             assert_eq!(draw.copy_count(), 0);
             {
-                let _other = mod_api::crash::enter_native_mod(mod_api::crash::NativeModCall {
-                    id: "unaffected-owner",
-                    hook: "test",
-                    part: None,
-                });
+                let _other = mod_platform::content::crash::enter_native_mod(
+                    mod_api::content::crash::ModCall {
+                        id: "unaffected-owner",
+                        hook: "test",
+                        part: None,
+                    },
+                );
                 other_group.set_len(game, 1).unwrap();
                 other_group.destroy(game).unwrap();
             }
@@ -1243,7 +1200,9 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn each_stage_is_asked_in_frame_order_and_its_lines_draw_there() {
         super::super::native_entity_refs::tests::with_client_game(|game| {
-            mod_api::__private::install(vec![ModEntry::new("staged", Box::new(Staged))].into());
+            mod_platform::__private::install(
+                vec![ModEntry::new("staged", Box::new(Staged))].into(),
+            );
             STAGES_ARMED.store(true, Ordering::Relaxed);
             let mut draw = WorldGeometry::default();
             game.fill_world_geometry(
@@ -1292,7 +1251,9 @@ mod tests {
             let model = grass(game);
             horizon_client::gfx::cap_prepared_instance_slots(8);
             *FILL_MODEL.lock().unwrap() = Some(model);
-            mod_api::__private::install(vec![ModEntry::new("batch", Box::new(FillBatch))].into());
+            mod_platform::__private::install(
+                vec![ModEntry::new("batch", Box::new(FillBatch))].into(),
+            );
             FILL_ARMED.store(true, Ordering::Relaxed);
             let mut draw = WorldGeometry::default();
             let mut entities = vec![<Vertex as bytemuck::Zeroable>::zeroed(); 4];

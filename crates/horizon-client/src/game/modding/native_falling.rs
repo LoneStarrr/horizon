@@ -6,7 +6,6 @@
 use super::{FallingBlock, Game};
 use horizon_core::{geometry::Vec3, position::BlockPos};
 use horizon_world::registry::BlockStateId;
-pub use mod_api::game::NativeFalling;
 
 /// The most falling blocks a level holds before `spawn_falling_block`
 /// refuses more: a mod's debris shouldn't take the server's tick with it.
@@ -42,7 +41,7 @@ impl Game<'_> {
         state: BlockStateId,
         pos: [f64; 3],
         velocity: [f64; 3],
-        falling: NativeFalling,
+        falling: mod_api::Falling,
     ) -> bool {
         if (self.serving.is_none() && self.options.dedicated.is_none())
             || dimension != self.dim.id()
@@ -85,6 +84,7 @@ impl Game<'_> {
             velocity,
             age: 0,
             no_gravity: false,
+            on_ground: false,
             drop_item: falling.drop_item,
             fall_distance: 0.0,
             stuck: Vec3::ZERO,
@@ -119,12 +119,19 @@ mod tests {
     fn falling_tick_preserves_its_owner_on_success_and_collision_error() {
         bound_falling_case(false, |game, _| {
             assert!(game.spawn_remote_projectile(
-                72,
                 "minecraft:falling_block",
-                [4.5, 70.0, 0.5],
+                &horizon_protocol::packets::play::AddEntity {
+                    id: 72,
+                    uuid: 72,
+                    kind: 0,
+                    position: [4.5, 70.0, 0.5],
+                    velocity: [0.0; 3],
+                    pitch: 0,
+                    yaw: 0,
+                    head_yaw: 0,
+                    data: game.falling[0].state.0 as i32
+                },
                 (0.0, 0.0),
-                [0.0; 3],
-                game.falling[0].state.0 as i32,
             ));
             let expected: Vec<_> = game.falling.iter().map(|f| (f.id, f.join)).collect();
             game.tick_one_falling(0, &[]).unwrap();
@@ -230,12 +237,19 @@ mod tests {
                     .unwrap();
                 for &(id, at) in entries {
                     assert!(game.spawn_remote_projectile(
-                        id as i32,
                         "minecraft:falling_block",
-                        at,
+                        &horizon_protocol::packets::play::AddEntity {
+                            id: id as i32,
+                            uuid: u128::from(id),
+                            kind: 0,
+                            position: at,
+                            velocity: [0.0; 3],
+                            pitch: 0,
+                            yaw: 0,
+                            head_yaw: 0,
+                            data: state.0 as i32
+                        },
                         (0.0, 0.0),
-                        [0.0; 3],
-                        state.0 as i32
                     ));
                 }
             },
@@ -272,6 +286,7 @@ mod tests {
                 .unwrap();
             let at = Vec3::new(0.5, 70.0, 0.5);
             game.falling.push(FallingBlock {
+                on_ground: false,
                 attachment_lifetime: Default::default(),
                 rotation: [0.0; 2],
                 join: Default::default(),

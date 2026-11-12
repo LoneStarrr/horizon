@@ -234,3 +234,112 @@ fn code_declared_types_build_a_root_and_membership_changes_invalidate_its_cache(
     fs::remove_dir_all(cache).unwrap();
     fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn code_items_can_reference_both_owned_namespaces_in_one_batch() {
+    let mut content = Content::declared("porter");
+    content.namespaces.push("legacy".into());
+    let mut mods = vec![ContentMod {
+        id: "porter".into(),
+        content,
+        jars: vec![],
+    }];
+    let items = [
+        ("legacy:wrench", "porter:spoon"),
+        ("porter:spoon", "legacy:wrench"),
+    ]
+    .map(|(id, remainder)| horizon_mod_package::content::Item {
+        id: id.into(),
+        template: "minecraft:stick".into(),
+        crafting_remainder: Some(remainder.into()),
+        ..horizon_mod_package::content::Item::default()
+    });
+    let errors = accept_declared(&mut mods, &[], &items, &[], &BTreeSet::new());
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(mods.len(), 1);
+    assert_eq!(mods[0].id, "porter");
+    assert_eq!(mods[0].content.items, items);
+}
+
+#[test]
+fn code_declarations_join_the_manifest_owner_of_a_secondary_namespace() {
+    let base = base("owned-namespace");
+    let mut content = Content::declared("porter");
+    content.namespaces.push("legacy".into());
+    let mut mods = vec![ContentMod {
+        id: "porter".into(),
+        content,
+        jars: vec![],
+    }];
+    let blocks = [Block {
+        id: "legacy:pot".into(),
+        template: "minecraft:stone".into(),
+        ..Block::default()
+    }];
+    let types = [kind("legacy:pot_type", &["legacy:pot"])];
+    let errors = accept_declared(&mut mods, &blocks, &[], &types, &BTreeSet::new());
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        mods.len(),
+        1,
+        "the secondary namespace is not a synthetic second package"
+    );
+    assert_eq!(mods[0].id, "porter");
+    assert_eq!(mods[0].content.blocks[0].id, "legacy:pot");
+    let plan = Plan::new(&base, &mods).unwrap();
+    assert_eq!(
+        plan.block_entity_factories.get("legacy:pot"),
+        Some(&"legacy:pot_type")
+    );
+    drop(plan);
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// Declared boxes are in block units, one block being 1: a code-declared half slab resolves to
+/// the bounds `[0, 0, 0, 1, 0.5, 1]`, as the same box in a JSON declaration does.
+#[test]
+fn a_code_declared_half_slab_resolves_to_block_unit_bounds() {
+    let (base, _) = block_base("code-slab", &[]);
+    let mut content = Content::declared("testmod");
+    content
+        .declare(
+            &[Block {
+                id: "testmod:slab".into(),
+                template: "minecraft:test".into(),
+                item: false,
+                collision_shapes: Some(BlockShapes(StateValues {
+                    property: String::new(),
+                    properties: Vec::new(),
+                    values: BTreeMap::new(),
+                    default: Some(vec![[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]),
+                })),
+                ..Block::default()
+            }],
+            &[],
+        )
+        .unwrap();
+    let mods = vec![ContentMod {
+        id: "testmod".into(),
+        content,
+        jars: Vec::new(),
+    }];
+    let plan = Plan::new(&base, &mods).unwrap();
+    for shape in plan.blocks[0].collision_shapes.as_ref().unwrap() {
+        let bounds: Vec<[f64; 6]> = shape
+            .boxes()
+            .iter()
+            .map(|b| {
+                [
+                    b.min(Axis::X),
+                    b.min(Axis::Y),
+                    b.min(Axis::Z),
+                    b.max(Axis::X),
+                    b.max(Axis::Y),
+                    b.max(Axis::Z),
+                ]
+            })
+            .collect();
+        assert_eq!(bounds, vec![[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]);
+    }
+    fs::remove_dir_all(base.parent().unwrap()).unwrap();
+}

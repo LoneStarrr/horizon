@@ -24,9 +24,9 @@ fn reload_resolves_parts_against_reloaded_tags() {
     }
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("reload", Box::new(ReloadMod))].into();
     crate::game::api_values::install_parts(&mods).unwrap();
-    mod_api::__private::install(mods);
+    mod_platform::__private::install(mods);
     super::native_entity_refs::tests::with_game(|game| {
-        let stone_key = mod_api::__private::part_tests::block_key("stone");
+        let stone_key = mod_platform::__private::part_tests::block_key("stone");
         let name = stone_key.id(game);
         let dir = std::env::temp_dir().join(format!("horizon-key-tags-{}", std::process::id()));
         game.session_lock = Some(horizon_client::save::SessionLock::acquire(&dir).unwrap());
@@ -46,15 +46,27 @@ fn reload_resolves_parts_against_reloaded_tags() {
             &game.pack.additional_data,
         );
         let root = game.options.resources.clone();
+        let previous = std::sync::Arc::new(mod_api::DatapackRegistrySet::first(
+            mod_api::DatapackCandidate::build(&[], &[]).unwrap(),
+            horizon_client::datapack_net::next_session(),
+        ));
+        horizon_client::datapack_net::serve(Some(previous.clone()));
         let prepared = game
             .prepare_world_reload(&stack, &root, game.mods.data_switched)
             .unwrap();
+        // Preparation must not publish to joining clients.
+        assert!(std::sync::Arc::ptr_eq(
+            &previous,
+            &horizon_client::datapack_net::served().unwrap(),
+        ));
         game.install_world_tables(prepared);
+        // A successful empty publication clears the previous world's served registries too.
+        assert!(horizon_client::datapack_net::served().is_none());
         game.run_native_advancement_grants();
         assert_eq!(stone_key.id(game), name);
         assert_eq!(
             stone_key,
-            mod_api::__private::part_tests::block_key("minecraft:stone")
+            mod_platform::__private::part_tests::block_key("minecraft:stone")
         );
         assert_eq!(game.block_in_tag(stone_key, "test:reload"), Some(true));
         assert_eq!(game.block_in_tag(stone_key, "minecraft:logs"), Some(false));
@@ -207,9 +219,7 @@ fn the_fluid_ray_passes_through_the_hollow_of_a_torch() {
 #[test]
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn right_click_block_controls_cauldron_use() {
-    use mod_api::{
-        self, Flow, Hooks, NativeBlockUpdateFlags, NativeTriState, RightClickBlockEvent,
-    };
+    use mod_api::{self, BlockUpdateFlags, Flow, Hooks, RightClickBlockEvent, TriState};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -227,11 +237,11 @@ fn right_click_block_controls_cauldron_use() {
                 return Flow::Cancel;
             }
             *event.use_block = if self.0.load(Ordering::SeqCst) {
-                NativeTriState::True
+                TriState::True
             } else {
-                NativeTriState::False
+                TriState::False
             };
-            *event.use_item = NativeTriState::False;
+            *event.use_item = TriState::False;
             Flow::Continue
         }
     }
@@ -242,7 +252,7 @@ fn right_click_block_controls_cauldron_use() {
         "right-click-observer",
         Box::new(Observer(allowed.clone(), cancel.clone(), calls.clone())),
     )]);
-    mod_api::__private::install(mods);
+    mod_platform::__private::install(mods);
     super::native_entity_refs::tests::with_game(|game| {
         game.options.dedicated = Some(Vec::new());
         game.world
@@ -256,7 +266,7 @@ fn right_click_block_controls_cauldron_use() {
             .default_state("minecraft:cauldron")
             .unwrap();
         assert_eq!(
-            game.level_set_block(level, [0, 64, 0], empty, NativeBlockUpdateFlags::NEIGHBORS),
+            game.level_set_block(level, [0, 64, 0], empty, BlockUpdateFlags::NEIGHBORS),
             Ok(true)
         );
         game.inventory[game.selected] = Some(ItemStack::new("minecraft:water_bucket", 1));
@@ -272,7 +282,7 @@ fn right_click_block_controls_cauldron_use() {
         game.use_hand(Some(&hit)).unwrap();
         assert_ne!(game.world.block(0, 64, 0), empty);
         assert_eq!(
-            game.level_set_block(level, hit.pos, empty, NativeBlockUpdateFlags::NEIGHBORS),
+            game.level_set_block(level, hit.pos, empty, BlockUpdateFlags::NEIGHBORS),
             Ok(true)
         );
         game.inventory[game.selected] = Some(ItemStack::new("minecraft:water_bucket", 1));
@@ -288,7 +298,7 @@ fn right_click_block_controls_cauldron_use() {
             .default_state("minecraft:campfire")
             .unwrap();
         assert_eq!(
-            game.level_set_block(level, hit.pos, campfire, NativeBlockUpdateFlags::NEIGHBORS),
+            game.level_set_block(level, hit.pos, campfire, BlockUpdateFlags::NEIGHBORS),
             Ok(true)
         );
         let entity = game.new_block_entity("minecraft:campfire").unwrap();
@@ -309,7 +319,7 @@ fn right_click_block_controls_cauldron_use() {
             .default_state("minecraft:oak_fence")
             .unwrap();
         assert_eq!(
-            game.level_set_block(level, hit.pos, fence, NativeBlockUpdateFlags::NEIGHBORS),
+            game.level_set_block(level, hit.pos, fence, BlockUpdateFlags::NEIGHBORS),
             Ok(true)
         );
         let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
@@ -348,7 +358,7 @@ fn right_click_block_controls_cauldron_use() {
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn fence_ties_without_a_lead_only_on_main_hand() {
     use horizon_client::mobs::leash::Holder;
-    use mod_api::NativeBlockUpdateFlags;
+    use mod_api::BlockUpdateFlags;
     super::native_entity_refs::tests::with_game(|game| {
         game.options.dedicated = Some(Vec::new());
         game.world
@@ -362,7 +372,7 @@ fn fence_ties_without_a_lead_only_on_main_hand() {
             .default_state("minecraft:oak_fence")
             .unwrap();
         assert_eq!(
-            game.level_set_block(level, [0, 64, 0], fence, NativeBlockUpdateFlags::NEIGHBORS),
+            game.level_set_block(level, [0, 64, 0], fence, BlockUpdateFlags::NEIGHBORS),
             Ok(true)
         );
         let hit = Hit {
@@ -464,7 +474,7 @@ fn an_unclean_start_leaves_fullscreen_and_keeps_the_packs() {
     assert!(settings.fullscreen);
 }
 
-/// `NativeScreenView.id` (the `screen_render_post` hook) is a mod's
+/// `ScreenView.id` (the `screen_render_post` hook) is a mod's
 /// contract: every `Screen` has its own id, and it does not change.
 /// `Screen::id`'s match makes a new variant give itself one; this list
 /// makes the test cover it too.
@@ -491,6 +501,9 @@ fn screen_ids_are_distinct_and_stable() {
         Screen::ConfirmLink,
         Screen::DialogWarning,
         Screen::Win,
+        Screen::Mod,
+        Screen::HudEditor,
+        Screen::Studio,
         Screen::DebugOptions,
     ];
     let ids: Vec<&'static str> = all.iter().map(|screen| screen.id()).collect();
@@ -507,6 +520,8 @@ fn screen_ids_are_distinct_and_stable() {
     assert_eq!(Screen::Playing.id(), "playing");
     assert_eq!(Screen::Inventory.id(), "inventory");
     assert_eq!(Screen::Win.id(), "win");
+    assert_eq!(Screen::Studio.id(), "studio");
+    assert_ne!(Screen::Studio.id(), Screen::Chat.id());
 }
 
 /// The `modifiers` a native mod's input hooks hand over are GLFW's bits
@@ -566,8 +581,15 @@ fn glfw_button_indices_are_glfw_indices() {
 /// F3 left on when leaving a world kept the axes on the title screen.
 #[test]
 fn the_debug_crosshair_is_gone_once_the_world_is() {
-    assert!(debug_crosshair_drawn(true, true, false, false));
-    assert!(!debug_crosshair_drawn(true, true, false, true));
+    assert!(debug_crosshair_drawn(true, true, false, false, false));
+    assert!(!debug_crosshair_drawn(true, true, false, true, false));
+}
+
+/// Opening a world in front of a block left its outline over Loading terrain's panorama (#12872).
+#[test]
+fn the_block_outline_stays_off_the_panorama() {
+    assert!(block_outline_drawn(false, false, true, false));
+    assert!(!block_outline_drawn(false, false, true, true));
 }
 
 /// Snuffing a candle or a candle cake draws one smoke per
@@ -623,6 +645,8 @@ fn an_interact_packet_cannot_name_a_mob_the_pick_would_refuse() {
     assert!(named_mob_pickable(true, 17, Some(23), Some(29)));
 }
 
+#[path = "incoming_tests/pet_order.rs"]
+mod pet_order_tests;
 /// The packet's location is `EntityHitResult.getLocation() -
 /// entity.position()`, the point the view ray met the box at measured
 /// from the mob's feet (`MultiPlayerGameMode.interact`). The old fixed
@@ -670,6 +694,7 @@ fn a_mod_screen_on_a_machine_menu_takes_the_stock_layout_out() {
 fn a_falling_block_keeps_its_model_offset() {
     let at = Vec3::new(3.5, 70.25, -1.5);
     let falling = FallingBlock {
+        on_ground: false,
         attachment_lifetime: Default::default(),
         rotation: [0.0, 0.0],
         join: Default::default(),
@@ -1134,4 +1159,132 @@ fn integrated_server_save_persists_owner_player_data() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Screen::Studio` is the Studio script slot: it never draws the chat screen
+/// (`Screen::Studio => {}` in `game.rs`'s draw match, unlike
+/// `Screen::Chat => draw_chat_screen`), it never blurs the background, and
+/// while it is up gameplay does not own the keyboard (WASD cannot walk
+/// through it, and movement keys are cleared on open).
+#[test]
+fn studio_screen_stays_off_the_chat_slot() {
+    assert!(Screen::Studio != Screen::Chat);
+    assert_eq!(Screen::Studio.id(), "studio");
+    assert!(!Screen::Studio.blurs_background(false));
+    assert!(!Screen::Studio.blurs_background(true));
+    assert!(!gameplay_has_keyboard(Screen::Studio, false, false));
+    // The pure gate behind `Game::open_studio_screen`, as
+    // `native_mod_screen_open`'s `mod_screen_opens` is gated.
+    use super::studio::studio_screen_opens;
+    assert_eq!(studio_screen_opens(Screen::Playing, false), None);
+    assert_eq!(studio_screen_opens(Screen::Playing, true), Some(false));
+    assert_eq!(studio_screen_opens(Screen::Chat, false), Some(false));
+    assert_eq!(studio_screen_opens(Screen::Studio, false), Some(true));
+    assert_eq!(studio_screen_opens(Screen::Studio, true), Some(true));
+}
+
+#[test]
+fn eager_saves_keep_dirty_order_cooldowns_and_writer_budget() {
+    use horizon_client::world::ModifiedChunks;
+    use std::cell::Cell;
+    let now = Instant::now();
+    let mut dirty = ModifiedChunks::default();
+    dirty.extend((0..27).map(|x| (x, 0)));
+    dirty.autosaved(&[(0, 0), (2, 0)], now);
+    dirty.remove(&(1, 0)); // already clean
+    let writes = Cell::new(127);
+    let mut chosen = Vec::new();
+    dirty.save_eagerly(
+        now,
+        || writes.get() < 128,
+        |k| k != (3, 0),
+        |k| {
+            chosen.push(k);
+            writes.set(writes.get() + 1);
+            true
+        },
+    );
+    assert_eq!(chosen, [(4, 0)]); // cooldown, clean, absent, then budget exhausted
+    chosen.clear();
+    dirty.save_eagerly(
+        now,
+        || true,
+        |_| true,
+        |k| {
+            chosen.push(k);
+            true
+        },
+    );
+    assert_eq!(chosen, (5..25).map(|x| (x, 0)).collect::<Vec<_>>()); // exactly 20
+    dirty.insert((4, 0)); // a later edit goes AFTER the still-cooled entries
+    chosen.clear();
+    dirty.save_eagerly(
+        now + Duration::from_secs(10),
+        || true,
+        |_| true,
+        |k| {
+            chosen.push(k);
+            true
+        },
+    );
+    assert_eq!(chosen, [(0, 0), (2, 0), (25, 0), (26, 0), (4, 0)]);
+    dirty.insert((4, 0));
+    dirty.save_eagerly(
+        now + Duration::from_secs(11),
+        || false,
+        |_| true,
+        |_| panic!("no time"),
+    );
+    assert!(dirty.contains(&(4, 0)));
+    dirty.unloaded(&(4, 0)); // unloading removes the cooldown even if reloaded immediately
+    chosen.clear();
+    dirty.save_eagerly(
+        now + Duration::from_secs(11),
+        || true,
+        |_| true,
+        |k| {
+            chosen.push(k);
+            true
+        },
+    );
+    assert_eq!(chosen, [(4, 0)]);
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn eager_saves_wait_for_an_open_world_and_for_light() {
+    let mut resources = None;
+    let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+    let dir = std::env::temp_dir().join(format!("horizon-eager-game-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    game.save = Arc::new(horizon_client::save::SaveDir::new(
+        dir.clone(),
+        horizon_client::save::LevelShape::OVERWORLD,
+    ));
+    Arc::make_mut(game.world.chunks.get_mut(&(0, 0)).unwrap()).lit = true;
+    game.world
+        .chunks
+        .insert((1, 0), Arc::new(horizon_client::chunk::Chunk::empty(1, 0)));
+    game.world.modified.extend([(0, 0), (1, 0)]);
+    game.save_chunks_eagerly(); // no world open: nothing to save into
+    assert!(game.world.modified.contains(&(0, 0)));
+    game.world_root = dir.clone();
+    game.save_chunks_eagerly();
+    assert!(!game.world.modified.contains(&(0, 0)));
+    assert!(game.world.modified.contains(&(1, 0))); // not lit yet
+    Arc::make_mut(game.world.chunks.get_mut(&(1, 0)).unwrap()).lit = true;
+    game.save_chunks_eagerly(); // still queued: no new dirty transition needed
+    assert!(!game.world.modified.contains(&(1, 0)));
+    game.save.flush().unwrap();
+    assert!(dir.join("region/r.0.0.mca").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[path = "incoming_tests/knot_command_view.rs"]
+mod knot_command_view_tests;
+
+#[test]
+fn the_debug_crosshair_gives_way_to_the_radial_menu() {
+    assert!(!debug_crosshair_drawn(true, true, false, false, true));
 }

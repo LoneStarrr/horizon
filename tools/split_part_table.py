@@ -12,7 +12,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = Path('crates/horizon-mod-api/src/part_table.rs')
+SOURCE = Path('crates/horizon-mod-vocab/src/part_table.rs')
 DIRECTORY = SOURCE.with_suffix('')
 INCLUDE = 'include!(concat!(env!("OUT_DIR"), "/part_table_generated.rs"));\n'
 COMMENT = '//! Shared table state, cross-kind registration and common test fixtures only.\n'

@@ -113,7 +113,7 @@ impl FinalizeLevel for Level<'_> {
         let index = self.created;
         self.created += 1;
         let mut m = Mob::new(index as u32 + 1, t, Vec3::ZERO, 0.0);
-        m.random = LegacyRandom::new(self.eseed.wrapping_add(index as i64));
+        m.random.set_seed(self.eseed.wrapping_add(index as i64));
         Some(m)
     }
     fn spawn_data(&self) -> SpawnData<'_> {
@@ -317,7 +317,13 @@ fn describe(m: &Mob, all: &[Mob], regs: &SpawnRegistries) -> String {
                 let _ = write!(text, "[{}]", list.join(","));
             }
         }
-        if slot == 5 && horizon_client::mobs::raider::is_captain(m) {
+        // The ominous banner's components, read from the stack the mob wears.
+        if slot == 5
+            && m.extra
+                .slot_stack(horizon_items::equipment::HEAD)
+                .and_then(|s| s.data())
+                .is_some_and(|d| d.ominous_banner)
+        {
             text.push_str("*4");
         }
         eq.push(format!("{name}:{text}"));

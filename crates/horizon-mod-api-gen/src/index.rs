@@ -5,7 +5,7 @@ use syn::{Item, UseTree};
 
 /// The crates whose items mod API signatures name: crate name and source directory.
 const CRATES: &[(&str, &str)] = &[
-    ("mod_api", "crates/horizon-mod-api/src"),
+    ("mod_api", "crates/horizon-mod-vocab/src"),
     ("horizon_core", "crates/horizon-core/src"),
     ("horizon_mod_runtime", "crates/horizon-mod-runtime/src"),
     ("horizon_world", "crates/horizon-world/src"),

@@ -31,7 +31,7 @@ removed entity or remove a newly created one. `After::Changed` and `After::Updat
 position-based; `root_commit` coalesces `Changed` but does not generally coalesce `Updated`.
 Neither direct deletion nor assuming the present journal already handles lifecycle changes is safe.
 
-`BlockEntityRef` in `horizon-mod-api/src/lib.rs` identifies a level, position and lifecycle generation.
+The vocabulary's `BlockEntityRef`, re-exported by `mod_api`, identifies a level, position and lifecycle generation.
 `native_block_entity_target` rejects a replacement or reloaded entity at that position, just as it
 rejects an absent entity or an old world epoch. In-place payload edits preserve identity. The
 contract below preserves this identity rule; it does not offer transactional lifecycle writes yet.

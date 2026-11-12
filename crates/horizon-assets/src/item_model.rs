@@ -1,7 +1,7 @@
 //! The 26.3 client item definitions (`assets/<ns>/items/*.json`): the model
 //! tree (`model`, `composite`, `condition`, `select`, `range_dispatch`,
-//! `special`, `bundle/selected_item`, `empty`), its properties and tints, and
-//! the resolver that turns one stack into render layers
+//! `special`, `neoforge:fluid_container`, `bundle/selected_item`, `empty`), its
+//! properties and tints, and the resolver that turns one stack into render layers
 //! (`ItemModelResolver.updateForTopItem`).
 //!
 //! Baked geometry lives in [`crate::item_bake`]; this module decides *which*
@@ -17,12 +17,15 @@ use std::{
 };
 
 mod component_predicate;
+mod fluid_container;
 mod foreign;
 mod mod_properties;
 mod special;
+pub use fluid_container::{FluidAppearance, FluidContainer, FluidContainerTextures};
 pub use mod_properties::{
-    is_range_property, is_select_property, is_tint_source, register_range_properties,
-    register_select_properties, register_tint_sources,
+    is_item_model_type, is_mod_id, is_range_property, is_select_property, is_tint_source,
+    keep_mod_ids, register_item_models, register_range_properties, register_select_properties,
+    register_tint_sources,
 };
 pub use special::{SpecialKind, SpecialModel};
 
@@ -424,7 +427,18 @@ pub enum ItemModelNode {
         transformation: Option<Mat4>,
         model: SpecialModel,
     },
+    FluidContainer(FluidContainer),
     BundleSelectedItem,
+    /// A node of a type a native mod registered (`register_item_models`): per stack, its mod
+    /// answers which of `models`, by name, draw (`item_model_update`).
+    Registered {
+        kind: String,
+        transformation: Option<Mat4>,
+        /// The node's JSON object, converted once at load.
+        config: Arc<horizon_core::nbt::Tag>,
+        /// The node's `models` object: named nodes decoded and baked as any other.
+        models: Vec<(String, ItemModelNode)>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct SwitchCase {
@@ -565,14 +579,31 @@ impl ItemModelNode {
                 model: SpecialModel::decode(required(m, "model")?)?,
             },
             "minecraft:bundle/selected_item" => Self::BundleSelectedItem,
-            other if foreign::is_foreign(other) => foreign::decode_node(other, m),
-            _ => return Err(err("unknown item model type")),
+            // NeoForge's own item model type, which the engine owns. It is matched ahead of
+            // the types mods register, so no mod can take it over.
+            "neoforge:fluid_container" => Self::FluidContainer(FluidContainer::decode(m)?),
+            kind if is_item_model_type(kind) => Self::Registered {
+                kind: kind.to_owned(),
+                transformation: optional_transformation(m)?,
+                config: Arc::new(
+                    horizon_core::json_nbt::json_to_tag(v)
+                        .map_err(|_| err("invalid item model data"))?,
+                ),
+                models: match m.get("models") {
+                    None => Vec::new(),
+                    Some(models) => object(models)?
+                        .iter()
+                        .map(|(name, node)| Ok((name.clone(), Self::decode(node)?)))
+                        .collect::<Result<_>>()?,
+                },
+            },
+            other => return Err(err(&format!("unknown item model type {other}"))),
         })
     }
     /// Every model resource id the tree can ask for.
     pub fn dependencies(&self, out: &mut Vec<String>) {
         match self {
-            Self::Empty | Self::BundleSelectedItem => {}
+            Self::Empty | Self::BundleSelectedItem | Self::FluidContainer(_) => {}
             Self::Model(leaf) => out.push(leaf.model.clone()),
             Self::Composite { models, .. } => models.iter().for_each(|m| m.dependencies(out)),
             Self::Condition {
@@ -594,6 +625,9 @@ impl ItemModelNode {
                 fallback.iter().for_each(|f| f.dependencies(out));
             }
             Self::Special { base, .. } => out.push(base.clone()),
+            Self::Registered { models, .. } => {
+                models.iter().for_each(|(_, m)| m.dependencies(out));
+            }
         }
     }
 }
@@ -1100,6 +1134,31 @@ pub trait ItemEnv {
     ) -> i32 {
         -1
     }
+    /// The fluid `stack` holds (`FluidUtil.getFirstStackContained`), or `None` when it
+    /// holds none. The game answers for vanilla's buckets and asks a mod's own items
+    /// (`contained_fluid`); a container nothing answers for draws its declared fluid.
+    fn stack_fluid(&self, _stack: &StackView) -> Option<&str> {
+        None
+    }
+    /// What `fluid` draws with in an item: its still sprite and the tint
+    /// `FluidContentsTint` gives a stack holding it. `None` for a fluid the host has no
+    /// model for, `minecraft:empty` included; the resolver draws the missing sprite for
+    /// those, except the empty fluid, which draws nothing.
+    fn fluid_appearance(&self, _fluid: &str) -> Option<FluidAppearance> {
+        None
+    }
+    /// A mod's registered node type for `stack`, with the node's object and the surroundings
+    /// `ItemModel.update` reads (`ctx`): push the names of the node's `models` to draw, in order.
+    /// None draw when no mod answers.
+    fn item_model_update(
+        &self,
+        _kind: &str,
+        _config: &horizon_core::nbt::Tag,
+        _stack: &StackView,
+        _ctx: &Context,
+        _models: &mut Vec<String>,
+    ) {
+    }
     /// `PotionContents.getColorOr` for the potion/effects part: the mixed
     /// effect colour, or `None` when the contents have no visible effects.
     fn potion_effect_color(&self, _potion_contents: &Value) -> Option<i32> {
@@ -1154,6 +1213,12 @@ pub enum FoilType {
 pub enum LayerContent {
     /// A cuboid model resource, baked by [`crate::item_bake`].
     Model { model: String },
+    /// One `item/generated` layer of a sprite, its pixels kept only where `mask`'s
+    /// are opaque: NeoForge's `bakeItemMaskQuads`.
+    Sprite {
+        sprite: String,
+        mask: Option<String>,
+    },
     /// `MissingItemModel`.
     Missing,
     Special {
@@ -1268,6 +1333,15 @@ struct Resolve<'a> {
     components: ComponentsView<'a>,
     ctx: &'a Context<'a>,
     env: &'a dyn ItemEnv,
+}
+
+/// A `Transformation` of scale `(1, 1, z)` as `FaceBakery.bakeVertex` applies a model
+/// state's: about `BLOCK_MIDDLE` (0.5, 0.5, 0.5), in the model's 0..1 space.
+fn depth_scale(z: f32) -> Mat4 {
+    Mat4::IDENTITY
+        .translate([0.5; 3])
+        .scale([1.0, 1.0, z])
+        .translate([-0.5; 3])
 }
 
 fn compose(parent: &Mat4, own: &Option<Mat4>) -> Mat4 {
@@ -1430,13 +1504,101 @@ impl Resolve<'_> {
                     transform,
                 });
             }
+            ItemModelNode::FluidContainer(container) => {
+                self.fluid_container(out, container, parent);
+            }
             ItemModelNode::BundleSelectedItem => {
                 if let Some(selected) = self.bundle_selected() {
                     self.models
                         .append_layers(out, &selected, self.ctx, self.env);
                 }
             }
+            ItemModelNode::Registered {
+                kind,
+                transformation,
+                config,
+                models,
+            } => {
+                let mut drawn = Vec::new();
+                self.env
+                    .item_model_update(kind, config, self.stack, self.ctx, &mut drawn);
+                let child = compose(parent, transformation);
+                for name in &drawn {
+                    if let Some((_, model)) = models.iter().find(|(key, _)| key == name) {
+                        self.node(out, model, &child);
+                    }
+                }
+            }
         }
+    }
+    /// `DynamicFluidContainerModel.bakeModelForFluid`: the base layer, then the held
+    /// fluid's still sprite through the `fluid` mask, then the cover. The fluid layer is
+    /// baked under `FLUID_TRANSFORM` and the cover under `COVER_TRANSFORM` (offsets 403-415,
+    /// 617-629), Z scales of 1.002 and 1.004 (`<clinit>` 0-83) that `FaceBakery` applies
+    /// about the block's middle: each sits a little further out than the one below it.
+    fn fluid_container(&self, out: &mut ResolvedItem, container: &FluidContainer, parent: &Mat4) {
+        let textures = &container.textures;
+        // `update`: the fluid the stack holds, else the model's own (offsets 0-29).
+        let held = self.env.stack_fluid(self.stack);
+        let drawn = held.unwrap_or(&container.fluid);
+        if let Some(base) = &textures.base {
+            self.sprite_layer(out, base, None, Vec::new(), parent);
+        }
+        // `fluid != EMPTY ? FluidStateModelSet.get(fluid).stillMaterial() : null` (offsets
+        // 129-145): a fluid the host has no model for gets `ModelBakery.MissingModels.fluid`,
+        // the missing sprite with no tint source, so it draws `missingno` untinted.
+        let appearance = self.env.fluid_appearance(drawn).or_else(|| {
+            (drawn != "minecraft:empty").then(|| FluidAppearance {
+                still: crate::item_bake::MISSING_SPRITE.to_owned(),
+                tint: -1,
+            })
+        });
+        if let (Some(mask), Some(appearance)) = (&textures.fluid, appearance) {
+            // `FluidContentsTint` colours the layer from the fluid the stack holds, not the one
+            // drawn: a stack holding none gets the empty fluid's model, which has no tint source,
+            // so -1, even while the declared fluid is drawn. A stack that holds one draws that
+            // same fluid, so its tint is the appearance already looked up.
+            let tint = if held.is_some() { appearance.tint } else { -1 };
+            let parent = parent.mul(&depth_scale(1.002));
+            self.sprite_layer(out, &appearance.still, Some(mask), vec![tint], &parent);
+        }
+        // The cover is always the mask (`bakeItemMaskQuads(baker, 0, cover, drawn, ...)`, offsets
+        // 631-639). With `cover_is_mask` it picks out the parts of `base` drawn again over the
+        // fluid, so it needs a base (offsets 147-164); otherwise the cover draws itself.
+        if let Some(cover) = &textures.cover {
+            let drawn = if container.cover_is_mask {
+                textures.base.as_deref()
+            } else {
+                Some(cover.as_str())
+            };
+            if let Some(drawn) = drawn {
+                let parent = parent.mul(&depth_scale(1.004));
+                self.sprite_layer(out, drawn, Some(cover), Vec::new(), &parent);
+            }
+        }
+    }
+    /// One `item/generated` layer, which [`crate::item_bake::bake_sprite_layer`] extrudes.
+    fn sprite_layer(
+        &self,
+        out: &mut ResolvedItem,
+        sprite: &str,
+        mask: Option<&str>,
+        tints: Vec<i32>,
+        parent: &Mat4,
+    ) {
+        out.layers.push(Layer {
+            content: LayerContent::Sprite {
+                sprite: sprite.to_owned(),
+                mask: mask.map(str::to_owned),
+            },
+            tints,
+            foil: if self.has_foil() {
+                FoilType::Standard
+            } else {
+                FoilType::None
+            },
+            transform: *parent,
+        });
     }
     fn item_in_compass_tag(&self) -> bool {
         // `ItemTags.COMPASSES`: the compass and the recovery compass.
@@ -1837,14 +1999,13 @@ fn stack_from_template(template: &Value) -> Option<StackView> {
 
 /// `RangeSelectItemModel.lastIndexLessOrEqual`.
 fn last_index_less_or_equal(entries: &[(f32, ItemModelNode)], needle: f32) -> Option<usize> {
-    let haystack: Vec<f32> = entries.iter().map(|e| e.0).collect();
-    let found = if haystack.len() < 16 {
-        haystack
+    let found = if entries.len() < 16 {
+        entries
             .iter()
-            .position(|h| *h > needle)
-            .map_or(haystack.len() as i64 - 1, |i| i as i64 - 1)
+            .position(|e| e.0 > needle)
+            .map_or(entries.len() as i64 - 1, |i| i as i64 - 1)
     } else {
-        match binary_search(&haystack, needle) {
+        match binary_search(entries, needle) {
             Ok(index) => index as i64,
             Err(insertion) => insertion as i64 - 1,
         }
@@ -1853,8 +2014,8 @@ fn last_index_less_or_equal(entries: &[(f32, ItemModelNode)], needle: f32) -> Op
 }
 /// `Arrays.binarySearch(float[], float)`, including its handling of equal
 /// values (-0.0 below 0.0, NaN above everything).
-fn binary_search(a: &[f32], key: f32) -> std::result::Result<usize, usize> {
-    let (mut low, mut high) = (0i64, a.len() as i64 - 1);
+fn binary_search(entries: &[(f32, ItemModelNode)], key: f32) -> std::result::Result<usize, usize> {
+    let (mut low, mut high) = (0i64, entries.len() as i64 - 1);
     let bits = |v: f32| -> i32 {
         if v.is_nan() {
             0x7fc0_0000
@@ -1864,7 +2025,7 @@ fn binary_search(a: &[f32], key: f32) -> std::result::Result<usize, usize> {
     };
     while low <= high {
         let mid = (low + high) >> 1;
-        let value = a[mid as usize];
+        let value = entries[mid as usize].0;
         if value < key {
             low = mid + 1;
         } else if value > key {
@@ -1883,6 +2044,8 @@ fn binary_search(a: &[f32], key: f32) -> std::result::Result<usize, usize> {
     Err(low as usize)
 }
 
+#[cfg(test)]
+mod fluid_container_tests;
 #[cfg(test)]
 mod foreign_tests;
 #[cfg(test)]

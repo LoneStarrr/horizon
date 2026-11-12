@@ -78,10 +78,25 @@ fn vehicle_id(t: Target) -> Option<u32> {
 
 impl Game<'_> {
     /// `AbstractMinecart.getDismountLocationForPassenger` for a standing mob.
-    pub(super) fn cart_dismount_point(&self, vehicle: u32, rider: usize) -> Option<Vec3> {
+    pub(super) fn cart_dismount_point(&self, vehicle: u32, rider: u32) -> Option<Vec3> {
+        self.cart_dismount_point_from(self.cart_object(vehicle)?, self.mob_object(rider)?)
+    }
+
+    pub(super) fn cart_dismount_mob(
+        &self,
+        vehicle: u32,
+        rider: &horizon_client::mobs::Mob,
+    ) -> Option<Vec3> {
+        self.cart_dismount_point_from(self.cart_object(vehicle)?, rider)
+    }
+
+    /// The live tick snapshot may have moved beyond the cart's owning slot.
+    pub(super) fn cart_dismount_point_from(
+        &self,
+        cart: &super::minecarts::Minecart,
+        rider: &horizon_client::mobs::Mob,
+    ) -> Option<Vec3> {
         use horizon_core::geometry::Aabb;
-        let cart = self.carts.iter().find(|c| c.id == vehicle)?;
-        let rider = &self.mobs[rider];
         let direction =
             (f64::from(cart.yaw) / 90.0 + 0.5).floor() as i32 + if cart.flipped { 3 } else { 1 };
         let (fx, fz) = [(0, 1), (-1, 0), (0, -1), (1, 0)][(direction & 3) as usize];
@@ -130,13 +145,20 @@ impl Game<'_> {
 
     /// `AbstractHorse.getDismountLocationForPassenger`: try either side
     /// through the mount's height, then fall back to its feet.
-    pub(super) fn horse_dismount_point(&self, vehicle: u32, rider: usize) -> Option<Vec3> {
+    pub(super) fn horse_dismount_point(&self, vehicle: u32, rider: u32) -> Option<Vec3> {
+        self.horse_dismount_mobs(self.mob_object(vehicle)?, self.mob_object(rider)?)
+    }
+
+    /// The horse search for a mount and rider currently lent out of the mob list.
+    pub(super) fn horse_dismount_mobs(
+        &self,
+        mount: &horizon_client::mobs::Mob,
+        rider: &horizon_client::mobs::Mob,
+    ) -> Option<Vec3> {
         use horizon_core::geometry::{Aabb, trig};
-        let mount = self
-            .mobs
-            .iter()
-            .find(|m| m.id == vehicle && is_horse(m.species()))?;
-        let rider = &self.mobs[rider];
+        if !is_horse(mount.species()) {
+            return None;
+        }
         let turn = if rider.main_arm_left() { -90.0 } else { 90.0 };
         let reach =
             (f64::from(mount.width()) + f64::from(rider.width()) + f64::from(1e-5_f32)) / 2.0;
@@ -179,19 +201,13 @@ impl Game<'_> {
     /// `Entity.teleportCrossDimension` ejects the riders before calculating
     /// their transitions. Dismounting also seats their own passengers again.
     fn prepare_vehicle_transition(&mut self, root: u32) {
-        let riders: Vec<_> = self
-            .mobs
-            .iter()
-            .filter(|m| m.extra.mount == Some(root))
-            .map(|m| m.id)
-            .collect();
+        let riders = self.mob_passenger_ids(root);
         for &rider in riders.iter().rev() {
             self.dismount_mob(rider);
-            self.snap_mob_passengers(rider);
         }
         for rider in riders {
             self.prepare_vehicle_transition(rider);
-            if let Some(m) = self.mobs.iter_mut().find(|m| m.id == rider) {
+            if let Some(m) = self.mob_object_mut(rider) {
                 // Preserve the tree for serialization after all transitions
                 // have used the positions left by ejectPassengers.
                 m.extra.mount = Some(root);
@@ -201,29 +217,66 @@ impl Game<'_> {
     }
 
     /// `Entity.teleportPassengers` on a mob dismounted during a transition.
-    fn snap_mob_passengers(&mut self, root: u32) {
+    pub(super) fn snap_mob_passengers(&mut self, root: u32) {
         use horizon_client::mobs::riders;
-        let Some(vehicle) = self.mobs.iter().find(|m| m.id == root) else {
+        let Some(vehicle) = self.mob_object(root) else {
             return;
         };
-        let (position, yaw, width, attachment, vehicle_box) = (
+        let (position, yaw, width, vehicle_box) = (
             vehicle.position,
             vehicle.yaw,
             vehicle.width(),
-            riders::passenger_attachment(vehicle),
             vehicle.bounds(),
         );
-        let mut children = Vec::new();
-        for m in self.mobs.iter_mut().filter(|m| m.extra.mount == Some(root)) {
+        let children = self.seated_passengers(root);
+        for (seat, &(_, id, player)) in children.iter().enumerate() {
+            if player {
+                continue;
+            }
+            let Some(m) = self.mob_object(id) else {
+                continue;
+            };
+            let attachment = Self::mob_passenger_attachment(
+                self.mob_object(root).unwrap(),
+                m,
+                seat,
+                children.len(),
+            );
             let offset = riders::vehicle_attachment(m, width);
+            let m = self.mob_object_mut(id).unwrap();
             m.seated(root, offset, vehicle_box);
             m.position = riders::seat(attachment, offset, position, yaw);
             m.previous = m.position;
-            children.push(m.id);
         }
-        for child in children {
-            self.snap_mob_passengers(child);
+        for (_, child, player) in children {
+            if !player {
+                self.snap_mob_passengers(child);
+            }
         }
+    }
+
+    /// The cross-level teleport of a command's target: a general entity tree
+    /// carries itself across (identity kept, join identity new) and always
+    /// answers; a vehicle tree answers only when it moved. `None` leaves the
+    /// target to the caller's player path.
+    pub(in crate::game) fn teleport_target_across(
+        &mut self,
+        target: Target,
+        destination: super::Dim,
+        at: [f64; 3],
+        rotation: Option<[f32; 2]>,
+        turn_riders: bool,
+    ) -> horizon_client::Result<Option<bool>> {
+        if let Target::General(id) = target {
+            return Ok(Some(self.teleport_general_tree_across(
+                id,
+                destination,
+                at,
+            )?));
+        }
+        Ok(self
+            .teleport_vehicle_across(target, destination, at, rotation, turn_riders)?
+            .then_some(true))
     }
 
     /// `Entity.teleportCrossDimension`: carry a command's entire vehicle tree
@@ -244,8 +297,7 @@ impl Game<'_> {
             if source == destination {
                 return Ok(false);
             }
-            // The vehicle and the server players riding it are asked before
-            // anything moves; one cancel keeps them all where they are.
+            // Refused passengers are dismounted and remain in the source level.
             if !game.tree_may_travel(root, destination) {
                 return Ok(true);
             }
@@ -258,15 +310,16 @@ impl Game<'_> {
                 .any(|m| m.id == root && m.extra.mount.is_some())
             {
                 game.dismount_mob(root);
-                game.snap_mob_passengers(root);
             }
             game.prepare_vehicle_transition(root);
             game.teleport_to_in_level(target, at, rotation, [false; 3], turn_riders);
-            let mounts: Vec<_> = game.mobs.iter().map(|m| (m.id, m.extra.mount)).collect();
+            game.teleport_stops(target);
+            let mounts: Vec<_> = game.mob_objects().map(|m| (m.id, m.extra.mount)).collect();
             let tree = super::persist::vehicle_tree(root, &mounts);
             let tag = game.vehicle_tree_nbt(root).ok_or("missing vehicle tree")?;
-            let kind = horizon_client::entity_nbt::kind(&tag).ok_or("missing vehicle type")?;
-            let uuid = horizon_client::entity_nbt::uuid(&tag);
+            let state = game
+                .capture_vehicle_tree_state(root)
+                .ok_or("missing vehicle object state")?;
             let mut players = Vec::new();
             // A command runs with its source player swapped out of the hub.
             if game.riding.is_some_and(|id| tree.contains(&id))
@@ -293,11 +346,8 @@ impl Game<'_> {
                     }
                 }
             }
-            let players: Vec<_> = players
-                .into_iter()
-                .map(|(conn, at, rotation, mount)| (conn, at, rotation, game.uuid_for(mount)))
-                .collect();
             game.mobs.retain(|m| !tree.contains(&m.id));
+            game.persist.off_level.retain(|id, _| !tree.contains(id));
             game.boats.retain(|b| !tree.contains(&b.id));
             game.carts.retain(|c| !tree.contains(&c.id));
             for id in tree {
@@ -308,28 +358,25 @@ impl Game<'_> {
             game.enter_level(destination)?;
             // restoreFrom reloads saved state into fresh entities, rather than
             // retaining navigation paths or goals from the old level.
-            game.load_listed(&kind, uuid, game.level.player_uuid, tag)
-                .map_err(|_| "could not restore vehicle tree")?;
+            let restored_objects = game
+                .restore_vehicle_tree_state(tag, state)
+                .ok_or("could not restore vehicle tree")?;
             // AbstractHorse.addPassenger snaps a reattached passenger to the
             // new horse's getViewYRot(0) / getViewXRot(0). A fresh living
             // entity's previous head yaw is still zero, before its first tick.
-            let new_root = uuid
-                .and_then(|uuid| game.vehicle_by_uuid(uuid))
-                .ok_or("restored vehicle is missing")?;
-            let mounts: Vec<_> = game.mobs.iter().map(|m| (m.id, m.extra.mount)).collect();
+            let new_root = restored_objects.root;
+            let mounts: Vec<_> = game.mob_objects().map(|m| (m.id, m.extra.mount)).collect();
             let restored = super::persist::vehicle_tree(new_root, &mounts);
             let horses: Vec<_> = game
-                .mobs
-                .iter()
+                .mob_objects()
                 .filter(|m| restored.contains(&m.id) && is_horse(m.species()))
                 .map(|m| (m.id, m.head_pitch))
                 .collect();
             for (horse, pitch) in horses {
-                for rider in game
-                    .mobs
-                    .iter_mut()
-                    .filter(|m| m.extra.mount == Some(horse))
-                {
+                for id in game.mob_passenger_ids(horse) {
+                    let Some(rider) = game.mob_object_mut(id) else {
+                        continue;
+                    };
                     rider.yaw = 0.0;
                     rider.previous_yaw = 0.0;
                     rider.head_pitch = pitch;
@@ -343,7 +390,7 @@ impl Game<'_> {
                         dim: destination,
                         at,
                         rotation: Some(rotation),
-                        vehicle: game.vehicle_by_uuid(mount),
+                        vehicle: restored_objects.by_source.get(&mount).copied(),
                     });
             }
             game.native_joins_flush(false, 0);
@@ -357,29 +404,11 @@ impl Game<'_> {
     /// carries) may all travel to `destination` by a teleport
     /// (`entity_travel_to_dimension`).
     fn tree_may_travel(&mut self, root: u32, destination: super::Dim) -> bool {
-        let mounts: Vec<_> = self.mobs.iter().map(|m| (m.id, m.extra.mount)).collect();
-        let tree = super::persist::vehicle_tree(root, &mounts);
-        let mut asked = vec![root];
-        if self.riding.is_some_and(|id| tree.contains(&id))
-            && let Some(id) = self.network_entity_id(Target::Player)
-        {
-            asked.push(id as u32);
-        }
-        if let Some(host) = self.lan.as_ref() {
-            asked.extend(
-                host.hub
-                    .guests
-                    .iter()
-                    .filter(|g| {
-                        Some(g.conn) != self.lan_acting
-                            && g.vehicle.is_some_and(|id| tree.contains(&id))
-                    })
-                    .map(|g| g.entity_id as u32),
-            );
-        }
-        asked.into_iter().all(|id| {
-            self.entity_may_travel(id, destination, super::server_travel::TravelCause::Teleport)
-        })
+        self.entity_may_travel(
+            root,
+            destination,
+            super::server_travel::TravelCause::Teleport,
+        )
     }
 
     /// `Entity.teleportSameDimension`: after `t` moved from `from` to `to`, its
@@ -411,16 +440,14 @@ impl Game<'_> {
         new: Vec3,
         rotation: Option<PlacedRotation>,
     ) {
-        let riders: Vec<u32> = self
-            .mobs
-            .iter()
-            .filter(|m| m.extra.mount == Some(vehicle))
-            .map(|m| m.id)
-            .collect();
+        let riders = self.mob_passenger_ids(vehicle);
         for id in riders {
-            if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
+            let mut carried = None;
+            if let Some(m) = self.mob_object_mut(id) {
+                let from = m.position;
                 m.position = passenger_destination(old, new, m.position);
                 m.previous = m.position;
+                carried = Some((from, m.position));
                 // Entity.calculatePassengerTransition turns the rider with the
                 // vehicle, then Entity.teleportSetPosition keeps the old angles
                 // for the interpolation.
@@ -435,14 +462,23 @@ impl Game<'_> {
                     m.previous_head_pitch = pitch;
                 }
             }
+            // Each rider's `teleportSetPosition` is a position update of its own.
+            if let Some((from, to)) = carried {
+                self.entity_section_step(id, [from.x, from.y, from.z], [to.x, to.y, to.z]);
+            }
             self.move_riders(id, old, new, rotation);
         }
         if self.riding == Some(vehicle)
             && let Some(p) = self.player.as_mut()
         {
+            let from = p.position;
             p.position = passenger_destination(old, new, p.position);
             p.teleported = true;
             self.previous_position = p.position;
+            let (to, own) = (p.position, self.own_entity_id());
+            if let Ok(own) = u32::try_from(own) {
+                self.entity_section_step(own, [from.x, from.y, from.z], [to.x, to.y, to.z]);
+            }
         }
         if let Some(placed) = rotation
             && self.riding == Some(vehicle)
@@ -502,7 +538,7 @@ impl Game<'_> {
             [b.yaw, b.pitch]
         } else if let Some(c) = self.carts.iter().find(|c| c.id == id) {
             [c.yaw, c.pitch]
-        } else if let Some(m) = self.mobs.iter().find(|m| m.id == id) {
+        } else if let Some(m) = self.mob_object(id) {
             [m.yaw, m.head_pitch]
         } else {
             [0.0, 0.0]

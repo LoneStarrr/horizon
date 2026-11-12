@@ -1,7 +1,7 @@
 //! What the browser shows beyond a search hit: a project's page (description, gallery, links,
 //! authors) and the search's filters (categories, loader, game version, environment, sort), with
 //! the lists of values each source offers for them. Data only: `mods_page` draws it.
-use super::{GAME, Kind};
+use super::{Kind, GAME};
 use serde_json::Value;
 
 /// How results are ordered.
@@ -84,6 +84,9 @@ pub struct Filters {
     pub environment: Option<Environment>,
     /// None: by relevance with search text, else by downloads.
     pub sort: Option<Sort>,
+    /// Only what works on the selected instance: Horizon's registry leaves out the native mods
+    /// with no version that builds on it.
+    pub works_on: bool,
 }
 
 impl Filters {

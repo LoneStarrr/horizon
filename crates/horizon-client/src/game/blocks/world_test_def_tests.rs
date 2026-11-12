@@ -27,7 +27,10 @@ fn world_with_pack(tag: &str) -> std::path::PathBuf {
     world
 }
 
-fn game(world: &std::path::Path) -> Game<'static> {
+fn game<'a>(
+    resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>,
+    world: &std::path::Path,
+) -> Game<'a> {
     let root = std::path::PathBuf::from(
         std::env::var_os("HORIZON_TEST_RESOURCES")
             .expect("set HORIZON_TEST_RESOURCES to prepared resources"),
@@ -49,7 +52,7 @@ fn game(world: &std::path::Path) -> Game<'static> {
     let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
     options.resources = root.clone();
     options.execution_role = execution_role::ExecutionRole::IntegratedServer;
-    let res: &'static _ = Box::leak(Box::new(loaded.resources));
+    let res = resources.insert(loaded.resources);
     let mut game = Game::new(
         res,
         loaded.pack,
@@ -72,9 +75,10 @@ fn game(world: &std::path::Path) -> Game<'static> {
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn a_test_instance_from_an_enabled_world_pack_is_found_and_runs() {
     let world = world_with_pack("found");
-    let mut game = game(&world);
+    let mut resources = None;
+    let mut game = game(&mut resources, &world);
     // The world opens: its state, registries and test instances.
-    game.load_world_state();
+    game.load_world_state().unwrap();
     game.ensure_datapacks();
     let enabled = &game.ui.registries.datapacks_enabled;
     assert!(
@@ -158,11 +162,15 @@ fn a_world_keeps_the_test_instances_it_opened_with() {
         &[("h275:broken", FAILING), ("minecraft:always_pass", FAILING)],
     );
     let b = world_with("b", &[("h275:other", FAILING)]);
-    let mut game = game(&a);
+    let mut resources = None;
+    let mut game = game(&mut resources, &a);
     // No world opened yet: the game's own data, as before.
     let builtin = game.test_def("minecraft:always_pass").expect("built in");
     assert!(!builtin.block_based, "the built-in function test");
-    game.load_world_state();
+    // World opening publishes its data packs before snapshotting test instances.
+    game.reload_datapacks(false, &game.level.enabled_features.clone())
+        .unwrap();
+    game.load_world_state().unwrap();
     let ids = |game: &Game<'_>| game.ui.registries.ids("minecraft:test_instance").to_vec();
     assert_eq!(ids(&game), ["h275:broken", "minecraft:always_pass"]);
     assert!(
@@ -191,7 +199,9 @@ fn a_world_keeps_the_test_instances_it_opened_with() {
     assert_eq!(ids(&game), ["h275:broken", "minecraft:always_pass"]);
     // World B.
     game.world_root = b.clone();
-    game.load_world_state();
+    game.reload_datapacks(false, &game.level.enabled_features.clone())
+        .unwrap();
+    game.load_world_state().unwrap();
     assert_eq!(ids(&game), ["h275:other", "minecraft:always_pass"]);
     assert!(
         game.test_def("h275:broken").is_none(),

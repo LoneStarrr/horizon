@@ -140,12 +140,15 @@ impl Goal for Spell {
             // `performSpellCasting` blinds the target whatever it is: a
             // villager or an iron golem as well as the player.
             match m.ai.target {
-                Some(Who::Player) => cx.events.push(MobEvent::EffectPlayer {
-                    effect: BLINDNESS,
-                    ticks: 400,
-                    amplifier: 0,
-                    ambient: false,
-                }),
+                Some(Who::Player) => {
+                    cx.events
+                        .push(cx.w.route_player_event(MobEvent::EffectPlayer {
+                            effect: BLINDNESS,
+                            ticks: 400,
+                            amplifier: 0,
+                            ambient: false,
+                        }))
+                }
                 Some(Who::Mob(target)) => cx.events.push(MobEvent::EffectMob {
                     target,
                     effect: BLINDNESS,

@@ -12,20 +12,19 @@ pub(in crate::game) use fire::{
     BlockDropsCall, BlockScreenEffectDrawCall, ConnectsToCall, EntityChangeBlockPreCall,
     ItemAfterVerticalCollisionCall, UpdateShapeCall,
 };
+use mod_api::{BlockEntityDataSource, BlockEntityRef};
 
-use super::native_data_maps::NativeDataMapType;
+use super::native_data_maps::DataMapType;
 use super::{
     Game, GameLevel, LevelDimension, Screen,
     execution_role::{self, ExecutionRole},
-    maps::{NativeMapDecoration, NativeMapInfo},
     mod_api_host,
     native_block_entity_draw::BlockEntityDraw,
-    native_configs::{NativeConfig, NativeConfigFile},
-    native_mob_draw::{NativeMobRender, NativePlayerRender},
+    native_configs::ConfigFile,
+    native_mob_draw::{MobRender, PlayerRender},
     native_panel_recipes::RecipePage,
 };
 use horizon_client::block_contact::Pending;
-use horizon_client::creative::Creative;
 use horizon_client::{
     atlas_sources::qualified,
     biome::{BiomeColors, SpawnEntry},
@@ -50,7 +49,7 @@ use horizon_client::{
     lan::menu::Slots,
     merchant::MerchantOffer,
     mobs::{Damage, Who},
-    mod_list::{self, Installed, KeyMapping, NativePage},
+    mod_list::{self, Installed, KeyMapping, NativePage, NativeSetting, NativeSettingValue},
     music::{Music, MusicLayer},
     particles::{ParticleOptions, ParticleType},
     text::Text,
@@ -68,34 +67,33 @@ use horizon_world::level::{BonemealCheck, PlaceContext};
 use mod_api::CommandSource;
 use mod_api::GameMode;
 use mod_api::GameTests;
-pub use mod_api::game::{NativeClock, NativeShake, PhantomSpawnResult, SleepProblem};
+pub use mod_api::game::{PhantomSpawnResult, Shake, SleepProblem};
 use mod_api::{
-    self, Answered, BlockPlacement, BlockTintSources, CameraDrawContext, ClientAudioOptions,
-    ClientChatOptions, ClientGraphicsOptions, ClientGuiOptions, ClientInputOptions,
-    ClientMiningPrediction, ClientModifiers, ClientReloadListeners, CommandInvocation,
-    EnchantmentInfo, EntityRef, GameRuleActor, InteractionAttempt, InteractionKey, LayerDefinition,
-    LivingRef, NativeCamera, NativeCommand, NativeDispensed, NativeHandRender, NativeKeyMapping,
-    NativeLifecycleContext, NativeNoteBlockChange, PathComputationType, Placement, PlayerRef,
-    RecipeBookCategory, ScreenId, ScreenOpening, ScreenshotImage, ServerReloadListeners,
-    ServerTickPhase, TicketController, ToolUse, WorldPhase,
+    self, Answered, BlockPlacement, BlockTintSources, CameraDrawContext, CauldronFluidContents,
+    CauldronInteractions, ClientAudioOptions, ClientChatOptions, ClientGraphicsOptions,
+    ClientGuiOptions, ClientInputOptions, ClientMiningPrediction, ClientModifiers,
+    ClientReloadListeners, ColorResolvers, CommandInvocation, EnchantmentDamageEffects,
+    EnchantmentInfo, EntityRef, GameRuleActor, HandRender, InsideEffects, InteractionAttempt,
+    InteractionKey, JsonAnimationType, LayerDefinition, LifecycleContext, LivingRef,
+    LoadConditions, NoteBlockChange, ParticleProviders, PathComputationType, Placement, PlayerRef,
+    PoiTypeExtensions, RecipeBookCategory, ScreenId, ScreenOpening, ScreenshotImage,
+    ServerReloadListeners, ServerTickPhase, TicketController, ToolUse, VillagerProfessions,
+    WorldPhase,
 };
 use mod_api::{
-    AttachmentStore, BonemealSource, ChunkRef, FluidStack, LevelRef, LogicalSide,
-    NativeActiveEffect, NativeBlockClick, NativeBlockUpdateFlags, NativeInteractionResult,
-    NativeItemClick, NativeItemDrop, NativeTriState, NeighbourUpdate, TooltipElement, UsePhase,
+    ActiveEffect, AttachmentStore, BlockClick, BlockUpdateFlags, BonemealSource, ChunkRef,
+    FluidStack, ItemClick, ItemDrop, LevelRef, LogicalSide, NeighbourUpdate, TooltipElement,
+    TriState, UsePhase,
 };
 use mod_api::{
-    BlockKey, DebugEntry, DebugRenderer, EffectKey, GuiLayer, MapDecorationType, RuntimeSprite,
-    TaskId,
-};
-use mod_api::{
-    CameraType, Identifier, MobRef, NativeDespawn, NativePermissionLevel, SoundPlay, SoundRef,
+    BlockKey, DebugEntry, DebugRenderer, EffectKey, GuiLayer, HiddenParts, MapDecorationType,
+    ParticleGroup, PosedParts, RuntimeSprite, TaskId, TextureAtlasRegistration,
 };
 pub(crate) use mod_api::{
-    ClientPacket, ClientPayload, NativeBlockRim, NativeColoredLight, NativeExplosionStart,
-    NativeItemFished, NativeLootDrops, NativeMinimap, NativePanelEvent, NativePortalShape,
-    NativeScreen, NativeScreenView, NativeStack, NativeZoom,
+    BlockRim, ClientPacket, ClientPayload, ColoredLight, ExplosionStart, ItemFished, LootDrops,
+    PanelEvent, PortalShape, ScreenView,
 };
+use mod_api::{CameraType, Despawn, Identifier, MobRef, PermissionLevel, SoundPlay, SoundRef};
 use std::{
     collections::HashMap,
     fs,
@@ -118,7 +116,9 @@ use {
 
 include!(concat!(env!("OUT_DIR"), "/native_hook_modules.rs"));
 pub(in crate::game) use add_attribute_tooltips::HookedAttributeTooltips;
+pub(in crate::game) use bounce_restitution::install_block_contact_hooks;
 pub(in crate::game) use fishing_medium::NativeFishingMedium;
+pub(in crate::game) use living_change_target::NativeHookHost;
 include!("shared.rs");
 
 use mod_api::ModBlockEntity;

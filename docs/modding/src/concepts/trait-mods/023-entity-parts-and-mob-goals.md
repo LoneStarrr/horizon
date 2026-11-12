@@ -39,6 +39,17 @@ mob itself through the engine's own paths: `move_to(pos, speed)` and `stop_navig
 with its setter's side effects, and a brain-backed species refuses, since its target is a brain
 memory that `MobRef::set_brain_target` writes from a server host). Writes to other entities
 are not part of a goal; the write handles a `ServerHost` takes do not exist in a goal tick.
+Clearing a fox's target ends defending without changing its trusted entities. An enderman's
+target controls its creepy flag and attacking speed modifier; clearing it also clears its stared-at
+flag. A zombified piglin schedules its first anger sound and next alert when it acquires a target
+from none, not when switching between targets. Targeting a player does not count as player damage.
+
+
+#### Brain behaviors
+
+Native mods only: entity parts do not cross to wasm yet.
+
+`EntityPart::register_behaviors` receives a `BehaviorRegistrar` whenever a brain-driven species builds or rebuilds its brain. Use `add(activity, priority, min_duration, max_duration, requirements, behavior)` to join a fresh `Behavior` to the species' supported activity. Registration returns a `BehaviorRefusal` for an unsupported activity or invalid duration. Behaviors start and stop in vanilla `Brain.tick` order: priority, activity bucket, then insertion order, with mod behaviors after vanilla behaviors in the same bucket. Their state is not saved. `BehaviorCx` provides the mob, host, random source and typed brain memory access; each species refuses memories it does not support.
 
 The part's other method, `spawn_cluster_size`, changes how large a natural spawn group of the type grows
 (`Mob.getMaxSpawnClusterSize`); [controlling spawns](../../how-to/spawning.md#changing-how-large-a-spawn-group-grows)

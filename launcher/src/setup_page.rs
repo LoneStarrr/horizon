@@ -1,21 +1,21 @@
 //! The Windows setup window: `horizon-launcher-setup.exe` installs, `horizon-launcher.exe
 //! uninstall` removes. The launcher's own sky and plates (docs/design-system.md, "Night"); the
 //! work is `horizon_launcher::installer`, on a thread, reported over a channel.
-use crate::Kind;
 use crate::glass_ui;
 use crate::scene;
 use crate::shell::{c, text};
 use crate::sky::Sky;
-use crate::theme::{self, Theme, night};
+use crate::theme::{self, night, Theme};
 use crate::titlebar;
+use crate::Kind;
 use gpui::{
-    App, Bounds, ClickEvent, Context, Div, PathPromptOptions, Render, Task, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    div, prelude::*, px, size, App, Bounds, ClickEvent, Context, Div, PathPromptOptions, Render,
+    Task, Window, WindowBounds, WindowOptions,
 };
 use horizon_launcher::backend::Settings;
 use horizon_launcher::i18n::{self, tr};
 use horizon_launcher::installer::{self, Mode, Options, Step};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 enum Stage {
@@ -57,7 +57,7 @@ pub fn open(mode: Mode, cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(760.), px(520.))),
             titlebar: Some(titlebar::options()),
-            app_id: Some("horizon-launcher".into()),
+            app_id: Some(horizon_launcher::identity::APP_ID.into()),
             ..Default::default()
         },
         |window, cx| cx.new(|cx| Setup::new(mode, window, cx)),
@@ -145,15 +145,13 @@ impl Setup {
             };
             let _ = tx.send(Event::Done(result));
         });
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(80))
-                    .await;
-                match this.update(cx, |this, cx| this.drain(cx)) {
-                    Ok(true) => {}
-                    _ => break,
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            match this.update(cx, |this, cx| this.drain(cx)) {
+                Ok(true) => {}
+                _ => break,
             }
         })
         .detach();
@@ -280,7 +278,7 @@ impl Setup {
             Stage::Welcome if self.mode == Mode::Install => {
                 body = body
                     .child(text(night::UI, c(n.ink_soft)).child(
-                        tr("Installs Horizon Launcher for this account. No administrator needed.")
+                        tr(if cfg!(horizon_fork_launcher) { "Installs Horizon Fork Launcher (arismoko) for this account. No administrator needed." } else { "Installs Horizon Launcher for this account. No administrator needed." })
                             .to_string(),
                     ))
                     .child(self.folder_row(cx))
@@ -309,7 +307,7 @@ impl Setup {
             Stage::Welcome => {
                 body = body
                     .child(text(night::UI, c(n.ink_soft)).child(
-                        tr("Removes Horizon Launcher from this computer. Your worlds and the game's folder stay.")
+                        tr(if cfg!(horizon_fork_launcher) { "Removes Horizon Fork Launcher (arismoko) from this computer. Your worlds and the game's folder stay." } else { "Removes Horizon Launcher from this computer. Your worlds and the game's folder stay." })
                             .to_string(),
                     ))
                     .child(self.toggle(
@@ -348,8 +346,18 @@ impl Setup {
             }
             Stage::Done { left } => {
                 let said = match self.mode {
-                    Mode::Install => tr("Horizon Launcher is installed.").to_string(),
-                    Mode::Uninstall => tr("Horizon Launcher was removed.").to_string(),
+                    Mode::Install => tr(if cfg!(horizon_fork_launcher) {
+                        "Horizon Fork Launcher (arismoko) is installed."
+                    } else {
+                        "Horizon Launcher is installed."
+                    })
+                    .to_string(),
+                    Mode::Uninstall => tr(if cfg!(horizon_fork_launcher) {
+                        "Horizon Fork Launcher (arismoko) was removed."
+                    } else {
+                        "Horizon Launcher was removed."
+                    })
+                    .to_string(),
                 };
                 body = body.child(text(night::TITLE, c(n.ink)).child(said));
                 if !left.is_empty() {
@@ -370,10 +378,17 @@ impl Setup {
                 if self.mode == Mode::Install {
                     body = body.child(
                         div().flex().items_center().justify_end().child(
-                            crate::button("launch", tr("Launch Horizon"), Kind::Primary, &t)
-                                .on_click(
-                                    cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
-                                ),
+                            crate::button(
+                                "launch",
+                                tr(if cfg!(horizon_fork_launcher) {
+                                    "Launch Horizon Fork Launcher (arismoko)"
+                                } else {
+                                    "Launch Horizon"
+                                }),
+                                Kind::Primary,
+                                &t,
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx))),
                         ),
                     );
                 }
@@ -398,7 +413,9 @@ impl Setup {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(text(night::DISPLAY, c(n.ink)).child("Horizon"))
+            .child(
+                text(night::DISPLAY, c(n.ink)).child(tr(horizon_launcher::identity::WINDOW_TITLE)),
+            )
             .child(body)
     }
 }

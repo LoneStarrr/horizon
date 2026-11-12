@@ -37,11 +37,13 @@ pub(super) fn validate(
     if let Some(marker) = hook.host {
         match marker {
             HostAccess::Read if !is_level && hook.side != Side::Client => {}
+            // A server hit's level writes through its random host; a both-side one reads, as
+            // a both-side `GameLevel` does, and is told its side by `LevelSide`.
             HostAccess::Level
                 if !game_level(hook)
-                    && hook.side == Side::Server
-                    && mutable == Some(true)
-                    && !ticks => {}
+                    && !ticks
+                    && (hook.side == Side::Server && mutable == Some(true)
+                        || hook.side == Side::Both && mutable == Some(false)) => {}
             HostAccess::Read | HostAccess::Level => {
                 return Err(format!("{name}: this entry takes no host marker"));
             }
@@ -77,7 +79,7 @@ pub(super) fn context_param(
         PhaseContext::Registration => "RegistrationContext",
         PhaseContext::DataLoad => "LoadContext",
         PhaseContext::Loop => "LoopContext",
-        PhaseContext::Worldgen => "WorldgenContext",
+        PhaseContext::Worldgen => "OwningWorldgen",
     };
     let valid = args.first().is_some_and(|(name, ty)| {
         name == "context"
@@ -174,7 +176,7 @@ mod tests {
             (PhaseContext::Loop, "&LoopContext", "&dyn LoopContext"),
             (
                 PhaseContext::Worldgen,
-                "&WorldgenContext",
+                "&OwningWorldgen",
                 "&dyn WorldgenHost",
             ),
         ] {

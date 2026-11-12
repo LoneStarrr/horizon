@@ -591,6 +591,7 @@ fn next_generation() -> u64 {
 impl Font {
     /// Build from the atlas holding the bitmap font sheets (`sprites`, of
     /// `atlas` size) with `region` the reserved rows.
+    #[horizon_mod_api_macros::replaceable]
     pub fn load(
         source: &ResourceSource,
         sprites: &HashMap<String, Rect>,
@@ -1069,6 +1070,7 @@ impl Font {
         None
     }
     /// Atlas pixels rasterized since the last call.
+    #[horizon_mod_api_macros::replaceable]
     pub fn take_patches(&self) -> Vec<Patch> {
         std::mem::take(&mut self.cache.borrow_mut().region.pending)
     }
@@ -1162,11 +1164,11 @@ impl Font {
     /// goes on in the style at the break. Lines keep their codes for drawing.
     pub fn split_formatted(&self, t: &Text, max_width: f32) -> Vec<Text> {
         let max_width = max_width.max(1.0);
-        let mut parts: Vec<(Vec<char>, Style)> = t
+        let mut parts: Vec<(Vec<char>, Span)> = t
             .spans
             .iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| (s.text.chars().collect(), s.style.clone()))
+            .map(|s| (s.text.chars().collect(), s.with_text(String::new())))
             .collect();
         let mut flat: Vec<char> = parts.iter().flat_map(|p| p.0.iter().copied()).collect();
         let mut out = Vec::new();
@@ -1181,15 +1183,12 @@ impl Font {
             flat.drain(..at + skip);
         }
         if !parts.is_empty() {
-            let mut rest = Text::default();
-            rest.spans = parts
-                .into_iter()
-                .map(|(text, style)| Span {
-                    text: text.into_iter().collect(),
-                    style,
-                })
-                .collect();
-            out.push(rest);
+            out.push(Text::from_spans(
+                parts
+                    .into_iter()
+                    .map(|(text, span)| span.with_text(text.into_iter().collect::<String>()))
+                    .collect(),
+            ));
         } else if force_new_line {
             out.push(Text::empty());
         }
@@ -1197,11 +1196,11 @@ impl Font {
     }
     /// `StringSplitter.LineBreakFinder` fed by `StringDecomposer.iterateFormatted`:
     /// where the parts break (a character index) and the style there.
-    fn line_break(&self, parts: &[(Vec<char>, Style)], max_width: f32) -> Option<(usize, Style)> {
+    fn line_break(&self, parts: &[(Vec<char>, Span)], max_width: f32) -> Option<(usize, Style)> {
         let (mut width, mut had_visible, mut last_space) = (0.0f32, false, None);
         let mut offset = 0;
         for (contents, part_style) in parts {
-            let mut style = part_style.clone();
+            let mut style = part_style.style.clone();
             let mut i = 0;
             while i < contents.len() {
                 let c = contents[i];
@@ -1241,7 +1240,9 @@ impl Font {
             .into_iter()
             .map(|(line, wrapped)| {
                 if wrapped {
-                    Text::literal(" ").append(line)
+                    let mut spans = Text::literal(" ").into_spans();
+                    spans.extend(line.into_spans());
+                    Text::from_spans(spans)
                 } else {
                     line
                 }
@@ -1328,13 +1329,10 @@ impl Font {
 
 /// `StringSplitter.FlatComponents.splitAt`: the parts before `at` as a line,
 /// `skip` characters dropped, and the part it ends in restyled as `style`.
-fn split_at(parts: &mut Vec<(Vec<char>, Style)>, at: usize, skip: usize, style: &Style) -> Text {
-    let mut line = Text::default();
-    let mut push = |text: &[char], style: &Style| {
-        line.spans.push(Span {
-            text: text.iter().collect(),
-            style: style.clone(),
-        })
+fn split_at(parts: &mut Vec<(Vec<char>, Span)>, at: usize, skip: usize, style: &Style) -> Text {
+    let mut line = Vec::new();
+    let mut push = |text: &[char], span: &Span| {
+        line.push(span.with_text(text.iter().collect::<String>()));
     };
     // Each part done is removed, so the one at hand is always the first.
     let (mut position, mut in_skip) = (at, false);
@@ -1357,14 +1355,16 @@ fn split_at(parts: &mut Vec<(Vec<char>, Style)>, at: usize, skip: usize, style: 
             if position == size {
                 parts.remove(0);
             } else {
-                parts[0] = (text[position..].to_vec(), style.clone());
+                let mut span = part_style.clone();
+                span.style = style.clone();
+                parts[0] = (text[position..].to_vec(), span);
             }
             break;
         }
         parts.remove(0);
         position -= size;
     }
-    line
+    Text::from_spans(line)
 }
 
 #[cfg(test)]
@@ -1814,13 +1814,11 @@ mod tests {
         );
         let font = load(&root);
         let _ = std::fs::remove_dir_all(&root);
-        let mut text = Text::default();
-        text.spans = ["a§", "a a"]
-            .map(|part| Span {
-                text: part.into(),
-                style: Style::default(),
-            })
-            .into();
+        let text = Text::from_spans(
+            ["a§", "a a"]
+                .map(|part| Span::new(part, Style::default()))
+                .into(),
+        );
         // 3 + 3 + 4 + 3 is past 12: the line breaks at the space.
         let lines: Vec<String> = font
             .split_formatted(&text, 12.0)
@@ -1828,6 +1826,21 @@ mod tests {
             .map(Text::plain)
             .collect();
         assert_eq!(lines, ["a§a", "a"]);
+        let mixed = Text::literal("aa")
+            .append(Text::untrusted("aa"))
+            .with_style(&Style {
+                click: Some(crate::text::ClickEvent::OpenFile("/tmp/local".into())),
+                ..Style::default()
+            });
+        let lines = font.split_formatted(&mixed, 6.0);
+        assert_eq!(
+            lines.iter().map(Text::plain).collect::<Vec<_>>(),
+            ["aa", "aa"]
+        );
+        assert_eq!(lines[0].spans[0].origin(), crate::text::Origin::Local);
+        assert_eq!(lines[1].spans[0].origin(), crate::text::Origin::Remote);
+        assert!(lines[0].spans[0].click_event().is_some());
+        assert!(lines[1].spans[0].click_event().is_none());
     }
 
     /// A renderer rebuilt over the same font (the loading screen's handoff)

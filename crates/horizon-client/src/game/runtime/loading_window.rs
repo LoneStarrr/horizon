@@ -32,10 +32,12 @@ pub(super) fn build_renderer(
     prepared: Option<horizon_client::gfx::PreparedTextures>,
     api: horizon_client::graphics::GraphicsApi,
     translucent_batching: bool,
-    // HDR with Smooth Gradients (`Graphics::wide_frame`): a 16-bit frame where HDR output is
-    // offered (`Renderer::new`).
-    wide_frame: bool,
+    vsync: bool,
+    // HDR and Smooth Gradients pick the frame, with what the window's display reported to the
+    // renderer before (`display`, `Renderer::new`).
+    settings: &horizon_client::graphics::Graphics,
     shader_pack: shader_packs::PickedPack,
+    display: horizon_client::gfx::DisplayReading,
     filtering: (i32, i32),
 ) -> Result<Renderer> {
     let assets = &pack.render;
@@ -73,10 +75,10 @@ pub(super) fn build_renderer(
         previous,
         api,
         translucent_batching,
-        wide_frame,
         shader_pack.draws_flat,
-        shader_pack.linear,
-        shader_pack.hdr_float,
+        settings,
+        shader_pack.frame(),
+        display,
     ))?;
     let (prepared_vertices, prepared_ranges) =
         native_block_entity_draw::StandaloneGeometry::new(pack, gui).prepared_upload();
@@ -85,6 +87,10 @@ pub(super) fn build_renderer(
         &prepared_vertices,
         prepared_ranges,
     )?;
+    // The loading renderer may have been built before the saved graphics settings were
+    // adopted. Configure the world swapchain before its first gameplay frame instead of
+    // waiting for `Game::apply_settings` after the handoff.
+    renderer.set_present_mode(vsync, settings.present_mode);
     renderer.hud.sprite_animations = atlas
         .sprite_animations
         .iter()
@@ -92,17 +98,20 @@ pub(super) fn build_renderer(
         .collect();
     renderer
         .hud
-        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
+        .set_text_shader(&renderer.device, atlas.text_shaders.gui.as_deref());
     pack.item_renderer
         .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
     renderer.set_lines_shader(atlas.lines_shader.as_deref());
+    renderer.set_world_text_shaders(&atlas.text_shaders);
     renderer.set_sky_shaders(atlas.sky_shader.as_deref(), atlas.stars_shader.as_deref());
-    renderer.set_custom_sky(&pack.custom_sky);
+    renderer.set_custom_sky(&*pack.custom_sky);
     renderer.set_shared_material_maps(&atlas.material_maps);
     let cit_glints = pack.item_renderer.cit.as_ref().map(|c| &c.glint_textures);
     renderer
         .hud
         .set_cit_glints(&renderer.device, &renderer.queue, cit_glints);
+    // Last, so a renderer that fails before this marks none of the pack's pipelines invalid.
+    renderer.build_mod_pipelines(&pack.render.mod_pipelines)?;
     Ok(renderer)
 }
 
@@ -155,11 +164,11 @@ pub(super) fn loading_renderer(
         api,
         // It draws no terrain.
         false,
-        // An 8-bit frame, which HDR output takes as well.
         false,
-        false,
-        false,
-        false,
+        // An 8-bit frame, which HDR output takes as well: HDR off until the settings apply.
+        &horizon_client::graphics::Graphics::default(),
+        Default::default(),
+        previous.map(|r| r.display_reading()).unwrap_or_default(),
     ))?;
     if let Some(atlas) = atlas {
         renderer.hud.sprite_animations = atlas
@@ -347,6 +356,8 @@ pub(super) fn start_game<'a>(
                 fps_cap: None,
                 offscreen: game.options.offscreen,
                 game_dir: std::env::current_dir()?,
+                set: game.options.benchmark_set.clone(),
+                profile: game.options.benchmark_profile,
             },
         );
     }
@@ -360,6 +371,10 @@ pub(super) fn start_game<'a>(
     }
     if let Some(directory) = std::env::var_os("HORIZON_BOAT_AUTHORITY_FIXTURE") {
         game.run_boat_authority_fixture(std::path::Path::new(&directory))?;
+        return Ok(None);
+    }
+    if let Ok(spec) = std::env::var("HORIZON_SCREEN_BUILD_FIXTURE") {
+        game.screen_build_fixture(&spec)?;
         return Ok(None);
     }
     if let Ok(spec) = std::env::var("HORIZON_DISPENSE_FIXTURE") {
@@ -376,14 +391,11 @@ pub(super) fn start_game<'a>(
         result?;
         return Ok(None);
     }
-    // The atlases the initial load stitched, then FMLClientSetupEvent: once per process, here in
-    // `run`, after the initial load applied.
+    // The atlases the initial load stitched, the models it baked, then FMLClientSetupEvent: once
+    // per process, here in `run`, after the initial load applied.
     // A dedicated server has no client and returned above; a splitscreen guest's `run` is
     // another local player of the same process.
-    if game.options.is_client_start() {
-        game.texture_atlases_stitched();
-        game.native_client_setup();
-    }
+    game.publish_initial_client_models();
     // Finish Setup -> Config -> World before any screen, connection, input or tick hooks.
     game.native_configs_client_start();
     if let Some(error) = pack_error {
@@ -416,11 +428,9 @@ pub(super) fn start_game<'a>(
             } else {
                 // Start after the window is handed over, so --world uses the
                 // same responsive initialization path as the title screen.
-                let title = Title::new(
-                    std::env::current_dir()?.join("saves"),
-                    &game.options.resources,
-                )
-                .with_user(|| game.options.player_name());
+                let title = game
+                    .new_title(std::env::current_dir()?.join("saves"))
+                    .with_user(|| game.options.player_name());
                 game.show_title(title);
                 game.pending_entry = Some(PendingWorldEntry::Local {
                     folder,
@@ -433,11 +443,9 @@ pub(super) fn start_game<'a>(
         }
         None if handoff => {}
         None => {
-            let mut title = Title::new(
-                std::env::current_dir()?.join("saves"),
-                &game.options.resources,
-            )
-            .with_user(|| game.options.player_name());
+            let mut title = game
+                .new_title(std::env::current_dir()?.join("saves"))
+                .with_user(|| game.options.player_name());
             title.last_server = game.settings.file.string("lastServer");
             title.skip_multiplayer_warning = game.settings.file.bool("skipMultiplayerWarning");
             // Gui.addInitialScreens: the accessibility onboarding comes first.

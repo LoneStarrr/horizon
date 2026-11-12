@@ -2,16 +2,17 @@
 //! (docs/modding/src/how-to/native-mods.md, "Entity and level handles", #7387): `Entity.discard`
 //! and `Entity.remove` with a reason. Nothing dies and nothing drops loot.
 //! `Entity.spawnAtLocation` drops an item at one.
-//! Everything `Entity.setRemoved` tells the world happens at the call: the
-//! handle and selectors stop finding the entity, its passengers get off and
-//! mods hear it leave. A mob's list entry is marked at once too; the other
+//! Outside a mod block-entity tick, `Entity.setRemoved` tells the world at the call:
+//! the handle and selectors stop finding it, passengers get off and mods hear it leave.
+//! Dropped-item removal inside that tick is instead staged with its final snapshot;
+//! scoped reads hide it immediately, while the leave notification waits for publication. A mob's list entry is marked at once too; the other
 //! kinds stay in their lists until the level's next sweep of departed
 //! entities, a few times per tick, so a hook that removes one never shifts the
 //! lists the game is walking. A vehicle with a chest spills it at that sweep, as vanilla's `remove` does.
 use super::{Game, commands::Target};
 use horizon_client::items::ItemStack;
 use horizon_core::{geometry::Vec3, position::BlockPos};
-use mod_api::{EntityRef, NativeRemovalReason};
+use mod_api::{EntityRef, RemovalReason};
 
 impl Game<'_> {
     /// Removes the entity with no death and no loot (`Entity.discard`): a
@@ -19,15 +20,15 @@ impl Game<'_> {
     /// a boat its lead, as vanilla's `remove` does. False for a player, a dragon part,
     /// or a stale handle.
     pub(super) fn entity_discard(&mut self, entity: EntityRef) -> bool {
-        self.entity_remove(entity, NativeRemovalReason::Discarded)
+        self.entity_remove(entity, RemovalReason::Discarded)
     }
     /// Removes the entity for `reason` (`Entity.remove`): `Discarded`, as
     /// `discard`, or `Killed`, which also runs a mob's effects that act on
     /// removal (Oozing's slimes, Weaving's cobwebs, Wind Charged's burst),
     /// still with no death and no loot. False for a player, a dragon part, or a stale
     /// handle.
-    pub(super) fn entity_remove(&mut self, entity: EntityRef, reason: NativeRemovalReason) -> bool {
-        let killed = reason == NativeRemovalReason::Killed;
+    pub(super) fn entity_remove(&mut self, entity: EntityRef, reason: RemovalReason) -> bool {
+        let killed = reason == RemovalReason::Killed;
         match self.native_entity_target(entity) {
             // A part leaves the level with its dragon, never alone.
             None | Some(Target::Player | Target::Guest(_) | Target::DragonPart(_)) => false,
@@ -35,15 +36,48 @@ impl Game<'_> {
                 self.remove_mob_now(id, killed);
                 true
             }
+            Some(Target::Item(id)) if self.block_entity_tick_key.is_some() => {
+                self.stage_tick_item(id, None).unwrap_or(false)
+            }
             Some(t) => {
                 // Read before the entity counts as removed: its handle stops resolving.
-                let passengers = self.entity_passengers(entity).unwrap_or_default();
+                let vehicle_y = match t {
+                    Target::Boat(id) => {
+                        self.boats.iter().find(|b| b.id == id).map(|b| b.position.y)
+                    }
+                    Target::Cart(id) => {
+                        self.carts.iter().find(|c| c.id == id).map(|c| c.position.y)
+                    }
+                    _ => None,
+                };
+                let passengers: Vec<_> = self
+                    .entity_passengers(entity)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|passenger| {
+                        vehicle_y.is_none()
+                            || !matches!(
+                                self.native_entity_target(*passenger),
+                                Some(Target::Mob(_))
+                            )
+                    })
+                    .collect();
                 // `Entity.setRemoved`: the reason first, so the hooks below see
                 // it removed; then the passengers get off and the level is told.
                 // Only players and mobs ride, so this kind has no vehicle to leave.
                 self.persist.removals.push(t);
+                self.retire_vehicle_registration(t);
+                if vehicle_y.is_some() {
+                    self.persist.notified_vehicle_removals.insert(entity.id());
+                }
                 for passenger in passengers {
                     self.entity_stop_riding(passenger);
+                }
+                if let Some(y) = vehicle_y {
+                    // Notify actual Mob edges here, including rejected objects.
+                    // A reentrant physical sweep must not notify them again.
+                    self.dismount_destroyed_vehicle_mobs(entity.id(), y);
+                    self.score_destroyed_vehicle_once(entity.id());
                 }
                 self.native_entity_left(entity.id());
                 true
@@ -160,20 +194,43 @@ impl Game<'_> {
         if self.persist.removals.is_empty() {
             return;
         }
-        for t in std::mem::take(&mut self.persist.removals) {
+        // Keep every deferred vehicle logically removed while callbacks in
+        // this sweep can inspect the remaining physical owning slots.
+        let pending = std::mem::take(&mut self.persist.removals);
+        let mut already_marked = Vec::new();
+        for &target in &pending {
+            if matches!(target, Target::Boat(_) | Target::Cart(_))
+                && !self.persist.destroying_vehicles.insert(target)
+            {
+                already_marked.push(target);
+            }
+        }
+        for t in pending {
             match t {
                 Target::Crystal(id) => self.crystals.retain(|c| c.id != id),
                 Target::Dragon(id) => {
                     if self.dragon.as_ref().is_some_and(|d| d.id == id) {
-                        self.dragon.discard();
+                        self.discard_resident_dragon();
                     }
                 }
-                Target::Player | Target::Guest(_) | Target::Mob(_) => {}
-                // The kinds `/kill` already removes with no death.
-                t => {
+                Target::Boat(id) | Target::Cart(id) => {
+                    let marked = !already_marked.contains(&t);
                     self.spill_vehicle(t);
-                    self.kill_target_in_level(t);
+                    // Actual native removals already notified the edges. A
+                    // raw deferred entry still needs its own guarded pass.
+                    if marked && !self.persist.notified_vehicle_removals.contains(&id) {
+                        self.persist.destroying_vehicles.remove(&t);
+                    }
+                    self.kill_vehicle_object(t);
+                    self.score_destroyed_vehicle_once(id);
+                    if marked {
+                        self.persist.destroying_vehicles.remove(&t);
+                    }
+                    self.native_entity_left(id);
                 }
+                Target::Player | Target::Guest(_) | Target::Mob(_) => {}
+                // The remaining kinds `/kill` already removes with no death.
+                t => self.kill_target_in_level(t),
             }
         }
     }
@@ -197,7 +254,7 @@ mod tests {
             cart.items[26] = Some(ItemStack::new("minecraft:sand", 7));
             game.carts.push(cart);
             let entity = game.entity(600).unwrap();
-            assert!(game.entity_remove(entity, NativeRemovalReason::Killed));
+            assert!(game.entity_remove(entity, RemovalReason::Killed));
             assert!(game.dropped.is_empty());
             game.native_removals_flush();
             assert!(game.carts.is_empty());
@@ -226,7 +283,9 @@ mod tests {
 
         with_game(|game| {
             game.others.push(OtherEntity {
+                attachment_lifetime: Default::default(),
                 knot_check: None,
+                eye: None,
                 join: Default::default(),
                 item_transformation: None,
                 interaction: None,
@@ -279,7 +338,7 @@ mod tests {
             Box::new(observer.clone()),
         )]
         .into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 game.native_joins_skip();
                 let boat_id = game.take_entity_id();
@@ -334,7 +393,9 @@ mod tests {
                 .chunks
                 .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
             game.others.push(OtherEntity {
+                attachment_lifetime: Default::default(),
                 knot_check: None,
+                eye: None,
                 join: Default::default(),
                 item_transformation: None,
                 interaction: None,
@@ -387,8 +448,7 @@ mod tests {
             assert!(game.mobs[0].removed);
             assert!(!mob.discard(game));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let player = game.entity(20).unwrap();
             assert!(!player.discard(game));
             assert!(game.player.is_some());
@@ -472,6 +532,7 @@ mod tests {
                     invisible: false,
                     check_interval: 0,
                     custom_name: None,
+                    random: horizon_core::random::LegacyRandom::new(0),
                 });
             }
             game.paintings.push(Painting {
@@ -518,7 +579,9 @@ mod tests {
 
         with_game(|game| {
             game.others.push(OtherEntity {
+                attachment_lifetime: Default::default(),
                 knot_check: None,
+                eye: None,
                 join: Default::default(),
                 item_transformation: None,
                 interaction: None,

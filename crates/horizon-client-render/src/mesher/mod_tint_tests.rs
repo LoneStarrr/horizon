@@ -2,13 +2,14 @@ use super::*;
 use horizon_assets::resource_source::ResourceRoot;
 use horizon_world::registry::BlockRegistry;
 use mod_api::{
-    BlockAndTintGetter, BlockMetadata, BlockState as ModState, BlockTintSource, TintLayer,
-    VanillaTint,
+    BiomeColorResolver, BlockAndTintGetter, BlockMetadata, BlockState as ModState, BlockTintSource,
+    ColorResolver, ColorResolverRegistry, ColorResolvers, ResolverBiome, TintLayer, VanillaTint,
 };
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn resources() -> Option<std::path::PathBuf> {
+pub(super) fn resources() -> Option<std::path::PathBuf> {
     let root = std::env::var_os("HORIZON_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -19,9 +20,9 @@ fn resources() -> Option<std::path::PathBuf> {
 }
 
 // Independent API fixture for the air, stone and two leaf states exercised below.
-fn tint_values(registry: &BlockRegistry) -> ModTintValues {
+pub(super) fn tint_values(registry: &BlockRegistry) -> ModTintValues {
     use horizon_mod_runtime::block_definitions::BlockDefinition;
-    mod_api::__private::part_tests::install_parts_fixture(&[]).unwrap();
+    mod_platform::__private::part_tests::install_parts_fixture(&[]).unwrap();
     let empty = BTreeMap::new();
     let near = BTreeMap::from([("distance".into(), "1".into())]);
     let far = BTreeMap::from([("distance".into(), "7".into())]);
@@ -279,4 +280,244 @@ fn the_mesher_asks_a_mod_source_once_per_block_with_the_world_around_it() {
         let packed = pack_rgb([tint >> 16 & 255, tint >> 8 & 255, tint & 255]);
         assert!(colours.contains(&packed), "no face tinted {tint:06X}");
     }
+}
+
+/// `getColor` as vanilla's foliage resolver answers it: the biome's own foliage colour.
+struct FoliageCopy;
+impl BiomeColorResolver for FoliageCopy {
+    fn color(&self, _: &str, info: &ResolverBiome, _: f64, _: f64) -> u32 {
+        info.colors.foliage
+    }
+}
+
+/// The block column itself, x in red and z in blue, so a blend shows which columns it asked.
+struct ByColumn;
+impl BiomeColorResolver for ByColumn {
+    fn color(&self, _: &str, _: &ResolverBiome, x: f64, z: f64) -> u32 {
+        ((x as i32 & 255) << 16 | (z as i32 & 255)) as u32
+    }
+}
+
+struct Throwing;
+impl BiomeColorResolver for Throwing {
+    fn color(&self, _: &str, _: &ResolverBiome, _: f64, _: f64) -> u32 {
+        panic!("test resolver failure")
+    }
+}
+
+/// The test resolvers, registered once for the whole test binary.
+fn test_resolvers() -> [ColorResolver; 2] {
+    static HANDLES: OnceLock<[ColorResolver; 2]> = OnceLock::new();
+    *HANDLES.get_or_init(|| {
+        let mut registry = ColorResolverRegistry::default();
+        let handles = [
+            registry.register(Arc::new(FoliageCopy)),
+            registry.register(Arc::new(ByColumn)),
+        ];
+        registry.register(Arc::new(Throwing));
+        assert!(register_color_resolvers(registry.into_resolvers()));
+        handles
+    })
+}
+
+fn mod_resolver(handle: ColorResolver) -> Resolver {
+    let ColorResolver::Mod(handle) = handle else {
+        panic!("a registered resolver is a mod's");
+    };
+    Resolver::Mod(mod_api::__private::mod_color_resolver_index(handle))
+}
+
+/// A chunk whose every quart cell holds `biome`.
+fn filled(cx: i32, cz: i32, biome: u16) -> Chunk {
+    let mut chunk = Chunk::empty(cx, cz);
+    for qy in 0..(384 / 4) {
+        for qz in 0..4 {
+            for qx in 0..4 {
+                chunk.set_biome_cell(qx, qy, qz, biome);
+            }
+        }
+    }
+    chunk
+}
+
+/// `RegisterColorHandlersEvent.ColorResolvers`: a mod's resolver blends over the biome blend
+/// radius exactly as vanilla's do, over one biome and over a border between two, and is asked
+/// with each column it blends.
+#[test]
+fn a_mod_resolver_blends_over_the_biomes_as_vanilla_resolvers_do() {
+    let Some(root) = resources() else {
+        return;
+    };
+    let biomes = Biomes::load(&ResourceRoot::directory(root)).unwrap();
+    let [foliage, by_column] = test_resolvers().map(mod_resolver);
+    let (forest, desert) = (biomes.id("minecraft:forest"), biomes.id("minecraft:desert"));
+    let chunks: Vec<Vec<Chunk>> = (0..3)
+        .map(|rz| (0..3).map(|rx| filled(rx - 1, rz - 1, forest)).collect())
+        .collect();
+    let mut east = filled(1, 0, forest);
+    for qy in 0..(384 / 4) {
+        east.set_biome_cell(0, qy, 2, desert);
+    }
+    let uniform: [[Option<&Chunk>; 3]; 3] =
+        std::array::from_fn(|rz| std::array::from_fn(|rx| Some(&chunks[rz][rx])));
+    let mut mixed = uniform;
+    mixed[1][2] = Some(&east);
+    for region in [&uniform, &mixed] {
+        for radius in [0, 2, 5] {
+            let new = || Tints::new(region, &biomes, BiomeZoom::new(42), radius, [0, 0, 64]);
+            let (mut vanilla, mut modded) = (new(), new());
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        modded.get(foliage, x, 3, z),
+                        vanilla.get(Resolver::Foliage, x, 3, z),
+                        "r{radius} at {x} {z}"
+                    );
+                }
+            }
+        }
+    }
+    // Radius 1 averages columns x-1..=x+1 and z-1..=z+1: their mean is the block's own column.
+    let mut tints = Tints::new(&uniform, &biomes, BiomeZoom::new(42), 1, [0, 0, 64]);
+    for (x, z) in [(1, 1), (7, 3), (14, 12)] {
+        let foliage_color = biomes.get(forest).foliage & 0xFF_FFFF;
+        assert_eq!(tints.get(foliage, x, 0, z), foliage_color);
+        assert_eq!(tints.get(by_column, x, 0, z), (x as u32) << 16 | z as u32);
+        assert_eq!(tints.get(foliage, x, 0, z), foliage_color);
+    }
+}
+
+#[test]
+fn unknown_mod_resolver_does_not_allocate_cache_slots() {
+    let Some(root) = resources() else { return };
+    test_resolvers();
+    let biomes = Biomes::load(&ResourceRoot::directory(root)).unwrap();
+    let region = [[None; 3]; 3];
+    let mut tints = Tints::new(&region, &biomes, BiomeZoom::new(42), 1, [0, 0, 64]);
+    // A small invalid index kills the missing-check mutant without exhausting memory.
+    for index in [32, u32::MAX] {
+        assert_eq!(tints.get(Resolver::Mod(index), 1, 0, 1), 0xFF_FFFF);
+        assert_eq!(
+            tints
+                .layers
+                .iter()
+                .flatten()
+                .map(|l| l.mods.len())
+                .sum::<usize>(),
+            0
+        );
+    }
+}
+
+/// Colours oak leaves with a mod resolver, through the level as vanilla's sources read it.
+struct Resolved(ColorResolver);
+impl BlockTintSource for Resolved {
+    fn color(&self, _: &ModState, _: &dyn BlockMetadata) -> u32 {
+        0xFF_FFFF
+    }
+    fn color_in_world(
+        &self,
+        _: &ModState,
+        _: &dyn BlockMetadata,
+        level: &dyn BlockAndTintGetter,
+        pos: [i32; 3],
+    ) -> u32 {
+        level.block_tint(pos, self.0)
+    }
+}
+
+/// A block whose tint source reads a mod's resolver is drawn with the resolver's blended colour,
+/// and a new mesh after the resolver's input changes (the biome's colours, as a biome colour
+/// refresh or a pack reload changes them) draws the new colour, not a cached one.
+#[test]
+fn a_block_tinted_by_a_mod_resolver_meshes_with_its_colour_and_follows_its_inputs() {
+    let Some(root) = resources() else {
+        return;
+    };
+    let assets = Assets::load(&root).unwrap();
+    let facts = BlockFacts::load(&root, assets.registry).unwrap();
+    let mut biomes = Biomes::load(&ResourceRoot::directory(root.clone())).unwrap();
+    let render = assets
+        .reload(&ResourceRoot::directory(root.clone()))
+        .unwrap();
+    let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
+    let mut tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
+    let [foliage, _] = test_resolvers();
+    let layers = BTreeMap::from([(
+        "minecraft:oak_leaves".to_string(),
+        Arc::from([TintLayer::Source(Arc::new(Resolved(foliage)))]),
+    )]);
+    tables
+        .apply_tint_layers(assets.registry, &layers, Some(tint_values(assets.registry)))
+        .unwrap();
+    let oak = assets
+        .registry
+        .default_state("minecraft:oak_leaves")
+        .unwrap();
+    let forest = biomes.id("minecraft:forest");
+    let mut chunk = filled(0, 0, forest);
+    chunk.set(6, MIN_Y + 5, 6, oak.0);
+    let mut region = [[None; 3]; 3];
+    region[1][1] = Some(&chunk);
+    let colours = |biomes: &Biomes, tables: &MeshTables| {
+        let mut mesher = Mesher {
+            nether_shading: false,
+            shader_pack_lighting: false,
+            separate_ao: false,
+            shader_pack: false,
+            assets: &assets,
+            render: &render,
+            tables,
+            biomes,
+            visibility: visibility.clone(),
+            zoom: BiomeZoom::new(0),
+            blend_radius: 2,
+            smooth_lighting: false,
+            cutout_leaves: true,
+            opaque_ice: false,
+            translucent_layers: &[],
+            leaf_culling: LeafCullingMode::Off,
+            hidden_states: &[],
+        };
+        let mesh = mesher.mesh(&region, 0);
+        mesh.solid
+            .iter()
+            .chain(&mesh.translucent)
+            .map(|v| v.color)
+            .collect::<Vec<u32>>()
+    };
+    // Up faces are unshaded (1.0), so they carry the tint itself, packed as RGBA.
+    let packed = |tint: u32| pack_rgb([tint >> 16 & 255, tint >> 8 & 255, tint & 255]);
+    let before = biomes.get(forest).foliage & 0xFF_FFFF;
+    assert!(
+        colours(&biomes, &tables).contains(&packed(before)),
+        "no face tinted {before:06X}"
+    );
+    biomes.list[usize::from(forest)].foliage = 0x12_3456;
+    let after = colours(&biomes, &tables);
+    assert!(
+        after.contains(&packed(0x12_3456)),
+        "the new mesh kept {before:06X}"
+    );
+    assert!(!after.contains(&packed(before)));
+
+    // A failed native callback must still produce a mesh, and the next mesh of
+    // the same section must complete normally.
+    let mut failing = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
+    let mut registry = ColorResolverRegistry::default();
+    registry.register(Arc::new(FoliageCopy));
+    registry.register(Arc::new(ByColumn));
+    let throwing = registry.register(Arc::new(Throwing));
+    failing
+        .apply_tint_layers(
+            assets.registry,
+            &BTreeMap::from([(
+                "minecraft:oak_leaves".to_string(),
+                Arc::from([TintLayer::Source(Arc::new(Resolved(throwing)))]),
+            )]),
+            Some(tint_values(assets.registry)),
+        )
+        .unwrap();
+    assert!(colours(&biomes, &failing).contains(&packed(0xFF_FFFF)));
+    assert!(colours(&biomes, &tables).contains(&packed(0x12_3456)));
 }

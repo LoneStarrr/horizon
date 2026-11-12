@@ -18,6 +18,7 @@ use std::sync::{
 struct Probe {
     calls: Arc<Mutex<Vec<(i32, String, String)>>>,
     answer: Arc<AtomicU8>,
+    hands: Arc<Mutex<Vec<mod_api::Hand>>>,
     claim_entity: Arc<AtomicBool>,
     discard: Arc<AtomicBool>,
 }
@@ -29,7 +30,8 @@ impl Hooks for Probe {
             r.item_part(key, self.clone());
         }
     }
-    fn entity_interact(&self, _: &mut dyn ServerHost, _: &mut EntityInteractEvent<'_>) -> Flow {
+    fn entity_interact(&self, _: &mut dyn ServerHost, event: &mut EntityInteractEvent<'_>) -> Flow {
+        self.hands.lock().unwrap().push(event.hand);
         if self.claim_entity.load(Ordering::Relaxed) {
             Flow::Cancel
         } else {
@@ -56,7 +58,7 @@ impl ItemPart for Probe {
         let answer = self.answer.load(Ordering::Relaxed);
         if answer != 0 && self.discard.load(Ordering::Relaxed) {
             let entity = host.entity(event.entity as u32).unwrap();
-            assert!(entity.remove(host, mod_api::NativeRemovalReason::Discarded));
+            assert!(entity.remove(host, mod_api::RemovalReason::Discarded));
         }
         match answer {
             0 => None,
@@ -76,7 +78,7 @@ fn setup(game: &mut Game<'_>, probe: &Probe, kind: &str, id: u32) {
     game.offhand = Some(ItemStack::new("minecraft:paper", 3));
     game.swing = Default::default();
     game.swings_started = 0;
-    game.tick_hit = None;
+    game.tick_hit.set(None);
     game.tick_mob = None;
     game.riding = None;
     probe.calls.lock().unwrap().clear();
@@ -94,28 +96,35 @@ fn target(id: i32) -> Option<InteractTarget> {
 #[test]
 #[ignore = "private prepared resources; process-wide mods, run this test alone"]
 fn actual_item_interact_mob_fallback_priority_and_filters() {
+    crate::game::in_own_process(
+        "game::item_interact_mob_tests::actual_item_interact_mob_fallback_priority_and_filters",
+        actual_item_interact_mob_fallback_priority_and_filters_isolated,
+    );
+}
+
+fn actual_item_interact_mob_fallback_priority_and_filters_isolated() {
     let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-    let settings = Settings::default();
-    let loaded = load_resources(
-        horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-        Vec::new(),
-        None,
-        &root,
-        &settings,
-        Instant::now(),
-        false,
-        crate::game::execution_role::ExecutionRole::IntegratedServer,
-        &Progress::new(),
-        &mut |_, _| unreachable!(),
-    )
-    .unwrap();
-    let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-    options.resources = root.clone();
-    options.execution_role = execution_role::ExecutionRole::IntegratedServer;
     let probe = Probe::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("item", Box::new(probe.clone()))].into();
-    mod_api::testing::with_mods(mods.clone(), || {
+    mod_platform::testing::with_mods(mods.clone(), || {
         crate::game::api_values::install_parts(&mods).unwrap();
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = execution_role::ExecutionRole::IntegratedServer;
         mod_api::__private::mark_game_thread();
         let mut game = Game::new(
             &loaded.resources,
@@ -130,7 +139,8 @@ fn actual_item_interact_mob_fallback_priority_and_filters() {
         )
         .unwrap();
         game.native_lifecycle
-            .begin_open(mod_api::NativeAuthority::IntegratedServer);
+            .begin_open(mod_api::Authority::IntegratedServer);
+        crate::game::native_entity_refs::tests::resolve_parts(&game).unwrap();
         game.world = World::new(game.res.facts().air, 1);
         game.world
             .chunks
@@ -140,6 +150,26 @@ fn actual_item_interact_mob_fallback_priority_and_filters() {
         game.pitch = 0.0;
         game.selected = 0;
         game.set_mode_id(0);
+
+        // The actual click sequence must distinguish identical stacks, including
+        // empty hands. A claimed main-hand interaction ends before the off hand.
+        for occupied in [false, true] {
+            for claimed in [false, true] {
+                setup(&mut game, &probe, "minecraft:zombie", 42);
+                game.inventory[0] = occupied.then(|| ItemStack::new("minecraft:stick", 1));
+                game.offhand = game.inventory[0].clone();
+                probe.answer.store(0, Ordering::Relaxed);
+                probe.claim_entity.store(claimed, Ordering::Relaxed);
+                probe.hands.lock().unwrap().clear();
+                game.use_item_as_player().unwrap();
+                let expected = if claimed {
+                    vec![mod_api::Hand::Main]
+                } else {
+                    vec![mod_api::Hand::Main, mod_api::Hand::Off]
+                };
+                assert_eq!(*probe.hands.lock().unwrap(), expected);
+            }
+        }
 
         // A custom item willing to own every mob still cannot preempt trading.
         setup(&mut game, &probe, "minecraft:villager", 42);

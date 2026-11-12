@@ -1,7 +1,7 @@
 //! Beehives and bee nests in the game (`crate::beehive` holds their logic):
 //! their server tick, bees going in, and the bees let out, angry, when a
 //! player breaks the hive or fire reaches it.
-use super::Game;
+use super::{Game, item_abilities::ability};
 use horizon_client::{
     Result,
     beehive::{self, Beehive, BeehiveExt, HiveHost, Release},
@@ -77,9 +77,94 @@ impl HiveHost for GameHive<'_, '_> {
             .audio
             .play(&format!("minecraft:{name}"), Some(at), 1.0, 1.0);
     }
+    fn set_changed(&mut self, at: [i32; 3]) {
+        self.game.world.modified.insert((at[0] >> 4, at[2] >> 4));
+    }
 }
 
 impl Game<'_> {
+    /// Route a target assigned outside the mob tick through the same listener
+    /// as AI, before changing the player's binding or the mob's state.
+    pub(super) fn set_event_ai_target(
+        &mut self,
+        id: u32,
+        target: Option<Who>,
+        player: Option<u32>,
+    ) -> bool {
+        if matches!(target, Some(Who::Player))
+            && (self.lan_acting_fake
+                || player.is_some_and(|conn| {
+                    self.lan
+                        .as_ref()
+                        .and_then(|host| host.hub.guest(conn))
+                        .is_some_and(|guest| guest.is_fake())
+                }))
+        {
+            return false;
+        }
+        let is_brain = self
+            .mobs
+            .iter()
+            .find(|mob| mob.id == id)
+            .is_some_and(|mob| horizon_client::mobs::ai::brain_target(mob).is_some());
+        let mut chosen = target;
+        let mut redirected = false;
+        if self.native_authoritative()
+            && mod_api::__private::listened(mod_api::HookId::LivingChangeTarget)
+        {
+            let Some(epoch) = self.native_lifecycle.epoch() else {
+                return false;
+            };
+            let mob = mod_api::MobRef::new(mod_api::EntityRef::new(epoch, id));
+            let original = match target {
+                None => None,
+                Some(Who::Mob(target)) => Some(mod_api::LivingRef::new(mod_api::EntityRef::new(
+                    epoch, target,
+                ))),
+                Some(Who::Player) => {
+                    let Some(target) = self
+                        .player_entity_id_by_connection(player)
+                        .and_then(|id| u32::try_from(id).ok())
+                    else {
+                        return false;
+                    };
+                    Some(mod_api::LivingRef::new(mod_api::EntityRef::new(
+                        epoch, target,
+                    )))
+                }
+            };
+            let Some(result) = self.native_mob_target_event(mob, original, is_brain) else {
+                return false;
+            };
+            if result != original {
+                let Some(bound) = self.native_mob_bind_target(id, result) else {
+                    return false;
+                };
+                chosen = bound;
+                redirected = true;
+            }
+        }
+        if !redirected
+            && chosen == Some(Who::Player)
+            && let Some(host) = self.lan.as_mut()
+        {
+            match player {
+                Some(conn) => {
+                    host.mob_players.insert(id, conn);
+                }
+                None => {
+                    host.mob_players.remove(&id);
+                }
+            }
+        }
+        let Some(mob) = self.mobs.iter_mut().find(|m| m.id == id) else {
+            return false;
+        };
+        if !is_brain || !horizon_client::mobs::ai::set_brain_target(mob, chosen) {
+            mob.set_target(chosen);
+        }
+        true
+    }
     fn hive_with_honey(&self, state: BlockStateId, level: i32) -> Option<BlockStateId> {
         let registry = self.pack.assets.registry;
         let mut s = registry.state(state)?.clone();
@@ -221,13 +306,19 @@ impl Game<'_> {
         );
         let sedated = beehive::smokey(&self.mob_world_base(&[]), at);
         if let Some(p) = self.player_view().map(|p| p.position) {
-            for m in self.mobs.iter_mut().filter(|m| released.contains(&m.id)) {
-                if m.distance_sqr(p) <= 16.0 {
-                    if sedated {
+            let ids: Vec<u32> = self
+                .mobs
+                .iter()
+                .filter(|m| released.contains(&m.id) && m.distance_sqr(p) <= 16.0)
+                .map(|m| m.id)
+                .collect();
+            for id in ids {
+                if sedated {
+                    if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
                         bee::set_stay_out_of_hive_countdown(m);
-                    } else {
-                        m.ai.target = Some(Who::Player);
                     }
+                } else {
+                    self.set_event_ai_target(id, Some(Who::Player), self.lan_acting);
                 }
             }
         }
@@ -239,7 +330,7 @@ impl Game<'_> {
     /// smokes the hive, the bees come out angry. True when it took the click.
     pub(super) fn use_beehive(&mut self, pos: [i32; 3], held: Option<&ItemStack>) -> Result<bool> {
         let Some(held) = held else { return Ok(false) };
-        let shears = &*held.item == "minecraft:shears";
+        let shears = self.stack_shears(held, ability::SHEARS_HARVEST);
         if !shears && &*held.item != "minecraft:glass_bottle" {
             return Ok(false);
         }
@@ -282,13 +373,14 @@ impl Game<'_> {
             // shrink(1), then the honey bottle in the hand, the inventory or
             // on the ground.
             self.audio.play("minecraft:item.bottle.fill", at, 1.0, 1.0);
-            let cell = self.held_mut();
-            if let Some(s) = cell.as_mut() {
-                s.count -= 1;
-                if s.count == 0 {
-                    *cell = None;
+            self.edit_block_use_stack(|cell| {
+                if let Some(s) = cell.as_mut() {
+                    s.count -= 1;
+                    if s.count == 0 {
+                        *cell = None;
+                    }
                 }
-            }
+            });
             let bottle = ItemStack::new("minecraft:honey_bottle", 1);
             if self.held().is_none() {
                 *self.held_mut() = Some(bottle);
@@ -330,10 +422,14 @@ impl Game<'_> {
                 .block_entities
                 .put(lease, BlockEntity::Beehive(hive));
             if let Some(p) = self.player_view().map(|p| p.position) {
-                for m in self.mobs.iter_mut().filter(|m| released.contains(&m.id)) {
-                    if m.distance_sqr(p) <= 16.0 {
-                        m.ai.target = Some(Who::Player);
-                    }
+                let ids: Vec<u32> = self
+                    .mobs
+                    .iter()
+                    .filter(|m| released.contains(&m.id) && m.distance_sqr(p) <= 16.0)
+                    .map(|m| m.id)
+                    .collect();
+                for id in ids {
+                    self.set_event_ai_target(id, Some(Who::Player), self.lan_acting);
                 }
             }
         }
@@ -363,7 +459,7 @@ impl Game<'_> {
                 host.hub
                     .guests
                     .iter()
-                    .filter(|g| host.hub.here(g) && g.loaded && !g.dead)
+                    .filter(|g| host.hub.here(g) && g.loaded && !g.dead && !g.is_fake())
                     .filter(|g| super::lan_mobs::guest_bounds(g).intersects(area))
                     .map(|g| Some(g.conn)),
             );
@@ -387,14 +483,7 @@ impl Game<'_> {
                 .random
                 .next_int_bound(players.len() as i32)
                 .unwrap_or(0) as usize;
-            self.mobs[i].ai.target = Some(Who::Player);
-            // The player a mob sees is its guest binding, else the window's.
-            if let Some(host) = self.lan.as_mut() {
-                match players[pick] {
-                    Some(conn) => host.mob_players.insert(self.mobs[i].id, conn),
-                    None => host.mob_players.remove(&self.mobs[i].id),
-                };
-            }
+            self.set_event_ai_target(self.mobs[i].id, Some(Who::Player), players[pick]);
         }
     }
 }
@@ -506,5 +595,93 @@ mod stay_tests {
             game.tick_beehive(key);
             assert_eq!((inside(game), game.mobs.len()), (0, 3), "day");
         });
+    }
+}
+
+#[cfg(test)]
+mod changed_tests {
+    use crate::game::game_tests::tests::server_game;
+    use horizon_client::{
+        beehive::{Beehive, Occupant},
+        containers::BlockEntity,
+        mobs::Mob,
+    };
+    use horizon_core::geometry::Vec3;
+    use horizon_core::nbt::Tag;
+
+    fn hive_at(game: &mut super::Game<'_>, key: (i32, i32, i32), hive: Beehive) {
+        let state = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:beehive")
+            .unwrap();
+        game.world.set(key.0, key.1, key.2, state).unwrap();
+        game.world
+            .block_entities
+            .insert(key, BlockEntity::Beehive(Box::new(hive)));
+    }
+
+    /// `BeehiveBlockEntity.serverTick` -> `tickOccupants` calls `setChanged`
+    /// when a bee leaves. The hive's saved `bees` list lost an entry, and
+    /// nothing else in the tick changed a block state.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_released_bee_marks_the_chunk() {
+        let mut game_resources = None;
+        let mut game = server_game(&mut game_resources);
+        let key = (8, 64, 8);
+        hive_at(
+            &mut game,
+            key,
+            Beehive {
+                bees: vec![Occupant {
+                    entity_data: Tag::compound([("id", Tag::String("minecraft:bee".into()))]),
+                    ticks_in_hive: 601,
+                    min_ticks_in_hive: 600,
+                }],
+                flower: None,
+            },
+        );
+        game.world.day_time = 1_000;
+        game.world.modified.clear();
+
+        game.tick_beehive(key);
+
+        let Some(BlockEntity::Beehive(h)) = game.world.block_entities.get(&key) else {
+            panic!("no hive");
+        };
+        assert!(h.bees.is_empty(), "the ready bee was let out");
+        assert_eq!(game.mobs.len(), 1, "the bee reached the level");
+        assert!(
+            game.world.modified.contains(&(0, 0)),
+            "a released bee left the chunk unmarked"
+        );
+    }
+
+    /// `BeehiveBlockEntity.addOccupant` ends with `setChanged`: the hive
+    /// stored the bee and the mob is gone, which no block state shows.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_bee_going_in_marks_the_chunk() {
+        let mut game_resources = None;
+        let mut game = server_game(&mut game_resources);
+        let key = (8, 64, 8);
+        hive_at(&mut game, key, Beehive::default());
+        let kind = game.res.mob_types().get("minecraft:bee").unwrap().clone();
+        game.mobs
+            .push(Mob::new(42, kind, Vec3::new(8.0, 64.0, 8.0), 0.0));
+        game.world.modified.clear();
+
+        game.bee_enter_hive(42, [8, 64, 8]);
+
+        let Some(BlockEntity::Beehive(h)) = game.world.block_entities.get(&key) else {
+            panic!("no hive");
+        };
+        assert_eq!(h.bees.len(), 1, "the bee went in");
+        assert!(
+            game.world.modified.contains(&(0, 0)),
+            "a stored bee left the chunk unmarked"
+        );
     }
 }

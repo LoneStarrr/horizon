@@ -8,7 +8,7 @@ use horizon_launcher::account::{self, Accounts, SignIn, SignInState};
 use horizon_launcher::backend::{self, Job, Logged};
 use horizon_launcher::instances;
 use horizon_launcher::jars::{self, Permission};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -53,7 +53,7 @@ fn session_tools() -> Value {
         { "name": "server_log", "description": "The most recent lines of the server's console.",
           "inputSchema": { "type": "object", "properties": { "lines": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "How many lines (default 50)." } } } },
         { "name": "server_stop", "description": "Stop the server started with server cleanly (it saves the world), killing it if it does not stop within 30 seconds.", "inputSchema": none },
-        { "name": "account_list", "description": "The Microsoft accounts signed in to the launcher (names and UUIDs, never tokens), which one the game plays as (none = offline), and how a sign-in started with account_sign_in is going. CLI: horizon-launcher account list", "inputSchema": none },
+        { "name": "account_list", "description": "The Microsoft accounts signed in to the launcher (names and UUIDs, never tokens), which one the game plays as (none = the first), and how a sign-in started with account_sign_in is going. CLI: horizon-launcher account list", "inputSchema": none },
         { "name": "account_sign_in", "description": "Start signing in a Microsoft account: returns a link and a code the player enters in their browser. The sign-in finishes in the background; check it with account_list. Only when the player asks to sign in. CLI: horizon-launcher account sign-in", "inputSchema": none },
     ])
 }
@@ -298,7 +298,7 @@ impl Session {
             }
             // No AI turned on during the session: nothing more runs.
             "tools/call" if backend::no_ai() => {
-                Err((-32000, horizon_core::no_ai::REFUSAL.to_string()))
+                Err((-32000, horizon_platform::no_ai::REFUSAL.to_string()))
             }
             "tools/call" => {
                 let name = params

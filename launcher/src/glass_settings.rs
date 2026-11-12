@@ -12,15 +12,17 @@ use super::*;
 use crate::glass_ui::{self as ui, white};
 use horizon_theme::glass::{fill, ink, radius};
 
-/// The list's entries: name and icon. The mockup's seven.
-const SECTIONS: [(&str, &str); 7] = [
+/// The list's entries: name and icon. The settings sections.
+const SECTIONS: [(&str, &str); 9] = [
     ("Account", "user"),
     ("Updates", "refresh"),
     ("Launcher", "computer"),
     ("Network", "globe-02"),
     ("Game", "game-controller-01"),
+    ("Storage", "computer"),
     ("AI", "ai-chat-02"),
     ("About", "information-circle"),
+    ("Data collection", "view"),
 ];
 
 /// What `settings_page` builds before it knows which look draws it.
@@ -94,6 +96,9 @@ fn note(s: &str) -> Option<AnyElement> {
 
 impl Launcher {
     pub(super) fn glass_settings(&mut self, b: Built, cx: &mut Context<Self>) -> Div {
+        if self.storage_report.is_none() && !self.storage_pending && self.storage_error.is_none() {
+            self.refresh_storage(None, false);
+        }
         let t = self.theme;
         let sections = ui::flat_rows(|| self.glass_settings_sections(b, cx));
         let active = self.settings_section(sections.len());
@@ -263,46 +268,6 @@ impl Launcher {
         )
     }
 
-    /// The selected instance's saved preference, also offered by a needed Mods picker.
-    fn native_mods_row(&mut self, cx: &mut Context<Self>) -> Div {
-        let t = self.theme;
-        let profile = self.native_profile();
-        let picker = segments(
-            "settings-native-profile",
-            &[
-                (native_mods::Profile::Optimized, "Optimized"),
-                (native_mods::Profile::Balanced, "Balanced"),
-            ],
-            profile,
-            &t,
-            {
-                let this = cx.entity().downgrade();
-                move |choice, _, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.choose_native_profile(choice);
-                        cx.notify();
-                    });
-                }
-            },
-        );
-        let said = crate::build_mode::mode_note(profile);
-        let instance = self
-            .selected_instance()
-            .map_or(tr("Default"), |i| i.name.as_str());
-        ui::setting_row(
-            tr("Native mods"),
-            Some(
-                div()
-                    .child(trf(
-                        "Build-mode preference for {instance}. {detail}",
-                        &[("instance", instance), ("detail", said)],
-                    ))
-                    .into_any_element(),
-            ),
-            Some(picker.into_any_element()),
-        )
-    }
-
     /// Updates' two tiles (the mockup's `AboutTile`s): Horizon and its update, the launcher and its
     /// own.
     fn update_tiles(
@@ -437,8 +402,7 @@ impl Launcher {
         let game = card()
             .child(self.game_architecture_row(n, cx))
             .child(self.game_args_row(n + 1, cx))
-            .child(self.mods_auto_update_row(cx))
-            .child(self.native_mods_row(cx));
+            .child(self.mods_auto_update_row(cx));
         let ai = card()
             .child(self.no_ai_row(n, cx))
             .children(self.agents_section(cx));
@@ -450,17 +414,7 @@ impl Launcher {
                 .into_any_element()
         };
         let about = card()
-            .child(index_row(
-                0,
-                tr("Data folder"),
-                Some(mono(short(&backend::data_dir()))),
-                Some(
-                    button("about-open-data", "Open", Kind::Secondary, &t)
-                        .on_click(|_, _, cx| crate::glass_toast::open(cx, &backend::data_dir()))
-                        .into_any_element(),
-                ),
-                &t,
-            ))
+            .child(self.location_row(0, cx).mb(px(0.)))
             .child(index_row(
                 0,
                 tr("Logs"),
@@ -492,9 +446,18 @@ impl Launcher {
                     Some(b.menu_entry.into_any_element()),
                     &t,
                 ))
-            })
-            .children(self.dev_options_section(cx));
-        vec![account, updates, launcher, network, game, ai, about]
+            });
+        vec![
+            account,
+            updates,
+            launcher,
+            network,
+            game,
+            self.glass_storage(cx),
+            ai,
+            about,
+            card().child(self.collection_section(cx)),
+        ]
     }
 }
 
@@ -502,11 +465,11 @@ impl Launcher {
 mod tests {
     use super::spy;
 
-    /// A 600 px pane over the mockup's seven cards: tall ones, then About, too short for its
+    /// A 600 px pane over the eight settings cards: tall ones, then About, too short for its
     /// top ever to reach 30 % of the pane.
-    const TOPS: [f32; 7] = [0., 420., 700., 1000., 1300., 1600., 1900.];
+    const TOPS: [f32; 8] = [0., 420., 700., 1000., 1300., 1600., 1900., 2200.];
     const HEIGHT: f32 = 600.;
-    const MAX: f32 = 2100. - HEIGHT;
+    const MAX: f32 = 2400. - HEIGHT;
 
     fn at(scrolled: f32) -> usize {
         let tops: Vec<f32> = TOPS.iter().map(|t| t - scrolled).collect();
@@ -539,11 +502,11 @@ mod tests {
         // Every section is marked on the way down, in order, never skipped.
         let mut order = seen.clone();
         order.dedup();
-        assert_eq!(order, (0..7).collect::<Vec<_>>());
+        assert_eq!(order, (0..8).collect::<Vec<_>>());
         // About is marked for a stretch of scroll before the end, not for one step.
-        let about = seen.iter().filter(|&&s| s == 6).count();
+        let about = seen.iter().filter(|&&s| s == 7).count();
         assert!(about >= 8, "About marked for {about} steps of 10 px");
-        assert_eq!(at(MAX), 6);
+        assert_eq!(at(MAX), 7);
     }
 
     #[test]

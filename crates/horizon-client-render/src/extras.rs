@@ -3,7 +3,6 @@
 //! stays exactly vanilla's, and the logic behind them. Every extra is off by
 //! default; see `docs/extras.md`. Horizon's own switches outside the Extras page
 //! (No AI, Agent Control) are kept here too.
-pub use mod_api::extras::Corner;
 use std::{collections::VecDeque, fs, path::Path};
 
 pub const FILE: &str = "horizon-extras.txt";
@@ -11,10 +10,16 @@ pub const FILE: &str = "horizon-extras.txt";
 pub const SORT_KEY: &str = "horizon.sort";
 /// The 3D skin layers line, here and in the `options.txt` that held it first.
 const SKIN_LAYERS_KEY: &str = "threeDSkinLayers";
+/// The emote wheel's key, here and in the `key_key.emote` line #10092 wrote to `options.txt`.
+const EMOTE_KEY: &str = "emoteKey";
+const OLD_EMOTE_LINE: &str = "key_key.emote";
 
 /// The minimap's sizes in GUI pixels, and its zooms in blocks per pixel.
 pub const MINIMAP_SIZES: [(u8, &str); 3] = [(64, "Small"), (96, "Medium"), (128, "Large")];
 pub const MINIMAP_ZOOMS: [f32; 4] = [0.5, 1.0, 2.0, 4.0];
+
+/// A screen corner for an overlay.
+pub use mod_api::client::extras::Corner;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Extras {
@@ -72,6 +77,10 @@ pub struct Extras {
     pub ui_sound_reserve: bool,
     /// The player's own name tag over its model in third person.
     pub own_name_tag: bool,
+    /// NeoForge's `skipModdedSplashesIfVanillaModified`, on by default: a
+    /// pack's own `minecraft` splashes replace every namespace's
+    /// (`horizon_client::splashes::pool`). No Extras page entry.
+    pub skip_modded_splashes_if_vanilla_modified: bool,
     /// No particles from breaking or mining a block (other particles stay).
     pub hide_block_particles: bool,
     /// Mouse Tweaks-style drags in the inventory and storage containers.
@@ -82,6 +91,10 @@ pub struct Extras {
     pub sort: bool,
     /// A vanilla key name: sorts the part under the cursor.
     pub sort_key: String,
+    /// The emote wheel's key (`key.emote`), as the game last saved it. The live binding is
+    /// `Settings::keys`, bound in Controls with the vanilla ones; it is only kept in this file
+    /// so that `options.txt` stays vanilla's (`Settings::load` hands it over, `save` takes it back).
+    pub emote_key: String,
     /// A new chat line slides in from the left while it fades in (`Chat::layout`).
     pub chat_animation: bool,
     /// The indicator bar at the left of a chat line (on by default, as vanilla).
@@ -105,7 +118,7 @@ pub struct Extras {
     /// Splitscreen: each player's name in the corner of their view (`splitscreenNames`).
     pub splitscreen_names: bool,
     /// The wheel over a cycle button in the settings changes it (`CycleButton.mouseScrolled`,
-    /// off by default); on, it cycles the hovered setting as vanilla does.
+    /// on by default as vanilla); off, the wheel only scrolls the list.
     pub wheel_cycles_settings: bool,
     /// The built-in music tracks the Music page turned off (sound ids): they
     /// leave every pool they play in (`musicOff`, empty by default: vanilla's
@@ -151,11 +164,13 @@ impl Default for Extras {
             auto_reconnect: false,
             ui_sound_reserve: false,
             own_name_tag: false,
+            skip_modded_splashes_if_vanilla_modified: true,
             hide_block_particles: false,
             mouse_tweaks: false,
             mouse_tweaks_wheel: true,
             sort: false,
             sort_key: "key.keyboard.unknown".into(),
+            emote_key: crate::keybinds::KeyBinds::default_of("key.emote").into(),
             chat_animation: false,
             chat_indicator: true,
             no_ai: false,
@@ -242,11 +257,16 @@ impl Extras {
                 "autoReconnect" => e.auto_reconnect = flag(e.auto_reconnect),
                 "uiSoundReserve" => e.ui_sound_reserve = flag(e.ui_sound_reserve),
                 "ownNameTag" => e.own_name_tag = flag(e.own_name_tag),
+                "skipModdedSplashesIfVanillaModified" => {
+                    e.skip_modded_splashes_if_vanilla_modified =
+                        flag(e.skip_modded_splashes_if_vanilla_modified)
+                }
                 "hideBlockParticles" => e.hide_block_particles = flag(e.hide_block_particles),
                 "mouseTweaks" => e.mouse_tweaks = flag(e.mouse_tweaks),
                 "mouseTweaksWheel" => e.mouse_tweaks_wheel = flag(e.mouse_tweaks_wheel),
                 "sort" => e.sort = flag(e.sort),
                 "sortKey" if value.starts_with("key.") => e.sort_key = value.to_owned(),
+                EMOTE_KEY if value.starts_with("key.") => e.emote_key = value.to_owned(),
                 "chatAnimation" => e.chat_animation = flag(e.chat_animation),
                 "chatIndicator" => e.chat_indicator = flag(e.chat_indicator),
                 horizon_core::no_ai::KEY => e.no_ai = flag(e.no_ai),
@@ -256,6 +276,8 @@ impl Extras {
                 "splitscreenTwo" => e.splitscreen_two = value.parse().unwrap_or(0).min(2),
                 "splitscreenThree" => e.splitscreen_three = value.parse().unwrap_or(0).min(2),
                 "splitscreenNames" => e.splitscreen_names = flag(e.splitscreen_names),
+                // A new name: `wheelCyclesSettings` was written as true by every
+                // install while it was the default, so it says nothing of a choice.
                 "wheelCyclesListSettings" => {
                     e.wheel_cycles_settings = flag(e.wheel_cycles_settings)
                 }
@@ -278,7 +300,7 @@ impl Extras {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "packBrowser:{}\npregen:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesListSettings:{}\nmusicOff:{}\nmusicPage:{}\n{}:{}\n",
+            "packBrowser:{}\npregen:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nskipModdedSplashesIfVanillaModified:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesListSettings:{}\nmusicOff:{}\nmusicPage:{}\n{}:{}\n",
             bool_text(self.pack_browser),
             bool_text(self.pregen),
             bool_text(self.fullbright),
@@ -309,6 +331,7 @@ impl Extras {
             bool_text(self.auto_reconnect),
             bool_text(self.ui_sound_reserve),
             bool_text(self.own_name_tag),
+            bool_text(self.skip_modded_splashes_if_vanilla_modified),
             bool_text(self.hide_block_particles),
             bool_text(self.mouse_tweaks),
             bool_text(self.mouse_tweaks_wheel),
@@ -330,25 +353,36 @@ impl Extras {
             SKIN_LAYERS_KEY,
             bool_text(self.three_d_skin_layers),
         );
+        text.push_str(&format!("{EMOTE_KEY}:{}\n", self.emote_key));
         self.pvp.serialize(&mut text);
         text
     }
     /// Adopts the settings `options.txt` held before they moved here, while
-    /// this file (`own`) has no line of its own: 3D skin layers was an
-    /// `options.txt` line. Vanilla's `Options.save` drops lines it doesn't
+    /// this file (`own`) has no line of its own: 3D skin layers and the emote key were
+    /// `options.txt` lines. Vanilla's `Options.save` drops lines it doesn't
     /// know, so it is read there once, the first start after the update.
     pub fn read_old_options(&mut self, own: &str, options_txt: &str) {
-        fn line(text: &str) -> Option<&str> {
+        fn line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
             text.lines().find_map(|l| {
                 l.split_once(':')
-                    .filter(|(key, _)| *key == SKIN_LAYERS_KEY)
+                    .filter(|(key, _)| *key == name)
                     .map(|(_, value)| value)
             })
         }
-        if line(own).is_none()
-            && let Some(value) = line(options_txt)
+        if line(own, SKIN_LAYERS_KEY).is_none()
+            && let Some(value) = line(options_txt, SKIN_LAYERS_KEY)
         {
             self.three_d_skin_layers = value == "true";
+        }
+        // The emote key was a `key_key.emote` line of options.txt (#10092): a rebound key is kept.
+        if line(own, EMOTE_KEY).is_none()
+            && let Some(value) = line(options_txt, OLD_EMOTE_LINE).map(str::trim)
+            && value.starts_with("key.")
+            && (value == "key.keyboard.unknown"
+                || crate::keybinds::key_code(value).is_some()
+                || crate::keybinds::mouse_button(value).is_some())
+        {
+            self.emote_key = value.to_owned();
         }
     }
     /// Binds the extra key `name` (`SORT_KEY`); false for
@@ -362,13 +396,16 @@ impl Extras {
         true
     }
     /// Written only once something differs from the defaults, so a vanilla
-    /// setup gains no file.
+    /// setup gains no file. The settings stores of this file follow these lines
+    /// (`horizon_hooks::settings`).
     pub fn save(&self, dir: &Path) {
         let path = dir.join(FILE);
-        if *self == Self::default() && !path.exists() {
+        let mut text = self.serialize();
+        let stores_default = horizon_hooks::settings::engine::append(FILE, &mut text);
+        if *self == Self::default() && stores_default && !path.exists() {
             return;
         }
-        let _ = fs::write(path, self.serialize());
+        let _ = fs::write(path, text);
     }
 }
 
@@ -505,7 +542,9 @@ pub enum Item {
 pub fn rows() -> Vec<Result<Item, &'static str>> {
     use Item::*;
     // Fullbright, Dynamic lights and Hide block-break particles change the picture: they
-    // are on the graphics screen's Quality page (`graphics_ui::rows`), not here.
+    // are on the graphics screen's Quality page (`graphics_ui::rows`), not here. The Cosmetics
+    // group comes last, from the cosmetics' own section (`pages::Place::Extras`) while they are
+    // offered.
     vec![
         Err("horizon.extras.header.third_person"),
         Ok(OwnNameTag),
@@ -752,7 +791,8 @@ impl Item {
             },
         }
     }
-    /// A click: every item is a switch, so it flips. The sort key binds instead.
+    /// A click (`back` for the right button: a PvP & HUD choice steps back; a switch flips
+    /// either way). The sort key binds instead.
     pub fn cycle(self, e: &mut Extras, back: bool) {
         match self {
             Item::Fullbright => e.fullbright = !e.fullbright,
@@ -951,7 +991,7 @@ mod tests {
     #[test]
     fn items_cycle_through_their_values() {
         let mut e = Extras::default();
-        Item::Sort.cycle(&mut e, false);
+        Item::Sort.cycle(&mut e, true);
         assert_eq!(Item::Sort.value(&e), "On");
         // The minimap's old keys still parse, for the move to its mod.
         assert_eq!(

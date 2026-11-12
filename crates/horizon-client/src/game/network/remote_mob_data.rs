@@ -3,6 +3,7 @@
 //! `onSyncedDataUpdated`): what a client draws from it rather than from its
 //! own simulation, which a client of a server doesn't run.
 use super::Game;
+#[cfg(test)]
 use horizon_client::mobs::render::VILLAGER_TYPES;
 use horizon_client::mobs::{
     Mob, Species, Who, armadillo, bat, bee, camel, creaking, equine, finalize, illusioner, panda,
@@ -16,8 +17,14 @@ use horizon_world::registry::BlockStateId;
 /// The values `apply` takes from one SetEntityData packet, by vanilla's entry
 /// indices (Entity 0..=7, LivingEntity 8..=14, Mob 15, then the subclasses).
 /// `builtin` names the ids of built-in registries.
-fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_entity: i32) {
+pub(super) fn apply(
+    m: &mut Mob,
+    values: &[(u8, i32, Value)],
+    builtin: &Builtin,
+    local_entity: i32,
+) -> Option<[f64; 3]> {
     let species = m.species();
+    let mut stare_sound = None;
     let baby = super::lan::baby_index(species);
     if &*m.kind.id == "minecraft:player" {
         player_poses(m, values);
@@ -78,6 +85,10 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
             // the swirls of its effects (`tickEffects` draws them).
             (10, Value::Particles(list)) => m.extra.effect_particles = swirls(list, builtin),
             (11, Value::Bool(ambient)) => m.extra.effect_ambient = *ambient,
+            // LivingEntity.DATA_ARROW_COUNT_ID and DATA_STINGER_COUNT_ID: what
+            // is stuck in the body, which a player's layers draw.
+            (12, Value::Int(count)) => m.extra.stuck.arrows = *count,
+            (13, Value::Int(count)) => m.extra.stuck.stingers = *count,
             // Mob.DATA_MOB_FLAGS_ID: no AI 1, left-handed 2, aggressive 4.
             // Mob.isAggressive draws the illagers' and skeletons' attack
             // poses and the vindicator's axe.
@@ -155,9 +166,9 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
             }
             // Piglin.DATA_IS_DANCING: the dance pose.
             (Species::Piglin, 19, Value::Bool(dancing)) => m.extra.scratch[0] = i32::from(*dancing),
-            // TamableAnimal.DATA_FLAGS_ID: sitting 1, tame 4.
+            // TamableAnimal.DATA_FLAGS_ID: in the sitting pose 1, tame 4.
             (Species::Wolf | Species::Cat | Species::Parrot, 18, Value::Byte(flags)) => {
-                m.extra.sitting = flags & 1 != 0;
+                m.extra.sitting_pose = flags & 1 != 0;
                 m.extra.tame = flags & 4 != 0;
             }
             // Cat.IS_LYING and RELAX_STATE_ONE.
@@ -176,11 +187,11 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
                 m.extra.size = (*size).clamp(1, 127);
             }
             // SulfurCube.MAX_FUSE: onSyncedDataUpdated copies it into the fuse
-            // the client ticks for swell / white flash (#4548).
-            (Species::SulfurCube, 20, Value::Int(fuse)) => {
-                m.extra.counter2 = (*fuse).max(0) + 1;
+            // the client ticks for swell / white flash (#4548); -1 is not primed.
+            (Species::SulfurCube, 19, Value::Int(fuse)) => {
+                m.extra.counter2 = (*fuse).max(-1) + 1;
             }
-            (Species::SulfurCube, 19, Value::Bool(from_bucket)) => {
+            (Species::SulfurCube, 20, Value::Bool(from_bucket)) => {
                 m.extra.scratch[3] = i32::from(*from_bucket);
             }
             // Phantom.ID_SIZE: `updatePhantomSizeInfo` grows its box and bite,
@@ -188,7 +199,13 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
             (Species::Phantom, 16, Value::Int(size)) => phantom::set_size(m, *size),
             // Enderman.DATA_CREEPY (after DATA_CARRY_STATE): the open mouth
             // and raised head of an angry enderman.
-            (Species::Enderman, 17, Value::Bool(creepy)) => m.extra.flag = *creepy,
+            (Species::Enderman, 17, Value::Bool(creepy)) => {
+                m.extra.flag = *creepy;
+                if m.extra.flag2 {
+                    stare_sound = horizon_client::mobs::enderman::stare_sound(m);
+                }
+            }
+            (Species::Enderman, 18, Value::Bool(stared)) => m.extra.flag2 = *stared,
             // Warden.CLIENT_ANGER_LEVEL: the heartbeat's pace.
             (Species::Warden, 16, Value::Int(anger)) => {
                 if let Some(st) = m.extra.warden.as_mut() {
@@ -364,6 +381,7 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
             _ => {}
         }
     }
+    stare_sound
 }
 
 /// A tropical fish's packed variant: the pattern's id (the size, then the
@@ -426,9 +444,6 @@ fn player_poses(m: &mut Mob, values: &[(u8, i32, Value)]) {
             (0, Value::Byte(flags)) => m.extra.fall_flying = flags & -128 != 0,
             (6, Value::Id(pose)) => m.extra.synced_pose = (*pose).clamp(0, 17) as u8,
             (8, Value::Byte(flags)) => m.extra.auto_spin_attack = flags & 4 != 0,
-            // LivingEntity.DATA_ARROW_COUNT_ID and DATA_STINGER_COUNT_ID.
-            (12, Value::Int(count)) => m.extra.arrow_count = *count,
-            (13, Value::Int(count)) => m.extra.stinger_count = *count,
             // Player.DATA_SHOULDER_PARROT_LEFT and _RIGHT.
             (19, Value::Id(v)) => {
                 m.extra.shoulder_parrots[0] = (*v > 0).then(|| (*v - 1).clamp(0, 4))
@@ -465,32 +480,7 @@ fn swirls(list: &[Particle], builtin: &Builtin) -> Vec<ParticleOptions> {
         .collect()
 }
 
-/// VillagerData as the network sends it: the type and the profession by
-/// their built-in registry ids, then the level.
-fn villager_data(m: &mut Mob, data: &[i32], builtin: &Builtin) {
-    let &[kind, profession, level] = data else {
-        return;
-    };
-    let index = |registry: &str, id: i32, names: &[&str]| {
-        let name = builtin
-            .get(registry)?
-            .name(id)?
-            .strip_prefix("minecraft:")?;
-        names.iter().position(|n| *n == name).map(|i| i as u8)
-    };
-    if let Some(t) = index("minecraft:villager_type", kind, &VILLAGER_TYPES) {
-        m.extra.variant = t;
-    }
-    if let Some(p) = builtin
-        .get("minecraft:villager_profession")
-        .and_then(|r| r.name(profession))
-        .and_then(|name| name.strip_prefix("minecraft:"))
-        .and_then(horizon_client::mobs::villager::profession_index)
-    {
-        m.extra.profession = horizon_client::mobs::villager::ProfessionState::from_index(p);
-    }
-    m.extra.villager_level = level.max(1);
-}
+use super::villager_client::villager_data;
 
 impl Game<'_> {
     /// SetEntityData for a mob of the server's.
@@ -504,13 +494,19 @@ impl Game<'_> {
             (14, _, Value::OptPos(bed)) => Some(bed.map_or(0, |b| self.bed_facing(b))),
             _ => None,
         });
+        let professions = r.professions.clone();
         if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
-            apply(m, values, &r.builtin, r.entity_id);
+            let stare_sound =
+                super::villager_client::receive(m, values, &r.builtin, r.entity_id, &professions);
             apply_registry_data(m, values, &r.registries, self.world.game_time);
             if let Some(code) = bed
                 && m.species() == Species::Villager
             {
                 m.extra.ints[1] = code;
+            }
+            if let Some(at) = stare_sound {
+                self.audio
+                    .play_unshared("minecraft:entity.enderman.stare", Some(at), 2.5, 1.0);
             }
         }
     }
@@ -554,6 +550,7 @@ mod tests {
             "minecraft:witch" => Species::Witch,
             "minecraft:ravager" => Species::Ravager,
             "minecraft:zombie" => Species::Zombie,
+            "minecraft:enderman" => Species::Enderman,
             _ => panic!("unknown fixture species"),
         };
         // Metadata needs no AI or model. Avoid the resource loader, which also
@@ -601,11 +598,66 @@ mod tests {
             brain: Brain::Passive,
             anim: Anim::Zombie,
             sounds: [""; 3],
-            step_sound: None,
+            sound_overrides: Default::default(),
             food: Arc::default(),
             tempt: Arc::default(),
+            passenger_attachments: Vec::new(),
         });
         Mob::new(1, kind, horizon_core::geometry::Vec3::ZERO, 0.0)
+    }
+
+    #[test]
+    fn enderman_stare_metadata_requests_one_local_sound_with_cooldown() {
+        let mut mob = fixture_mob("minecraft:enderman");
+        let builtin = Builtin::default();
+        let apply =
+            |mob: &mut Mob, values: &[(u8, i32, Value)]| super::apply(mob, values, &builtin, 99);
+        assert_eq!(
+            apply(&mut mob, &[(18, s::BOOLEAN, Value::Bool(true))]),
+            None
+        );
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(true))]),
+            Some([0.0, 1.5, 0.0])
+        );
+        mob.age = 399;
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(false))]),
+            None
+        );
+        mob.age = 400;
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(true))]),
+            Some([0.0, 1.5, 0.0])
+        );
+        mob.age = 800;
+        mob.silent = true;
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(false))]),
+            None
+        );
+        mob.silent = false;
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(true))]),
+            None
+        );
+        mob.age = 1200;
+        // Entries are assigned in packet order: a clear of creepy still sees
+        // the previous stared-at flag before the following clear of index 18.
+        assert!(
+            apply(
+                &mut mob,
+                &[
+                    (17, s::BOOLEAN, Value::Bool(false)),
+                    (18, s::BOOLEAN, Value::Bool(false)),
+                ]
+            )
+            .is_some()
+        );
+        assert_eq!(
+            apply(&mut mob, &[(17, s::BOOLEAN, Value::Bool(true))]),
+            None
+        );
     }
 
     #[test]
@@ -620,7 +672,7 @@ mod tests {
             };
             assert_eq!(mob.air, max, "initial air: {kind}");
             for (air, frozen) in [(100, -3), (-20, 140), (max, 0)] {
-                super::apply(
+                let _ = super::apply(
                     &mut mob,
                     &[
                         (1, s::INT, Value::Int(air)),
@@ -692,7 +744,7 @@ mod tests {
                             sent.push((*index, *value));
                         }
                     }
-                    super::apply(&mut client, &data.values, &Builtin::default(), 99);
+                    let _ = super::apply(&mut client, &data.values, &Builtin::default(), 99);
                 }
             }
             sent.sort_unstable_by_key(|v| v.0);
@@ -771,7 +823,7 @@ mod tests {
         ] {
             let mut m = fixture_mob(&format!("minecraft:{kind}"));
             for on in [true, false, true, false] {
-                super::apply(
+                let _ = super::apply(
                     &mut m,
                     &[(16, s::BOOLEAN, Value::Bool(on))],
                     &Builtin::default(),
@@ -786,7 +838,7 @@ mod tests {
         }
         for kind in ["zombie", "cow"] {
             let mut m = fixture_mob(&format!("minecraft:{kind}"));
-            super::apply(
+            let _ = super::apply(
                 &mut m,
                 &[(16, s::BOOLEAN, Value::Bool(true))],
                 &Builtin::default(),
@@ -855,7 +907,7 @@ mod tests {
                             sent.push(*on);
                         }
                     }
-                    super::apply(&mut client, &data.values, &Builtin::default(), 99);
+                    let _ = super::apply(&mut client, &data.values, &Builtin::default(), 99);
                 }
             }
             trace.push((
@@ -944,7 +996,7 @@ mod tests {
     }
 
     fn apply(m: &mut Mob, values: &[(u8, i32, Value)]) {
-        super::apply(m, values, &builtin(), 99);
+        let _ = super::apply(m, values, &builtin(), 99);
     }
 
     fn mob(kind: &str) -> Option<Mob> {
@@ -1191,7 +1243,7 @@ mod tests {
                 (21, s::INT, Value::Int(11)),
             ],
         );
-        assert!(m.extra.tame && m.extra.sitting);
+        assert!(m.extra.tame && m.extra.sitting_pose);
         assert_eq!(m.extra.color, 11);
     }
 
@@ -1274,7 +1326,8 @@ mod tests {
                 VILLAGER_TYPES[m.extra.variant as usize],
                 horizon_client::mobs::villager::profession_table().entries()
                     [m.extra.profession.index().unwrap_or(0) as usize]
-                    .id,
+                    .id
+                    .as_str(),
                 m.extra.villager_level,
             )
         };
@@ -1340,17 +1393,19 @@ mod tests {
     }
 
     /// LivingEntity.DATA_ARROW_COUNT_ID and DATA_STINGER_COUNT_ID of another
-    /// player, which ArrowLayer and BeeStingerLayer draw.
+    /// player, which ArrowLayer and BeeStingerLayer draw, and of a mob.
     #[test]
-    fn another_players_stuck_arrows_and_stingers_are_kept() {
-        let Some(mut m) = mob("minecraft:player") else {
-            return;
-        };
-        apply(&mut m, &[(12, s::INT, Value::Int(4))]);
-        apply(&mut m, &[(13, s::INT, Value::Int(2))]);
-        assert_eq!((m.extra.arrow_count, m.extra.stinger_count), (4, 2));
-        apply(&mut m, &[(12, s::INT, Value::Int(0))]);
-        assert_eq!((m.extra.arrow_count, m.extra.stinger_count), (0, 2));
+    fn stuck_arrows_and_stingers_are_kept() {
+        for kind in ["minecraft:player", "minecraft:zombie"] {
+            let Some(mut m) = mob(kind) else {
+                return;
+            };
+            apply(&mut m, &[(12, s::INT, Value::Int(4))]);
+            apply(&mut m, &[(13, s::INT, Value::Int(2))]);
+            assert_eq!((m.extra.stuck.arrows, m.extra.stuck.stingers), (4, 2));
+            apply(&mut m, &[(12, s::INT, Value::Int(0))]);
+            assert_eq!((m.extra.stuck.arrows, m.extra.stuck.stingers), (0, 2));
+        }
     }
 
     #[test]
@@ -1453,19 +1508,26 @@ mod tests {
         }
     }
 
-    /// #4548: SulfurCube.MAX_FUSE copies into the fuse the client ticks for swell.
+    /// #4548: SulfurCube.MAX_FUSE (19, after AbstractCubeMob.ID_SIZE) copies into
+    /// the fuse the client ticks for swell; its default, -1, is not primed
+    /// (`isPrimed`: fuse >= 0). FROM_BUCKET is 20 (#13721).
     #[test]
     fn sulfur_cube_max_fuse_sets_the_client_fuse() {
+        use horizon_client::mobs::sulfur_cube::{fuse, primed};
         let Some(mut m) = mob("minecraft:sulfur_cube") else {
             return;
         };
         assert_eq!(m.extra.counter2, 0);
-        apply(&mut m, &[(20, s::INT, Value::Int(40))]);
-        assert_eq!(horizon_client::mobs::sulfur_cube::fuse(&m), 40);
-        assert!(horizon_client::mobs::sulfur_cube::primed(&m));
-        apply(&mut m, &[(20, s::INT, Value::Int(0))]);
+        apply(&mut m, &[(19, s::INT, Value::Int(40))]);
+        assert_eq!(fuse(&m), 40);
+        assert!(primed(&m));
+        apply(&mut m, &[(19, s::INT, Value::Int(0))]);
         // Last fuse tick: still primed at 0 until the server removes it.
-        assert_eq!(horizon_client::mobs::sulfur_cube::fuse(&m), 0);
+        assert_eq!(fuse(&m), 0);
+        apply(&mut m, &[(19, s::INT, Value::Int(-1))]);
+        assert!(!primed(&m));
+        apply(&mut m, &[(20, s::BOOLEAN, Value::Bool(true))]);
+        assert!(!primed(&m));
     }
 
     /// `Pig.onSyncedDataUpdated` and `Strider.onSyncedDataUpdated`: a synced
@@ -1540,3 +1602,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "remote_mob_data/pet_pose_meta_tests.rs"]
+mod pet_pose_meta_tests;

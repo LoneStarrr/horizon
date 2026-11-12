@@ -10,7 +10,7 @@ The pause-change pre hook sees the old state; the post hook sees the new state.
 `ClientHost::playing()` is true while the player is in the world with nothing over it: no screen, title, sign
 editor or book, so keys and zoom apply. `ClientHost::mapping(name)` reads a vanilla key mapping (`key.forward`,
 `key.left`, `key.back`, `key.right`, `key.jump`, `key.sneak`, `key.sprint`, `key.attack`, `key.use`) as a
-`NativeKeyMapping`: whether it is held (`KeyMapping.isDown`) and the `label` of the key it is bound to, as Controls
+`KeyMapping`: whether it is held (`KeyMapping.isDown`) and the `label` of the key it is bound to, as Controls
 shows it. It is `None` for any other name. Both read without `&mut`, so the HUD and screen hooks can ask them.
 
 `ClientHost::clipboard_text()` reads the system clipboard (`KeyboardHandler.getClipboard`, empty text when it
@@ -34,8 +34,8 @@ Setting a type never emits `camera_type_cycle`; F5 alone cycles, and its final e
 wins over requests made inside the cycle callback.
 
 `ClientHost::crosshair_target()` returns the ordinary interaction-range target as
-`NativeCrosshairTarget::Block { pos, state, hit }` or
-`NativeCrosshairTarget::Entity { entity, point }`. The block hit contains its world-space
+`CrosshairTarget::Block { pos, state, hit }` or
+`CrosshairTarget::Entity { entity, point }`. The block hit contains its world-space
 location, face and inside flag; the entity point is also in world coordinates.
 It uses the game's current targeting ray and block/entity reach, respects blocks
 occluding entities, and returns `None` on a miss or without a client world.
@@ -45,3 +45,29 @@ when the client level is replaced or the client disconnects; a same-level respaw
 keeps its epoch. This supplies identity, not client entity reads: the server-only
 entity data methods still reject client handles. Unlike `view_hit` and `raycast`, this does not find blocks
 in distant terrain or return a block behind a targeted entity.
+
+### Combat targeting
+
+`ClientHost::targeting()` and `set_targeting(ClientTargeting)` control liquid picking,
+entity occlusion and an optional crosshair entity override. Defaults preserve ordinary
+vanilla targeting. Set `pick_liquids` to include source and flowing fluid shapes, or
+`hit_through_walls` to ignore block occlusion for entity picks and attacks. An `entity`
+override must name a live entity in this client level; stale or self handles make the
+setter return `false` without changing the controls. The setter requires a logged-in
+client world. An override is rechecked for reach, held-item range and occlusion when
+used and disappears from reads after its level is replaced.
+
+Reach remains attribute-backed: use the server player's living handle and
+`set_attribute_base(host, "minecraft:block_interaction_range", value)` or
+`"minecraft:entity_interaction_range"`. The client's cached reach follows the server's
+attribute updates. Client targeting controls do not grant extra server reach.
+
+`client_attack_target` receives a mutable `targets` list before an ordinary melee click
+(spear jabs use their existing path). It starts with the crosshair entity. Replace it
+for redirection, append for multiple hits, or clear it to suppress an entity attack.
+`Flow::Cancel` cancels the batch. There is no batch cap; duplicates are sent once
+in first-occurrence order. Each target is checked again against live handles,
+attackability, reach, held-item range and the occlusion control. Clearing an entity hit
+does not mine the block behind it; an empty list on a block or miss keeps the ordinary
+path. Each accepted hit uses normal attack packets and prediction. Server validation
+and cooldowns still apply. Native and Wasm mods use the same typed API.

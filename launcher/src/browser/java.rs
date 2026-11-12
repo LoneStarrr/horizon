@@ -7,7 +7,7 @@
 //!
 //! Installing copies the carried-over folder mod into `horizon-mods/<mod id>/` beside
 //! `options.txt` and turns it on in `horizon-mods.txt`, where the game's Options > Mods reads it.
-use super::{FileRef, Kind, Project, Source, Support, Version, installed::Entry, pick};
+use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
 use horizon_port_pack::check::{self, Check, Verdict};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -122,17 +122,26 @@ pub fn is_enabled(home: &Path, id: &str) -> bool {
 
 /// Turns mod `id` on (or off) in `horizon-mods.txt`, keeping the other lines.
 pub fn set_enabled(home: &Path, id: &str, on: bool) -> Result<(), String> {
+    set_all_enabled(home, &[id], on)
+}
+
+/// Turns every mod in `ids` on (or off) in one locked rewrite of `horizon-mods.txt`: either all
+/// of them change or, when the write fails, none do.
+pub fn set_all_enabled(home: &Path, ids: &[&str], on: bool) -> Result<(), String> {
     let _lock = super::lock_home(home).map_err(|e| e.to_string())?;
     let path = home.join(MODS_LIST);
     let text = fs::read_to_string(&path).unwrap_or_default();
-    let key = format!("mod.{id}");
+    let keys: Vec<String> = ids.iter().map(|id| format!("mod.{id}")).collect();
     let mut lines: Vec<String> = text
         .lines()
-        .filter(|l| l.split_once(':').is_none_or(|(k, _)| k.trim() != key))
+        .filter(|l| {
+            l.split_once(':')
+                .is_none_or(|(k, _)| !keys.iter().any(|key| k.trim() == key))
+        })
         .map(str::to_owned)
         .collect();
     if on {
-        lines.push(format!("{key}:true"));
+        lines.extend(keys.iter().map(|key| format!("{key}:true")));
     }
     let mut out = lines.join("\n");
     if !out.is_empty() {

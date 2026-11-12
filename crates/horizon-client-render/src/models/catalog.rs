@@ -5,7 +5,7 @@ use crate::{Result, sprites::Sprites};
 use horizon_assets::{
     bake::{BlockModelTransform, ModelQuad, RenderType, bake_block_model},
     blockstate::{
-        BlockStateDefinition, Variant, VariantSet,
+        BlockStateDefinition, BlockStateFile, Variant, VariantSet,
         bind::{Properties, PropertySchema, PropertyValues, SelectedModels},
         choice::CompiledChoices,
     },
@@ -210,6 +210,27 @@ fn definition_layers(text: &str) -> std::result::Result<Vec<String>, String> {
         _ => Ok(vec![text.to_owned()]),
     }
 }
+/// One layer of block `block`'s blockstate file, read and bound to its `possible` states:
+/// vanilla's variants and multipart, or the picks of the definition type a mod registered.
+fn bind_layer(
+    text: &str,
+    block: &str,
+    schema: &PropertySchema,
+    possible: &[Properties],
+) -> std::result::Result<(BlockStateDefinition, Vec<Option<SelectedModels>>), String> {
+    match BlockStateFile::from_json(text).map_err(|e| e.to_string())? {
+        BlockStateFile::Vanilla(definition) => {
+            let bound = definition
+                .bind(schema, possible)
+                .map_err(|e| e.to_string())?;
+            Ok((definition, bound))
+        }
+        BlockStateFile::Typed { kind, config } => {
+            crate::mod_block_state_models::instantiate(&kind, block, &config, possible)
+                .map(BlockStateDefinition::from_picks)
+        }
+    }
+}
 /// Each state's model from definitions bound bottom first: the topmost one
 /// that binds the state, as (its layer, its selection). A higher pack's
 /// definition replaces only the states it binds (`putAll` in
@@ -319,34 +340,23 @@ impl StateModels {
             // gets no model, and the other blocks still load. A file several
             // packs provide binds each pack's definition on its own, bottom
             // first (`loadBlockStateDefinitionStack`).
+            let file = format!("assets/{namespace}/blockstates/{path}.json");
             let layers = match root
-                .read_to_string(&format!("assets/{namespace}/blockstates/{path}.json"))
+                .read_to_string(&file)
                 .map_err(|e| e.to_string())
                 .and_then(|text| definition_layers(&text))
             {
                 Ok(layers) => layers,
                 Err(e) => {
-                    log::warn!(
-                        "Horizon: blockstate definition of {namespace}:{path} not loaded: {e}"
-                    );
+                    log::warn!("Horizon: blockstate definition {file} not loaded: {e}");
                     continue;
                 }
             };
             let mut loaded = Vec::with_capacity(layers.len());
             for text in &layers {
-                let layer = BlockStateDefinition::from_json(text)
-                    .map_err(|e| e.to_string())
-                    .and_then(|definition| {
-                        let bound = definition
-                            .bind(&schema, &possible)
-                            .map_err(|e| e.to_string())?;
-                        Ok((definition, bound))
-                    });
-                match layer {
+                match bind_layer(text, &name, &schema, &possible) {
                     Ok(layer) => loaded.push(layer),
-                    Err(e) => log::warn!(
-                        "Horizon: blockstate definition of {namespace}:{path} not loaded: {e}"
-                    ),
+                    Err(e) => log::warn!("Horizon: blockstate definition {file} not loaded: {e}"),
                 }
             }
             if loaded.is_empty() {
@@ -789,6 +799,7 @@ mod tests {
         );
         let connected = crate::connected::ConnectedTextures::load(
             root.source(),
+            horizon_optifine::ctm::load(root.source()),
             &registry,
             &mut sprites,
             |_, _| Some(base),

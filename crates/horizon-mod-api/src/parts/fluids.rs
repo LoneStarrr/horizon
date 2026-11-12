@@ -1,29 +1,5 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
 use super::*;
-/// The world fluids the mods declared in code, once they have all registered.
-pub fn declared_world_fluids() -> &'static [(String, crate::WorldFluid)] {
-    installed().map_or(&[], |installed| &installed.world_fluids)
-}
-
-impl HookParts {
-    pub(crate) fn fluid<'k>(
-        &self,
-        id: impl FnOnce() -> Option<&'k str>,
-    ) -> &[Attached<dyn FluidPart>] {
-        attached(&self.fluids, id)
-    }
-}
-
-impl dyn Registrar + '_ {
-    /// Attach `part` to the world fluid `fluid`, a mod's, by the id it was declared with.
-    pub fn fluid_part<P: FluidPart>(&mut self, fluid: &str, part: P) {
-        self.attach_fluid_part(fluid, type_name::<P>(), Arc::new(part));
-    }
-}
-
-pub(crate) fn resolved_fluids() -> &'static OnceLock<horizon_mod_runtime::registry_keys::Names> {
-    static EMPTY: OnceLock<horizon_mod_runtime::registry_keys::Names> = OnceLock::new();
-    installed().map_or(&EMPTY, |installed| &installed.fluids)
-}
 
 /// Fixtures that tests of other crates use to install Parts.
 #[cfg(any(test, feature = "testing"))]
@@ -40,20 +16,22 @@ pub mod tests {
     fn world_fluid_declarations_refuse_generated_names() {
         for (first, second) in [("oil", "flowing_oil"), ("flowing_oil", "oil")] {
             let mut registrar = super::PartRegistrar::new("maker");
-            let options = crate::WorldFluid {
-                tick_delay: 20,
-                drop_off: 2,
-                slope_find_distance: 3,
-                source_conversion: true,
-                bucket: false,
+            let options = {
+                let mut value: crate::WorldFluid = Default::default();
+                value.tick_delay = 20;
+                value.drop_off = 2;
+                value.slope_find_distance = 3;
+                value.source_conversion = true;
+                value.bucket = false;
+                value
             };
             assert_ne!(
                 registrar.declare_world_fluid(first, options),
-                crate::FluidKey(u32::MAX)
+                mod_vocab::__private::parts_installation::fluid_key(u32::MAX)
             );
             assert_eq!(
                 registrar.declare_world_fluid(second, options),
-                crate::FluidKey(u32::MAX)
+                mod_vocab::__private::parts_installation::fluid_key(u32::MAX)
             );
             assert_eq!(registrar.world_fluids.len(), 1);
             let world = registrar.world_fluids[0].1;
@@ -83,7 +61,7 @@ pub mod tests {
 
     #[test]
     pub(crate) fn fluid_keys_resolve_declarations_after_requests_and_reject_unknown() {
-        use crate::registry_keys::{fluid_id, fluid_key, resolve_fluids};
+        use mod_vocab::__private::{fluid_id, fluid_key, resolve_fluids};
         struct Request;
         #[mod_api::__subscriptions]
         impl Hooks for Request {
@@ -104,15 +82,15 @@ pub mod tests {
             ModEntry::new("maker", Box::new(Declare)),
         ]
         .into();
-        crate::install(mods.clone());
+        crate::__private::install(mods.clone());
         install_parts(&mods, &crate::parts::tests::rule_schema(), |_| false).unwrap();
         let error = resolve_fluids(&[], &[]).unwrap_err();
         assert_eq!(
             error,
-            vec![crate::UnknownFluid {
-                mod_id: "reader",
-                id: "minecraft:water".to_owned()
-            }]
+            vec![mod_vocab::__private::parts_installation::unknown_fluid(
+                "reader",
+                "minecraft:water".to_owned()
+            )]
         );
         resolve_fluids(&["minecraft:water", "minecraft:lava"], &[]).unwrap();
         let chocolate = fluid_key("maker:chocolate").unwrap();
@@ -120,20 +98,30 @@ pub mod tests {
         for name in ["minecraft:water", "minecraft:lava", "maker:chocolate"] {
             let key = fluid_key(name).unwrap();
             assert_eq!(
-                crate::registry_keys::fluid_key_utf16(&name.encode_utf16().collect::<Vec<_>>()),
+                mod_vocab::__private::fluid_key_utf16(&name.encode_utf16().collect::<Vec<_>>()),
                 Some(key)
             );
             assert_eq!(fluid_id(key), Some(name));
         }
         for path in ["water", "lava"] {
             assert_eq!(
-                crate::registry_keys::fluid_key_utf16(&path.encode_utf16().collect::<Vec<_>>()),
+                mod_vocab::__private::fluid_key_utf16(&path.encode_utf16().collect::<Vec<_>>()),
                 fluid_key(path)
             );
         }
-        assert_eq!(FluidKey::from_slot(chocolate.0), Ok(chocolate));
+        assert_eq!(
+            mod_vocab::__private::parts_installation::validate_fluid_key(
+                mod_vocab::__private::parts_installation::fluid_key_slot(chocolate)
+            ),
+            Ok(chocolate)
+        );
         assert!(fluid_key("missing:fluid").is_none());
-        assert_eq!(fluid_id(FluidKey(u32::MAX)), None);
+        assert_eq!(
+            fluid_id(mod_vocab::__private::parts_installation::fluid_key(
+                u32::MAX
+            )),
+            None
+        );
     }
     /// A mod's tank: the game's tank at its position, reached from every side but its top, and
     /// misanswering as `lie` says.
@@ -290,11 +278,10 @@ pub mod tests {
     }
     #[cfg(test)]
     impl mod_api::prelude::BlockEntitiesBackend for TankWorld {
-        fn block_entity_kind(
-            &self,
-            BlockEntityRef { position: pos, .. }: BlockEntityRef,
-        ) -> Option<BlockEntityTypeKey> {
-            self.types.get(&pos).map(|id| type_key(id))
+        fn block_entity_kind(&self, entity: BlockEntityRef) -> Option<BlockEntityTypeKey> {
+            self.types
+                .get(&mod_vocab::__private::game::Fields::fields(&entity).position)
+                .map(|id| type_key(id))
         }
     }
     #[cfg(test)]
@@ -398,7 +385,7 @@ pub mod tests {
     #[cfg(test)]
     impl Host for TankWorld {
         fn backend(&self) -> Option<BackendRef<'_>> {
-            Some(BackendRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_ref(self))
         }
     }
     #[cfg(test)]
@@ -406,18 +393,20 @@ pub mod tests {
     #[cfg(test)]
     impl ServerHost for TankWorld {
         fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {
-            Some(BackendMutRef::of(self))
+            Some(mod_vocab::__private::parts_installation::backend_mut_ref(
+                self,
+            ))
         }
     }
     #[cfg(test)]
     mod_api::impl_server_host_areas!(TankWorld, except(mod_state));
     #[cfg(test)]
     impl crate::prelude::ModStateServerHost for TankWorld {
-        fn transaction_open(&mut self, _: TransactionSeal) {
-            self.journal.open(self.tanks.clone());
+        fn transaction_open(&mut self) -> TransactionSeal {
+            self.journal.open(self.tanks.clone())
         }
-        fn transaction_close(&mut self, _: TransactionSeal, commit: bool) {
-            if let Some(tanks) = self.journal.close(commit) {
+        fn transaction_close(&mut self, seal: &TransactionSeal, commit: bool) {
+            if let Some(tanks) = self.journal.close(seal, commit) {
                 self.tanks = tanks;
             }
         }
@@ -432,7 +421,7 @@ pub mod tests {
         FluidStack {
             components: Some(Box::new(crate::Components::from(components))),
             ..FluidStack::new(
-                crate::registry_keys::fluid_key("test:potion").unwrap(),
+                mod_vocab::__private::fluid_key("test:potion").unwrap(),
                 amount,
             )
         }
@@ -456,7 +445,7 @@ pub mod tests {
         // The same fluid with other components, or another fluid, doesn't go in.
         for other in [
             potion(500, "minecraft:poison"),
-            FluidStack::new(crate::registry_keys::fluid_key("test:potion").unwrap(), 500),
+            FluidStack::new(mod_vocab::__private::fluid_key("test:potion").unwrap(), 500),
         ] {
             world.tank(SOURCE, Some(other.clone()), true);
             assert_eq!(world.moved((SOURCE, None), (TANK, None), 4000), Ok(0));
@@ -465,7 +454,7 @@ pub mod tests {
         }
         // A drain-only tank has no capacity, and nothing moves.
         let water = FluidStack::new(
-            crate::registry_keys::fluid_key("minecraft:water").unwrap(),
+            mod_vocab::__private::fluid_key("minecraft:water").unwrap(),
             1000,
         );
         world.tank(SOURCE, Some(water.clone()), true);
@@ -482,7 +471,7 @@ pub mod tests {
         game_thread();
         let water = |amount| {
             FluidStack::new(
-                crate::registry_keys::fluid_key("minecraft:water").unwrap(),
+                mod_vocab::__private::fluid_key("minecraft:water").unwrap(),
                 amount,
             )
         };
@@ -536,7 +525,7 @@ pub mod tests {
         game_thread();
         let water = |amount| {
             Some(FluidStack::new(
-                crate::registry_keys::fluid_key("minecraft:water").unwrap(),
+                mod_vocab::__private::fluid_key("minecraft:water").unwrap(),
                 amount,
             ))
         };
@@ -561,55 +550,22 @@ pub mod tests {
                 Ok(first + second)
             });
             let owner = "doubler".to_owned();
-            assert_eq!(moved, Err(Overanswered { owner }), "{liar}");
+            assert_eq!(
+                moved,
+                Err(mod_vocab::__private::parts_installation::overanswered(
+                    owner
+                )),
+                "{liar}"
+            );
             let held = [SOURCE, OTHER, TANK].map(|pos| world.held(pos));
             assert_eq!(held, [water(1000), water(1000), None], "{liar}");
         }
     }
 }
 
-/// Registrar operations for fluids.
-pub trait FluidsRegistrar {
-    /// Request a fluid by canonical registry id, checked when the registry loads.
-    fn fluid_key(&mut self, id: &str) -> crate::FluidKey;
-
-    /// Declare a tank-only fluid in this mod's namespace and return its key.
-    fn declare_fluid(&mut self, path: &str) -> crate::FluidKey;
-
-    /// Declare a fluid in this mod's namespace that exists in the world (NeoForge's
-    /// `RegisterEvent` for a `FluidType`), with its block and, as `fluid` says, its bucket. Its
-    /// `data/<mod id>/horizon/fluid/<path>.json`, if any, says how it looks.
-    fn declare_world_fluid(&mut self, path: &str, fluid: crate::WorldFluid) -> crate::FluidKey;
-
-    /// Attach `part`, of kind `kind`, to the world fluid `fluid`.
-    fn attach_fluid_part(&mut self, fluid: &str, kind: &'static str, part: Arc<dyn FluidPart>);
-}
-
-impl FluidsRegistrar for PartRegistrar {
-    fn fluid_key(&mut self, id: &str) -> crate::FluidKey {
-        match self
-            .registry_keys
-            .borrow_mut()
-            .fluids
-            .request(self.mod_id, id)
-        {
-            Ok(slot) => crate::FluidKey(slot),
-            Err(error) => {
-                self.refused.push(error);
-                crate::FluidKey(u32::MAX)
-            }
-        }
-    }
-
-    fn declare_fluid(&mut self, path: &str) -> crate::FluidKey {
-        let id = format!("{}:{path}", self.mod_id);
-        if path.contains(':') || crate::Identifier::parse_namespaced(&id).is_none() {
-            self.refused.push(format!(
-                "mod {}: invalid fluid declaration {id:?}",
-                self.mod_id
-            ));
-            return crate::FluidKey(u32::MAX);
-        }
+impl PartRegistrar {
+    // Only callers that have resolved ownership may insert a declaration.
+    fn insert_declared_fluid(&mut self, id: String) -> crate::FluidKey {
         let previous = self
             .registry_keys
             .borrow_mut()
@@ -623,10 +579,45 @@ impl FluidsRegistrar for PartRegistrar {
         }
         self.fluid_key(&id)
     }
+}
+
+impl FluidsRegistrar for PartRegistrar {
+    fn fluid_key(&mut self, id: &str) -> crate::FluidKey {
+        match self
+            .registry_keys
+            .borrow_mut()
+            .fluids
+            .request(self.mod_id, id)
+        {
+            Ok(slot) => mod_vocab::__private::parts_installation::fluid_key(slot),
+            Err(error) => {
+                self.refused.push(error);
+                mod_vocab::__private::parts_installation::fluid_key(u32::MAX)
+            }
+        }
+    }
+
+    fn declare_fluid(&mut self, path: &str) -> crate::FluidKey {
+        let id = match self.owned_declaration_id(path) {
+            Ok(id) => id,
+            Err(reason) => {
+                self.refused.push(reason);
+                return mod_vocab::__private::parts_installation::fluid_key(u32::MAX);
+            }
+        };
+        self.insert_declared_fluid(id)
+    }
 
     fn declare_world_fluid(&mut self, path: &str, fluid: crate::WorldFluid) -> crate::FluidKey {
-        let id = format!("{}:{path}", self.mod_id);
-        let flowing = format!("{}:flowing_{path}", self.mod_id);
+        let id = match self.owned_declaration_id(path) {
+            Ok(id) => id,
+            Err(reason) => {
+                self.refused.push(reason);
+                return mod_vocab::__private::parts_installation::fluid_key(u32::MAX);
+            }
+        };
+        let (namespace, path) = id.split_once(':').expect("validated declaration id");
+        let flowing = format!("{namespace}:flowing_{path}");
         if [id.as_str(), flowing.as_str()].iter().any(|id| {
             self.registry_keys
                 .borrow()
@@ -635,17 +626,17 @@ impl FluidsRegistrar for PartRegistrar {
         }) {
             self.refused
                 .push(format!("world fluid {id}: name declared twice"));
-            return crate::FluidKey(u32::MAX);
+            return mod_vocab::__private::parts_installation::fluid_key(u32::MAX);
         }
         if let Err(error) = fluid.check() {
             self.refused.push(format!(
                 "mod {}: world fluid {path:?}: {error}",
                 self.mod_id
             ));
-            return crate::FluidKey(u32::MAX);
+            return mod_vocab::__private::parts_installation::fluid_key(u32::MAX);
         }
-        let key = self.declare_fluid(path);
-        if key != crate::FluidKey(u32::MAX) {
+        let key = self.insert_declared_fluid(id.clone());
+        if key != mod_vocab::__private::parts_installation::fluid_key(u32::MAX) {
             self.registry_keys
                 .borrow_mut()
                 .declared_fluids

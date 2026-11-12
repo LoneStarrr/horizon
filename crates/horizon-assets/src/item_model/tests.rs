@@ -353,3 +353,160 @@ fn a_patched_stack_reads_its_patch_over_its_items_defaults() {
     }
     assert_eq!(view.to_map(), *merged);
 }
+
+/// A node of a registered type draws, per stack, the named `models` its mod answers, in the
+/// mod's order, under the node's transformation; a name the node doesn't have draws nothing, and
+/// with no mod answering the node draws nothing.
+#[test]
+fn registered_node_draws_the_models_the_mod_answers_per_stack() {
+    struct Env;
+    impl ItemEnv for Env {
+        fn item_model_update(
+            &self,
+            kind: &str,
+            config: &horizon_core::nbt::Tag,
+            stack: &StackView,
+            ctx: &Context,
+            models: &mut Vec<String>,
+        ) {
+            assert_eq!(kind, "nodetest:charge");
+            if ctx.display == DisplayContext::Ground {
+                models.push("full".to_owned());
+                return;
+            }
+            assert_eq!(config.get("glow"), Some(&horizon_core::nbt::Tag::Byte(1)));
+            let names: &[&str] = match stack.count {
+                1 => &["empty"],
+                2 => &["full", "empty"],
+                _ => &["absent"],
+            };
+            models.extend(names.iter().map(|name| (*name).to_owned()));
+        }
+    }
+    assert_eq!(
+        register_item_models(vec![
+            "nodetest:charge".into(),
+            "minecraft:charge".into(),
+            "unnamespaced".into(),
+        ]),
+        ["nodetest:charge"]
+    );
+    let json = r#"{"model":{"type":"nodetest:charge","glow":true,
+        "transformation":{"translation":[1,0,0],"left_rotation":[0,0,0,1],"scale":[1,1,1],"right_rotation":[0,0,0,1]},
+        "models":{
+            "empty":{"type":"minecraft:model","model":"nodetest:item/empty"},
+            "full":{"type":"minecraft:model","model":"nodetest:item/full"}
+        }}}"#;
+    let definition = ClientItem::from_json(json).unwrap();
+    let mut dependencies = Vec::new();
+    definition.model.dependencies(&mut dependencies);
+    dependencies.sort();
+    assert_eq!(dependencies, ["nodetest:item/empty", "nodetest:item/full"]);
+    let mut models = ItemModels::default();
+    models
+        .definitions
+        .insert("nodetest:cell".into(), definition);
+    let context = Context {
+        display: DisplayContext::Gui,
+        owner: None,
+        level: None,
+        seed: 0,
+    };
+    let drawn = |count: i32, env: &dyn ItemEnv| {
+        let mut stack = StackView::new("nodetest:cell", count);
+        stack.patch.insert(
+            "minecraft:item_model".into(),
+            Some(serde_json::json!("nodetest:cell")),
+        );
+        models
+            .resolve(&stack, &context, env)
+            .layers
+            .iter()
+            .map(|layer| match &layer.content {
+                LayerContent::Model { model } => (model.clone(), layer.transform.0[3][0]),
+                other => panic!("not a model layer: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(drawn(1, &Env), [("nodetest:item/empty".to_owned(), 1.0)]);
+    assert_eq!(
+        drawn(2, &Env),
+        [
+            ("nodetest:item/full".to_owned(), 1.0),
+            ("nodetest:item/empty".to_owned(), 1.0)
+        ]
+    );
+    assert!(drawn(3, &Env).is_empty(), "a name the node lacks");
+    // The surroundings reach the mod: on the ground the same stack draws `full`.
+    let ground = Context {
+        display: DisplayContext::Ground,
+        ..context.clone()
+    };
+    let mut stack = StackView::new("nodetest:cell", 1);
+    stack.patch.insert(
+        "minecraft:item_model".into(),
+        Some(serde_json::json!("nodetest:cell")),
+    );
+    let layers = models.resolve(&stack, &ground, &Env).layers;
+    assert!(matches!(&layers[..], [layer] if matches!(&layer.content,
+        LayerContent::Model { model } if model == "nodetest:item/full")));
+    assert!(drawn(1, &NoEnv).is_empty(), "no mod answers");
+}
+
+#[test]
+fn last_index_less_or_equal_linear_and_binary() {
+    use super::last_index_less_or_equal;
+    let make = |thresholds: &[f32]| -> Vec<(f32, ItemModelNode)> {
+        thresholds
+            .iter()
+            .map(|&t| (t, ItemModelNode::Empty))
+            .collect()
+    };
+
+    // Empty
+    assert_eq!(last_index_less_or_equal(&[], 0.0), None);
+
+    // Short (< 16): linear search
+    let short = make(&[-1.0, 0.0, 1.0, 2.5, 5.0]);
+    assert_eq!(last_index_less_or_equal(&short, -2.0), None);
+    assert_eq!(last_index_less_or_equal(&short, -1.0), Some(0));
+    assert_eq!(last_index_less_or_equal(&short, -0.5), Some(0));
+    assert_eq!(last_index_less_or_equal(&short, 0.0), Some(1));
+    assert_eq!(last_index_less_or_equal(&short, 2.5), Some(3));
+    assert_eq!(last_index_less_or_equal(&short, 3.0), Some(3));
+    assert_eq!(last_index_less_or_equal(&short, 5.0), Some(4));
+    assert_eq!(last_index_less_or_equal(&short, 10.0), Some(4));
+
+    // Long (>= 16): binary search
+    let thresholds: Vec<f32> = (0..32).map(|i| i as f32 * 10.0).collect();
+    let long = make(&thresholds);
+    assert_eq!(last_index_less_or_equal(&long, -5.0), None);
+    assert_eq!(last_index_less_or_equal(&long, 0.0), Some(0));
+    assert_eq!(last_index_less_or_equal(&long, 5.0), Some(0));
+    assert_eq!(last_index_less_or_equal(&long, 10.0), Some(1));
+    assert_eq!(last_index_less_or_equal(&long, 150.0), Some(15));
+    assert_eq!(last_index_less_or_equal(&long, 155.0), Some(15));
+    assert_eq!(last_index_less_or_equal(&long, 310.0), Some(31));
+    assert_eq!(last_index_less_or_equal(&long, 1000.0), Some(31));
+
+    // Short lists use upper-bound tie behavior, including signed zero.
+    let duplicates = make(&[1.0, 1.0, 2.0]);
+    assert_eq!(last_index_less_or_equal(&duplicates, 1.0), Some(1));
+
+    let zeroes = make(&[-0.0, 0.0]);
+    assert_eq!(last_index_less_or_equal(&zeroes, -0.0), Some(1));
+    assert_eq!(last_index_less_or_equal(&zeroes, 0.0), Some(1));
+
+    // At 16 entries, vanilla returns Arrays.binarySearch's hit, not the last tie.
+    // Expected indices were checked on the JVM.
+    let duplicates = make(&[
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 7.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0,
+    ]);
+    assert_eq!(last_index_less_or_equal(&duplicates, 7.0), Some(7));
+
+    let zeroes = make(&[
+        -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -0.0, -0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0,
+    ]);
+    assert_eq!(last_index_less_or_equal(&zeroes, -0.0), Some(7));
+    assert_eq!(last_index_less_or_equal(&zeroes, 0.0), Some(9));
+}

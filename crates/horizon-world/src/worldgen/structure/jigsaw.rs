@@ -13,7 +13,7 @@ use std::{
 };
 use {
     super::{
-        Mirror, Rotation, StructureResources, StructureTemplate,
+        LazyTemplate, Mirror, Rotation, StructureResources, StructureTemplate,
         processor::{PlaceSettings, Processor, ProcessorList, place_in_world},
     },
     horizon_core::bounding_box::BoundingBox,
@@ -49,7 +49,7 @@ impl Projection {
 pub enum PoolElement {
     Empty,
     Single {
-        template: Arc<StructureTemplate>,
+        template: LazyTemplate,
         processors: ProcessorList,
         /// The element's `processors` as written: a list id or an inline list,
         /// saved back as it was.
@@ -151,9 +151,7 @@ impl PoolElement {
                     .as_str()
                     .ok_or(DecodeError::Field("location"))?;
                 Self::Single {
-                    template: resources.template(location).ok_or_else(|| {
-                        DecodeError::Registry(format!("missing template {location}"))
-                    })?,
+                    template: resources.lazy_template(location),
                     processors: ProcessorList::decode(
                         &value["processors"].to_string(),
                         resources,

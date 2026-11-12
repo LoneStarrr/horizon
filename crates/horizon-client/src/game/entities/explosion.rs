@@ -15,9 +15,9 @@ use horizon_core::{
     position::BlockPos,
     random::{LegacyRandom, RandomSource},
 };
+use mod_api::ExplosionStart;
 #[cfg(test)]
-use mod_api::NativeItemDrop;
-use mod_api::{NativeBlockInteraction, NativeExplosionStart};
+use mod_api::ItemDrop;
 use std::{cmp::Ordering, io};
 use {
     horizon_core::java_hash_map::{JavaHashMap, JavaKey},
@@ -45,6 +45,16 @@ struct ExplosionBlockDrops {
 struct ExplosionDropPiece {
     group: usize,
     count: u32,
+}
+
+/// The causing entity of an explicit explosion damage source. Minecart ignition
+/// keeps this in memory only, just like `MinecartTNT.ignitionSource`.
+#[derive(Clone, Debug)]
+pub(super) struct ExplosionCause {
+    pub entity: (u32, Text),
+    pub player: bool,
+    pub guest: Option<u32>,
+    pub species: Option<horizon_client::mobs::Species>,
 }
 
 /// `Level.clip` with `ClipContext.Block.COLLIDER`, no fluids and the
@@ -156,10 +166,21 @@ pub(super) enum BlockInteraction {
 #[derive(Clone, Copy, Default)]
 pub(super) struct ExplosionSource {
     silent: bool,
+    pub(super) portal_proof: bool,
+    /// The entity that exploded and its kind (`Explosion.getDirectSourceEntity`), when known.
+    entity: Option<(u32, &'static str)>,
 }
 impl ExplosionSource {
     pub(super) fn with_silence(mut self, silent: bool) -> Self {
         self.silent = silent;
+        self
+    }
+    pub(super) fn with_portal_proof(mut self, portal_proof: bool) -> Self {
+        self.portal_proof = portal_proof;
+        self
+    }
+    pub(super) fn with_entity(mut self, id: u32, kind: &'static str) -> Self {
+        self.entity = Some((id, kind));
         self
     }
 }
@@ -223,6 +244,10 @@ fn blast_direction(center: [f64; 3], origin: [f64; 3]) -> [f64; 3] {
 struct ExplosionHookContext<'a> {
     center: [f64; 3],
     blocks: &'a [[i32; 3]],
+    explicit_cause: Option<Option<ExplosionCause>>,
+    direct_name: Option<Text>,
+    held_item: Option<Text>,
+    credit: bool,
 }
 
 /// An entity in the blast's reach: how far (as a share of the blast's
@@ -239,13 +264,10 @@ fn hurt_mob(
     m: &mut horizon_client::mobs::Mob,
     hurtable: bool,
     cause: Option<horizon_client::mobs::Species>,
-    (amount, source): (f32, horizon_client::mobs::Damage),
-) {
-    let shielded =
-        cause.is_some_and(|c| horizon_client::mobs::wither::shielded_from(m.species(), c));
-    if hurtable && !shielded {
-        m.damage(level, amount, source);
-    }
+    (amount, mut source): (f32, horizon_client::mobs::Damage),
+) -> bool {
+    source.attacker_species = cause;
+    hurtable && m.damage(level, amount, source)
 }
 
 /// A blast's causing entity and its name (`Explosion.getIndirectSourceEntity`):
@@ -281,8 +303,101 @@ pub(super) fn client_float() -> f32 {
 }
 
 impl Game<'_> {
-    /// `blast_cause` for the blast going off now.
+    pub(super) fn explosion_entity_name(&self, id: u32, kind: &str) -> Text {
+        self.persist_raw(id)
+            .and_then(|r| r.get("CustomName"))
+            .map_or_else(
+                || Text::translate(&format!("entity.{}", kind.replace(':', ".")), &[]),
+                |name| {
+                    horizon_client::scoreboard::comp_text(&horizon_client::scoreboard::tag_to_json(
+                        name,
+                    ))
+                },
+            )
+    }
+
+    fn explosion_cause_resolves(&self, cause: &ExplosionCause) -> bool {
+        if !cause.player {
+            return self
+                .mobs
+                .iter()
+                .any(|m| m.id == cause.entity.0 && !m.removed);
+        }
+        let acting = self
+            .lan_acting_entity
+            .or_else(|| self.player.as_ref().map(|p| p.entity_id as u32));
+        acting == Some(cause.entity.0)
+            || self.lan.as_ref().is_some_and(|host| {
+                host.hub
+                    .guests
+                    .iter()
+                    .any(|g| g.entity_id as u32 == cause.entity.0)
+            })
+    }
+
+    /// An explicit DamageSource must not inherit an enclosing blast's cause.
+    pub(super) fn with_explosion_cause<R>(
+        &mut self,
+        cause: Option<ExplosionCause>,
+        direct_source: (u32, Text),
+        run: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // The DamageSource retains the removed mob's display name. This is
+        // deliberately not added to exploded_kinds: its EntityReference no
+        // longer resolves for kill credit, unlike Horizon's early exploders.
+        if let Some(cause) = &cause
+            && cause.species.is_some()
+            && !self.mobs.iter().any(|m| m.id == cause.entity.0)
+            && !self
+                .combat
+                .exploded
+                .iter()
+                .any(|(id, _)| *id == cause.entity.0)
+        {
+            self.combat.exploded.push(cause.entity.clone());
+        }
+        let source = self.combat.explosion_source.take();
+        let owner = self.combat.explosion_owner.take();
+        let player = self.combat.blast_owner.take();
+        let guest = self.combat.blast_guest.take();
+        let direct = self.combat.explosion_cause.take();
+        self.combat.explosion_source = Some(direct_source.0);
+        let outer_direct = self
+            .combat
+            .explicit_explosion_direct
+            .replace(direct_source.1);
+        if let Some(cause) = &cause {
+            if cause.player {
+                self.combat.blast_owner = Some(cause.entity.clone());
+                self.combat.blast_guest = cause.guest;
+            } else {
+                self.combat.explosion_owner = Some(cause.entity.0);
+            }
+        }
+        let outer = self.combat.explicit_explosion_cause.replace(cause);
+        let result = run(self);
+        self.combat.explicit_explosion_cause = outer;
+        self.combat.explosion_source = source;
+        self.combat.explosion_owner = owner;
+        self.combat.blast_owner = player;
+        self.combat.blast_guest = guest;
+        self.combat.explosion_cause = direct;
+        self.combat.explicit_explosion_direct = outer_direct;
+        result
+    }
+
+    /// The blast damage's cause. An explicit crystal/cart DamageSource may
+    /// differ from the explosion's own indirect source.
     pub(super) fn blast_attacker(&self) -> Option<(u32, Text)> {
+        if let Some(cause) = &self.combat.explicit_explosion_cause {
+            return cause.as_ref().map(|c| {
+                let name = (!c.player)
+                    .then(|| self.mob_display_name(c.entity.0))
+                    .flatten()
+                    .unwrap_or_else(|| c.entity.1.clone());
+                (c.entity.0, name)
+            });
+        }
         // `Explosion.getIndirectSourceEntity`: a primed TNT's owner names the
         // blast before any mob does, which makes the damage type
         // `minecraft:player_explosion` (`server_explode` asks this).
@@ -296,7 +411,12 @@ impl Game<'_> {
         })
     }
     /// `ServerExplosion.getSeenPercent` for an entity box.
-    pub(super) fn seen_percent(&self, center: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f32 {
+    pub(in crate::game) fn seen_percent(
+        &self,
+        center: [f64; 3],
+        min: [f64; 3],
+        max: [f64; 3],
+    ) -> f32 {
         let xs = 1.0 / ((max[0] - min[0]) * 2.0 + 1.0);
         let ys = 1.0 / ((max[1] - min[1]) * 2.0 + 1.0);
         let zs = 1.0 / ((max[2] - min[2]) * 2.0 + 1.0);
@@ -357,6 +477,48 @@ impl Game<'_> {
         }
         hits as f32 / count as f32
     }
+    /// What a ray's step through the block at `pos` takes from its power
+    /// (`ExplosionDamageCalculator.getBlockExplosionResistance`), and whether
+    /// the block is spared.
+    fn blast_step<S: std::hash::BuildHasher>(
+        &self,
+        pos: [i32; 3],
+        resists: Option<([i32; 3], f32)>,
+        cap: Option<f32>,
+        portal_proof: bool,
+        wither_immune: Option<&std::collections::HashSet<String, S>>,
+    ) -> (f32, bool) {
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let f = self.res.facts().get(state);
+        // USED_PORTAL_DAMAGE_CALCULATOR returns no resistance and never explodes a portal.
+        if portal_proof && &*f.name == "minecraft:nether_portal" {
+            return (0.0, true);
+        }
+        let fluid = if f.fluid != Fluid::None {
+            100.0f32
+        } else {
+            0.0
+        };
+        // A primed TNT minecart's rails and the blocks they
+        // stand on: no resistance, and never blown up.
+        let spared = self.combat.rail_proof_blast
+            && (self.rail(pos[0], pos[1], pos[2]).is_some()
+                || self.rail(pos[0], pos[1] + 1, pos[2]).is_some());
+        let taken = match resists {
+            Some((at, resistance)) if at == pos => (resistance + 0.3) * 0.3,
+            _ if !self.res.facts().is_air(state) || f.fluid != Fluid::None => {
+                let base = if spared {
+                    0.0
+                } else {
+                    f.explosion_resistance.max(fluid)
+                };
+                let immune = wither_immune.is_some_and(|t| t.contains(&*f.name));
+                (blast_resistance(base, cap, immune) + 0.3) * 0.3
+            }
+            _ => 0.0,
+        };
+        (taken, spared)
+    }
     /// `ServerExplosion.calculateExplodedPositions`; `resists` overrides one
     /// block's resistance (`ExplosionDamageCalculator.getBlockExplosionResistance`).
     fn exploded_positions(
@@ -364,6 +526,7 @@ impl Game<'_> {
         center: [f64; 3],
         radius: f32,
         resists: Option<([i32; 3], f32)>,
+        portal_proof: bool,
     ) -> Vec<[i32; 3]> {
         let (min_y, max_y) = self.with_level(|_, level, _| {
             use horizon_world::level::LevelAccess;
@@ -395,6 +558,11 @@ impl Game<'_> {
                     zd /= d;
                     let mut power = radius * (0.7 + self.world.random.next_float() * 0.6);
                     let (mut xp, mut yp, mut zp) = (center[0], center[1], center[2]);
+                    // A ray's steps are 0.3 long, about three to a block: a
+                    // step in the block the last one was in takes what that
+                    // one took (the level does not change while rays cast),
+                    // and that block is in `set` already if it is to be.
+                    let mut last: Option<([i32; 3], f32, bool)> = None;
                     while power > 0.0 {
                         let pos = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
                         if pos[1] < min_y
@@ -404,35 +572,22 @@ impl Game<'_> {
                         {
                             break;
                         }
-                        let state = self.world.block(pos[0], pos[1], pos[2]);
-                        let f = self.res.facts().get(state);
-                        let fluid = if f.fluid != Fluid::None {
-                            100.0f32
-                        } else {
-                            0.0
+                        let (taken, spared, again) = match last {
+                            Some((at, taken, spared)) if at == pos => (taken, spared, true),
+                            _ => {
+                                let (taken, spared) = self.blast_step(
+                                    pos,
+                                    resists,
+                                    cap,
+                                    portal_proof,
+                                    wither_immune.as_ref(),
+                                );
+                                last = Some((pos, taken, spared));
+                                (taken, spared, false)
+                            }
                         };
-                        // A primed TNT minecart's rails and the blocks they
-                        // stand on: no resistance, and never blown up.
-                        let spared = self.combat.rail_proof_blast
-                            && (self.rail(pos[0], pos[1], pos[2]).is_some()
-                                || self.rail(pos[0], pos[1] + 1, pos[2]).is_some());
-                        match resists {
-                            Some((at, resistance)) if at == pos => {
-                                power -= (resistance + 0.3) * 0.3;
-                            }
-                            _ if !self.res.facts().is_air(state) || f.fluid != Fluid::None => {
-                                let base = if spared {
-                                    0.0
-                                } else {
-                                    f.explosion_resistance.max(fluid)
-                                };
-                                let immune =
-                                    wither_immune.as_ref().is_some_and(|t| t.contains(&*f.name));
-                                power -= (blast_resistance(base, cap, immune) + 0.3) * 0.3;
-                            }
-                            _ => {}
-                        }
-                        if power > 0.0 && !spared {
+                        power -= taken;
+                        if power > 0.0 && !spared && !again {
                             set.put(Key(pos), ());
                         }
                         xp += xd * f64::from(0.3f32);
@@ -468,7 +623,7 @@ impl Game<'_> {
         attacker: Option<&(u32, Text)>,
         cause: Option<&horizon_client::advancements::EntityView>,
     ) -> Option<[f64; 3]> {
-        let ExplosionHookContext { center, blocks } = *context;
+        let ExplosionHookContext { center, blocks, .. } = *context;
         let diameter = f64::from(radius * 2.0);
         // Blast protection: `EXPLOSION_KNOCKBACK_RESISTANCE` (0.15 per level and
         // piece, so two Blast Protection IV pieces cancel it).
@@ -484,7 +639,7 @@ impl Game<'_> {
             + (feet[2] - center[2]).powi(2))
         .sqrt()
             / diameter;
-        if dist > 1.0 || p.health.dead_or_dying() {
+        if dist > 1.0 {
             return None;
         }
         // ServerPlayer.onExplosionHit: the blast that hit the player is theirs.
@@ -521,18 +676,46 @@ impl Game<'_> {
         let flying = self.player.as_ref().is_some_and(|p| p.flying);
         let mut outcome = horizon_client::health::BlockOutcome::default();
         let mut pushed = None;
+        let explicit = context.explicit_cause.as_ref().and_then(|c| c.as_ref());
+        let living_attacker = explicit.is_none_or(|c| c.player || c.species.is_some());
+        let living_non_player = context
+            .explicit_cause
+            .as_ref()
+            .map_or(attacker.is_some(), |c| {
+                c.as_ref().is_some_and(|c| !c.player && c.species.is_some())
+            });
         // The death message names the blast's causing entity. It goes to this
         // player's tracker, the host's or a guest's.
         if let Some((id, name)) = attacker.filter(|_| !creative && !spectator && hurtable) {
-            self.note_named_attacker(damage_type, *id, name.clone());
+            if living_attacker && context.credit {
+                self.note_player_attacker(
+                    damage_type,
+                    *id,
+                    name.clone(),
+                    context.held_item.clone(),
+                );
+            } else {
+                self.note_uncredited_attacker(
+                    damage_type,
+                    *id,
+                    name.clone(),
+                    context.held_item.clone(),
+                    living_attacker,
+                );
+            }
+        } else if !creative
+            && !spectator
+            && hurtable
+            && let Some(direct) = context.direct_name.clone()
+        {
+            self.note_direct_entity(damage_type, direct);
         }
         let rules = self.world.health_rules;
         if let Some(p) = self.player.as_mut()
             && let Some(id) = self.health_resources.damage.id(damage_type)
         {
-            // Creative players are invulnerable to explosions.
-            if !creative
-                && !spectator
+            // Creative damage is attempted and refused by Player.hurtServer, not here.
+            if !spectator
                 && hurtable
                 && let Ok(o) = p.hurt_caused_by(
                     crate::game::entity::damage_level_of!(self, scoped),
@@ -541,7 +724,7 @@ impl Game<'_> {
                     id,
                     amount,
                     blocking,
-                    attacker.is_some(),
+                    living_non_player,
                     // The blast's causing entity.
                     attacker.map_or(0, |(id, _)| *id as i32),
                     false,
@@ -574,7 +757,7 @@ impl Game<'_> {
         }
         self.combat.forget_noted(outcome.canceled);
         if raised {
-            let source = mod_api::health::HurtSource {
+            let source = mod_api::entity::health::HurtSource {
                 damage_type,
                 causing: attacker.map_or(0, |(id, _)| *id as i32),
                 direct: 0,
@@ -632,7 +815,7 @@ impl Game<'_> {
         if radius < 1.0e-5 {
             return Vec::new();
         }
-        self.explosion_hits_special(center, radius, blocks);
+        self.explosion_hits_special(center, radius, blocks, damage_type);
         let diameter = f64::from(radius * 2.0);
         let damage = |dist: f64, exposure: f32| {
             let pow = (1.0 - dist) * f64::from(exposure);
@@ -652,7 +835,33 @@ impl Game<'_> {
         // same for all of them (`onExplosionHit(this.source)`).
         let attacker = self.blast_attacker();
         let blast_source = self.combat.explosion_cause.clone();
-        let context = ExplosionHookContext { center, blocks };
+        let context = ExplosionHookContext {
+            center,
+            blocks,
+            explicit_cause: self.combat.explicit_explosion_cause.clone(),
+            direct_name: self.combat.explicit_explosion_direct.clone(),
+            credit: self
+                .combat
+                .explicit_explosion_cause
+                .as_ref()
+                .is_none_or(|cause| {
+                    cause
+                        .as_ref()
+                        .is_some_and(|cause| self.explosion_cause_resolves(cause))
+                }),
+            held_item: self
+                .combat
+                .explicit_explosion_cause
+                .as_ref()
+                .and_then(|c| c.as_ref())
+                .and_then(|c| {
+                    if c.player {
+                        self.player_main_hand_custom_name(c.guest)
+                    } else {
+                        self.mob_main_hand_name(c.entity.0)
+                    }
+                }),
+        };
         let own = self.explosion_hurt_player(
             &context,
             radius,
@@ -667,7 +876,7 @@ impl Game<'_> {
                 .hub
                 .guests
                 .iter()
-                .filter(|g| host.hub.here(g) && g.loaded && !g.dead)
+                .filter(|g| host.hub.here(g))
                 .map(|g| g.conn)
                 .collect();
             for conn in guests {
@@ -689,10 +898,17 @@ impl Game<'_> {
         // Mobs. `WitherBoss.hurtServer`: a wither shrugs off an undead cause.
         let cause = self
             .combat
-            .explosion_owner
-            .or(exploding)
-            .and_then(|id| self.mobs.iter().find(|m| m.id == id))
-            .map(|m| m.species());
+            .explicit_explosion_cause
+            .as_ref()
+            .and_then(|c| c.as_ref())
+            .and_then(|c| c.species)
+            .or_else(|| {
+                self.combat
+                    .explosion_owner
+                    .or(exploding)
+                    .and_then(|id| self.mobs.iter().find(|m| m.id == id))
+                    .map(|m| m.species())
+            });
         // `ServerExplosion.hurtEntities`: every entity in reach, on the walk. Each
         // answers `ignoreExplosion` itself (`Entity::ignores_explosion`); the rest
         // is the same for all, and only what a blast does to a kind differs. The
@@ -701,7 +917,8 @@ impl Game<'_> {
         // (as `retain` does), and a destroyed boat or cart shifts its list, so
         // `gone` counts how far.
         let blast = Blast {
-            vehicles_ignore: self.combat.blast_owner.is_none()
+            vehicles_ignore: self.combat.explicit_explosion_cause.is_none()
+                && self.combat.blast_owner.is_none()
                 && self.blast_attacker().is_some()
                 && !self
                     .ui
@@ -719,6 +936,22 @@ impl Game<'_> {
         let (mut items_kept, mut orbs_kept) = (0, 0);
         let (mut boats_gone, mut carts_gone) = (0, 0);
         let mut destroyed_contents = Vec::new();
+        macro_rules! blocked_damage {
+            ($id:expr, $kind:expr) => {{
+                let source = horizon_client::health::HurtSource {
+                    damage_type,
+                    causing: attacker.as_ref().map_or(0, |(id, _)| *id as i32),
+                    direct: exploding.map_or(0, |id| id as i32),
+                    position: Some(center),
+                };
+                let creative = self.creative_damage_source_id(source.causing);
+                let vanilla = self.saved_refuses_damage($id as u32, damage_type, creative);
+                crate::game::entity::damage_level_of!(self, scoped).invulnerability_check(
+                    horizon_client::health::Hurting::Entity($id, $kind, source),
+                    vanilla,
+                )
+            }};
+        }
         for handle in self.entity_handles() {
             let handle = match handle {
                 EntityHandle::Boat(i) => EntityHandle::Boat(i - boats_gone),
@@ -746,24 +979,66 @@ impl Game<'_> {
                             kind: horizon_client::mobs::DamageKind::Explosion,
                             // A projectile's owner (`getIndirectSourceEntity`),
                             // else the exploding mob itself.
-                            attacker: attacker
+                            attacker: self
+                                .combat
+                                .explicit_explosion_cause
                                 .as_ref()
-                                .map(|&(id, _)| id)
-                                .filter(|&o| o != m.id)
-                                .map(horizon_client::mobs::Who::Mob),
+                                .and_then(|c| c.as_ref())
+                                .filter(|c| c.player)
+                                .map(|_| Who::Player)
+                                .or_else(|| {
+                                    attacker
+                                        .as_ref()
+                                        .map(|&(id, _)| id)
+                                        .filter(|&o| o != m.id)
+                                        .filter(|_| {
+                                            self.combat
+                                                .explicit_explosion_cause
+                                                .as_ref()
+                                                .is_none_or(|c| {
+                                                    c.as_ref().is_some_and(|c| c.species.is_some())
+                                                })
+                                        })
+                                        .map(horizon_client::mobs::Who::Mob)
+                                }),
                             from: Some(center),
                             attacker_species: cause,
                         };
                         // `EXPLOSION_KNOCKBACK_RESISTANCE`, not `KNOCKBACK_RESISTANCE`:
                         // its base is 0 for every mob type, so iron golems and
                         // ravagers are pushed.
-                        hurt_mob(
+                        let victim = m.id;
+                        let hurt = hurt_mob(
                             crate::game::entity::damage_level_of!(self, scoped),
                             m,
                             hurtable,
                             cause,
                             (amount, source),
                         );
+                        if hurt {
+                            if source.attacker == Some(Who::Player) {
+                                let guest = self.combat.blast_guest;
+                                if let Some(uuid) = self.player_uuid_of(guest) {
+                                    self.last_hurt_by_player.insert(
+                                        victim,
+                                        crate::game::combat::PlayerCredit(
+                                            horizon_client::lan::playerdata::ints_uuid(uuid),
+                                        ),
+                                    );
+                                }
+                                if let Some(host) = self.lan.as_mut() {
+                                    match guest {
+                                        Some(conn) => {
+                                            host.mob_players.insert(victim, conn);
+                                        }
+                                        None => {
+                                            host.mob_players.remove(&victim);
+                                        }
+                                    }
+                                }
+                            }
+                            self.resolve_player_responsible(victim, source);
+                        }
                         // Enderman.hurtServer teleports inside the hurt, before
                         // the push (the mob order stays as it was).
                         if let Err(e) = self.settle_hurt_teleports() {
@@ -772,13 +1047,18 @@ impl Game<'_> {
                     }
                     // `ItemEntity.hurtServer`: the damage comes off `Health`
                     // (5 to start) in f32 and the item is destroyed at zero, so
-                    // a survivor keeps the health the blast left it. The nether
-                    // star is `ItemStack.canBeHurtBy`'s explosion exception, and
-                    // a blast with a source entity under `mobGriefing` off never
+                    // a survivor keeps the health the blast left it. Stack damage
+                    // resistance is resolved against this blast's damage type. A
+                    // blast with a source entity under `mobGriefing` off never
                     // reaches here (`items_ignore`).
                     EntityHandle::Item(i) => {
+                        let id = self.dropped[i].id as i32;
+                        let blocked = blocked_damage!(id, "minecraft:item");
+                        let can_hurt = self
+                            .stack_can_be_hurt_by(&self.dropped[i].stack, damage_type)
+                            .unwrap_or(true);
                         let item = &mut self.dropped[i];
-                        if &*item.stack.item != "minecraft:nether_star" {
+                        if !blocked && can_hurt {
                             item.health = (item.health as f32 - amount) as i32;
                             destroyed = item.health <= 0;
                             if destroyed {
@@ -796,20 +1076,29 @@ impl Game<'_> {
                     }
                     // `ExperienceOrb.hurtServer` takes the damage off their 5 health.
                     EntityHandle::Orb(i) => {
-                        destroyed = self.orbs[i].hurt(amount);
+                        let id = self.orbs[i].id as i32;
+                        if !blocked_damage!(id, "minecraft:experience_orb") {
+                            destroyed = self.orbs[i].hurt(amount);
+                        }
                     }
                     // `VehicleEntity.hurtServer` (explosions ignite TNT carts);
                     // a destroyed one is gone before the push.
                     EntityHandle::Cart(i) => {
-                        let len = self.carts.len();
-                        self.hurt_cart(i, amount, false, true);
-                        carts_gone += len - self.carts.len();
+                        let (id, kind) = (self.carts[i].id as i32, self.carts[i].kind.id());
+                        if !blocked_damage!(id, kind) {
+                            let len = self.carts.len();
+                            self.hurt_cart(i, amount, false, true);
+                            carts_gone += len - self.carts.len();
+                        }
                     }
                     // `VehicleEntity.hurtServer`: damage * 10, broken past 40.
                     EntityHandle::Boat(i) => {
-                        let len = self.boats.len();
-                        self.hurt_boat(i, amount, false);
-                        boats_gone += len - self.boats.len();
+                        let (id, kind) = (self.boats[i].id as i32, self.boats[i].entity_type());
+                        if !blocked_damage!(id, &kind) {
+                            let len = self.boats.len();
+                            self.hurt_boat(i, amount, false);
+                            boats_gone += len - self.boats.len();
+                        }
                     }
                     // `hurtServer` does nothing to the rest.
                     _ => {}
@@ -861,14 +1150,40 @@ impl Game<'_> {
         // Frames, paintings, cushions and armour stands last: vanilla lists
         // the entities in reach before hurting any, so the items they drop
         // here are neither destroyed nor pushed by the same blast.
+        // BlockAttachedEntity.kill / ArmorStand.kill credit DamageSource.getEntity.
+        // VehicleEntity.destroy above uses Entity.kill and keeps the vehicle as source.
         self.explosion_breaks_frames(center, diameter, interaction);
         self.explosion_breaks_decorations(center, diameter, interaction);
         pushed
     }
-    /// `blast_spares_decorations` for the blast going off now: its causing
-    /// mob (`blast_attacker`) is the source's entity.
+    fn blast_damage_caused_by_mob(&self) -> bool {
+        self.combat.explicit_explosion_cause.as_ref().map_or_else(
+            || self.blast_attacker().is_some(),
+            |cause| cause.as_ref().is_some_and(|c| c.species.is_some()),
+        )
+    }
+
+    /// Decoration kills credit `DamageSource.getEntity`: the explicit blast
+    /// cause, including a TNT igniter or the player who broke an end crystal.
+    pub(super) fn explosion_kill_credit(&self) -> Option<super::commands::Target> {
+        use super::commands::Target;
+        // A primed TNT's owner (a player) names the blast before any mob does.
+        if self.combat.blast_owner.is_some() {
+            return Some(
+                self.combat
+                    .blast_guest
+                    .map_or(Target::Player, Target::Guest),
+            );
+        }
+        if let Some((id, _)) = self.blast_attacker() {
+            return Some(Target::Mob(id));
+        }
+        self.crystal_blast_player()
+    }
+    /// Decoration hurt checks use the damage source's cause (`instanceof Mob`),
+    /// unlike vehicles, which use the explosion's indirect source.
     pub(super) fn blast_spares_decorations(&self, interaction: BlockInteraction) -> bool {
-        let by_mob = self.blast_attacker().is_some();
+        let by_mob = self.blast_damage_caused_by_mob();
         blast_spares_decorations(
             self.ui
                 .rules
@@ -898,7 +1213,7 @@ impl Game<'_> {
         interaction: BlockInteraction,
     ) {
         // An armour stand is no `BlockAttachedEntity`: a source in water does not spare it.
-        let by_mob = self.blast_attacker().is_some();
+        let by_mob = self.blast_damage_caused_by_mob();
         let spares_stands = blast_spares_decorations(
             self.ui
                 .rules
@@ -927,6 +1242,22 @@ impl Game<'_> {
             if !super::armor_stands::spared_by_blast(a)
                 && blast_reaches(center, diameter, [p.x, p.y, p.z])
             {
+                let id = a.id;
+                let source = horizon_client::health::HurtSource {
+                    damage_type,
+                    causing: causing as i32,
+                    direct: causing as i32,
+                    position: Some(center),
+                };
+                let creative = self.creative_damage_source_id(source.causing);
+                let vanilla = self.saved_refuses_damage(id, damage_type, creative);
+                if crate::game::entity::damage_level_of!(self, scoped).invulnerability_check(
+                    horizon_client::health::Hurting::ArmorStand(id as i32, source),
+                    vanilla,
+                ) {
+                    i += 1;
+                    continue;
+                }
                 self.break_armor_stand_by_anything(i, damage_type, causing);
             } else {
                 i += 1;
@@ -935,7 +1266,10 @@ impl Game<'_> {
     }
     /// `ExplosionEvent.Start` for the explosion `start`: true when a mod
     /// cancels it, and nothing of it happens.
-    pub(super) fn explosion_start_cancelled(&mut self, start: &NativeExplosionStart<'_>) -> bool {
+    pub(in crate::game) fn explosion_start_cancelled(
+        &mut self,
+        start: &ExplosionStart<'_>,
+    ) -> bool {
         if !mod_api::__private::listened(mod_api::HookId::ExplosionStart) {
             return false;
         }
@@ -952,7 +1286,9 @@ impl Game<'_> {
             let (lo, hi) = self.paintings[i].bounds();
             let at = [0, 1, 2].map(|k| (lo[k] + hi[k]) / 2.0);
             // A painting a mod keeps stays at `i`.
-            if !(blast_reaches(center, diameter, at) && self.break_painting(i, false)) {
+            if !(blast_reaches(center, diameter, at)
+                && self.break_painting_by(i, false, self.explosion_kill_credit()))
+            {
                 i += 1;
             }
         }
@@ -960,7 +1296,7 @@ impl Game<'_> {
         while i < self.cushions.len() {
             let p = self.cushions[i].position;
             if blast_reaches(center, diameter, [p.x, p.y, p.z]) {
-                self.break_cushion(i, false);
+                self.break_cushion_by(i, false, self.explosion_kill_credit());
             } else {
                 i += 1;
             }
@@ -981,7 +1317,10 @@ impl Game<'_> {
     /// Runs an explosion whose source empties the hives it destroys
     /// (`BeehiveBlock.getDrops`: primed TNT, creeper, wither skull, wither,
     /// TNT minecart).
-    pub(super) fn with_hive_emptying_blast<R>(&mut self, blast: impl FnOnce(&mut Self) -> R) -> R {
+    pub(in crate::game) fn with_hive_emptying_blast<R>(
+        &mut self,
+        blast: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.combat.hive_emptying_blast = true;
         let result = blast(self);
         self.combat.hive_emptying_blast = false;
@@ -1014,12 +1353,38 @@ impl Game<'_> {
         fire: bool,
         source: ExplosionSource,
     ) -> Result<()> {
-        let damage_type = super::creatures::damage_type(
-            horizon_client::mobs::DamageKind::Explosion,
-            self.blast_attacker().is_some(),
-        );
-        self.server_explode_as_source(center, radius, interaction, fire, damage_type, None, source)
+        self.server_explode_from_cause(center, radius, interaction, fire, source, None)
     }
+    /// An explicit `DamageSource` is independent of the blast's indirect owner.
+    /// `Some(None)` is explicitly ownerless; `None` keeps the ordinary source.
+    pub(super) fn server_explode_from_cause(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        interaction: BlockInteraction,
+        fire: bool,
+        source: ExplosionSource,
+        cause: Option<Option<ExplosionCause>>,
+    ) -> Result<()> {
+        let blast = |g: &mut Self| {
+            let damage_type = super::creatures::damage_type(
+                horizon_client::mobs::DamageKind::Explosion,
+                g.blast_attacker().is_some(),
+            );
+            g.server_explode_as_source(center, radius, interaction, fire, damage_type, None, source)
+        };
+        match cause {
+            None => blast(self),
+            Some(cause) => {
+                let (id, kind) = source.entity.ok_or_else(|| {
+                    io::Error::other("an explicit explosion cause needs its direct entity")
+                })?;
+                let direct = (id, self.explosion_entity_name(id, kind));
+                self.with_explosion_cause(cause, direct, blast)
+            }
+        }
+    }
+
     /// `server_explode` with the damage type the player takes and a block
     /// whose explosion resistance the damage calculator overrides.
     pub(super) fn server_explode_as(
@@ -1051,25 +1416,22 @@ impl Game<'_> {
         resists: Option<([i32; 3], f32)>,
         source: ExplosionSource,
     ) -> Result<()> {
+        let start = ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+            dimension: self.dim.id(),
+            center,
+            radius,
+            fire,
+            interaction: match interaction {
+                BlockInteraction::Keep => mod_api::BlockInteraction::Keep,
+                BlockInteraction::Destroy => mod_api::BlockInteraction::Destroy,
+                BlockInteraction::DestroyWithDecay => mod_api::BlockInteraction::DestroyWithDecay,
+            },
+            damage_type,
+            source: self.combat.explosion_source,
+            // `getIndirectSourceEntity`, as the blast's attacker is.
+            owner: self.blast_attacker().map(|(id, _)| id),
+        });
         if self.serving.is_some() || self.options.dedicated.is_some() {
-            let start =
-                NativeExplosionStart::from(mod_api::__private::built::NativeExplosionStart {
-                    dimension: self.dim.id(),
-                    center,
-                    radius,
-                    fire,
-                    interaction: match interaction {
-                        BlockInteraction::Keep => NativeBlockInteraction::Keep,
-                        BlockInteraction::Destroy => NativeBlockInteraction::Destroy,
-                        BlockInteraction::DestroyWithDecay => {
-                            NativeBlockInteraction::DestroyWithDecay
-                        }
-                    },
-                    damage_type,
-                    source: self.combat.explosion_source,
-                    // `getIndirectSourceEntity`, as the blast's attacker is.
-                    owner: self.blast_attacker().map(|(id, _)| id),
-                });
             if self.explosion_start_cancelled(&start) {
                 return Ok(());
             }
@@ -1082,12 +1444,15 @@ impl Game<'_> {
                 p.position.z - center[2],
             ];
             let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            self.pad_rumble(horizon_client::gamepad::Rumble::Explosion { distance, radius });
+            self.input_feedback(horizon_client::input_source::Feedback::Explosion {
+                distance,
+                radius,
+            });
         }
         // Explosion.explode: the blast is heard.
         let ctx = horizon_client::sculk::Context::default();
         self.post_game_event("minecraft:explode", center, ctx);
-        let mut targets = self.exploded_positions(center, radius, resists);
+        let mut targets = self.exploded_positions(center, radius, resists, source.portal_proof);
         let dimension = self.dim.id();
         self.native_explosion_detonate(dimension, center, &mut targets);
         let pushed =
@@ -1100,7 +1465,7 @@ impl Game<'_> {
             }
             let mut drops = ExplosionDrops::default();
             for &pos in &targets {
-                self.explosion_hit_block(pos, radius, interaction, &mut drops)?;
+                self.explosion_hit_block(pos, radius, interaction, &start, &mut drops)?;
             }
             self.spawn_explosion_drops(drops);
         }
@@ -1143,12 +1508,38 @@ impl Game<'_> {
         self.lan_explode(center, small, radius, block_count, pushed);
         Ok(())
     }
+    /// `InfestedBlock.spawnAfterBreak` without a tool that prevents it: while
+    /// blocks drop, its silverfish (`spawnInfestation`) comes out at the
+    /// bottom centre of the block, with its spawn animation.
+    pub(super) fn spawn_infestation(&mut self, pos: [i32; 3]) {
+        if !self
+            .ui
+            .rules
+            .bool_at(horizon_client::gamerules::vanilla::BLOCK_DROPS)
+        {
+            return;
+        }
+        let at = [
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]),
+            f64::from(pos[2]) + 0.5,
+        ];
+        if let Some(id) = self.spawn_mob(
+            "minecraft:silverfish",
+            at,
+            false,
+            crate::game::creatures::SpawnSite::Plain,
+        ) {
+            self.mob_poof(id);
+        }
+    }
     /// `BlockBehaviour.onExplosionHit` (TNT: `wasExploded` primes a short fuse).
     fn explosion_hit_block(
         &mut self,
         pos: [i32; 3],
         radius: f32,
         interaction: BlockInteraction,
+        explosion: &ExplosionStart<'_>,
         dropped: &mut ExplosionDrops,
     ) -> Result<()> {
         let state = self.world.block(pos[0], pos[1], pos[2]);
@@ -1157,10 +1548,18 @@ impl Game<'_> {
         }
         let name = self.res.facts().get(state).name.clone();
         let is_tnt = &*name == "minecraft:tnt";
-        // CreakingHeartBlock.onExplosionHit: its creaking dies (no
-        // experience, as Horizon does not track a TNT's owner).
+        // CreakingHeartBlock.onExplosionHit: its creaking dies, and a blast
+        // whose indirect source is a player (a primed TNT's owner) awards
+        // the heart's experience (`tryAwardExperience`).
         if &*name == "minecraft:creaking_heart" {
-            self.creaking_heart_broken(pos, false);
+            // tryAwardExperience checks the TNT owner's own abilities.
+            let award = match self.combat.blast_guest {
+                Some(conn) => self
+                    .command_guest(conn)
+                    .is_some_and(|g| !g.creative() && !g.spectator()),
+                None => self.combat.blast_owner_player && !self.creative && !self.spectator(),
+            };
+            self.creaking_heart_broken_by(pos, award);
         }
         // Block.onExplosionHit: the drops copy from the block entity, which
         // then spills its contents as the block turns to air.
@@ -1183,9 +1582,29 @@ impl Game<'_> {
         }
         if let Some(entity) = self.world.block_entities.get(&key).cloned() {
             let custom = self.world.block_names.get(&key).cloned();
-            self.pending.record(pos, &entity, &name, custom);
+            self.pending
+                .record(pos, &entity, &name, custom, self.world.block_lock(key));
         } else if let Some(tag) = super::spill::saved_entity(&self.world, pos) {
             self.pending.record_saved(pos, &tag);
+        }
+        // Block.onExplosionHit runs spawnAfterBreak before the drops.
+        if !is_tnt && name.starts_with("minecraft:infested_") {
+            self.spawn_infestation(pos);
+        }
+        // Its dropExperience is whether the blast's indirect source is a
+        // player (a primed TNT's owner, not a mob's): ores, sculk and spawners
+        // sample their experience then, and pop it while blocks drop.
+        if !is_tnt && self.combat.blast_owner_player {
+            let xp = horizon_world::level::removal::break_experience(&mut self.world.random, &name)
+                .unwrap_or(0);
+            if xp > 0
+                && self
+                    .ui
+                    .rules
+                    .bool_at(horizon_client::gamerules::vanilla::BLOCK_DROPS)
+            {
+                self.spawn_orbs(pos.map(|v| f64::from(v) + 0.5), xp);
+            }
         }
         if !is_tnt {
             let dynamic = self.pending.dynamic(pos);
@@ -1243,6 +1662,7 @@ impl Game<'_> {
             }
         }
         self.pending.clear(pos);
+        self.notify_block_exploded(pos, state, explosion);
         self.level_set(pos, self.world.air)?;
         // BeehiveBlock.onExplosionHit: the bees about turn on the player.
         if is_hive {
@@ -1260,10 +1680,18 @@ impl Game<'_> {
             let rot = r.next_double() * f64::from(std::f32::consts::TAU);
             let fuse = r.next_int_bound(20).unwrap_or(0) + 10;
             // TntBlock.wasExploded hands the new TNT the blast's indirect
-            // source, so a chain reaction keeps the player who started it.
-            let (owner, guest) = match &self.combat.blast_owner {
-                Some(_) => (Some(Who::Player), self.combat.blast_guest),
-                None => (None, None),
+            // source, so a chain reaction keeps a primed TNT's owner, player or mob.
+            let (owner, guest) = match &self.combat.explicit_explosion_cause {
+                // A crystal/cart's explicit DamageSource does not change
+                // Explosion.getIndirectSourceEntity, which is null for them.
+                Some(_) => (None, None),
+                None => match &self.combat.blast_owner {
+                    Some(_) if self.combat.blast_owner_player => {
+                        (Some(Who::Player), self.combat.blast_guest)
+                    }
+                    Some((id, _)) => (Some(Who::Mob(*id)), None),
+                    None => (None, None),
+                },
             };
             self.add_primed_tnt(
                 BlockPos::new(pos[0], pos[1], pos[2]),
@@ -1337,6 +1765,46 @@ impl Game<'_> {
         for item in merged.into_iter().flatten().chain(edited) {
             self.spawn_item(item.stack, item.position, item.velocity, item.pickup_delay);
         }
+    }
+
+    /// ServerExplosion: rays from a 16^3 grid lose (resistance + 0.3) * 0.3 per step.
+    /// A mob explosion (`ServerLevel.explode` with `ExplosionInteraction.MOB`:
+    /// blocks are kept without mobGriefing, else the mob_explosion_drop_decay
+    /// rule picks decay).
+    pub(super) fn explode(
+        &mut self,
+        source: Option<u32>,
+        center: [f64; 3],
+        radius: f32,
+        blast: ExplosionSource,
+    ) -> Result<()> {
+        self.explode_with(source, center, radius, false, blast)
+    }
+    /// `ServerLevel.explode` with `ExplosionInteraction.MOB` and the caller's fire flag.
+    pub(super) fn explode_mob(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        fire: bool,
+        blast: ExplosionSource,
+    ) -> Result<()> {
+        self.explode_with(None, center, radius, fire, blast)
+    }
+    /// `SulfurCube.tickFuse`: `ExplosionInteraction.TNT` (the
+    /// tnt_explosion_drop_decay rule) with mobGriefing, `NONE` without.
+    pub(super) fn explode_sulfur_cube(
+        &mut self,
+        source: Option<u32>,
+        center: [f64; 3],
+        radius: f32,
+        blast: ExplosionSource,
+    ) -> Result<()> {
+        let interaction = if !self.can_entity_grief(source) {
+            BlockInteraction::Keep
+        } else {
+            self.destroy_type(horizon_client::gamerules::vanilla::TNT_EXPLOSION_DROP_DECAY)
+        };
+        self.server_explode_from(center, radius, interaction, false, blast)
     }
 }
 
@@ -1496,7 +1964,7 @@ mod tests {
                 if matches!(event.pos.x, 1 | 4) {
                     return mod_api::Flow::Cancel;
                 }
-                *event.drops = vec![NativeItemDrop::new(
+                *event.drops = vec![ItemDrop::new(
                     mod_api::ItemStack::new(
                         mod_api::__private::item_key("minecraft:emerald").unwrap(),
                         3,
@@ -1540,12 +2008,27 @@ mod tests {
             let blast = |game: &mut Game<'_>| {
                 game.dropped.clear();
                 game.orbs.clear();
-                game.world.random = LegacyRandom::new(7);
+                game.world.random.set_seed(7);
                 let mut drops = ExplosionDrops::default();
                 for pos in [[1, 64, 1], [2, 64, 1]] {
                     game.world.set(pos[0], pos[1], pos[2], dirt).unwrap();
-                    game.explosion_hit_block(pos, 4.0, BlockInteraction::Destroy, &mut drops)
-                        .unwrap();
+                    game.explosion_hit_block(
+                        pos,
+                        4.0,
+                        BlockInteraction::Destroy,
+                        &ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+                            dimension: "minecraft:overworld",
+                            center: [0.0; 3],
+                            radius: 4.0,
+                            fire: false,
+                            interaction: mod_api::BlockInteraction::Destroy,
+                            damage_type: "minecraft:explosion",
+                            source: None,
+                            owner: None,
+                        }),
+                        &mut drops,
+                    )
+                    .unwrap();
                 }
                 game.spawn_explosion_drops(drops);
                 game.world.random.next_int()
@@ -1565,7 +2048,7 @@ mod tests {
                 )]
                 .into()
             };
-            mod_api::testing::with_mods(mods(false), || {
+            mod_platform::testing::with_mods(mods(false), || {
                 assert_eq!(blast(game), baseline);
                 assert_eq!(game.dropped.len(), 1);
                 assert_eq!(game.dropped[0].stack.count, 2);
@@ -1574,7 +2057,7 @@ mod tests {
             });
             assert_eq!(*seen.lock().unwrap(), [[1, 64, 1], [2, 64, 1]]);
             seen.lock().unwrap().clear();
-            mod_api::testing::with_mods(mods(true), || {
+            mod_platform::testing::with_mods(mods(true), || {
                 blast(game);
                 let check = |game: &Game<'_>| {
                     assert_eq!(game.dropped.len(), 1);
@@ -1587,7 +2070,7 @@ mod tests {
                     assert_eq!(
                         game.orbs
                             .iter()
-                            .map(|orb| orb.value * orb.count)
+                            .map(|orb| orb.points() * orb.count)
                             .sum::<u32>(),
                         5
                     );
@@ -1629,7 +2112,130 @@ mod tests {
                 *seen.lock().unwrap(),
                 [[1, 64, 1], [2, 64, 1], [3, 64, 1], [4, 64, 1], [5, 64, 1]]
             );
+            game.ui
+                .rules
+                .set("block_drops", horizon_client::gamerules::Value::Bool(true));
+            game.world.set(6, 64, 1, infested).unwrap();
+            game.handle_mob_events(vec![MobEvent::BreakBlock {
+                pos: [6, 64, 1],
+                drop: true,
+                by: None,
+                breaker: None,
+            }])
+            .unwrap();
+            assert_eq!(game.world.block(6, 64, 1), game.world.air);
+            assert_eq!(
+                game.mobs.len(),
+                1,
+                "allowed spawnAfterBreak runs exactly once"
+            );
+            assert_eq!(
+                game.mobs[0].species(),
+                horizon_client::mobs::Species::Silverfish
+            );
         });
+    }
+
+    /// `exploded_positions` before rays reused their last block's lookup:
+    /// every step looked its block up.
+    fn exploded_positions_stepwise(
+        game: &mut Game<'_>,
+        center: [f64; 3],
+        radius: f32,
+        resists: Option<([i32; 3], f32)>,
+    ) -> Vec<[i32; 3]> {
+        let (min_y, max_y) = game.with_level(|_, level, _| {
+            use horizon_world::level::LevelAccess;
+            (level.min_y(), level.max_y())
+        });
+        let mut set: JavaHashMap<Key, ()> = JavaHashMap::default();
+        for xx in 0..16 {
+            for yy in 0..16 {
+                for zz in 0..16 {
+                    if !(xx == 0 || xx == 15 || yy == 0 || yy == 15 || zz == 0 || zz == 15) {
+                        continue;
+                    }
+                    let mut xd = f64::from(xx as f32 / 15.0 * 2.0 - 1.0);
+                    let mut yd = f64::from(yy as f32 / 15.0 * 2.0 - 1.0);
+                    let mut zd = f64::from(zz as f32 / 15.0 * 2.0 - 1.0);
+                    let d = (xd * xd + yd * yd + zd * zd).sqrt();
+                    (xd, yd, zd) = (xd / d, yd / d, zd / d);
+                    let mut power = radius * (0.7 + game.world.random.next_float() * 0.6);
+                    let (mut xp, mut yp, mut zp) = (center[0], center[1], center[2]);
+                    while power > 0.0 {
+                        let pos = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
+                        if pos[1] < min_y || pos[1] >= max_y {
+                            break;
+                        }
+                        let state = game.world.block(pos[0], pos[1], pos[2]);
+                        let f = game.res.facts().get(state);
+                        let fluid = if f.fluid != Fluid::None {
+                            100.0f32
+                        } else {
+                            0.0
+                        };
+                        match resists {
+                            Some((at, resistance)) if at == pos => {
+                                power -= (resistance + 0.3) * 0.3;
+                            }
+                            _ if !game.res.facts().is_air(state) || f.fluid != Fluid::None => {
+                                let base = f.explosion_resistance.max(fluid);
+                                power -= (blast_resistance(base, None, false) + 0.3) * 0.3;
+                            }
+                            _ => {}
+                        }
+                        if power > 0.0 {
+                            set.put(Key(pos), ());
+                        }
+                        xp += xd * f64::from(0.3f32);
+                        yp += yd * f64::from(0.3f32);
+                        zp += zd * f64::from(0.3f32);
+                        power -= 0.225_000_01;
+                    }
+                }
+            }
+        }
+        set.entries().map(|(k, _)| k.0).collect()
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn rays_reusing_their_last_block_explode_what_each_step_did() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let registry = &game.pack.assets.registry;
+        let states: Vec<BlockStateId> = [
+            "minecraft:stone",
+            "minecraft:air",
+            "minecraft:water",
+            "minecraft:dirt",
+            "minecraft:obsidian",
+            "minecraft:air",
+            "minecraft:oak_planks",
+            "minecraft:glass",
+        ]
+        .iter()
+        .map(|n| registry.default_state(n).unwrap())
+        .collect();
+        // A jumble of blocks of every resistance around the blast, in the
+        // loaded chunk at the origin.
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 56..74 {
+                    let i = ((x * 7 + y * 3 + z * 5) as usize) % states.len();
+                    game.world.set(x, y, z, states[i]).unwrap();
+                }
+            }
+        }
+        let center = [8.3, 64.6, 7.9];
+        for (radius, resists) in [(4.0, None), (6.0, None), (4.0, Some(([8, 64, 8], 1200.0)))] {
+            game.world.random.set_seed(7);
+            let expected = exploded_positions_stepwise(&mut game, center, radius, resists);
+            game.world.random.set_seed(7);
+            let got = game.exploded_positions(center, radius, resists, false);
+            assert!(expected.len() > 20, "{radius}: {}", expected.len());
+            assert_eq!(got, expected, "radius {radius}, {resists:?}");
+        }
     }
 
     #[test]
@@ -1728,9 +2334,10 @@ mod tests {
             brain: Brain::Passive,
             anim: Anim::Humanoid { zombie_arms: true },
             sounds: ["", "", ""],
-            step_sound: None,
+            sound_overrides: Default::default(),
             food: Default::default(),
             tempt: Default::default(),
+            passenger_attachments: Vec::new(),
         })
     }
 
@@ -1990,5 +2597,282 @@ mod tests {
                 f64::from(m.height())
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "explosion/explosion_part_tests.rs"]
+mod explosion_part_tests;
+
+#[cfg(test)]
+mod shulker_lock_drop_tests {
+    use super::super::game_tests::tests::server_game;
+    use super::*;
+    use horizon_client::{containers::BlockEntity, save};
+    use horizon_core::nbt::Tag;
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    fn destruction_captures_the_external_shulker_lock_before_removal() {
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.block_ticks
+            .add_empty_chunk(BlockPos::new(0, 0, 0).chunk())
+            .unwrap();
+        assert!(game.run_command("fill 0 199 0 15 199 15 stone"));
+        assert!(
+            game.ui
+                .rules
+                .bool_at(horizon_client::gamerules::vanilla::BLOCK_DROPS),
+            "actual drop rule must be enabled"
+        );
+        game.creative = false;
+        game.selected = 0;
+        game.inventory[0] = Some(ItemStack::new("minecraft:diamond_pickaxe", 1));
+        let clock = game.world.game_time;
+        let mut missing = Vec::new();
+        for (x, z, kind, locked, route) in [
+            (3, 3, "shulker_box", true, "command"),
+            (11, 3, "shulker_box", true, "player"),
+            (3, 11, "shulker_box", true, "explosion"),
+            (11, 11, "red_shulker_box", false, "command"),
+            (7, 3, "chest", true, "command"),
+            (7, 11, "crafter", true, "command"),
+        ] {
+            let shulker = kind.ends_with("shulker_box");
+            let mut fields = Vec::new();
+            if shulker {
+                fields.push("CustomName:\"Box\"");
+                fields.push("Items:[{Slot:0b,id:\"minecraft:diamond\",count:3,components:{\"minecraft:custom_data\":{h211:1}}},{Slot:26b,id:\"minecraft:apple\",count:5}]");
+            }
+            if locked {
+                fields.push("lock:{items:\"minecraft:diamond\"}");
+            }
+            assert!(game.run_command(&format!(
+                "setblock {x} 200 {z} minecraft:{kind}{{{}}}",
+                fields.join(",")
+            )));
+            let pos = [x, 200, z];
+            let key = (x, 200, z);
+            assert_eq!(
+                &*game.res.facts().get(game.world.block(x, 199, z)).name,
+                "minecraft:stone",
+                "positive floor"
+            );
+            let actual_lock = game.world.block_lock(key).cloned();
+            assert_eq!(actual_lock.is_some(), locked, "actual external source lock");
+            if locked {
+                assert!(matches!(&actual_lock,Some(Tag::Compound(c)) if !c.is_empty()));
+            }
+            let entity = game
+                .world
+                .block_entities
+                .get(&key)
+                .expect("actual command-created source");
+            assert!(
+                save::encode_block_entity(key, entity, &format!("minecraft:{kind}"))
+                    .get("lock")
+                    .is_none(),
+                "external lock must not be invented in modeled serializer"
+            );
+            if shulker {
+                let BlockEntity::Chest(slots) = entity else {
+                    panic!("modeled shulker inventory missing");
+                };
+                assert_eq!(slots[0].as_ref().unwrap().count, 3);
+                assert_eq!(slots[26].as_ref().unwrap().count, 5);
+                assert_eq!(
+                    game.world.block_names.get(&key),
+                    Some(&Tag::String("Box".into()))
+                );
+            }
+            let start = game.dropped.len();
+            match route {
+                "command" => {
+                    assert!(game.run_command(&format!("setblock {x} 200 {z} air destroy")))
+                }
+                "player" => game.break_block(pos).unwrap(),
+                "explosion" => game
+                    .server_explode(
+                        pos.map(|v| f64::from(v) + 0.5),
+                        2.0,
+                        BlockInteraction::Destroy,
+                        false,
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            game.flush_spill();
+            assert!(
+                game.res.facts().is_air(game.world.block(x, 200, z)),
+                "actual destruction occurred: {route}"
+            );
+            assert!(!game.world.block_entities.contains_key(&key));
+            assert!(
+                game.world.block_lock(key).is_none(),
+                "actual external source was removed"
+            );
+            let item_id = format!("minecraft:{kind}");
+            let drops: Vec<_> = game.dropped[start..]
+                .iter()
+                .filter(|d| *d.stack.item == item_id)
+                .collect();
+            assert_eq!(drops.len(), 1, "actual one-item drop: {kind}/{route}");
+            let stack = &drops[0].stack;
+            assert_eq!(stack.count, 1);
+            let data = stack.data();
+            let dropped_lock = data.and_then(|d| d.other("minecraft:lock"));
+            if shulker {
+                let data = data.expect("actual shulker components");
+                assert_eq!(data.custom_name, Some(Tag::String("Box".into())));
+                let slots = &data.container;
+                assert_eq!(slots.len(), 2);
+                let diamond = &slots.iter().find(|(slot, _)| *slot == 0).unwrap().1;
+                assert_eq!((&*diamond.item, diamond.count), ("minecraft:diamond", 3));
+                assert_eq!(
+                    diamond
+                        .data()
+                        .and_then(|d| d.other("minecraft:custom_data"))
+                        .and_then(|t| t.get("h211")),
+                    Some(&Tag::Int(1))
+                );
+                assert_eq!(
+                    slots.iter().find(|(slot, _)| *slot == 26).unwrap().1.count,
+                    5
+                );
+            }
+            if shulker && locked {
+                if dropped_lock != actual_lock.as_ref() {
+                    missing.push((route, dropped_lock.cloned(), actual_lock));
+                }
+            } else {
+                assert!(
+                    dropped_lock.is_none(),
+                    "non-shulker/unlocked policy unchanged"
+                );
+            }
+            assert_eq!(game.world.game_time, clock, "zero observation ticks");
+        }
+        assert!(
+            missing.is_empty(),
+            "actual external lock lost at destruction capture sites: {missing:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod explicit_source_tests {
+    use super::*;
+    use horizon_client::{mobs::Mob, motion::PlayerMotion};
+
+    #[test]
+    #[ignore = "requires prepared resources"]
+    fn explicit_sources_keep_names_without_inventing_kill_credit() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            game.options.dedicated = None;
+            game.creative = false;
+            game.ui.difficulty = 2;
+            game.build_registries();
+            for mode in 0..5 {
+                let nested = mode == 4;
+                game.combat = Default::default();
+                game.mobs.clear();
+                game.orbs.clear();
+                game.dropped.clear();
+                game.player =
+                    Some(PlayerMotion::new(game.motion, Vec3::new(10.5, 64.0, 8.5)).unwrap());
+                let kind = game.res.mob_types().get("minecraft:husk").unwrap().clone();
+                let species = kind.species;
+                if mode == 2 || nested {
+                    game.mobs
+                        .push(Mob::new(43, kind, Vec3::new(40.0, 64.0, 40.0), 0.0));
+                }
+                // An enclosing blast must not leak its owner into an explicit source.
+                game.combat.explosion_owner = Some(99);
+                game.combat.exploded.push((99, Text::literal("Outer")));
+                let cause = (mode != 0).then(|| ExplosionCause {
+                    entity: (43, Text::literal("Igniter")),
+                    player: false,
+                    guest: None,
+                    species: (mode != 1).then_some(species),
+                });
+                if nested {
+                    game.options.dedicated = Some(Vec::new());
+                    game.combat.explicit_explosion_cause = Some(cause);
+                    game.combat.explicit_explosion_direct = Some(Text::literal("Outer"));
+                    game.combat.blast_owner = Some((99, Text::literal("Outer")));
+                    game.combat.blast_guest = Some(17);
+                    let center = [8.5, 64.0, 8.5];
+                    let level = game.level("minecraft:overworld").unwrap();
+                    assert!(game.level_explode(
+                        level,
+                        center,
+                        2.0,
+                        false,
+                        mod_api::ExplosionInteraction::None
+                    ));
+                    assert!(matches!(
+                        game.combat.explicit_explosion_cause,
+                        Some(Some(_))
+                    ));
+                    assert!(game.combat.explicit_explosion_direct.is_some());
+                    assert_eq!(
+                        game.combat.blast_owner.as_ref().map(|owner| owner.0),
+                        Some(99)
+                    );
+                    assert_eq!(game.combat.blast_guest, Some(17));
+                } else {
+                    game.server_explode_from_cause(
+                        [8.5, 64.0, 8.5],
+                        2.0,
+                        BlockInteraction::Keep,
+                        false,
+                        ExplosionSource::default()
+                            .with_entity(7, "minecraft:end_crystal")
+                            .with_silence(true),
+                        Some(cause),
+                    )
+                    .unwrap();
+                }
+                let events = std::mem::take(&mut game.player.as_mut().unwrap().events);
+                game.record_combat(&events);
+                assert_eq!(
+                    game.combat
+                        .last_blow()
+                        .map(|(kind, id)| (kind.to_owned(), id)),
+                    Some((
+                        if mode == 0 || nested {
+                            "minecraft:explosion"
+                        } else {
+                            "minecraft:player_explosion"
+                        }
+                        .into(),
+                        if mode == 0 || nested { 0 } else { 43 }
+                    ))
+                );
+                assert_eq!(
+                    game.combat.kill_credit(game.world.game_time),
+                    (mode == 2).then_some(43)
+                );
+                if mode == 1 || mode == 3 || nested {
+                    let death = game
+                        .combat_death_message_for(Text::literal("Victim"))
+                        .component();
+                    if nested {
+                        assert_eq!(death["with"].as_array().unwrap().len(), 1);
+                    } else {
+                        assert_eq!(death["with"][1]["text"].as_str(), Some("Igniter"));
+                    }
+                }
+                assert_eq!(game.combat.explosion_owner, Some(99));
+                assert_eq!(game.combat.explicit_explosion_cause.is_some(), nested);
+            }
+        });
     }
 }

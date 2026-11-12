@@ -1,11 +1,6 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
 use super::*;
 
-/// Load-owned particle key requests, resolved before any world can emit particles.
-pub trait ParticlesRegistrar {
-    /// Request a vanilla particle or a custom sprite provider by canonical registry ID.
-    /// Unknown IDs are reported with the requesting mod when the content registry loads.
-    fn particle_key(&mut self, id: &str) -> crate::ParticleKey;
-}
 impl ParticlesRegistrar for PartRegistrar {
     fn particle_key(&mut self, id: &str) -> crate::ParticleKey {
         match self
@@ -14,10 +9,10 @@ impl ParticlesRegistrar for PartRegistrar {
             .particles
             .request(self.mod_id, id)
         {
-            Ok(slot) => crate::ParticleKey(slot),
+            Ok(slot) => mod_vocab::__private::parts_installation::particle_key(slot),
             Err(error) => {
                 self.refused.push(error);
-                crate::ParticleKey(u32::MAX)
+                mod_vocab::__private::parts_installation::particle_key(u32::MAX)
             }
         }
     }
@@ -36,7 +31,12 @@ mod tests {
             fn register(&self, registrar: &mut dyn Registrar, _: &RegistrationContext) {
                 let custom = registrar.particle_key("test:spark");
                 let smoke = registrar.particle_key("smoke");
-                assert_eq!(crate::ParticleKey::from_slot(custom.0), Ok(custom));
+                assert_eq!(
+                    mod_vocab::__private::parts_installation::validate_particle_key(
+                        mod_vocab::__private::parts_installation::particle_key_slot(custom)
+                    ),
+                    Ok(custom)
+                );
                 assert_eq!(smoke, registrar.particle_key("minecraft:smoke"));
                 self.0.lock().unwrap().extend([custom, smoke]);
             }
@@ -50,13 +50,13 @@ mod tests {
         .unwrap();
         let keys = keys.lock().unwrap();
         assert!(
-            crate::particle_keys::resolve_particles(["minecraft:smoke"], |_| Some(
+            mod_vocab::__private::resolve_particles(["minecraft:smoke"], |_| Some(
                 horizon_mod_runtime::registry_keys::ParticleKind::Custom
             ))
             .is_err()
         );
-        assert!(!crate::particle_keys::particles_resolved());
-        crate::particle_keys::resolve_particles(["minecraft:smoke", "test:spark"], |id| {
+        assert!(!mod_vocab::__private::particles_resolved());
+        mod_vocab::__private::resolve_particles(["minecraft:smoke", "test:spark"], |id| {
             Some(if id == "minecraft:smoke" {
                 horizon_mod_runtime::registry_keys::ParticleKind::Vanilla(5)
             } else {
@@ -65,12 +65,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            crate::particle_keys::particle_name(keys[0]),
+            mod_vocab::__private::particle_name(keys[0]),
             Some("test:spark")
         );
-        assert_eq!(crate::particle_keys::particle_vanilla_key(5), Some(keys[1]));
+        assert_eq!(mod_vocab::__private::particle_vanilla_key(5), Some(keys[1]));
         assert_eq!(
-            crate::particle_keys::particle_kind(keys[0]),
+            mod_vocab::__private::particle_kind(keys[0]),
             Some(horizon_mod_runtime::registry_keys::ParticleKind::Custom)
         );
     }

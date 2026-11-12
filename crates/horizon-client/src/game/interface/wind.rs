@@ -7,6 +7,7 @@ use horizon_client::advancements::EntityView;
 use horizon_client::join_seq::Joined as _;
 use horizon_client::{
     Result,
+    items::ItemStack,
     mobs::{Damage, DamageKind, Species, Who},
     particles::{ParticleOptions, ParticleType},
     projectiles::{Hit, Projectile, ProjectileKind},
@@ -24,6 +25,35 @@ const PLAYER_RADIUS: f32 = 1.2;
 const PLAYER_KNOCKBACK: f32 = 1.22;
 /// `BreezeWindCharge.RADIUS`.
 const BREEZE_RADIUS: f32 = 3.0;
+
+/// The wind charges that met a boat or a minecart in a tick's projectile pass,
+/// as they were before it: one whose vehicle an earlier charge of the tick
+/// breaks ticks again without it (`Game::broken_vehicle_retick`).
+pub(super) struct VehicleWinds {
+    vehicles: Vec<u32>,
+    before: Vec<Projectile>,
+}
+impl VehicleWinds {
+    /// `p` before its tick, when it may come to need a second one.
+    pub(super) fn before(&self, p: &Projectile) -> Option<Projectile> {
+        let wind = matches!(
+            p.kind,
+            ProjectileKind::WindCharge | ProjectileKind::BreezeWindCharge
+        );
+        (wind && p.guest.is_none() && !self.vehicles.is_empty()).then(|| p.clone())
+    }
+    /// Keeps `before` when the tick's `hit` is a boat or a minecart.
+    pub(super) fn met(&mut self, before: Option<Projectile>, hit: Hit) {
+        if let Hit::Entity {
+            who: Who::Mob(id), ..
+        } = hit
+            && self.vehicles.contains(&id)
+            && let Some(before) = before
+        {
+            self.before.push(before);
+        }
+    }
+}
 
 /// A burst `wind_burst` puts off until a guest's turn is over.
 pub(super) struct Burst {
@@ -77,8 +107,52 @@ fn triggers(name: &str) -> bool {
         || n == "bell"
 }
 impl Game<'_> {
+    /// `Player.itemAttackInteraction` applies trigger-only held-item effects
+    /// after an EnderDragonPart is successfully hit.
+    pub(super) fn post_attack_dragon_burst(&mut self) {
+        if let Some(held) = self.held().cloned() {
+            self.post_attack_bursts(&held, "minecraft:ender_dragon");
+        }
+    }
+
+    /// `ServerExplosion.hurtEntities` knockback for a trigger-only blast such
+    /// as Wind Burst. The dragon is not in the normal entity lists, but its
+    /// body still receives the blast impulse (without taking damage).
+    pub(super) fn wind_burst_knockback(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        multiplier: f32,
+        blocks: &[[i32; 3]],
+    ) {
+        let Some(d) = self.dragon.as_ref() else {
+            return;
+        };
+        let whole = d.whole_box();
+        let (lo, hi) = (whole.min_position(), whole.max_position());
+        let exposure = self.seen_percent(center, [lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
+        let Some((id, mut push)) = self
+            .dragon
+            .as_ref()
+            .and_then(|d| Some((d.id, d.explosion_knockback(center, radius, exposure)?)))
+        else {
+            return;
+        };
+        for component in &mut push {
+            *component *= f64::from(multiplier);
+        }
+        self.native_explosion_knockback(self.dim.id(), center, blocks, Some(id), &mut push);
+        if let Some(d) = self.dragon.as_mut() {
+            d.velocity = Vec3::new(
+                d.velocity.x + push[0],
+                d.velocity.y + push[1],
+                d.velocity.z + push[2],
+            );
+        }
+    }
+
     /// `WindChargeItem.use`.
-    pub(super) fn throw_wind_charge(&mut self) -> Result<bool> {
+    pub(super) fn throw_wind_charge(&mut self, stack: &ItemStack) -> Result<bool> {
         let (Some(eye), Some(p)) = (self.eye_position(), self.player.as_ref()) else {
             return Ok(false);
         };
@@ -86,17 +160,8 @@ impl Game<'_> {
         let velocity = self.known_player_movement();
         let start = Vec3::new(pos.x, eye[1], pos.z);
         let mut proj = Projectile::new(ProjectileKind::WindCharge, start, Some(Who::Player));
-        proj.shoot_from_rotation(
-            &mut self.world.random,
-            self.pitch,
-            self.yaw,
-            0.0,
-            1.5,
-            1.0,
-            velocity,
-            on_ground,
-        );
-        self.add_projectile(proj);
+        proj.shoot_from_rotation(self.pitch, self.yaw, 0.0, 1.5, 1.0, velocity, on_ground);
+        self.spawn_projectile(proj, stack);
         let pitch = 0.4 / (self.world.random.next_float() * 0.4 + 0.8);
         self.audio
             .play("minecraft:entity.wind_charge.throw", Some(eye), 0.5, pitch);
@@ -148,19 +213,82 @@ impl Game<'_> {
         self.creatures.wind_source = None;
         burst
     }
+    /// The boats and minecarts of this tick's projectile pass.
+    pub(super) fn vehicle_winds(&self) -> VehicleWinds {
+        VehicleWinds {
+            vehicles: (self.boats.iter().map(|b| b.id))
+                .chain(self.carts.iter().map(|c| c.id))
+                .collect(),
+            before: Vec::new(),
+        }
+    }
+    /// The hit to resolve for `p`. Vanilla ticks its entities one after the
+    /// other, so a wind charge never meets a boat or a minecart that an earlier
+    /// charge of the same tick broke (`Entity.canBeHitByProjectile`: alive):
+    /// it flies on to the next one in its way, or past. Here the tick's hits
+    /// were all found first, so such a charge (`winds` holds it as it was
+    /// before the tick) ticks again now, without the broken vehicle. None: it
+    /// met nothing this time and flies on.
+    pub(super) fn broken_vehicle_retick(
+        &mut self,
+        p: Projectile,
+        hit: Hit,
+        winds: &mut VehicleWinds,
+    ) -> Option<(Projectile, Hit)> {
+        let Hit::Entity {
+            who: Who::Mob(id), ..
+        } = hit
+        else {
+            return Some((p, hit));
+        };
+        let Some(k) = winds.before.iter().position(|w| w.id == p.id) else {
+            return Some((p, hit));
+        };
+        let mut again = winds.before.swap_remove(k);
+        if self.boats.iter().any(|b| b.id == id) || self.carts.iter().any(|c| c.id == id) {
+            return Some((p, hit));
+        }
+        let mut targets = self.projectile_targets();
+        if again.owner != Some(Who::Player) || super::lan_pvp::meets_players(&again.kind) {
+            targets.extend(self.lan_projectile_targets());
+        }
+        let border = Some(self.border.bounds());
+        let (mut keep, mut hit) = {
+            let w = self.mob_world_base(&[]);
+            again.tick(&super::creatures::ProjWorld {
+                w: &w,
+                targets,
+                border,
+            })
+        };
+        // The first run of this tick already gave these.
+        again.take_shoot_event();
+        again.bubble_surfaces.clear();
+        // AbstractWindCharge.tick: out of the world's top it bursts.
+        if keep && again.position.y > 350.0 {
+            keep = false;
+            hit = Hit::Block {
+                pos: [0; 3],
+                at: again.position,
+                face: [0; 3],
+            };
+        }
+        if keep {
+            self.add_projectile(again.clone());
+        }
+        (hit != Hit::None).then_some((again, hit))
+    }
     /// `AbstractWindCharge.onHitEntity`: one point of damage.
     fn wind_charge_damage(&mut self, p: &Projectile, who: Who) {
         let owner_breeze = matches!(p.owner, Some(Who::Mob(id))
             if self.mobs.iter().any(|m| m.id == id && m.species() == Species::Breeze));
         match who {
             Who::Player => {
-                if !self.creative {
-                    self.mob_hits_player_kind(
-                        1.0,
-                        [p.previous.x, p.previous.y, p.previous.z],
-                        "minecraft:wind_charge",
-                    );
-                }
+                self.mob_hits_player_kind(
+                    1.0,
+                    [p.previous.x, p.previous.y, p.previous.z],
+                    "minecraft:wind_charge",
+                );
             }
             // An ender dragon part takes the point of damage too; a crystal is
             // not hit (`AbstractWindCharge.canHitEntity`).
@@ -174,6 +302,11 @@ impl Game<'_> {
                         Some(p),
                     );
                 }
+            }
+            // A boat or a minecart (`VehicleEntity.hurtServer`): the point of
+            // damage shakes it, and the fifth one in a row breaks it.
+            Who::Mob(id) if !self.mobs.iter().any(|m| m.id == id) => {
+                self.hurt_vehicle(p, id, 1.0);
             }
             Who::Mob(id) => {
                 let source = Damage {
@@ -203,8 +336,7 @@ impl Game<'_> {
                     self.remember_mob_player_credit(id);
                 }
                 if hurt {
-                    let charge = "minecraft:wind_charge";
-                    self.shot_post_attack(p, who, charge, charge);
+                    self.shot_post_attack(p, who, p.kind.id(), "minecraft:wind_charge");
                 }
             }
         }
@@ -391,7 +523,9 @@ impl Game<'_> {
         }
         let mut entities = self.take_entities();
         for_each_entity_mut!(entities, entity => {
-            if let Some((_, push)) = late.iter().find(|(id, _)| *id == entity.id()) {
+            // Every burst of the tick pushed it, one after the other.
+            let id = entity.id();
+            for (_, push) in late.iter().filter(|(pushed, _)| *pushed == id) {
                 entity.push_from_explosion(*push);
             }
         });
@@ -501,23 +635,21 @@ impl Game<'_> {
             return Ok(());
         }
         if self.serving.is_some() || self.options.dedicated.is_some() {
-            let start = mod_api::NativeExplosionStart::from(
-                mod_api::__private::built::NativeExplosionStart {
-                    dimension: self.dim.id(),
-                    center,
-                    radius,
-                    fire: false,
-                    interaction: mod_api::NativeBlockInteraction::TriggerBlock,
-                    // `DamageSources.explosion(source, owner)`.
-                    damage_type: if cause.source.is_some() && cause.owner.is_some() {
-                        "minecraft:player_explosion"
-                    } else {
-                        "minecraft:explosion"
-                    },
-                    source: cause.source,
-                    owner: cause.owner,
+            let start = mod_api::ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+                dimension: self.dim.id(),
+                center,
+                radius,
+                fire: false,
+                interaction: mod_api::BlockInteraction::TriggerBlock,
+                // `DamageSources.explosion(source, owner)`.
+                damage_type: if cause.source.is_some() && cause.owner.is_some() {
+                    "minecraft:player_explosion"
+                } else {
+                    "minecraft:explosion"
                 },
-            );
+                source: cause.source,
+                owner: cause.owner,
+            });
             if self.explosion_start_cancelled(&start) {
                 return Ok(());
             }
@@ -527,6 +659,7 @@ impl Game<'_> {
         self.post_game_event("minecraft:explode", center, ctx);
         let mut targets = self.wind_positions(center, radius);
         let pushed = self.wind_knockback(center, radius, multiplier, breeze, wind_charge, &targets);
+        self.wind_burst_knockback(center, radius, multiplier, &targets);
         let block_count = targets.len();
         // Explosion.canTriggerBlocks: a breeze's charge needs mob griefing.
         if !breeze
@@ -669,7 +802,7 @@ impl Game<'_> {
         at: glam::Vec3,
         light: u32,
         partial: f32,
-        out: &mut Vec<mod_render::render::Vertex>,
+        out: &mut Vec<horizon_client_render::render_geometry::Vertex>,
     ) {
         let Some(model) = self.entity_models.wind_charge.as_ref() else {
             return;
@@ -712,6 +845,10 @@ impl Game<'_> {
     }
 }
 #[cfg(test)]
+#[path = "tests/wind_dragon_tests.rs"]
+mod wind_dragon_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -737,6 +874,7 @@ mod tests {
         assert!(!push_waits_for_tick(false, 3, Some(7)), "ticks before it");
         assert!(!push_waits_for_tick(true, 3, None), "not a charge's burst");
         let tnt = crate::game::tnt::PrimedTnt {
+            attachment_lifetime: Default::default(),
             rotation: [0.0, 0.0],
             id: 1,
             position: Vec3::ZERO,

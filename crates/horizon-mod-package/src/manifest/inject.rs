@@ -1,4 +1,6 @@
-//! Unified `[[inject]]` declarations and routing, independent of source staging or catalog I/O.
+//! `[[inject]]` declarations and their compiled slots, independent of catalog I/O. An inject
+//! never compiles game code: a place with no slot is refused, and [`super::mixin`] is the form
+//! that edits source.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -9,7 +11,7 @@ const RESERVED: &str = concat!(
     "override priv try typeof unsized virtual yield"
 );
 
-/// A listener in the mod's crate root. Freshness fields are written by the inject tool.
+/// A listener at a compiled slot. Freshness fields are written by the inject tool.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Inject {
@@ -18,60 +20,116 @@ pub struct Inject {
     pub kind: Kind,
     pub with: String,
     #[serde(default)]
-    pub access: Access,
-    #[serde(default)]
     pub priority: i32,
-    pub hash: String,
-    pub call: Option<String>,
-    pub nth: Option<usize>,
-    pub ctx: Option<String>,
+    /// Optional pinning: the function's catalog fingerprint `inject add` writes. Absent, the
+    /// build takes it from the pinned game's catalog, which `[native] horizon` fixes exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+/// What a listener does at its place, spelled in snake case in the manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Head,
     Return,
-    ModifyArg,
     Replace,
-    BeforeCall,
-    AfterCall,
-    ModifyCallArg,
-    ModifyValue,
-    WrapCall,
-    WrapIf,
-    ModifyLocal,
-    Field,
-    Expression,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Access {
-    #[default]
-    Api,
-    Internals,
 }
 
 impl Kind {
-    fn slot(self) -> Option<SlotKind> {
-        Some(match self {
-            Self::Head | Self::ModifyArg | Self::Replace => SlotKind::Head,
-            Self::Return => SlotKind::Return,
-            Self::BeforeCall
-            | Self::AfterCall
-            | Self::ModifyCallArg
-            | Self::ModifyValue
-            | Self::WrapCall
-            | Self::WrapIf => SlotKind::Site,
-            Self::ModifyLocal => SlotKind::Local,
-            Self::Field => SlotKind::Extension,
-            Self::Expression => return None,
-        })
-    }
+    pub const ALL: [Self; 3] = [Self::Head, Self::Return, Self::Replace];
 
-    fn needs_call(self) -> bool {
-        matches!(self.slot(), Some(SlotKind::Site | SlotKind::Local))
+    /// The manifest spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Return => "return",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+impl Serialize for Kind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// A removed spelling is refused naming the form that replaced it; it is never read as that form.
+/// The source-level kinds name the `[[native.mixin]]` form that compiles them.
+impl<'de> Deserialize<'de> for Kind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = std::borrow::Cow::<str>::deserialize(deserializer)?;
+        if let Some(kind) = Self::ALL.into_iter().find(|kind| kind.name() == name) {
+            return Ok(kind);
+        }
+        Err(serde::de::Error::custom(match &*name {
+            "modify_arg" => {
+                "kind `modify_arg` was removed: use `head`, whose listener already gets \
+                             every argument to change"
+                    .to_owned()
+            }
+            "modify_call_arg" | "before_call" | "after_call" | "modify_value" | "wrap_call"
+            | "wrap_if" => source_level(&name, "`[[native.mixin]]` function replacement"),
+            "modify_local" => source_level(&name, "`[[native.mixin]]` kind `MODIFY_VARIABLE`"),
+            "expression" => source_level(
+                &name,
+                "`[[native.mixin]]` kind `MODIFY_CONSTANT` or `MODIFY_EXPRESSION_VALUE`",
+            ),
+            "field" => source_level(&name, "an attachment for per-object mod data"),
+            other => format!(
+                "unknown kind `{other}`, expected one of {}",
+                Self::ALL.map(Self::name).join(", ")
+            ),
+        }))
+    }
+}
+
+fn source_level(kind: &str, form: &str) -> String {
+    format!(
+        "E_INJECT_NO_SLOT: kind `{kind}` has no compiled slot and `[[inject]]` never compiles \
+         game code: use {form} in a native mod"
+    )
+}
+
+/// The manifest's `[[inject]]` rows. A row's kind is read before its other keys, so a removed
+/// kind is refused by name even when keys that went with it follow. The removed `access` key is
+/// refused by name too: an injection is always through the API.
+pub(super) fn rows<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Inject>, D::Error> {
+    Vec::<toml::Table>::deserialize(deserializer)?
+        .into_iter()
+        .map(row)
+        .collect::<Result<_, toml::de::Error>>()
+        .map_err(serde::de::Error::custom)
+}
+
+/// One `[[inject]]` row: the one place a row is read, so a removed kind or key gets its own
+/// refusal and never serde's "unknown field".
+pub(super) fn row(row: toml::Table) -> Result<Inject, toml::de::Error> {
+    if let Some(kind) = row.get("kind") {
+        Kind::deserialize(kind.clone())?;
+    }
+    if let Some(access) = row.get("access") {
+        return Err(serde::de::Error::custom(
+            if access.as_str() == Some("internals") {
+                "E_INJECT_INVALID: field `access`: `internals` injections were removed: \
+                 use `[[native.mixin]]` in a native mod"
+            } else {
+                "E_INJECT_INVALID: field `access` was removed, an injection is always \
+                 through the API: remove this line"
+            },
+        ));
+    }
+    row.try_into()
+}
+
+impl Kind {
+    pub fn slot(self) -> SlotKind {
+        match self {
+            Self::Head | Self::Replace => SlotKind::Head,
+            Self::Return => SlotKind::Return,
+        }
     }
 }
 
@@ -90,8 +148,18 @@ impl Inject {
             if entry.id.trim().is_empty() || !ids.insert(&entry.id) {
                 return Err(invalid("id", "use a nonempty, unique inject id"));
             }
-            if entry.at.trim().is_empty() || entry.hash.trim().is_empty() {
-                return Err(invalid("at/hash", "run inject add for the pinned game"));
+            if entry.at.trim().is_empty() {
+                return Err(invalid("at", "name the target function's canonical path"));
+            }
+            if entry
+                .hash
+                .as_ref()
+                .is_some_and(|hash| hash.trim().is_empty())
+            {
+                return Err(invalid(
+                    "hash",
+                    "omit it, or run inject add for the pinned game",
+                ));
             }
             let name = entry.with.as_bytes();
             if RESERVED.split_whitespace().any(|word| word == entry.with)
@@ -101,45 +169,23 @@ impl Inject {
             {
                 return Err(invalid("with", "name a function in the mod's crate root"));
             }
-            let call = entry.call.as_ref().is_some_and(|s| !s.trim().is_empty());
-            let ctx = entry.ctx.as_ref().is_some_and(|s| !s.trim().is_empty());
-            if if entry.kind.needs_call() {
-                !call || entry.nth.is_none() || !ctx
-            } else {
-                entry.call.is_some() || entry.nth.is_some() || entry.ctx.is_some()
-            } {
-                return Err(invalid("call/nth/ctx", "calls/locals only: all three"));
-            }
         }
         Ok(())
     }
 }
 
-/// Compiled listener forms; replace uses Head with forced cancellation and a result.
+/// Compiled listener forms; replace uses Head with forced cancellation or a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotKind {
     Head,
     Return,
-    Site,
-    Local,
-    Extension,
 }
 
-/// Resolved catalog places, including unlisted ones; calls use resolved paths, not source text.
+/// Resolved catalog places; calls use resolved paths, not source text.
 #[derive(Clone, Debug)]
 pub struct Place {
     pub at: String,
     pub hash: String,
-    pub slots: Vec<SlotKind>,
-    pub calls: Vec<CallPlace>,
-    pub native_only: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct CallPlace {
-    pub call: String,
-    pub nth: usize,
-    pub ctx: String,
     pub slots: Vec<SlotKind>,
 }
 
@@ -154,42 +200,20 @@ pub struct Entry<'a> {
     pub inject: &'a Inject,
     pub target: Target,
     pub mod_id: &'a str,
-    pub resolved_call: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoSlotReason {
-    NotListed,
-    KindHasNoSlot,
-    NativeOnly,
-    WasmSitesPending,
-    LocalSlotsPending,
-    ExtensionSlotsPending,
-    ApiSitesPending,
-    SourcePending,
-    ReplacePending,
+    NoApiRecord,
+    ReplaceWithoutValue,
 }
-
 impl fmt::Display for NoSlotReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::NotListed => "not listed",
-            Self::KindHasNoSlot => "kind has no slot",
-            Self::NativeOnly => "native-only place",
-            Self::WasmSitesPending => "wasm sites pending",
-            Self::LocalSlotsPending => "local slots pending (I5)",
-            Self::ExtensionSlotsPending => "extension slots pending (I6)",
-            Self::ApiSitesPending => "API site listeners pending (U4c)",
-            Self::SourcePending => "source injects pending (U5)",
-            Self::ReplacePending => "replace listeners pending (U9)",
+            Self::NoApiRecord => "no API record: a parameter has no API type yet",
+            Self::ReplaceWithoutValue => "replace needs a return its record carries",
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
-    Slot(SlotKind),
-    Source(NoSlotReason),
 }
 
 /// Escape-hatch refusals, never part of `mod_api`; `id` is qualified as `package:inject`.
@@ -210,14 +234,6 @@ pub enum InjectError {
         old: String,
         new: String,
     },
-    Moved {
-        id: String,
-        nth: usize,
-    },
-    Lost {
-        id: String,
-        at: String,
-    },
     NoSlot {
         id: String,
         reason: NoSlotReason,
@@ -231,8 +247,6 @@ impl fmt::Display for InjectError {
             Self::Invalid { .. } => "E_INJECT_INVALID",
             Self::Missing { .. } => "E_INJECT_MISSING",
             Self::Changed { .. } => "E_INJECT_CHANGED",
-            Self::Moved { .. } => "E_INJECT_MOVED",
-            Self::Lost { .. } => "E_INJECT_LOST",
             Self::NoSlot { .. } => "E_INJECT_NO_SLOT",
         };
         write!(f, "{code}: ")?;
@@ -242,24 +256,23 @@ impl fmt::Display for InjectError {
             Self::Changed { id, at, old, new } => {
                 write!(f, "{id}: {at} {old} -> {new}; run inject update")
             }
-            Self::Moved { id, nth } => write!(f, "{id} now at nth={nth}; run inject update"),
-            Self::Lost { id, at } => write!(f, "{id}: {at} lost or ambiguous; rerun inject add"),
             Self::NoSlot {
                 id,
                 reason,
                 declaration,
             } => write!(
                 f,
-                "{id}: {reason}; slot declaration {declaration}; use a native mod or a game build supporting this slot"
+                "{id}: {reason}; engine API point {declaration}; use an engine function with an API record, or [[native.mixin]] in a native mod"
             ),
         }
     }
 }
 impl std::error::Error for InjectError {}
 
-/// Route a validated entry against a resolved catalog, without I/O or source inspection.
-/// Freshness failures never fall back to source. Wasm call/local slots await W3.
-pub fn route(entry: Entry<'_>, slots: &[Place]) -> Result<Route, InjectError> {
+/// The compiled slot a validated entry attaches to, against a resolved catalog and without I/O.
+/// A place or kind with no slot is refused on every target: nothing here rebuilds the game.
+/// Native and wasm use the same API records.
+pub fn route(entry: Entry<'_>, slots: &[Place]) -> Result<SlotKind, InjectError> {
     let inject = entry.inject;
     let id = format!("{}:{}", entry.mod_id, inject.id);
     let Some(place) = slots.iter().find(|p| p.at == inject.at) else {
@@ -268,327 +281,128 @@ pub fn route(entry: Entry<'_>, slots: &[Place]) -> Result<Route, InjectError> {
             at: inject.at.clone(),
         });
     };
-    if place.hash != inject.hash {
+    // An absent hash follows the catalog routed against: the pinned game's own.
+    if let Some(old) = inject.hash.as_ref().filter(|hash| **hash != place.hash) {
         return Err(InjectError::Changed {
             id,
             at: inject.at.clone(),
-            old: inject.hash.clone(),
+            old: old.clone(),
             new: place.hash.clone(),
         });
     }
-    if let Some(reason) = match inject.kind {
-        Kind::ModifyLocal => Some(NoSlotReason::LocalSlotsPending),
-        Kind::Field => Some(NoSlotReason::ExtensionSlotsPending),
-        _ => None,
-    } {
-        return Err(InjectError::NoSlot {
-            id,
-            reason,
-            declaration: format!(
-                "slots/{}.txt: {}{}",
-                entry.mod_id,
-                if inject.kind == Kind::Field {
-                    "type "
-                } else {
-                    ""
-                },
-                inject.at
-            ),
-        });
+    if place.slots.contains(&inject.kind.slot()) {
+        return Ok(inject.kind.slot());
     }
-    let available = if inject.kind.needs_call() {
-        // An unlisted native internals call is checked against source by U2 before compilation.
-        if entry.target == Target::Native
-            && inject.access == Access::Internals
-            && inject.kind.slot() == Some(SlotKind::Site)
-            && !place
-                .calls
-                .iter()
-                .any(|c| Some(c.call.as_str()) == entry.resolved_call)
-        {
-            return Ok(Route::Source(NoSlotReason::NotListed));
-        }
-        let mut candidates = place.calls.iter().filter(|c| {
-            Some(c.call.as_str()) == entry.resolved_call
-                && Some(c.ctx.as_str()) == inject.ctx.as_deref()
-        });
-        let current = candidates.clone().find(|c| Some(c.nth) == inject.nth);
-        let (Some(call), None) = current.map_or_else(
-            || (candidates.next(), candidates.next()),
-            |call| (Some(call), None),
-        ) else {
-            return Err(InjectError::Lost {
-                id,
-                at: inject.at.clone(),
-            });
-        };
-        if Some(call.nth) != inject.nth {
-            return Err(InjectError::Moved { id, nth: call.nth });
-        }
-        &call.slots
-    } else {
-        &place.slots
-    };
-    let reason = if entry.target == Target::Wasm && place.native_only {
-        NoSlotReason::NativeOnly
-    } else if entry.target == Target::Wasm && inject.kind.needs_call() {
-        NoSlotReason::WasmSitesPending
-    } else if let Some(kind) = inject.kind.slot() {
-        if available.contains(&kind) {
-            return Ok(Route::Slot(kind));
-        }
-        NoSlotReason::NotListed
-    } else {
-        NoSlotReason::KindHasNoSlot
-    };
-    if entry.target == Target::Native {
-        return Ok(Route::Source(reason));
-    }
-    let line = if let Some(call) = &inject.call {
-        format!(
-            "{} | {call} | {} | {}",
-            inject.at,
-            inject.nth.unwrap(),
-            inject.ctx.as_deref().unwrap()
-        )
-    } else if inject.kind == Kind::Field {
-        format!("type {}", inject.at)
-    } else {
-        inject.at.clone()
-    };
     Err(InjectError::NoSlot {
         id,
-        reason,
-        declaration: format!("slots/{}.txt: {line}", entry.mod_id),
+        reason: NoSlotReason::NoApiRecord,
+        declaration: inject.at.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const DECL: &str =
-        "[[inject]]\nid='ground'\nat='game::tick'\nkind='head'\nwith='on_tick'\nhash='signature'\n";
-
-    fn parse(decl: &str, target: &str) -> Result<super::super::Manifest, String> {
-        super::super::Manifest::parse(&format!(
-            "id='sample'\nname='Sample'\nversion='1.0.0'\napi='0.2'\ncapabilities=['registries']\n{target}\n{decl}"
-        ))
+    fn inject() -> Inject {
+        toml::from_str("id='listen'\nat='game::tick'\nkind='head'\nwith='listen'").unwrap()
     }
-
-    fn inject(kind: Kind) -> Inject {
-        let wasm = format!("[wasm]\nsha512='{}'\ntoolchain='nightly'", "a".repeat(128));
-        let mut i = parse(DECL, &wasm).unwrap().inject.remove(0);
-        i.kind = kind;
-        if kind.needs_call() {
-            i.call = Some("self.callee".into());
-            i.nth = Some(0);
-            i.ctx = Some("context".into());
-        }
-        i
-    }
-
-    fn place() -> Place {
-        Place {
-            at: "game::tick".into(),
-            hash: "signature".into(),
-            native_only: false,
-            slots: vec![SlotKind::Head, SlotKind::Return, SlotKind::Extension],
-            calls: vec![CallPlace {
-                call: "game::callee".into(),
-                nth: 0,
-                ctx: "context".into(),
-                slots: vec![SlotKind::Site, SlotKind::Local],
-            }],
-        }
-    }
-
-    fn run(i: &Inject, target: Target, places: &[Place]) -> Result<Route, InjectError> {
-        route(
-            Entry {
-                inject: i,
-                target,
-                mod_id: "sample",
-                resolved_call: Some("game::callee"),
-            },
-            places,
-        )
-    }
-
     #[test]
-    fn only_absent_native_internals_calls_defer_identity_to_source() {
-        let mut i = inject(Kind::BeforeCall);
-        i.access = Access::Internals;
-        let mut p = place();
-        p.calls.clear();
+    fn only_api_function_kinds_parse() {
+        for kind in Kind::ALL {
+            let text = format!(
+                "id='listen'\nat='game::tick'\nkind='{}'\nwith='listen'",
+                kind.name()
+            );
+            assert_eq!(toml::from_str::<Inject>(&text).unwrap().kind, kind);
+        }
+        let text = "id='listen'\nat='game::tick'\nkind='head'\nwith='listen'";
+        for extra in ["call='f'", "nth=0", "ctx='x'"] {
+            assert!(toml::from_str::<Inject>(&format!("{text}\n{extra}")).is_err());
+        }
+        for kind in [
+            "before_call",
+            "after_call",
+            "modify_value",
+            "wrap_call",
+            "wrap_if",
+        ] {
+            assert!(serde_json::from_value::<Kind>(serde_json::json!(kind)).is_err());
+        }
+    }
+    #[test]
+    fn routing_checks_catalog_presence_and_signature() {
+        let mut i = inject();
+        let places = [Place {
+            at: i.at.clone(),
+            hash: "new".into(),
+            slots: vec![SlotKind::Head],
+        }];
         assert_eq!(
-            run(&i, Target::Native, &[p.clone()]),
-            Ok(Route::Source(NoSlotReason::NotListed))
+            route(
+                Entry {
+                    inject: &i,
+                    target: Target::Wasm,
+                    mod_id: "mod"
+                },
+                &places
+            )
+            .unwrap(),
+            SlotKind::Head
         );
+        i.hash = Some("old".into());
         assert!(matches!(
-            run(&i, Target::Wasm, &[p.clone()]),
-            Err(InjectError::Lost { .. })
-        ));
-        i.access = Access::Api;
-        assert!(matches!(
-            run(&i, Target::Native, &[p.clone()]),
-            Err(InjectError::Lost { .. })
-        ));
-        i.access = Access::Internals;
-        i.hash = "stale".into();
-        assert!(matches!(
-            run(&i, Target::Native, &[p]),
+            route(
+                Entry {
+                    inject: &i,
+                    target: Target::Native,
+                    mod_id: "mod"
+                },
+                &places
+            ),
             Err(InjectError::Changed { .. })
         ));
-        i.hash = "signature".into();
-        i.ctx = Some("wrong".into());
         assert!(matches!(
-            run(&i, Target::Native, &[place()]),
-            Err(InjectError::Lost { .. })
+            route(
+                Entry {
+                    inject: &i,
+                    target: Target::Native,
+                    mod_id: "mod"
+                },
+                &[]
+            ),
+            Err(InjectError::Missing { .. })
         ));
-        i.ctx = Some("context".into());
-        i.nth = Some(1);
-        assert!(matches!(
-            run(&i, Target::Native, &[place()]),
-            Err(InjectError::Moved { nth: 0, .. })
-        ));
     }
+}
 
+#[cfg(test)]
+mod provenance_tests {
     #[test]
-    fn manifest_boundary() {
-        let pin = "a".repeat(40);
-        let native = format!("[native]\ngame='26.3'\nhorizon='{pin}'\nmixins='{pin}'");
-        let m = parse(DECL, &native).unwrap();
-        assert_eq!((m.inject[0].access, m.inject[0].priority), (Access::Api, 0));
-        let call = "kind='wrap_call'\ncall='self.callee'\nnth=0\nctx='ctx'\naccess='internals'";
-        assert!(parse(&DECL.replace("kind='head'", call), &native).is_ok());
-        for (old, new) in [
-            ("id='ground'", "id=''"),
-            ("at='game::tick'", "at=''"),
-            ("hash='signature'", "hash=''"),
-            ("with='on_tick'", "with='src/lib.rs'"),
-            ("kind='head'", "kind='HEAD'"),
-            ("kind='head'", "kind='wrap_call'"),
-            ("kind='head'", "kind='head'\nnth=0"),
-            ("kind='head'", "kind='head'\naccess='raw'"),
-            ("at='game::tick'", "target='game::tick'"),
-        ] {
-            assert!(parse(&DECL.replace(old, new), &native).is_err(), "{new}");
-        }
-        assert!(parse(&format!("{DECL}{DECL}"), &native).is_err());
-        assert!(parse(DECL, "").is_err());
-        for name in RESERVED.split_whitespace() {
-            let mut i = inject(Kind::Head);
-            i.with = name.into();
-            assert!(
-                matches!(Inject::check_all(&[i], "sample", true), Err(InjectError::Invalid { id, field: "with", .. }) if id == "sample:ground")
-            );
-        }
+    fn removed_kind_names_mod_row_and_target() {
+        refused("kind='modify_arg'", "kind `modify_arg` was removed");
     }
-
     #[test]
-    fn every_kind_access_target_and_listing() {
-        use SlotKind::*;
-        let rows = [
-            (Kind::Head, Some(Head)),
-            (Kind::Return, Some(Return)),
-            (Kind::ModifyArg, Some(Head)),
-            (Kind::Replace, Some(Head)),
-            (Kind::BeforeCall, Some(Site)),
-            (Kind::AfterCall, Some(Site)),
-            (Kind::ModifyCallArg, Some(Site)),
-            (Kind::ModifyValue, Some(Site)),
-            (Kind::WrapCall, Some(Site)),
-            (Kind::WrapIf, Some(Site)),
-            (Kind::ModifyLocal, Some(Local)),
-            (Kind::Field, Some(Extension)),
-            (Kind::Expression, None),
-        ];
-        for (kind, expected) in rows {
-            for access in [Access::Api, Access::Internals] {
-                for (listed, native_only) in [(true, false), (false, false), (true, true)] {
-                    let mut i = inject(kind);
-                    i.access = access;
-                    let mut p = place();
-                    p.native_only = native_only;
-                    if !listed {
-                        p.slots.clear();
-                        p.calls[0].slots.clear();
-                    }
-                    if let Some(pending) = match kind {
-                        Kind::ModifyLocal => Some(NoSlotReason::LocalSlotsPending),
-                        Kind::Field => Some(NoSlotReason::ExtensionSlotsPending),
-                        _ => None,
-                    } {
-                        for target in [Target::Native, Target::Wasm] {
-                            assert!(
-                                matches!(run(&i, target, &[p.clone()]), Err(InjectError::NoSlot { reason, .. }) if reason == pending)
-                            );
-                        }
-                        continue;
-                    }
-                    let reason = match expected {
-                        None => Some(NoSlotReason::KindHasNoSlot),
-                        Some(_) if !listed => Some(NoSlotReason::NotListed),
-                        _ => None,
-                    };
-                    let native =
-                        reason.map_or_else(|| Route::Slot(expected.unwrap()), Route::Source);
-                    assert_eq!(run(&i, Target::Native, &[p.clone()]), Ok(native));
-                    let reason = if native_only {
-                        Some(NoSlotReason::NativeOnly)
-                    } else if matches!(expected, Some(Site | Local)) {
-                        Some(NoSlotReason::WasmSitesPending)
-                    } else {
-                        reason
-                    };
-                    let wasm = run(&i, Target::Wasm, &[p]);
-                    if let Some(r) = reason {
-                        assert!(
-                            matches!(wasm, Err(InjectError::NoSlot { reason, declaration, .. }) if reason == r && declaration.starts_with("slots/sample.txt:") && declaration.contains("game::tick"))
-                        );
-                    } else {
-                        assert_eq!(wasm, Ok(Route::Slot(expected.unwrap())));
-                    }
-                }
-            }
-        }
+    fn removed_access_names_mod_row_and_target() {
+        refused(
+            "kind='head'\naccess='internals'",
+            "field `access`: `internals` injections were removed: use `[[native.mixin]]`",
+        );
     }
-
     #[test]
-    fn freshness_refuses_both_targets() {
-        for target in [Target::Native, Target::Wasm] {
-            for (case, code) in [
-                ("missing", "E_INJECT_MISSING"),
-                ("changed", "E_INJECT_CHANGED"),
-                ("moved", "E_INJECT_MOVED"),
-                ("ambiguous", "E_INJECT_LOST"),
-                ("context", "E_INJECT_LOST"),
-                ("callee", "E_INJECT_LOST"),
-            ] {
-                let mut i = inject(Kind::WrapCall);
-                let mut places = vec![place()];
-                match case {
-                    "missing" => places.clear(),
-                    "changed" => places[0].hash = "new".into(),
-                    "moved" => {
-                        places[0].calls[0].nth = 1;
-                        let mut other = place().calls.remove(0);
-                        other.ctx = "another statement".into();
-                        places[0].calls.push(other);
-                    }
-                    "ambiguous" => {
-                        i.nth = Some(4);
-                        places[0].calls.push(place().calls.remove(0));
-                    }
-                    "context" => places[0].calls[0].ctx = "changed".into(),
-                    "callee" => places[0].calls[0].call = "game::other".into(),
-                    _ => unreachable!(),
-                }
-                let error = run(&i, target, &places).unwrap_err().to_string();
-                assert!(error.starts_with(code), "{case}");
-                assert!(error.contains("sample:ground"));
-            }
-        }
+    fn the_removed_access_key_is_refused_even_as_api() {
+        refused(
+            "kind='head'\naccess='api'",
+            "field `access` was removed, an injection is always through the API: remove this line",
+        );
+    }
+    fn refused(fields: &str, reason: &str) {
+        let text = format!(
+            "id='addon'\nname='Addon'\nversion='1.0.0'\napi='0.2'\ncapabilities=[]\n[[inject]]\nid='before'\nat='game::tick'\nwith='before'\n{fields}\n"
+        );
+        let error = super::super::Manifest::parse(&text).unwrap_err();
+        assert!(
+            error.contains("addon:before: game::tick:") && error.contains(reason),
+            "{error}"
+        );
     }
 }

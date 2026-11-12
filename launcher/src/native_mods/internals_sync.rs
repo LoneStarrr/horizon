@@ -14,7 +14,6 @@ use std::{
 #[derive(Debug)]
 pub(crate) enum Error {
     SourceUnavailable { revision: String, reason: String },
-    SourceInjection,
     Check(String),
 }
 
@@ -30,7 +29,6 @@ impl std::fmt::Display for Error {
                 "E_INTERNAL_SOURCE_UNAVAILABLE: internals sync needs the source for {revision}. It is not cached and could not be downloaded: {error}",
                 &[("revision", revision), ("error", reason)],
             )),
-            Self::SourceInjection => f.write_str(crate::i18n::tr("E_INTERNAL_SOURCE_INJECTION: internals sync checks library code and raw listeners, not source listeners, helpers or modules. Use cargo horizon-mod internals add for this mod.")),
             Self::Check(reason) => f.write_str(reason),
         }
     }
@@ -38,24 +36,19 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// No normal build reads this directory or its target. In particular, neither the attributes
-/// nor the warning-bearing metadata can reach the prebuilt or source build caches.
+/// nor the warning-bearing metadata can reach the normal build caches.
 pub(crate) fn check(folder: &Path) -> Result<Vec<ListedInternal>, Error> {
-    let _lease = crate::native_cache::Cache::acquire(&crate::backend::build_dir())
-        .map_err(|error| Error::Check(super::cache_error(error)))?;
-    super::clear_log()?;
-    discover(folder, &super::root().join("internals-sync"))
+    let catalog = pinned_catalog_with_modules(folder)?;
+    discover_catalog(folder, &catalog.directory)
 }
 
-fn discover(folder: &Path, cache_root: &Path) -> Result<Vec<ListedInternal>, Error> {
+fn discover_catalog(folder: &Path, game: &Path) -> Result<Vec<ListedInternal>, Error> {
     let bundle = super::bundle_in(folder)?.ok_or_else(|| {
         trf(
             "{path} is not a native mod project.",
             &[("path", &folder.display().to_string())],
         )
     })?;
-    if bundle.needs_mixins() {
-        return Err(Error::SourceInjection);
-    }
     let projects = [api::Project::read(&bundle).map_err(|e| e.to_string())?];
     let declared = [dependencies::from_manifest(&bundle.manifest.dependencies)];
     let inputs = [dependencies::Mod {
@@ -65,38 +58,13 @@ fn discover(folder: &Path, cache_root: &Path) -> Result<Vec<ListedInternal>, Err
         has_api: true,
     }];
     let resolution = dependencies::resolve(&inputs).map_err(|e| e.to_string())?;
-    let revision = &bundle
-        .manifest
-        .native
-        .as_ref()
-        .expect("native bundle")
-        .horizon;
-    let cache = cache_root.join(revision);
-    let game = cache.join("game");
-    if !game.join(".discovery-ready").is_file() {
-        let source = super::source(revision).map_err(|reason| Error::SourceUnavailable {
-            revision: revision.clone(),
-            reason,
-        })?;
-        let fresh = cache.join("game.new");
-        if fresh.exists() {
-            fs::remove_dir_all(&fresh).map_err(|e| e.to_string())?;
-        }
-        super::sync(&source, &fresh)?;
-        horizon_mod_api_gen::staging::stage(
-            &fresh,
-            &fresh.join(super::inject::POINTS),
-            &fresh.join(internals::INTERNALS),
-            horizon_mod_api_gen::staging::Mode::Discovery,
-        )?;
-        fs::write(fresh.join(".discovery-ready"), "").map_err(|e| e.to_string())?;
-        fs::rename(&fresh, &game).map_err(|e| e.to_string())?;
-    }
-    if super::prebuilt::source_refusal(&game, &projects)?.is_some() {
-        return Err(Error::SourceInjection);
-    }
+    let cache = game
+        .parent()
+        .ok_or_else(|| "invalid discovery cache".to_owned())?
+        .to_path_buf();
+    crate::storage::mark_used(&cache).map_err(super::cache_error)?;
     let stage = cache.join("stage");
-    prepare_stage(&game, &stage)?;
+    prepare_stage(game, &stage)?;
     let mut listed = internals::Catalog::read(&stage)?;
     listed.discovery = true;
     api::stage(&stage, &projects, &declared, &resolution, &listed)?;
@@ -141,6 +109,118 @@ fn discover(folder: &Path, cache_root: &Path) -> Result<Vec<ListedInternal>, Err
                 .map_err(|error| Error::Check(error.to_string()))
         })
         .collect()
+}
+
+/// The catalog directory is protected from concurrent native builds until this value drops.
+pub struct DiscoveryCatalog {
+    pub directory: PathBuf,
+    _lease: crate::native_cache::Cache,
+}
+
+impl DiscoveryCatalog {
+    /// Copy both files while the discovery lease is held; refuse a reused destination.
+    pub fn snapshot(&self, destination: &Path) -> Result<PathBuf, String> {
+        fs::create_dir(destination).map_err(|e| e.to_string())?;
+        for name in ["internals.json", "mod-catalog.json"] {
+            fs::copy(self.directory.join(name), destination.join(name))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(destination.to_path_buf())
+    }
+}
+
+/// Discover the pinned game with only this mod's modules, using the launcher's managed tools.
+/// Hold the returned catalog while reading its internals.json and mod-catalog.json files.
+pub fn pinned_catalog_with_modules(folder: &Path) -> Result<DiscoveryCatalog, String> {
+    super::require_consent().map_err(|e| e.to_string())?;
+    let lease = crate::native_cache::Cache::acquire(&crate::backend::build_dir())
+        .map_err(super::cache_error)?;
+    super::clear_log()?;
+    let directory = catalog_for_mod(folder, &super::root().join("internals-sync"))
+        .map_err(|e| e.to_string())?;
+    Ok(DiscoveryCatalog {
+        directory,
+        _lease: lease,
+    })
+}
+
+/// Return the pinned game's discovery tree and catalog pair with only this mod's modules
+/// applied. Each module discovery starts from pristine pinned source, never a staged tree.
+/// The launcher owns source downloads, Rust installation and horizon-mixins management.
+fn catalog_for_mod(folder: &Path, cache_root: &Path) -> Result<PathBuf, Error> {
+    catalog_for_mod_with(
+        folder,
+        cache_root,
+        super::source,
+        |bundle, prepared, input, fresh| {
+            let rust = rust_toolchain::install(|_| {})?;
+            let tool = super::tool(&rust, &bundle.native().mixins, &|_| {})?;
+            super::run(
+                super::apply(&rust, &tool, prepared, input, fresh),
+                "horizon-mixins",
+                |_| {},
+            )
+        },
+    )
+}
+
+// Keep downloads and the external executable at the boundary so fixtures exercise the actual
+// module-input preparation, source staging and catalog publication without installing tools.
+fn catalog_for_mod_with(
+    folder: &Path,
+    cache_root: &Path,
+    source: impl FnOnce(&str) -> Result<PathBuf, String>,
+    apply: impl FnOnce(&super::Bundle, &Path, &Path, &Path) -> Result<(), String>,
+) -> Result<PathBuf, Error> {
+    let bundle = super::bundle_in(folder)?.ok_or_else(|| "not a native mod project".to_owned())?;
+    let native = bundle.native();
+    let cache = if bundle.needs_mixins() {
+        cache_root
+            .join(&native.horizon)
+            .join("modules")
+            .join(&bundle.manifest.id)
+    } else {
+        cache_root.join(&native.horizon)
+    };
+    let game = cache.join(if bundle.needs_mixins() {
+        "module-game"
+    } else {
+        "game"
+    });
+    if !bundle.needs_mixins() && game.join(".discovery-ready").is_file() {
+        return Ok(game);
+    }
+    let source = source(&native.horizon).map_err(|reason| Error::SourceUnavailable {
+        revision: native.horizon.clone(),
+        reason,
+    })?;
+    let fresh = cache.join("game.new");
+    if fresh.exists() {
+        fs::remove_dir_all(&fresh).map_err(|e| e.to_string())?;
+    }
+    if bundle.needs_mixins() {
+        let input = cache.join("mixins.incoming");
+        super::stage_mixins(std::slice::from_ref(&bundle), &input)?;
+        let prepared = cache.join("mixins.source");
+        super::prepare_mixins_source(&source, &prepared)?;
+        apply(&bundle, &prepared, &input, &fresh)
+            .map_err(|error| format!("{}: {error}", bundle.manifest.id))?;
+    } else {
+        super::sync(&source, &fresh)?;
+    }
+    horizon_platform::mod_build::api_gen::staging::stage(
+        &fresh,
+        &fresh.join("points.json"),
+        &fresh.join(internals::INTERNALS),
+        horizon_platform::mod_build::api_gen::staging::Mode::Discovery,
+        horizon_mod_package::manifest::API,
+    )?;
+    fs::write(fresh.join(".discovery-ready"), "").map_err(|e| e.to_string())?;
+    if game.exists() {
+        fs::remove_dir_all(&game).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&fresh, &game).map_err(|e| e.to_string())?;
+    Ok(game)
 }
 
 // The pinned game never changes in this cache. Keep Cargo.lock after the first check:
@@ -277,40 +357,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn discovery_refuses_private_source_listeners_before_facade_assembly() {
-        for kind in ["before_call", "after_call", "modify_value"] {
-            let root = super::super::tests::dir("discovery-source-listener");
-            let folder = root.join("mod");
-            super::super::tests::write_bundle(&folder, "example", "");
-            fs::write(
-                folder.join("Cargo.toml"),
-                "[package]\nname='example'\nversion='0.1.0'\n[dependencies]\nmod_api={package='horizon-mod-api',version='0.1'}\n",
-            )
-            .unwrap();
-            let manifest = folder.join(horizon_mod_package::manifest::MANIFEST);
-            let text = fs::read_to_string(&manifest).unwrap();
-            fs::write(manifest, format!("{text}\n[[inject]]\nid='value'\nat='game::run'\nkind='{kind}'\nwith='listen'\naccess='internals'\nhash='signature'\ncall='game::other'\nnth=0\nctx='statement'\n")).unwrap();
-            let bundle = super::super::bundle_in(&folder).unwrap().unwrap();
-            let game = root
-                .join(&bundle.manifest.native.as_ref().unwrap().horizon)
-                .join("game");
-            fs::create_dir_all(&game).unwrap();
-            fs::write(game.join(".discovery-ready"), "").unwrap();
-            fs::write(game.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
-            fs::write(game.join("points.json"), r#"{"points":[],"sites":[]}"#).unwrap();
-            fs::write(game.join("internals.json"), json!([{
-                "path":"game::run", "kind":"fn", "signature":"fn run()", "hash":"signature", "cfg":"", "shape_only":false
-            }]).to_string()).unwrap();
-            let result = std::panic::catch_unwind(|| discover(&folder, &root));
-            assert!(
-                matches!(result, Ok(Err(Error::SourceInjection))),
-                "discovery must return the typed source refusal, not panic: {result:?}"
-            );
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
     fn discovery_cache_keeps_the_resolved_lock_and_game_sources_but_replaces_mods() {
         let root = super::super::tests::dir("discovery-cache");
         let game = root.join("game");
@@ -397,5 +443,45 @@ mod tests {
             parse(&event.to_string(), &own, stage),
             Some(Message::Failure(..))
         ));
+    }
+}
+
+#[cfg(test)]
+#[path = "internals_sync_tests.rs"]
+mod catalog_tests;
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    #[test]
+    fn catalog_snapshot_survives_a_second_discovery_between_reads() {
+        let dir = std::env::temp_dir().join(format!("catalog-snapshot-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        for name in ["internals.json", "mod-catalog.json"] {
+            fs::write(shared.join(name), "first").unwrap();
+        }
+        let lease = crate::native_cache::Cache::acquire(&dir.join("cache")).unwrap();
+        let catalog = DiscoveryCatalog {
+            directory: shared.clone(),
+            _lease: lease,
+        };
+        let snapshot = dir.join("snapshot");
+        let snapshot = catalog.snapshot(&snapshot).unwrap();
+        drop(catalog);
+        assert_eq!(
+            fs::read_to_string(snapshot.join("internals.json")).unwrap(),
+            "first"
+        );
+        // The next discovery replaces both published files once the first lease ends.
+        for name in ["internals.json", "mod-catalog.json"] {
+            fs::write(shared.join(name), "second").unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(snapshot.join("mod-catalog.json")).unwrap(),
+            "first"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

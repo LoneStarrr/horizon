@@ -1,9 +1,7 @@
 //! Whole-aggregate block-state boundaries. No partial snapshot or draw is admitted.
 use super::{TryIntoApi, TryIntoEngine, block_state};
 use crate::game::{native_scene::SceneBlock, native_structures::TemplateSnapshot};
-use mod_api::{
-    BlockStateError, NativeSceneBlock, StructureTemplateBlock, StructureTemplateSnapshot,
-};
+use mod_api::{BlockStateError, StructureTemplateBlock, StructureTemplateSnapshot};
 
 impl TryIntoApi for TemplateSnapshot<'_> {
     type Api = StructureTemplateSnapshot;
@@ -27,7 +25,7 @@ impl TryIntoApi for TemplateSnapshot<'_> {
 
 /// Borrowed API input: conversion allocates one engine vector per scene draw, but
 /// never clones entity identifiers or saved fields, and never resolves names.
-pub(in crate::game) struct SourceScene<'a>(pub &'a [NativeSceneBlock]);
+pub(in crate::game) struct SourceScene<'a>(pub &'a [mod_api::SceneBlock]);
 impl<'a> TryIntoEngine<()> for SourceScene<'a> {
     type Engine = Vec<SceneBlock<'a>>;
     type Error = BlockStateError;
@@ -55,7 +53,7 @@ mod tests {
 
     #[test]
     fn aggregates_preserve_properties_reorder_and_refuse_whole_values() {
-        mod_api::__private::part_tests::install_parts_fixture(&[]).unwrap();
+        mod_platform::__private::part_tests::install_parts_fixture(&[]).unwrap();
         let facts = r#"{"defaults":{"minecraft:air":0,"minecraft:stairs":2},"states":[["a",true,false,"","minecraft:air"],["s",false,false,"",{"id":"minecraft:stairs","properties":{"facing":"north","waterlogged":"false"}}],["s",false,false,"",{"id":"minecraft:stairs","properties":{"facing":"east","waterlogged":"true"}}]]}"#;
         let registry = BlockRegistry::from_facts_json(facts.as_bytes()).unwrap();
         super::super::resolve_block_definitions(&registry).unwrap();
@@ -109,9 +107,9 @@ mod tests {
         let entity =
             SceneBlockEntity::new(Identifier::parse("test:scene").unwrap(), Default::default());
         let mut scene = vec![
-            NativeSceneBlock::new([0, 0, 0], north, None),
-            NativeSceneBlock::new([1, 0, 0], east, Some(entity)),
-            NativeSceneBlock::new([2, 0, 0], north, None),
+            mod_api::SceneBlock::new([0, 0, 0], north, None),
+            mod_api::SceneBlock::new([1, 0, 0], east, Some(entity)),
+            mod_api::SceneBlock::new([2, 0, 0], north, None),
         ];
         let original = scene.clone();
         let prepared = SourceScene(&scene).try_into_engine(&()).unwrap();

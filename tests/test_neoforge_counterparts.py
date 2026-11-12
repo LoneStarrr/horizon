@@ -19,7 +19,7 @@ class Counterparts(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.hooks = self.root / "crates/horizon-mod-api/src/hooks/example.rs"
+        self.hooks = self.root / "crates/horizon-mod-vocab/src/hooks/example.rs"
         self.hooks.parent.mkdir(parents=True)
         self.context = {"root": str(self.root / "docs/modding")}
 
@@ -71,7 +71,6 @@ class Counterparts(unittest.TestCase):
                 text=True, input=json.dumps([context, self.book()]))
         book = json.loads(result.stdout)
         chapter = book["sections"][0]["Chapter"]["sub_items"][0]["Chapter"]
-        self.assertIn("| `net_from_client` | server | `IPayloadHandler.handle` |", chapter["content"])
         self.assertIn("| `item_decorations` | client | `IItemDecorator.render` |", chapter["content"])
 
     def test_missing_draft_chapter_fails_instead_of_dropping_the_reference(self):

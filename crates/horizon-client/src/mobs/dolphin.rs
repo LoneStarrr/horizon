@@ -140,22 +140,23 @@ impl Goal for SwimWithPlayer {
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         // getNearestPlayer(forNonCombat().range(10).ignoreLineOfSight()).
         m.can_see_player_through_walls(cx.w, 10.0)
-            && cx.w.player.as_ref().is_some_and(|p| p.swimming)
+            && cx.w.selected_player().is_some_and(|p| p.swimming)
             && m.ai.target != Some(Who::Player)
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        cx.w.player
-            .as_ref()
+        cx.w.selected_player()
             .is_some_and(|p| p.swimming && m.distance_sqr(p.position) < 256.0)
     }
     fn start(&mut self, _: &mut Mob, cx: &mut Cx) {
-        cx.events.push(grace());
+        cx.events.push(cx.w.route_player_event(grace()));
     }
     fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
         m.nav_stop();
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        let Some(p) = cx.w.player.clone() else { return };
+        let Some(p) = cx.w.selected_player().cloned() else {
+            return;
+        };
         let (y, x) = (m.kind.max_head_y_rot + 20.0, m.kind.max_head_x_rot);
         m.look_at_speed(p.eye, y, x);
         if m.distance_sqr(p.position) < 6.25 {
@@ -169,7 +170,7 @@ impl Goal for SwimWithPlayer {
             );
         }
         if p.swimming && m.random.next_int_bound(6).unwrap_or(1) == 0 {
-            cx.events.push(grace());
+            cx.events.push(cx.w.route_player_event(grace()));
         }
     }
 }
@@ -292,7 +293,7 @@ impl FollowPlayerRidden {
     /// `Entity.hasMovedHorizontallyRecently` of the rider, and the player's
     /// own position (its yaw gives the directions).
     fn rider<'a>(&self, cx: &'a Cx) -> Option<&'a super::PlayerView> {
-        cx.w.player.as_ref().filter(|p| {
+        cx.w.selected_player().filter(|p| {
             p.vehicle
                 .as_ref()
                 .is_some_and(|v| v.nautilus == self.nautilus)

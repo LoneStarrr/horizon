@@ -52,9 +52,10 @@ fn kind() -> Arc<MobType> {
         brain: Brain::Passive,
         anim: Anim::Quadruped,
         sounds: [""; 3],
-        step_sound: None,
+        sound_overrides: Default::default(),
         food: Arc::default(),
         tempt: Arc::default(),
+        passenger_attachments: Vec::new(),
     })
 }
 

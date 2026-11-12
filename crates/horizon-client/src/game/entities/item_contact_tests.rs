@@ -47,11 +47,18 @@ impl Hooks for Probe {
 #[test]
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated mod registry"]
 fn the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entity() {
+    crate::game::in_own_process(
+        "game::item_contact_tests::the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entity",
+        the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entity_isolated,
+    );
+}
+
+fn the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entity_isolated() {
     use crate::game::native_entity_refs::tests::with_game;
     let prepare = |game: &mut Game<'_>| {
         game.options.dedicated = Some(Vec::new());
         game.native_lifecycle
-            .begin_open(mod_api::NativeAuthority::IntegratedServer);
+            .begin_open(mod_api::Authority::IntegratedServer);
         game.world = World::new(game.res.facts().air, 1);
         game.world
             .chunks
@@ -98,7 +105,7 @@ fn the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entit
     let probe = Probe::default();
     let mods: mod_api::Mods =
         vec![mod_api::ModEntry::new("contact", Box::new(probe.clone()))].into();
-    mod_api::testing::with_mods(mods.clone(), || {
+    mod_platform::testing::with_mods(mods.clone(), || {
         crate::game::api_values::install_parts(&mods).unwrap();
         with_game(|game| {
             prepare(game);

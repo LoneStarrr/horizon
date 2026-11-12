@@ -18,12 +18,13 @@ use horizon_core::random::RandomSource;
 use horizon_protocol::packets::play::{self, Clientbound as C};
 
 /// A guest's open workstation menu.
+#[derive(Clone)]
 pub(super) struct GuestStation {
     pub(super) window: i32,
     state: i32,
     pub(super) kind: StationKind,
     pub(super) pos: [i32; 3],
-    menu: Box<Menu>,
+    pub(super) menu: Box<Menu>,
     /// The data slots the client was last sent. `None` is not sent yet,
     /// which is not a cost: an anvil's signed cost may be `i32::MIN`.
     sent_data: Vec<Option<i32>>,
@@ -107,7 +108,7 @@ impl Game<'_> {
             menu.data = self.beacon_data(station.pos).to_vec();
         }
         if let Some(host) = self.lan.as_mut() {
-            host.play.entry(conn).or_default().station = Some(GuestStation {
+            *host.play.entry(conn).or_default().station = Some(GuestStation {
                 window,
                 state: 0,
                 kind: station.kind,
@@ -293,7 +294,7 @@ impl Game<'_> {
             }
         }
         if let Some(host) = self.lan.as_mut() {
-            host.play.entry(conn).or_default().station = Some(gs);
+            *host.play.entry(conn).or_default().station = Some(gs);
         }
         self.lan_send_station(conn);
         true
@@ -529,7 +530,7 @@ impl Game<'_> {
             {
                 for (row, original) in drawn.iter().enumerate() {
                     if let Some(original_level) = *original {
-                        let offer = mod_api::stations::EnchantmentRow {
+                        let offer = mod_api::item::stations::EnchantmentRow {
                             player: guest_uuid,
                             player_entity_id: guest_entity_id,
                             row: row as i32,
@@ -623,7 +624,7 @@ impl Game<'_> {
                 seed,
                 button,
                 gs.menu.data[button],
-                &item.item,
+                &item,
             )
         });
         // Player.onEnchantmentPerformed, and EnchantmentMenu's awardStat(ENCHANT_ITEM).
@@ -720,7 +721,7 @@ impl Game<'_> {
             let pos = menu.pos?;
             Some((
                 pos,
-                !g.spectator() && menu.slots.still_valid(&self.world, g, menu.pos),
+                !g.spectator() && menu.still_valid(&host.hub.loop_context, &self.world, g),
                 g.carried.clone(),
                 g.uuid,
                 g.entity_id,
@@ -734,7 +735,7 @@ impl Game<'_> {
                 // other half). Single player's own player is a guest of
                 // its own host too (`lan.rs:165`), so this one path covers
                 // both single player and a LAN guest.
-                let context = mod_api::menu::MenuButtonContext {
+                let context = mod_api::item::menu::MenuButtonContext {
                     player: uuid,
                     player_entity_id: entity_id,
                     pos: [pos.0, pos.1, pos.2],

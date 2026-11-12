@@ -1,4 +1,4 @@
-//! Takes out of text what could say who or where a player is, before the player shares it by hand (the repro export):
+//! Takes out of text what could say who or where a player is, before it is kept to be sent:
 //! the user folder's name in paths, the user name, e-mail and IP addresses, UUIDs (accounts),
 //! and the terms the caller knows are private (world names, server addresses, account names).
 

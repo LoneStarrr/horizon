@@ -29,6 +29,14 @@ impl Resources {
     pub(super) fn environment(&self) -> &Environment {
         &self.core.environment
     }
+    /// The environment of a dimension type id; a type with no table of its own gets the overworld's.
+    pub(super) fn environment_of(&self, dimension_type: &str) -> &Environment {
+        match dimension_type {
+            "minecraft:the_nether" => self.nether_environment(),
+            "minecraft:the_end" => self.end_environment(),
+            _ => self.environment(),
+        }
+    }
     pub(super) fn mob_types(&self) -> &HashMap<String, Arc<MobType>> {
         &self.rest().mob_types
     }
@@ -98,8 +106,28 @@ impl Resources {
     }
 }
 
+/// Everything the title and menus draw: the GUI atlas with its font, the
+/// title panorama and the splash pool. Kept apart from the world bundle so the
+/// title can appear before the block sprites, models and gameplay tables are ready.
+pub struct UiResources {
+    /// The GUI, font, particle, map and skin atlas.
+    pub atlas: HudAtlas,
+    /// The title screen's panorama faces.
+    pub panorama: Arc<horizon_client::gfx::panorama::Faces>,
+    /// The title screen's splashes (`horizon_client::splashes::pool`).
+    pub splashes: Arc<str>,
+}
+
+impl Game<'_> {
+    /// A title screen over the current resources and their splash pool.
+    pub(crate) fn new_title(&self, saves: PathBuf) -> Title {
+        Title::new(saves, &self.options.resources, &self.gui.splashes)
+    }
+}
+
 impl UiResources {
     /// The resolved resource generation, including the base layer and pack filters.
+    /// Its splash pool is empty until `with_splashes`.
     pub fn load(root: &horizon_assets::resource_source::ResourceSource) -> Result<Self> {
         // The title screen waits for both: the panorama's six faces decode
         // beside the atlas.
@@ -109,7 +137,7 @@ impl UiResources {
                     horizon_client::gfx::panorama::Faces::load(root, root)
                 })
             });
-            let mod_image = horizon_client::gfx::native_render::world_drawn_hooked();
+            let mod_image = horizon_client_render::render_slots::world_drawn_hooked();
             let atlas = startup::time("ui.atlas", || {
                 HudAtlas::build_over_with_image(root, root, mod_image)
             });
@@ -119,8 +147,19 @@ impl UiResources {
             Ok(Self {
                 atlas: atlas?,
                 panorama: Arc::new(panorama),
+                splashes: Arc::from(""),
             })
         })
+    }
+    /// The title's splash pool from `stack` (`horizon_client::splashes::pool`).
+    pub fn with_splashes(
+        mut self,
+        stack: &horizon_assets::resource_source::ResourceSource,
+        vanilla: &std::path::Path,
+        skip_if_modified: bool,
+    ) -> Self {
+        self.splashes = horizon_client::splashes::pool(stack, vanilla, skip_if_modified).into();
+        self
     }
     /// What a server's game holds, since it draws nothing: the font, which books
     /// and chat measure with, and a one-pixel panorama.
@@ -128,6 +167,7 @@ impl UiResources {
         Ok(Self {
             atlas: HudAtlas::fonts(root)?,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])),
+            splashes: Arc::from(""),
         })
     }
 }
@@ -146,13 +186,18 @@ impl PackResources {
     ) -> Result<Self> {
         let visibility = models::load_visibility(root.prepared(), assets.registry)?;
         api_values::resolve_block_definitions(assets.registry)?;
-        let tables = Arc::new(MeshTables::new(
-            &assets,
-            &render,
-            facts,
-            visibility,
-            api_values::mod_tint_values(assets.registry)?,
-        )?);
+        mods::extend_poi_types(assets.registry);
+        mods::register_cauldron_fluid_contents(assets.registry);
+        let tables = Arc::new(
+            MeshTables::new(
+                &assets,
+                &render,
+                facts,
+                visibility,
+                api_values::mod_tint_values(assets.registry)?,
+            )?
+            .with_polytone_colormaps(root.source(), assets.registry),
+        );
         let item_renderer = horizon_client::item_render::ItemRenderer::load_with_library(
             root,
             render.model_library.clone(),
@@ -198,37 +243,40 @@ impl PackResources {
         // These pack-local resources do not depend on one another. Decode the
         // images and language map together so a custom-sky pack cannot put all
         // of the pack assembly on the critical path behind its own files.
-        let (names, clouds, forcefield, custom_sky) = std::thread::scope(|scope| {
-            let names = named_scope(scope, "pack.names", || Names::load(root.source()));
-            let clouds = named_scope(scope, "pack.clouds", || load_clouds(root.source()));
-            let forcefield =
-                named_scope(scope, "pack.forcefield", || load_forcefield(root.source()));
-            let custom_sky = named_scope(scope, "pack.custom_sky", || {
-                horizon_client::custom_sky::CustomSky::load(root.source())
+        let (names, clouds, forcefield, custom_sky, environments, polytone_particles) =
+            std::thread::scope(|scope| {
+                let names = named_scope(scope, "pack.names", || Names::load(root.source()));
+                let clouds = named_scope(scope, "pack.clouds", || load_clouds(root.source()));
+                let forcefield =
+                    named_scope(scope, "pack.forcefield", || load_forcefield(root.source()));
+                let custom_sky = named_scope(scope, "pack.custom_sky", || {
+                    horizon_client::custom_sky::load(root.source())
+                });
+                let environments =
+                    named_scope(scope, "pack.environments", || pack_environments(root));
+                let particles = named_scope(scope, "pack.particles", || {
+                    pack_particles(root, assets.registry)
+                });
+                (
+                    names.join().unwrap(),
+                    clouds.join().unwrap(),
+                    forcefield.join().unwrap(),
+                    custom_sky.join().unwrap(),
+                    environments.join().unwrap(),
+                    particles.join().unwrap(),
+                )
             });
-            (
-                names
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                clouds
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                forcefield
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                custom_sky
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            )
-        });
+        let polytone_post = horizon_client::polytone_post::PolytonePost::read(
+            root.source(),
+            horizon_client::packs::polytone_configs(&horizon_client::packs::Source::Opened(
+                root.source().clone(),
+            )),
+        )
+        .map(Arc::new);
         Self {
-            layer_names: Arc::new(
-                render
-                    .sprite_layers
-                    .iter()
-                    .map(|(name, layer)| (*layer, name.trim_start_matches("minecraft:").to_owned()))
-                    .collect(),
-            ),
+            layer_names: Arc::new(horizon_client::block_sprites::texture_names(
+                &render.sprite_layers,
+            )),
             context: Arc::new(WorkerContext {
                 assets: assets.clone(),
                 render: render.clone(),
@@ -248,7 +296,60 @@ impl PackResources {
             names: Arc::new(names),
             clouds: Arc::new(clouds),
             forcefield: Arc::new(forcefield),
-            custom_sky: Arc::new(custom_sky),
+            custom_sky,
+            environments,
+            polytone_particles,
+            polytone_post,
+            polytone_colors: Arc::new(read_colors(root)),
         }
     }
+}
+
+/// The overworld's, Nether's and End's attribute stacks with the Polytone biome and dimension
+/// modifiers of the packs merged at `root` (#11486); `None` when no pack has any. The overlay
+/// root links the vanilla data the stacks start from.
+fn pack_environments(
+    root: &horizon_assets::resource_source::ResourceRoot,
+) -> Option<Arc<[Environment; 3]>> {
+    let modifiers = horizon_client::environment::PackModifiers::read(root.source());
+    if modifiers.is_empty() {
+        return None;
+    }
+    let modifiers = modifiers.with_configs(horizon_client::packs::polytone_configs(
+        &horizon_client::packs::Source::Opened(root.source().clone()),
+    ));
+    let load = |d: &str| Environment::load_dimension_with(root.data(), d, &modifiers);
+    match (load("overworld"), load("the_nether"), load("the_end")) {
+        (Ok(o), Ok(n), Ok(e)) => Some(Arc::new([o, n, e])),
+        (o, n, e) => {
+            for error in [o.err(), n.err(), e.err()].into_iter().flatten() {
+                log::warn!("pack environment: {error}");
+            }
+            None
+        }
+    }
+}
+
+/// The custom particles and block emitters of the packs merged at `root` (#11486); `None` when
+/// no pack has any.
+fn pack_particles(
+    root: &horizon_assets::resource_source::ResourceRoot,
+    blocks: &'static horizon_world::registry::BlockRegistry,
+) -> Option<Arc<horizon_client::particles::polytone::Registry>> {
+    let configs = horizon_client::packs::polytone_configs(&horizon_client::packs::Source::Opened(
+        root.source().clone(),
+    ));
+    let registry =
+        horizon_client::particles::polytone::Registry::read(root.source(), configs, blocks);
+    (!registry.is_empty()).then(|| Arc::new(registry))
+}
+
+/// The packs' custom colours; their dye and sheep colours go to the draw paths' table.
+fn read_colors(
+    root: &horizon_assets::resource_source::ResourceRoot,
+) -> horizon_client::pack_palette::PackColors {
+    let colors = horizon_client::pack_palette::read(root.source());
+    horizon_client::pack_palette::set(&colors);
+    horizon_client::brewing::set_pack_colors(colors.effects.clone());
+    colors
 }

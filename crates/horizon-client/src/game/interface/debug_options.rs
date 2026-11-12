@@ -536,7 +536,9 @@ fn debug_options_interrupts(screen: Screen, playing_overlay: bool) -> bool {
         | Screen::Dead
         | Screen::Win
         | Screen::DebugOptions
-        | Screen::HudEditor => false,
+        | Screen::HudEditor
+        | Screen::Studio
+        | Screen::EmoteWheel => false,
     }
 }
 
@@ -614,7 +616,9 @@ mod tests {
         }
     }
 
-    fn title_game() -> Game<'static> {
+    fn title_game<'a>(
+        resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>,
+    ) -> Game<'a> {
         use super::super::*;
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
@@ -636,7 +640,7 @@ mod tests {
         let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
         options.resources = root.clone();
         options.execution_role = execution_role::ExecutionRole::IntegratedServer;
-        let res: &'static _ = Box::leak(Box::new(loaded.resources));
+        let res = resources.insert(loaded.resources);
         let mut game = Game::new(
             res,
             loaded.pack,
@@ -649,7 +653,7 @@ mod tests {
             None,
         )
         .unwrap();
-        game.title = Some(Title::new(std::path::PathBuf::from("saves"), &root));
+        game.title = Some(game.new_title(std::path::PathBuf::from("saves")));
         game
     }
 
@@ -657,7 +661,8 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
     fn title_debug_overlay_draws_without_a_level() {
         use horizon_client::debug_keys::KeyAction;
-        let mut game = title_game();
+        let mut resources = None;
+        let mut game = title_game(&mut resources);
         assert!(game.player.is_none() && game.renderer.is_none() && game.integrated.is_none());
         game.debug_key(KeyCode::F3, KeyAction::Press);
         game.debug_key(KeyCode::F3, KeyAction::Release);
@@ -686,7 +691,8 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
     fn title_debug_options_open_draw_and_return_without_a_level() {
         use horizon_client::debug_keys::KeyAction;
-        let mut game = title_game();
+        let mut resources = None;
+        let mut game = title_game(&mut resources);
         let original_title = game.title.as_ref().unwrap().screen_key();
         assert!(!game.captured);
         game.debug_key(KeyCode::F3, KeyAction::Press);

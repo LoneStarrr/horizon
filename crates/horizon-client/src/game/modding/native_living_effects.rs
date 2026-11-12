@@ -13,11 +13,11 @@ use super::commands::Target;
 use horizon_client::effects::{EffectInstance, PlayerEffects};
 use horizon_client::mobs::Mob;
 use horizon_items::items::ItemStack;
-use mod_api::{EffectKey, LivingRef, NativeActiveEffect};
+use mod_api::{ActiveEffect, EffectKey, LivingRef};
 
 /// A player's effect as the API's load-owned key and instance data.
-pub(super) fn active_effect(e: &EffectInstance) -> NativeActiveEffect {
-    NativeActiveEffect::from(mod_api::__private::built::NativeActiveEffect {
+pub(super) fn active_effect(e: &EffectInstance) -> ActiveEffect {
+    ActiveEffect::from(mod_api::__private::built::ActiveEffect {
         id: mod_api::__private::effect_key_by_index(
             e.registry_index.expect("active effect registry index"),
         )
@@ -26,12 +26,13 @@ pub(super) fn active_effect(e: &EffectInstance) -> NativeActiveEffect {
         amplifier: e.amplifier,
         ambient: e.ambient,
         visible: e.visible,
+        show_icon: e.show_icon,
     })
 }
 
 /// A mob's stored effect as the API's: ambient and particle flags remain in their own lists.
-pub(super) fn mob_effect(m: &Mob, e: &horizon_client::mobs::StoredEffect) -> NativeActiveEffect {
-    NativeActiveEffect::from(mod_api::__private::built::NativeActiveEffect {
+pub(super) fn mob_effect(m: &Mob, e: &horizon_client::mobs::StoredEffect) -> ActiveEffect {
+    ActiveEffect::from(mod_api::__private::built::ActiveEffect {
         id: mod_api::__private::effect_key_by_index(
             e.registry_index.expect("active effect registry index"),
         )
@@ -40,6 +41,7 @@ pub(super) fn mob_effect(m: &Mob, e: &horizon_client::mobs::StoredEffect) -> Nat
         amplifier: e.amplifier,
         ambient: m.extra.ambient_effects.contains(&e.id),
         visible: !m.extra.hidden_effects.contains(&e.id),
+        show_icon: e.show_icon,
     })
 }
 
@@ -62,9 +64,9 @@ impl Game<'_> {
             .clone();
         match target {
             t @ (Target::Player | Target::Guest(_)) => self
-                .for_player(t, |g| g.apply_consume_effect(&effect, None, false))
+                .for_player(t, |g| g.apply_consume_effect(stack, &effect, None))
                 .flatten(),
-            Target::Mob(_) => self.apply_consume_effect(&effect, Some(living), false),
+            Target::Mob(_) => self.apply_consume_effect(stack, &effect, Some(living)),
             _ => None,
         }
     }
@@ -93,11 +95,7 @@ impl Game<'_> {
     /// ticks. False before effect resolution, for a duration below -1, an armor
     /// stand, the dragon, a stale handle or a client, or when the active
     /// instance did not change, as in vanilla's `addEffect`.
-    pub(super) fn living_add_effect(
-        &mut self,
-        living: LivingRef,
-        effect: &NativeActiveEffect,
-    ) -> bool {
+    pub(super) fn living_add_effect(&mut self, living: LivingRef, effect: &ActiveEffect) -> bool {
         let Some(def) = mod_api::__private::effect_index(effect.id)
             .and_then(horizon_client_core::potions::effect_by_index)
         else {
@@ -110,6 +108,7 @@ impl Game<'_> {
         let mut instance = EffectInstance::from_def(def, effect.duration, amplifier);
         instance.ambient = effect.ambient;
         instance.visible = effect.visible;
+        instance.show_icon = effect.show_icon;
         match self.native_living_target(living) {
             Some(t @ (Target::Player | Target::Guest(_))) => self
                 .for_player(t, |g| g.add_player_effect(instance))
@@ -151,7 +150,7 @@ impl Game<'_> {
         &self,
         living: LivingRef,
         effect: EffectKey,
-    ) -> Option<NativeActiveEffect> {
+    ) -> Option<ActiveEffect> {
         let def = mod_api::__private::effect_index(effect)
             .and_then(horizon_client_core::potions::effect_by_index)?;
         match self.native_living_read_target(living)? {
@@ -175,7 +174,7 @@ impl Game<'_> {
     /// The entity's active effects (`LivingEntity.getActiveEffects`), in the
     /// order their store keeps them, in `Some` even when it has none. None
     /// for an armor stand, the dragon, a stale handle or a client.
-    pub(super) fn living_effects(&self, living: LivingRef) -> Option<Vec<NativeActiveEffect>> {
+    pub(super) fn living_effects(&self, living: LivingRef) -> Option<Vec<ActiveEffect>> {
         match self.native_living_read_target(living)? {
             t @ (Target::Player | Target::Guest(_)) => self
                 .native_living_player_effects(t)
@@ -355,15 +354,16 @@ mod tests {
     use super::super::native_entity_refs::tests::with_game;
     use horizon_client::mobs::Mob;
     use horizon_core::geometry::Vec3;
-    use mod_api::{EntityRef, LivingRef, NativeActiveEffect, NativeWorldEpoch};
+    use mod_api::{ActiveEffect, EntityRef, LivingRef, WorldEpoch};
 
-    fn effect(id: &'static str, duration: i32, amplifier: i32) -> NativeActiveEffect {
-        NativeActiveEffect::from(mod_api::__private::built::NativeActiveEffect {
-            id: mod_api::__private::part_tests::effect_key(id),
+    fn effect(id: &'static str, duration: i32, amplifier: i32) -> ActiveEffect {
+        ActiveEffect::from(mod_api::__private::built::ActiveEffect {
+            id: mod_platform::__private::part_tests::effect_key(id),
             duration,
             amplifier,
             ambient: false,
             visible: true,
+            show_icon: true,
         })
     }
 
@@ -380,20 +380,47 @@ mod tests {
             game.mobs.push(Mob::new(21, kind, Vec3::ZERO, 0.0));
             let zombie = game.living(game.entity(21).unwrap()).unwrap();
             // The same load-owned slot is used for application, enumeration and diagnostics.
-            let speed = NativeActiveEffect::new(
-                mod_api::__private::part_tests::effect_key("minecraft:speed"),
+            let speed = ActiveEffect::new(
+                mod_platform::__private::part_tests::effect_key("minecraft:speed"),
                 200,
                 0,
                 false,
+                true,
                 true,
             );
             assert!(game.living_add_effect(zombie, &speed));
             let listed = game.living_effects(zombie).unwrap();
             assert_eq!(
                 listed[0].id,
-                mod_api::__private::part_tests::effect_key("speed")
+                mod_platform::__private::part_tests::effect_key("speed")
             );
             assert_eq!(listed[0].id.id(game), "minecraft:speed");
+        });
+    }
+
+    /// `MobEffectInstance.showIcon` crosses `add_effect` and the reads both ways, for a player and
+    /// a mob, apart from the particle flag; adding it again with the other value changes it.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn an_effects_icon_flag_is_written_and_read_for_players_and_mobs() {
+        use horizon_client::motion::PlayerMotion;
+        with_game(|game| {
+            let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
+            game.mobs.push(Mob::new(23, kind, Vec3::ZERO, 0.0));
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.player.as_mut().unwrap().entity_id = 20;
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
+            let key = mod_platform::__private::part_tests::effect_key("minecraft:speed");
+            for id in [23, 20] {
+                let living = game.living(game.entity(id).unwrap()).unwrap();
+                for show_icon in [false, true] {
+                    let given = ActiveEffect::new(key, 200, 0, false, true, show_icon);
+                    assert!(game.living_add_effect(living, &given), "{id} {show_icon}");
+                    let read = game.living_effect(living, key).unwrap();
+                    assert_eq!((read.show_icon, read.visible), (show_icon, true), "{id}");
+                    assert_eq!(game.living_effects(living).unwrap(), vec![read]);
+                }
+            }
         });
     }
 
@@ -404,7 +431,7 @@ mod tests {
             let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
             game.mobs.push(Mob::new(22, kind, Vec3::ZERO, 0.0));
             let cow = game.living(game.entity(22).unwrap()).unwrap();
-            let key = mod_api::__private::part_tests::effect_key("speed");
+            let key = mod_platform::__private::part_tests::effect_key("speed");
             assert!(game.living_add_effect(cow, &effect("speed", 2, 1)));
             assert!(!game.living_add_effect(cow, &effect("speed", 5, 0)));
             let mob = &game.mobs[0];
@@ -436,7 +463,7 @@ mod tests {
             assert_eq!(game.world.random.next_float(), level_random.next_float());
             assert!(game.living_potion_affected(
                 cow,
-                mod_api::__private::part_tests::effect_key("minecraft:poison")
+                mod_platform::__private::part_tests::effect_key("minecraft:poison")
             ));
             assert_eq!(
                 game.living_apply_consume_effect(cow, &item("minecraft:honey_bottle"), 0),
@@ -476,7 +503,7 @@ mod tests {
                 None
             );
             let stale = LivingRef::new(EntityRef::new(
-                NativeWorldEpoch::new(cow.entity().epoch().get() + 1),
+                WorldEpoch::new(cow.entity().epoch().get() + 1),
                 12,
             ));
             assert_eq!(
@@ -513,7 +540,7 @@ mod tests {
             assert_eq!(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:darkness"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:darkness"),
                     0.5
                 ),
                 Some(0.0)
@@ -527,18 +554,18 @@ mod tests {
                 .push(EffectInstance::new("darkness", 200, 0));
             game.sculk.darkness = (0.0, 0.0);
             // The same effect reads whole on the client: `getEffect`, `getActiveEffects`, `hasEffect`.
-            let darkness = mod_api::__private::part_tests::effect_key("minecraft:darkness");
+            let darkness = mod_platform::__private::part_tests::effect_key("minecraft:darkness");
             assert!(me.potion_affected(game, darkness));
             assert_eq!(me.effect(game, darkness).map(|e| e.duration), Some(200));
             assert_eq!(me.effects(game).map(|list| list.len()), Some(1));
             assert!(!me.potion_affected(
                 game,
-                mod_api::__private::part_tests::effect_key("minecraft:nausea")
+                mod_platform::__private::part_tests::effect_key("minecraft:nausea")
             ));
             assert_eq!(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("darkness"),
+                    mod_platform::__private::part_tests::effect_key("darkness"),
                     1.0
                 ),
                 Some(0.0)
@@ -548,7 +575,7 @@ mod tests {
             assert!(close(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:darkness"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:darkness"),
                     0.0
                 ),
                 1.0 / 22.0
@@ -556,7 +583,7 @@ mod tests {
             assert!(close(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:darkness"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:darkness"),
                     0.5
                 ),
                 1.5 / 22.0
@@ -571,7 +598,7 @@ mod tests {
             assert!(close(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:nausea"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:nausea"),
                     0.5
                 ),
                 0.5 / 150.0
@@ -585,7 +612,7 @@ mod tests {
             assert_eq!(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed"),
                     0.0
                 ),
                 Some(0.0)
@@ -594,7 +621,7 @@ mod tests {
             assert_eq!(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed"),
                     0.5
                 ),
                 Some(0.5)
@@ -605,7 +632,7 @@ mod tests {
             assert_eq!(
                 me.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:darkness"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:darkness"),
                     0.5
                 ),
                 Some(0.0)
@@ -618,16 +645,16 @@ mod tests {
             assert_eq!(
                 other.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed"),
                     0.5
                 ),
                 None
             );
-            let stale = LivingRef::new(EntityRef::new(NativeWorldEpoch::new(epoch.get() + 1), 7));
+            let stale = LivingRef::new(EntityRef::new(WorldEpoch::new(epoch.get() + 1), 7));
             assert_eq!(
                 stale.effect_blend_factor(
                     game,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed"),
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed"),
                     0.5
                 ),
                 None
@@ -655,10 +682,13 @@ mod tests {
             assert!(game.living_add_effect(zombie, &effect("minecraft:speed", 200, 0)));
             assert!(game.living_potion_affected(
                 zombie,
-                mod_api::__private::part_tests::effect_key("speed")
+                mod_platform::__private::part_tests::effect_key("speed")
             ));
             assert_eq!(
-                game.living_effect(zombie, mod_api::__private::part_tests::effect_key("speed")),
+                game.living_effect(
+                    zombie,
+                    mod_platform::__private::part_tests::effect_key("speed")
+                ),
                 Some(effect("minecraft:speed", 200, 0))
             );
             assert_eq!(
@@ -673,7 +703,7 @@ mod tests {
             assert_eq!(
                 game.living_effect(
                     zombie,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed")
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed")
                 ),
                 Some(effect("minecraft:speed", 200, 0))
             );
@@ -681,7 +711,7 @@ mod tests {
             assert_eq!(
                 game.living_effect(
                     zombie,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed")
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed")
                 ),
                 Some(effect("minecraft:speed", 90, 1))
             );
@@ -703,16 +733,16 @@ mod tests {
             game.mobs[0].absorption = 8.0;
             assert!(game.living_remove_effect(
                 zombie,
-                mod_api::__private::part_tests::effect_key("minecraft:absorption")
+                mod_platform::__private::part_tests::effect_key("minecraft:absorption")
             ));
             assert_eq!(game.mobs[0].absorption, 0.0);
             assert!(!game.living_remove_effect(
                 zombie,
-                mod_api::__private::part_tests::effect_key("minecraft:absorption")
+                mod_platform::__private::part_tests::effect_key("minecraft:absorption")
             ));
             assert!(game.living_potion_affected(
                 zombie,
-                mod_api::__private::part_tests::effect_key("minecraft:speed")
+                mod_platform::__private::part_tests::effect_key("minecraft:speed")
             ));
 
             // remove_all_effects takes the rest, and says when there was none.
@@ -720,30 +750,29 @@ mod tests {
             assert_eq!(game.living_effects(zombie), Some(Vec::new()));
             assert!(!game.living_potion_affected(
                 zombie,
-                mod_api::__private::part_tests::effect_key("minecraft:speed")
+                mod_platform::__private::part_tests::effect_key("minecraft:speed")
             ));
             assert!(!game.living_remove_all_effects(zombie));
 
             // A stale handle reads nothing and writes nothing.
-            let stale =
-                EntityRef::new(NativeWorldEpoch::new(zombie.entity().epoch().get() + 1), 12);
+            let stale = EntityRef::new(WorldEpoch::new(zombie.entity().epoch().get() + 1), 12);
             let stale = LivingRef::new(stale);
             assert!(!game.living_add_effect(stale, &effect("minecraft:speed", 100, 0)));
             assert_eq!(
                 game.living_effect(
                     stale,
-                    mod_api::__private::part_tests::effect_key("minecraft:speed")
+                    mod_platform::__private::part_tests::effect_key("minecraft:speed")
                 ),
                 None
             );
             assert_eq!(game.living_effects(stale), None);
             assert!(!game.living_potion_affected(
                 stale,
-                mod_api::__private::part_tests::effect_key("minecraft:speed")
+                mod_platform::__private::part_tests::effect_key("minecraft:speed")
             ));
             assert!(!game.living_remove_effect(
                 stale,
-                mod_api::__private::part_tests::effect_key("minecraft:speed")
+                mod_platform::__private::part_tests::effect_key("minecraft:speed")
             ));
             assert!(!game.living_remove_all_effects(stale));
         });

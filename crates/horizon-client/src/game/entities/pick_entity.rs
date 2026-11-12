@@ -3,7 +3,7 @@
 //! the server answers with `Entity.getPickResult`.
 use super::Game;
 use horizon_client::{items::ItemStack, save::uuid_text};
-use mod_api::{BlockPos, EntityRef, NativeCrosshairTarget};
+use mod_api::{BlockPos, CrosshairTarget, EntityRef};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CrosshairEntityHit {
@@ -30,6 +30,20 @@ fn nearest_entity(
 
 impl Game<'_> {
     fn crosshair_entity_hit(&self) -> Option<CrosshairEntityHit> {
+        if let Some(entity) = self.targeting().entity {
+            let (_, distance) = self.targeting_entity_hit(entity)?;
+            return Some(CrosshairEntityHit {
+                id: entity.id() as i32,
+                distance,
+                pickable: !matches!(
+                    self.native_client_entity_target(entity)?,
+                    crate::game::commands::Target::Projectile(_)
+                        | crate::game::commands::Target::DragonPart(_)
+                        | crate::game::commands::Target::Other(_)
+                ),
+                suggest_uuid: self.level_dragon_part(entity.id()).is_none(),
+            });
+        }
         let hit = |id: u32, distance, pickable| CrosshairEntityHit {
             id: id as i32,
             distance,
@@ -66,21 +80,26 @@ impl Game<'_> {
     /// game's targeting ray, reach and occlusion. None without a client world
     /// or on a miss. Entity hits carry this client level's epoch. Unlike
     /// view_hit, this never traces distant terrain.
-    pub(super) fn crosshair_target(&self) -> Option<NativeCrosshairTarget> {
+    pub(super) fn crosshair_target(&self) -> Option<CrosshairTarget> {
         use crate::game::api_values::TryIntoApi;
         if !self.native_window() || self.title.is_some() {
             return None;
         }
         self.player.as_ref()?;
+        if let Some(entity) = self.targeting().entity {
+            let (point, _) = self.targeting_entity_hit(entity)?;
+            return Some(CrosshairTarget::Entity { entity, point });
+        }
         if let Some(hit) = self.crosshair_entity_hit() {
             let (eye, direction) = self.aim()?;
-            return Some(NativeCrosshairTarget::Entity {
+            let point = std::array::from_fn(|axis| eye[axis] + direction[axis] * hit.distance);
+            return Some(CrosshairTarget::Entity {
                 entity: EntityRef::new(self.native_lifecycle.epoch()?, hit.id as u32),
-                point: std::array::from_fn(|axis| eye[axis] + direction[axis] * hit.distance),
+                point,
             });
         }
         let hit = self.pick()?;
-        Some(NativeCrosshairTarget::Block {
+        Some(CrosshairTarget::Block {
             pos: BlockPos::new(hit.pos[0], hit.pos[1], hit.pos[2]),
             state: self
                 .world

@@ -54,10 +54,10 @@ mod sidebar {
 
 #[test]
 fn client_packet_hands_a_mod_the_type_and_custom_payload() {
-    use mod_api::testing::FakeHost;
     use mod_api::{
         ClientPacket, ClientPacketEvent, ClientPayload, Identifier, dispatch_client_packet,
     };
+    use mod_platform::testing::FakeHost;
     use std::sync::Mutex;
     static HEARD: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
     // A plugin-channel listener using only the mod API's plain data.
@@ -74,7 +74,7 @@ fn client_packet_hands_a_mod_the_type_and_custom_payload() {
             }
         }
     }
-    mod_api::testing::with_mods(vec![ModEntry::new("channels", hooks())].into(), || {
+    mod_platform::testing::with_mods(vec![ModEntry::new("channels", hooks())].into(), || {
         dispatch_client_packet(
             &mut FakeHost::new(),
             &ClientPacket::new(Identifier::parse("minecraft:ping").unwrap(), None),
@@ -100,18 +100,18 @@ fn client_packet_hands_a_mod_the_type_and_custom_payload() {
 
 mod model_layers {
     use mod_api::{
-        CubeListBuilder, Hooks, LayerDefinition, LayerDefinitionsEvent, MeshDefinition, ModEntry,
-        PartPose, RegistrationContext,
+        CubeListBuilder, Hooks, LayerDefinition, MeshDefinition, ModEntry, PartPose,
+        RegisterLayerDefinitionsEvent, RegistrationContext,
     };
 
     struct Golem(&'static str);
     #[mod_api::__subscriptions]
     impl Hooks for Golem {
-        // ANCHOR: layer_definitions
-        fn layer_definitions(
+        // ANCHOR: register_layer_definitions
+        fn register_layer_definitions(
             &self,
             _context: &RegistrationContext,
-            event: &mut LayerDefinitionsEvent<'_>,
+            event: &mut RegisterLayerDefinitionsEvent<'_>,
         ) {
             let mut mesh = MeshDefinition::new();
             let root = mesh.root();
@@ -123,14 +123,14 @@ mod model_layers {
                 .layers
                 .push((self.0.into(), LayerDefinition::create(mesh, 64, 32)));
         }
-        // ANCHOR_END: layer_definitions
+        // ANCHOR_END: register_layer_definitions
     }
 
     #[test]
-    fn layer_definitions_collect_each_mods_layers_in_order() {
+    fn register_layer_definitions_collect_each_mods_layers_in_order() {
         // The harness supplies the engine-owned context; the listener above uses only public API.
         use mod_api::__private::game::RegistrationContextNew;
-        mod_api::testing::with_mods(
+        mod_platform::testing::with_mods(
             vec![
                 ModEntry::new("first", Box::new(Golem("first:golem#main"))),
                 ModEntry::new("second", Box::new(Golem("second:golem#main"))),
@@ -138,7 +138,10 @@ mod model_layers {
             .into(),
             || {
                 let mut layers = Vec::new();
-                mod_api::dispatch_layer_definitions(&RegistrationContext::new(), &mut layers);
+                mod_api::dispatch_register_layer_definitions(
+                    &RegistrationContext::new(),
+                    &mut layers,
+                );
                 let ids: Vec<_> = layers.iter().map(|(id, _)| id.as_str()).collect();
                 assert_eq!(ids, ["first:golem#main", "second:golem#main"]);
                 let model = layers[0].1.bake_root();
@@ -153,8 +156,8 @@ mod model_layers {
 /// stops later mods. The fork's existing typed event owns this moment.
 #[test]
 fn an_anvil_update_is_changed_in_turn_and_cancel_stops_later_mods() {
-    use mod_api::menu::AnvilUpdate;
-    use mod_api::stations::AnvilResult;
+    use mod_api::item::menu::AnvilUpdate;
+    use mod_api::item::stations::AnvilResult;
     use mod_api::{AnvilUpdateEvent, Flow, Host, HostSide, ItemStack, ServerHost};
     fn key(id: &str) -> mod_api::ItemKey {
         mod_api::__private::item_key(id).unwrap()
@@ -204,10 +207,10 @@ fn an_anvil_update_is_changed_in_turn_and_cancel_stops_later_mods() {
         ModEntry::new("discount", Box::new(Discount)),
     ]
     .into();
-    mod_api::testing::with_mods(mods, || {
-        mod_api::__private::install_parts(
+    mod_platform::testing::with_mods(mods, || {
+        mod_platform::__private::install_parts(
             &[],
-            &mod_api::__private::part_tests::rule_schema(),
+            &mod_platform::__private::part_tests::rule_schema(),
             |_| false,
         )
         .unwrap();
@@ -285,7 +288,7 @@ fn wind_burst_filter_preserves_order_and_context() {
         }
     }
     let mods: mod_api::Mods = vec![ModEntry::new("claims", Box::new(Claims))].into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         let mut blocks = vec![[3, 70, -2], [1, 70, -2], [2, 70, -2]];
         dispatch_wind_burst(
             &mut TestHost,

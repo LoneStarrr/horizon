@@ -1,4 +1,5 @@
 //! A key press while a world is open (`KeyboardHandler.keyPress` and the gameplay mappings).
+use super::inventory_input::drop_whole_stack;
 use super::*;
 
 impl Game<'_> {
@@ -9,41 +10,8 @@ impl Game<'_> {
     /// the container's hotbar keys are now (`checkHotbarKeyPressed`).
     pub(super) fn key_pressed(&mut self, key: KeyCode, raw: KeyCode) -> Result<()> {
         self.direct_craft_stop();
-        if self.screen == Screen::Playing && self.studio_replay.is_some() {
-            match key {
-                KeyCode::Escape => {
-                    self.close_studio_replay();
-                    return Ok(());
-                }
-                KeyCode::KeyP => {
-                    self.pause_focus = None;
-                    self.screen = Screen::Paused;
-                    self.pause_menu = true;
-                    self.capture(false);
-                }
-                KeyCode::KeyF => self.handle_studio_timeline_action(
-                    horizon_client::studio::TimelineAction::ToggleFreecam,
-                ),
-                KeyCode::KeyT => self.studio_timeline.visible = !self.studio_timeline.visible,
-                KeyCode::KeyM => self.add_studio_marker(),
-                KeyCode::Home => self.handle_studio_topbar_action(
-                    horizon_client::studio::TopBarAction::ResetCameraToPlayer,
-                ),
-                KeyCode::KeyL => {
-                    self.studio_freecam.locked_to_path = !self.studio_freecam.locked_to_path;
-                }
-                KeyCode::KeyK => self.handle_studio_timeline_action(
-                    horizon_client::studio::TimelineAction::AddCameraKeyframe,
-                ),
-                KeyCode::Delete => {
-                    if let Some(index) = self.studio_timeline.selected_keyframe {
-                        self.handle_studio_timeline_action(
-                            horizon_client::studio::TimelineAction::RemoveCameraKeyframe(index),
-                        );
-                    }
-                }
-                _ => {}
-            }
+        if self.screen == Screen::Playing && self.replay.playing() {
+            self.studio_key(key);
             return Ok(());
         }
         // `CreativeModeInventoryScreen.keyPressed` clears `ignoreTextInput` on
@@ -62,7 +30,6 @@ impl Game<'_> {
             return Ok(());
         }
         if self.sort_key_press(key)
-            || self.hdr_key_press(key)
             || horizon_client::keybinds::key_name(key)
                 .is_some_and(|name| self.hud_editor_key_press(name))
         {
@@ -76,9 +43,10 @@ impl Game<'_> {
         }
         match key {
             KeyCode::Escape => match self.screen {
+                Screen::EmoteWheel => self.close_emote_wheel(None),
                 Screen::Options => self.options_key(KeyCode::Escape, None)?,
                 Screen::Playing => {
-                    if self.studio_replay.is_some() && self.captured {
+                    if self.replay.playing() && self.captured {
                         self.capture(false);
                         return Ok(());
                     }
@@ -95,6 +63,11 @@ impl Game<'_> {
                     self.capture(true);
                 }
                 Screen::Paused | Screen::Inventory => {
+                    // RecipeBookComponent.keyPressed: a narrow window's open
+                    // book takes Escape to close itself, not the screen.
+                    if self.screen == Screen::Inventory && self.recipe_book_escape() {
+                        return Ok(());
+                    }
                     self.close_container();
                     self.pause_focus = None;
                     self.set_screen(Screen::Playing);
@@ -122,6 +95,7 @@ impl Game<'_> {
                 Screen::Win => self.close_win_screen()?,
                 Screen::DebugOptions => self.close_debug_options(),
                 Screen::Mod => self.close_mod_screen(),
+                Screen::Studio => self.close_studio_screen(),
                 Screen::HudEditor => self.close_hud_editor(),
             },
             // `checkHotbarKeyPressed`: the keys the controls bind to the off
@@ -167,6 +141,7 @@ impl Game<'_> {
             {
                 if let Some(tab) = self.creative_screen.search_tab() {
                     select_creative_tab(&mut self.creative_screen, &mut self.inv_clicks, tab);
+                    self.build_screen();
                     self.creative_ignore_text = true;
                 }
             }
@@ -177,12 +152,39 @@ impl Game<'_> {
                 // an active use in the same tick.
                 self.release_use_for_keybind_screen();
             }
-            // key.socialInteractions.
+            // key.socialInteractions (Gui.handleKeybinds): only on a server; in single player
+            // the action bar says so, and the narrator.
+            KeyCode::KeyP if self.screen == Screen::Playing && !self.is_multiplayer_server() => {
+                let message = horizon_client::text::Text::translate(
+                    "multiplayer.socialInteractions.not_available",
+                    &[],
+                );
+                self.titles.set_overlay(message.clone(), false);
+                self.say_system_now(&message);
+            }
             KeyCode::KeyP if self.screen == Screen::Playing => {
                 self.open_social(false);
                 self.release_use_for_keybind_screen();
             }
             KeyCode::KeyL if self.screen == Screen::Advancements => self.close_advancements(),
+            // key.emote (Horizon's): the emote wheel, a tap again closes it.
+            KeyCode::KeyB if self.screen == Screen::Playing && super::cosmetics::enabled() => {
+                self.open_emote_wheel();
+            }
+            KeyCode::KeyB if self.screen == Screen::EmoteWheel => self.close_emote_wheel(None),
+            KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+                if self.screen == Screen::EmoteWheel =>
+            {
+                let slot = (key as u32).wrapping_sub(KeyCode::Digit1 as u32) as usize;
+                self.close_emote_wheel(Some(slot));
+            }
             // key.quickActions: only open if a datapack provides dialog actions.
             KeyCode::KeyG if self.screen == Screen::Playing => {
                 if self.has_quick_actions() {
@@ -193,7 +195,7 @@ impl Game<'_> {
             // key.toggleGui is a KeyMapping: it clicks only with no screen open.
             KeyCode::F1 if self.screen == Screen::Playing => self.toggle_hide_gui(),
             KeyCode::F11 => self.toggle_fullscreen(),
-            KeyCode::F5 if self.screen == Screen::Playing && self.studio_replay.is_none() => {
+            KeyCode::F5 if self.screen == Screen::Playing && !self.replay.playing() => {
                 self.cycle_camera()
             }
             KeyCode::KeyE
@@ -259,8 +261,7 @@ impl Game<'_> {
             KeyCode::KeyQ if self.screen == Screen::Playing => {
                 // handleKeybinds: the number keys select before key.drop.
                 self.select_queued_hotbar();
-                let all =
-                    drop_whole_stack(self.modifiers) || std::mem::take(&mut self.pad.drop_stack);
+                let all = drop_whole_stack(self.modifiers) || self.input_takes_stack_drop();
                 self.drop_held(all);
             }
             KeyCode::Digit1

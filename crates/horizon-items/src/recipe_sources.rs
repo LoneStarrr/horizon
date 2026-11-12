@@ -23,16 +23,15 @@ pub fn qualified(id: &str) -> String {
 pub fn sources(root: &Path, overlay: &PackOverlay) -> Result<Vec<(String, Value)>> {
     // Vanilla's recipes by bare name, then content mods' as `<ns>:<name>`.
     let mut sources: Vec<(String, Vec<u8>)> = Vec::new();
-    // NeoForge's load conditions: `mod_loaded` asks which mods' data is
+    // Load conditions: `mod_loaded` asks which mods' data is
     // in this root (`minecraft`, always, and the content mods').
     // `mod_loaded` asks which mods are loaded, not which namespaces
     // they own: a mod that also owns a namespace doesn't make that
     // namespace another mod.
     let inventory = horizon_mod_package::enabled::EnabledMods::read(root)?;
-    let mods: Vec<&str> = inventory
-        .server_ids()
-        .chain(std::iter::once("minecraft"))
-        .collect();
+    let conditions = overlay
+        .conditions
+        .with_mod_inventory(inventory.server_ids());
     for file in &horizon_world::json_folder::read(&root.join("data/minecraft/recipe"))?.files {
         sources.push((file.name.clone(), file.bytes()?.to_vec()));
     }
@@ -74,9 +73,8 @@ pub fn sources(root: &Path, overlay: &PackOverlay) -> Result<Vec<(String, Value)
                 continue;
             }
         };
-        // A file whose load conditions don't hold is silently absent,
-        // as NeoForge's ICondition leaves it out of the manager.
-        if !horizon_world::conditions::conditions_hold(&v, &|id: &str| mods.contains(&id)) {
+        // A file whose load conditions don't hold is silently absent.
+        if !conditions.allows_id(&v, "recipe", &qualified(&name)) {
             continue;
         }
         // The data's recipe filters, over the final set.

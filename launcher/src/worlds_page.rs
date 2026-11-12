@@ -11,11 +11,13 @@ pub(super) struct Worlds {
     /// read again, so the page doesn't jump.
     pub(super) home: Option<PathBuf>,
     pub(super) list: Vec<World>,
+    /// Which of the list's rows Home's glass Worlds tab has built and measured (`cull`).
+    pub(super) cull: cull::Cull,
     fresh: bool,
     reading: bool,
     /// The world being backed up, copied or deleted now.
     pub(super) busy: Option<String>,
-    confirm_delete: Option<String>,
+    pub(super) confirm_delete: Option<String>,
     /// What the last action did (a backup's zip), or why it failed.
     pub(super) done: Option<Result<(String, Option<PathBuf>), String>>,
 }
@@ -73,6 +75,7 @@ impl Launcher {
                 // Another instance may have been picked meanwhile.
                 if this.worlds.home.as_ref() == Some(&home) {
                     this.worlds.list = list;
+                    this.worlds.cull.reset();
                     this.worlds.fresh = true;
                     this.worlds.reading = false;
                 }
@@ -219,7 +222,11 @@ impl Launcher {
         facts.push(megabytes(w.size));
         let act = |id: &str, label: &'static str, kind: Kind| {
             let b = button(SharedString::from(format!("{id}-{i}")), label, kind, &t);
-            if busy { disabled(b) } else { b }
+            if busy {
+                disabled(b)
+            } else {
+                b
+            }
         };
         let mut actions = div().flex().items_center().gap(px(6.));
         if confirming {

@@ -252,7 +252,16 @@ impl Goal for UseSpell {
                             && (s.position.x - p.x).abs() <= 16.0
                             && (s.position.y - p.y).abs() <= 4.0
                             && (s.position.z - p.z).abs() <= 16.0
-                            && s.position.distance_squared(p) <= 16.0 * 16.0
+                            && {
+                                // `TargetingConditions.forNonCombat().range(16)`:
+                                // visibility scales the range, with a floor of 2.
+                                let range = if s.has_effect("invisibility") {
+                                    2.0
+                                } else {
+                                    16.0
+                                };
+                                s.position.distance_squared(p) <= range * range
+                            }
                     })
                     .map(|s| s.id)
                     .collect();
@@ -530,9 +539,9 @@ impl Goal for CrossbowAttack {
                 .is_some_and(|t| t.alive && !(t.is_player && t.creative));
         valid && holding_crossbow(m)
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
         m.ai.aggressive = false;
-        m.ai.target = None;
+        m.set_ai_target(cx.w, None);
         self.see_time = 0;
         m.extra.flag = false;
         m.extra.using_item = 0;
@@ -591,7 +600,8 @@ impl Goal for CrossbowAttack {
                 }
             }
             Crossbow::Charging => {
-                m.extra.using_item += 1;
+                // A mod may have set the use's ticks left to anything.
+                m.extra.using_item = m.extra.using_item.saturating_add(1);
                 if m.extra.using_item >= charge_ticks(m) {
                     m.extra.using_item = 0;
                     m.extra.flag = false;
@@ -661,9 +671,20 @@ fn shoot_crossbow(m: &mut Mob, who: Who, cx: &mut Cx) {
         Some(Who::Mob(m.id)),
     );
     p.set_bonus(super::gear::arrow_bonus(m));
+    if let Some(state) = p.arrow.as_mut() {
+        state.fired_from_weapon = if m.extra.using_off_hand {
+            m.extra
+                .slot_stack(horizon_items::equipment::OFFHAND)
+                .cloned()
+        } else {
+            m.extra.main_hand_stack().cloned()
+        };
+        if state.fired_from_weapon.is_some() {
+            p.bonus.damage = 0.0;
+        }
+    }
     // rangedAttackUncertainty: 14 - 4 * difficulty.
-    p.shoot(
-        &mut crate::random_source::entity(),
+    p.shoot_own(
         [dx, dy, dz],
         1.6,
         (14 - i32::from(cx.w.difficulty.id) * 4) as f32,
@@ -1130,5 +1151,52 @@ mod tests {
         }
         let saved = crate::entity_nbt::mob_to_nbt(&loaded, [0; 4], Some(&silent), None, |_| None);
         assert_eq!(saved.get("Johnny"), None);
+    }
+    /// `EvokerWololoSpellGoal` finds blue sheep with
+    /// `TargetingConditions.forNonCombat().range(16)`: an invisible sheep at
+    /// five blocks is out of range, one at two blocks is not.
+    #[test]
+    fn an_invisible_blue_sheep_is_not_wololoed_from_five_blocks() {
+        use crate::mobs::world::with_test_world;
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, _| {
+            for invisible in [false, true] {
+                let mut world = w.clone();
+                world.mob_griefing = true;
+                let mut sheep_kind = (*kind()).clone();
+                sheep_kind.species = Species::Sheep;
+                let mut sheep = Mob::new(2, Arc::new(sheep_kind), Vec3::new(5.5, 64.0, 0.5), 0.0);
+                sheep.extra.color = 11;
+                if invisible {
+                    sheep.add_effect("minecraft:invisibility", 200, 0);
+                }
+                let seen = [sheep.seen(None)];
+                let world = crate::mobs::MobWorld {
+                    others: &seen,
+                    ..world
+                };
+                let mut m = evoker(0);
+                m.position = Vec3::new(0.5, 64.0, 0.5);
+                m.ai.goals.add(6, UseSpell::new(Spell::Wololo));
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("UseSpell"));
+                m.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a visible sheep is chosen at five; an invisible one is not"
+        );
     }
 }

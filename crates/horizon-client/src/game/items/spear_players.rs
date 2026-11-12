@@ -137,7 +137,10 @@ impl Game<'_> {
             .player
             .as_ref()
             .map(|p| [p.position.x, p.position.y, p.position.z])?;
-        let magic_boost = self.enchant_damage_bonus("minecraft:player");
+        let magic_boost = self.enchant_damage_bonus(
+            "minecraft:player",
+            Some(self.stab_players[target].entity_id as u32),
+        );
         let (base_damage, magic_boost) = if self.using.is_none() {
             let scale = self.attack_strength_scale();
             (
@@ -165,8 +168,8 @@ impl Game<'_> {
         let disable_blocking = if self.using.is_some() {
             0.0
         } else {
-            self.attack_item_info()
-                .map_or(0.0, |i| i.disable_blocking_seconds)
+            self.held()
+                .map_or(0.0, |stack| self.items().weapon_disable_blocking(stack))
         };
         Some(PlayerStab {
             victim,
@@ -245,9 +248,17 @@ impl Game<'_> {
                 // whether or not the hurt went through.
                 let (strength, xd, zd) = s.knockback;
                 if s.deals_knockback {
-                    g.knock_back_player(0.4, xd, zd, SPEAR_SOURCE, &attack);
+                    g.knock_back_player_full(0.4, xd, zd, SPEAR_SOURCE, &attack, s.amount, false);
                     if strength > 0.0 {
-                        g.knock_back_player(f64::from(strength), xd, zd, SPEAR_SOURCE, &attack);
+                        g.knock_back_player_full(
+                            f64::from(strength),
+                            xd,
+                            zd,
+                            SPEAR_SOURCE,
+                            &attack,
+                            s.amount,
+                            true,
+                        );
                     }
                 }
                 if hurt

@@ -209,6 +209,17 @@ impl Default for ResourceSource {
     }
 }
 
+/// `name` from the highest-priority source that supplies it, read when the
+/// whole resource fits `max` bytes. Sources are ordered lowest priority first,
+/// as vanilla's `MultiPackResourceManager` lists a pack stack: a later source
+/// overrides an earlier one. None when no source has the file, the winning
+/// source cannot read it, or it is larger than `max` (a lower source's copy is
+/// not substituted for an oversized winner).
+pub fn read_winning_resource(sources: &[&ResourceSource], name: &str, max: u64) -> Option<Vec<u8>> {
+    let winner = sources.iter().rev().find(|source| source.contains(name))?;
+    winner.read_limited(name, max).ok()
+}
+
 /// A resource name cannot escape its layer. ZIP names already have separators
 /// normalized by `Zip`; reject drive/stream names and NULs on every platform.
 /// Whether a relative resource name cannot escape its source root.
@@ -255,6 +266,12 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>, active: &mut BTreeSet<Pa
 }
 
 impl ResourceSource {
+    /// Observe whether any reader still owns this resource generation, without retaining it.
+    pub fn liveness(&self) -> impl Fn() -> bool + Send + Sync + use<> {
+        let weak = Arc::downgrade(&self.0);
+        move || weak.strong_count() != 0
+    }
+
     /// Whether both readers belong to the same opened resource generation.
     pub fn same_generation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -354,6 +371,23 @@ impl ResourceSource {
                 .read(),
         }
     }
+    /// The folder that supplies `name`, following an index to the layer its
+    /// winning file comes from. None for an archive, merged bytes, or no file.
+    pub fn folder_of(&self, name: &str) -> Option<PathBuf> {
+        if !stays_inside(name) {
+            return None;
+        }
+        match self.0.as_ref() {
+            Storage::Directory(root) => root.join(name).is_file().then(|| root.clone()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Storage::Archive(_) => None,
+            Storage::Prefix { source, prefix } => source.folder_of(&format!("{prefix}{name}")),
+            Storage::Index(files) => match &files.get(name)?.0 {
+                ResourceStorage::File { source, name } => source.folder_of(name),
+                ResourceStorage::Bytes(_) => None,
+            },
+        }
+    }
     /// Copy a resource under a shared output budget, streaming archive entries.
     pub fn copy_to(
         &self,
@@ -368,6 +402,7 @@ impl ResourceSource {
             ));
         }
         match self.0.as_ref() {
+            #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(archive) => archive.copy_to(name, out, budget).map(|_| ()),
             Storage::Prefix { source, prefix } => {
                 source.copy_to(&format!("{prefix}{name}"), out, budget)
@@ -872,6 +907,47 @@ mod tests {
             source
                 .list("assets/demo/sounds/")
                 .contains(&sound.to_owned())
+        );
+    }
+
+    #[test]
+    fn winning_resource_takes_the_last_layer_with_a_bounded_read() {
+        let base = ResourceSource::indexed(BTreeMap::from([
+            (
+                "data/demo/config.json".to_owned(),
+                Resource::bytes(b"base".to_vec()),
+            ),
+            (
+                "data/demo/only-base.json".to_owned(),
+                Resource::bytes(b"base-only".to_vec()),
+            ),
+        ]));
+        let pack = ResourceSource::indexed(BTreeMap::from([(
+            "data/demo/config.json".to_owned(),
+            Resource::bytes(b"pack".to_vec()),
+        )]));
+        let empty = ResourceSource::default();
+        let sources = [&base, &empty, &pack];
+        assert_eq!(
+            read_winning_resource(&sources, "data/demo/config.json", 64),
+            Some(b"pack".to_vec())
+        );
+        assert_eq!(
+            read_winning_resource(&sources, "data/demo/only-base.json", 64),
+            Some(b"base-only".to_vec())
+        );
+        assert_eq!(
+            read_winning_resource(&sources, "data/demo/missing.json", 64),
+            None
+        );
+        // The winning layer is too large: the lower layer's smaller copy is not used.
+        assert_eq!(
+            read_winning_resource(&sources, "data/demo/config.json", 3),
+            None
+        );
+        assert_eq!(
+            read_winning_resource(&sources, "../data/demo/config.json", 64),
+            None
         );
     }
 

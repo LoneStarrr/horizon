@@ -245,6 +245,22 @@ impl Limits {
     }
 }
 
+/// A compound entry that [`read_named_bounded`] reads under a budget of its own, without
+/// changing the limits of the rest of the file: the entry keyed `key` directly inside a
+/// compound reached from the root by one of the key paths in `parents`.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounded {
+    /// The key paths from the root to each compound that holds the entry, at most
+    /// [`MAX_BOUNDED_PARENTS`]. `&["a", "b"]` is the root's `a`, then its `b`.
+    pub parents: &'static [&'static [&'static str]],
+    /// The entry's key.
+    pub key: &'static str,
+    /// The most bytes its payload may take.
+    pub max_bytes: usize,
+    /// The most compound and list levels its payload may hold, itself included.
+    pub max_depth: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub offset: usize,
@@ -266,11 +282,32 @@ struct Reader<'a, 's> {
     offset: usize,
     limits: Limits,
     nodes: usize,
+    heap: Option<(u64, u64)>,
     /// Lists with this key in the root compound or in a compound directly
     /// under it are streamed to the visitor instead of kept.
     stream: Option<(&'s str, Visit<'s>)>,
+    /// Entries read under their own budget (see [`read_named_bounded`]).
+    bounded: Option<Bounded>,
+    /// Inside a bounded entry, where a repeated key is an error.
+    strict: bool,
+    /// The [`Bounded::parents`] paths (one bit each) that lead to the compound about to be
+    /// read, at its depth.
+    entering: u32,
+    /// Bounded entries left out.
+    rejected: usize,
 }
 impl<'a> Reader<'a, '_> {
+    // Vanilla 26.3 NbtAccounter.accountBytes; disabled for existing disk readers.
+    fn charge(&mut self, bytes: u64) -> Result<(), Error> {
+        if let Some((used, quota)) = self.heap {
+            let next = used
+                .checked_add(bytes)
+                .filter(|&n| n <= quota)
+                .ok_or_else(|| self.error("heap quota exceeded"))?;
+            self.heap = Some((next, quota));
+        }
+        Ok(())
+    }
     fn error(&self, reason: &'static str) -> Error {
         Error {
             offset: self.offset,
@@ -325,7 +362,7 @@ impl<'a> Reader<'a, '_> {
         let len = u16::from_be_bytes(self.number()?) as usize;
         Ok(modified_utf8(self.take(len)?).unwrap_or_default())
     }
-    fn payload(&mut self, id: u8, depth: usize) -> Result<Tag, Error> {
+    fn entry(&mut self, id: u8, depth: usize) -> Result<(), Error> {
         if self.nodes >= self.limits.max_nodes {
             return Err(self.error("node limit exceeded"));
         }
@@ -333,6 +370,41 @@ impl<'a> Reader<'a, '_> {
         if matches!(id, 9 | 10) && depth >= self.limits.max_depth {
             return Err(self.error("depth limit exceeded"));
         }
+        self.charge(match id {
+            0 => 8,
+            1 => 9,
+            2 => 10,
+            3 | 5 => 12,
+            4 | 6 => 16,
+            7 | 11 | 12 => 24,
+            8 | 9 => 36,
+            10 => 48,
+            _ => 0,
+        })?;
+        Ok(())
+    }
+    fn list_header(&mut self) -> Result<(u8, usize), Error> {
+        let element_id = self.byte()?;
+        let len = self.count(0)?;
+        if len > 0 && (element_id == 0 || element_id > 12) {
+            return Err(self.error("invalid list element type"));
+        }
+        if len > self.limits.max_nodes.saturating_sub(self.nodes) {
+            return Err(self.error("node limit exceeded"));
+        }
+        self.list_fits(element_id, len)?;
+        Ok((element_id, len))
+    }
+    fn payload(&mut self, id: u8, depth: usize) -> Result<Tag, Error> {
+        self.entry(id, depth)?;
+        match id {
+            9 => self.list_payload(depth),
+            10 => self.compound_payload(depth),
+            _ => self.scalar_payload(id),
+        }
+    }
+    // Scalar temporaries must not occupy every recursive container frame.
+    fn scalar_payload(&mut self, id: u8) -> Result<Tag, Error> {
         Ok(match id {
             0 => Tag::End,
             1 => Tag::Byte(self.byte()? as i8),
@@ -349,54 +421,18 @@ impl<'a> Reader<'a, '_> {
             }
             7 => {
                 let len = self.count(1)?;
+                self.charge(len as u64)?;
                 Tag::ByteArray(self.take(len)?.to_vec())
             }
-            8 => Tag::String(self.string()?),
-            9 => {
-                let element_id = self.byte()?;
-                let len = self.count(0)?;
-                if len > 0 && (element_id == 0 || element_id > 12) {
-                    return Err(self.error("invalid list element type"));
-                }
-                if len > self.limits.max_nodes.saturating_sub(self.nodes) {
-                    return Err(self.error("node limit exceeded"));
-                }
-                // At least one byte per valid non-End payload; do not allocate from an unchecked count.
-                if len > self.bytes.len().saturating_sub(self.offset) {
-                    return Err(self.error("truncated list"));
-                }
-                let mut values = Vec::with_capacity(len);
-                for _ in 0..len {
-                    let mut value = self.payload(element_id, depth + 1)?;
-                    if let Tag::Compound(map) = &mut value
-                        && map.len() == 1
-                        && map.contains_key(&JavaString::default())
-                    {
-                        value = map.remove(&JavaString::default()).unwrap();
-                    }
-                    values.push(value);
-                }
-                Tag::List(values)
+            8 => {
+                let value = self.string()?;
+                self.charge(2 * value.0.len() as u64)?;
+                Tag::String(value)
             }
-            10 => {
-                let mut map = Compound::new();
-                loop {
-                    let id = self.byte()?;
-                    if id == 0 {
-                        break;
-                    }
-                    let name = self.string()?;
-                    let value = if id == 9 && depth <= 1 && self.streams(&name) {
-                        self.stream_list(depth + 1)?
-                    } else {
-                        self.payload(id, depth + 1)?
-                    };
-                    map.insert(name, value); // Java maps retain the last duplicate key.
-                }
-                Tag::Compound(map)
-            }
+
             11 => {
                 let len = self.count(4)?;
+                self.charge(4 * len as u64)?;
                 let mut values = Vec::with_capacity(len);
                 for _ in 0..len {
                     values.push(i32::from_be_bytes(self.number()?));
@@ -405,6 +441,7 @@ impl<'a> Reader<'a, '_> {
             }
             12 => {
                 let len = self.count(8)?;
+                self.charge(8 * len as u64)?;
                 let mut values = Vec::with_capacity(len);
                 for _ in 0..len {
                     values.push(i64::from_be_bytes(self.number()?));
@@ -413,6 +450,167 @@ impl<'a> Reader<'a, '_> {
             }
             _ => return Err(self.error("unknown tag type")),
         })
+    }
+    fn list_payload(&mut self, depth: usize) -> Result<Tag, Error> {
+        let (element_id, len) = self.list_header()?;
+        self.charge(4 * len as u64)?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut value = self.payload(element_id, depth + 1)?;
+            if let Tag::Compound(map) = &mut value
+                && map.len() == 1
+                && map.contains_key(&JavaString::default())
+            {
+                value = map.remove(&JavaString::default()).unwrap();
+            }
+            values.push(value);
+        }
+        Ok(Tag::List(values))
+    }
+    fn compound_payload(&mut self, depth: usize) -> Result<Tag, Error> {
+        let paths = std::mem::take(&mut self.entering);
+        let parent = self.holds_bounded(paths, depth);
+        let mut map = Compound::new();
+        loop {
+            let id = self.byte()?;
+            if id == 0 {
+                break;
+            }
+            let name = self.string()?;
+            self.charge(28 + 2 * name.0.len() as u64)?;
+            if self.strict && map.contains_key(&name) {
+                return Err(self.error("duplicate key"));
+            }
+            let value = if id == 9 && depth <= 1 && self.streams(&name) {
+                self.stream_list(depth + 1)?
+            } else if parent && !self.strict && self.bounds(&name) {
+                match self.bounded_payload(id, depth + 1)? {
+                    Some(value) => value,
+                    None => continue,
+                }
+            } else {
+                self.entering = if id == 10 && !self.strict {
+                    self.descend(paths, depth, &name)
+                } else {
+                    0
+                };
+                self.payload(id, depth + 1)?
+            };
+            // Java maps retain the last duplicate key and charge new entries only.
+            if map.insert(name, value).is_none() {
+                self.charge(36)?;
+            }
+        }
+        Ok(Tag::Compound(map))
+    }
+    fn bounds(&self, name: &JavaString) -> bool {
+        self.bounded.is_some_and(|b| is_key(name, b.key))
+    }
+    /// The `paths` that end at the compound at `depth`, so its [`Bounded::key`] is bounded.
+    fn holds_bounded(&self, paths: u32, depth: usize) -> bool {
+        self.parent_paths(paths)
+            .any(|(_, path)| path.len() == depth)
+    }
+    /// The `paths` that lead on from the compound at `depth` through its child `name`.
+    fn descend(&self, paths: u32, depth: usize, name: &JavaString) -> u32 {
+        self.parent_paths(paths)
+            .filter(|(_, path)| path.get(depth).is_some_and(|key| is_key(name, key)))
+            .fold(0, |next, (i, _)| next | 1 << i)
+    }
+    /// The [`Bounded::parents`] paths whose bits are set in `paths`, with their indices.
+    fn parent_paths(&self, paths: u32) -> impl Iterator<Item = (usize, &'static [&'static str])> {
+        let parents = self.bounded.map_or(&[][..], |b| b.parents);
+        let parents = &parents[..parents.len().min(MAX_BOUNDED_PARENTS)];
+        (0..parents.len())
+            .filter(move |i| paths & (1 << i) != 0)
+            .map(move |i| (i, parents[i]))
+    }
+    /// Whether `len` elements of type `element_id` can fit in what is left of the input and of
+    /// the byte limit, each taking at least its type's smallest payload.
+    fn list_fits(&self, element_id: u8, len: usize) -> Result<(), Error> {
+        let least = match element_id {
+            1 | 10 => 1,
+            2 | 8 => 2,
+            3 | 5 | 7 | 11 | 12 => 4,
+            4 | 6 => 8,
+            9 => 5,
+            _ => 0,
+        };
+        let needs = len.saturating_mul(least);
+        if needs > self.bytes.len().saturating_sub(self.offset) {
+            return Err(self.error("truncated list"));
+        }
+        if needs > self.limits.max_bytes.saturating_sub(self.offset) {
+            return Err(self.error("byte limit exceeded"));
+        }
+        Ok(())
+    }
+    /// A bounded entry's payload, or `None` when it passes its budget or repeats a key: it is
+    /// then read past without being built, under the file's own limits, so input the plain
+    /// reader refuses is still refused.
+    fn bounded_payload(&mut self, id: u8, depth: usize) -> Result<Option<Tag>, Error> {
+        let bounded = self.bounded.expect("bounds() checked it");
+        let (start, nodes, outer) = (self.offset, self.nodes, self.limits);
+        self.limits.max_bytes = outer.max_bytes.min(start.saturating_add(bounded.max_bytes));
+        self.limits.max_depth = outer.max_depth.min(depth.saturating_add(bounded.max_depth));
+        self.strict = true;
+        let read = self.payload(id, depth);
+        (self.limits, self.strict) = (outer, false);
+        if let Ok(tag) = read {
+            return Ok(Some(tag));
+        }
+        (self.offset, self.nodes) = (start, nodes);
+        self.skip(id, depth)?;
+        self.rejected += 1;
+        Ok(None)
+    }
+    /// Reads past a payload without building it, with the checks [`Self::payload`] makes.
+    fn skip(&mut self, id: u8, depth: usize) -> Result<(), Error> {
+        if self.nodes >= self.limits.max_nodes {
+            return Err(self.error("node limit exceeded"));
+        }
+        self.nodes += 1;
+        if matches!(id, 9 | 10) && depth >= self.limits.max_depth {
+            return Err(self.error("depth limit exceeded"));
+        }
+        match id {
+            0 => {}
+            1 => drop(self.take(1)?),
+            2 => drop(self.take(2)?),
+            3 | 5 => drop(self.take(4)?),
+            4 | 6 => drop(self.take(8)?),
+            7 | 11 | 12 => {
+                let width = match id {
+                    7 => 1,
+                    11 => 4,
+                    _ => 8,
+                };
+                let len = self.count(width)?;
+                self.take(len * width)?;
+            }
+            8 => drop(self.string()?),
+            9 => {
+                let element_id = self.byte()?;
+                let len = self.count(0)?;
+                if len > 0 && (element_id == 0 || element_id > 12) {
+                    return Err(self.error("invalid list element type"));
+                }
+                self.list_fits(element_id, len)?;
+                for _ in 0..len {
+                    self.skip(element_id, depth + 1)?;
+                }
+            }
+            10 => loop {
+                let id = self.byte()?;
+                if id == 0 {
+                    break;
+                }
+                self.string()?;
+                self.skip(id, depth + 1)?;
+            },
+            _ => return Err(self.error("unknown tag type")),
+        }
+        Ok(())
     }
     fn streams(&self, name: &JavaString) -> bool {
         self.stream
@@ -493,6 +691,10 @@ impl ListElements<'_, '_, '_> {
     }
 }
 
+fn is_key(name: &JavaString, key: &str) -> bool {
+    name.0.iter().copied().eq(key.encode_utf16())
+}
+
 /// `DataInput.readUTF`'s decoding, accepting its overlong sequences; `None`
 /// for bytes that aren't modified UTF-8.
 fn modified_utf8(bytes: &[u8]) -> Option<JavaString> {
@@ -535,7 +737,12 @@ pub fn read_named(bytes: &[u8], limits: Limits) -> Result<(NamedTag, usize), Err
         offset: 0,
         limits,
         nodes: 0,
+        heap: None,
         stream: None,
+        bounded: None,
+        strict: false,
+        entering: 0,
+        rejected: 0,
     };
     let id = reader.byte()?;
     let name = if id == 0 {
@@ -545,6 +752,41 @@ pub fn read_named(bytes: &[u8], limits: Limits) -> Result<(NamedTag, usize), Err
     };
     let tag = reader.payload(id, 0)?;
     Ok((NamedTag { name, tag }, reader.offset))
+}
+
+/// [`read_named`], except that the entry keyed `bounded.key` in each of the compounds
+/// `bounded.parents` names is read under that budget and may repeat no key inside it. An
+/// entry that passes its budget or repeats a key is read past without being built and left
+/// out of its compound; the third value counts those. The rest of the file reads as
+/// [`read_named`] reads it.
+/// The most [`Bounded::parents`] paths; later ones are ignored.
+pub const MAX_BOUNDED_PARENTS: usize = 31;
+
+pub fn read_named_bounded(
+    bytes: &[u8],
+    limits: Limits,
+    bounded: Bounded,
+) -> Result<(NamedTag, usize, usize), Error> {
+    let mut reader = Reader {
+        bytes,
+        offset: 0,
+        limits,
+        nodes: 0,
+        heap: None,
+        stream: None,
+        bounded: Some(bounded),
+        strict: false,
+        entering: (1u32 << bounded.parents.len().min(MAX_BOUNDED_PARENTS)) - 1,
+        rejected: 0,
+    };
+    let id = reader.byte()?;
+    let name = if id == 0 {
+        JavaString::default()
+    } else {
+        reader.root_name()?
+    };
+    let tag = reader.payload(id, 0)?;
+    Ok((NamedTag { name, tag }, reader.offset, reader.rejected))
 }
 
 /// [`read_named`], except that lists keyed `key` in the root compound or in
@@ -563,7 +805,12 @@ pub fn read_named_streaming(
         offset: 0,
         limits,
         nodes: 0,
+        heap: None,
         stream: Some((key, visit)),
+        bounded: None,
+        strict: false,
+        entering: 0,
+        rejected: 0,
     };
     let id = reader.byte()?;
     let name = if id == 0 {
@@ -582,10 +829,24 @@ pub fn read_network(bytes: &[u8], limits: Limits) -> Result<(Tag, usize), Error>
         offset: 0,
         limits,
         nodes: 0,
+        heap: None,
         stream: None,
+        bounded: None,
+        strict: false,
+        entering: 0,
+        rejected: 0,
     };
+    read_network_with_reader(&mut reader)
+}
+
+fn read_network_with_reader(reader: &mut Reader<'_, '_>) -> Result<(Tag, usize), Error> {
     let id = reader.byte()?;
-    let tag = reader.payload(id, 0)?;
+    // NbtIo.readAnyTag returns End directly without loading its payload.
+    let tag = if id == 0 {
+        Tag::End
+    } else {
+        reader.payload(id, 0)?
+    };
     Ok((tag, reader.offset))
 }
 
@@ -1051,6 +1312,160 @@ impl TryFrom<Tag> for Compound {
     }
 }
 
+/// Vanilla 26.3 NbtAccounter.defaultQuota, used by ByteBufCodecs.TAG.
+pub const NETWORK_NBT_QUOTA: u64 = 2_097_152;
+
+impl Tag {
+    /// Encode a nameless network root. End (also vanilla's null marker) is `[0]`.
+    /// Uses the engine's network writer, preserving NaN bits; refuses depth over
+    /// 512 and strings whose modified UTF-8 exceeds 65535 bytes.
+    /// Vanilla applies heap quotas when reading, not writing.
+    pub fn to_network_bytes(&self) -> Result<Vec<u8>, Error> {
+        write_network(
+            self,
+            Limits {
+                max_bytes: usize::MAX,
+                max_nodes: usize::MAX,
+                max_depth: 512,
+            },
+        )
+    }
+
+    /// Decode one nameless network root and return its consumed byte count.
+    /// Trailing bytes remain unread. `None` uses vanilla's 2 MiB heap quota;
+    /// `Some(quota)` supplies a caller quota in NbtAccounter bytes, not encoded
+    /// bytes. Container nesting is limited to 512. End represents vanilla null.
+    /// Malformed input, quota exhaustion and excessive depth return an Error.
+    pub fn from_network_bytes(bytes: &[u8], quota: Option<u64>) -> Result<(Self, usize), Error> {
+        let mut reader = Reader {
+            bytes,
+            offset: 0,
+            limits: Limits {
+                max_bytes: usize::MAX,
+                max_nodes: usize::MAX,
+                max_depth: 512,
+            },
+            nodes: 0,
+            heap: Some((0, quota.unwrap_or(NETWORK_NBT_QUOTA))),
+            stream: None,
+            bounded: None,
+            strict: false,
+            entering: 0,
+            rejected: 0,
+        };
+        read_network_with_reader(&mut reader)
+    }
+}
+
+#[cfg(test)]
+#[path = "nbt_network_tests.rs"]
+mod network_tests;
+
+/// A read position in a file's bytes for readers that decode a known layout
+/// without building a `Tag` tree (structure templates). Each method runs what
+/// the tree reader runs for the tags it reads, so a streamed read accepts
+/// and rejects the same bytes as [`read_named`]; the caller walks the root
+/// compound key by key and reads each value's payload in file order.
+pub struct Cursor<'a> {
+    reader: Reader<'a, 'static>,
+}
+
+/// A compound key read by [`Cursor::next_key`]. ASCII names (every name a
+/// template uses) are compared as the file's bytes, so no key allocates;
+/// other names go through the decoded string, so an overlong-encoded name
+/// matches the keys [`read_named`] would match.
+pub struct Key<'a> {
+    bytes: &'a [u8],
+    decoded: Option<JavaString>,
+}
+impl Key<'_> {
+    pub fn is(&self, name: &str) -> bool {
+        match &self.decoded {
+            None => self.bytes == name.as_bytes(),
+            Some(key) => with_key(name, |wanted| key == wanted),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl<'a> Cursor<'a> {
+    /// The root of a file; `None` when it is not a compound (its payload is
+    /// still read and checked, as [`read_named`] does).
+    pub fn file(bytes: &'a [u8], limits: Limits) -> Result<Option<Self>, Error> {
+        let mut reader = Reader {
+            bytes,
+            offset: 0,
+            limits,
+            nodes: 0,
+            stream: None,
+            heap: None,
+            bounded: None,
+            strict: false,
+            entering: 0,
+            rejected: 0,
+        };
+        let id = reader.byte()?;
+        if id == 0 {
+            reader.payload(id, 0)?;
+            return Ok(None);
+        }
+        reader.root_name()?;
+        if id != 10 {
+            reader.payload(id, 0)?;
+            return Ok(None);
+        }
+        let mut cursor = Self { reader };
+        cursor.reader.entry(10, 0)?;
+        Ok(Some(cursor))
+    }
+    /// The next key of the open compound and its value's tag type, `None` at
+    /// the compound's end; the payload that follows is the caller's to read.
+    pub fn next_key(&mut self) -> Result<Option<(Key<'a>, u8)>, Error> {
+        let id = self.reader.byte()?;
+        if id == 0 {
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes(self.reader.number()?) as usize;
+        let bytes = self.reader.take(len)?;
+        let decoded = if bytes.is_ascii() {
+            None
+        } else {
+            Some(
+                modified_utf8(bytes)
+                    .ok_or_else(|| self.reader.error("invalid Java modified UTF-8"))?,
+            )
+        };
+        Ok(Some((Key { bytes, decoded }, id)))
+    }
+    /// A whole tag payload, using the tree reader.
+    pub fn tag(&mut self, id: u8, depth: usize) -> Result<Tag, Error> {
+        self.reader.payload(id, depth)
+    }
+    /// A list element, unwrapped as `ListTag.addAndUnwrap` unwraps
+    /// it: a compound with a single empty-named member is that member.
+    pub fn element(&mut self, id: u8, depth: usize) -> Result<Tag, Error> {
+        let mut value = self.reader.payload(id, depth)?;
+        if let Tag::Compound(map) = &mut value
+            && map.len() == 1
+            && map.contains_key(&JavaString::default())
+        {
+            value = map.remove(&JavaString::default()).unwrap();
+        }
+        Ok(value)
+    }
+    /// A compound tag's entry checks (the caller saw type 10), then its keys.
+    pub fn compound(&mut self, depth: usize) -> Result<(), Error> {
+        self.reader.entry(10, depth)
+    }
+    /// A list tag's entry and header (the caller saw type 9).
+    pub fn list(&mut self, depth: usize) -> Result<(u8, usize), Error> {
+        self.reader.entry(9, depth)?;
+        self.reader.list_header()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,5 +1824,90 @@ mod tests {
         assert_eq!(parse_snbt("1.5f").unwrap().0, Tag::Float(1.5f32.to_bits()));
         assert_eq!(parse_snbt("3b").unwrap().0, Tag::Byte(3));
         assert_eq!(parse_snbt("-2L").unwrap().0, Tag::Long(-2));
+    }
+
+    /// A bounded entry with a key twice or past its budget is left out unbuilt; the rest of
+    /// the file, the same key under another parent or a parent of the same name deeper down,
+    /// and the input read plainly are as before.
+    #[test]
+    fn a_bounded_entry_over_its_budget_or_with_a_repeated_key_is_left_out() {
+        let budget = Bounded {
+            parents: &[&["p"]],
+            key: "b",
+            max_bytes: 16,
+            max_depth: 1,
+        };
+        let key = |out: &mut Vec<u8>, id: u8, name: &str| {
+            out.push(id);
+            out.extend((name.len() as u16).to_be_bytes());
+            out.extend(name.as_bytes());
+        };
+        // {<parent>:{a:1b, b:<b>, c:3b}}
+        let file = |parent: &str, b: &dyn Fn(&mut Vec<u8>)| {
+            let mut out = vec![10, 0, 0];
+            key(&mut out, 10, parent);
+            key(&mut out, 1, "a");
+            out.push(1);
+            b(&mut out);
+            key(&mut out, 1, "c");
+            out.extend([3, 0, 0]);
+            out
+        };
+        let twice = |out: &mut Vec<u8>| {
+            key(out, 10, "b");
+            out.extend([1, 0, 1, b'x', 1, 1, 0, 1, b'x', 2, 0]);
+        };
+        let big = |out: &mut Vec<u8>| {
+            key(out, 7, "b");
+            out.extend(20i32.to_be_bytes());
+            out.extend([0; 20]);
+        };
+        // A list whose count the whole file could hold, but its budget cannot.
+        let long_list = |out: &mut Vec<u8>| {
+            key(out, 9, "b");
+            out.push(1);
+            out.extend(64i32.to_be_bytes());
+            out.extend([0; 64]);
+        };
+        for b in [&twice as &dyn Fn(&mut Vec<u8>), &big, &long_list] {
+            let raw = file("p", b);
+            let (named, used, rejected) =
+                read_named_bounded(&raw, Limits::default(), budget).unwrap();
+            assert_eq!((used, rejected), (raw.len(), 1));
+            let p = named.tag.get("p").unwrap();
+            assert_eq!(p.get("b"), None);
+            assert_eq!(
+                (p.get("a"), p.get("c")),
+                (Some(&Tag::Byte(1)), Some(&Tag::Byte(3)))
+            );
+            assert!(read_named_bounded(&raw[..raw.len() - 3], Limits::default(), budget).is_err());
+        }
+        let elsewhere = file("q", &twice);
+        let (named, _, rejected) =
+            read_named_bounded(&elsewhere, Limits::default(), budget).unwrap();
+        let (plain, _) = read_named(&elsewhere, Limits::default()).unwrap();
+        assert_eq!(
+            (named, rejected),
+            (plain.clone(), 0),
+            "another parent's `b` reads as before"
+        );
+        let x = plain
+            .tag
+            .get("q")
+            .and_then(|q| q.get("b"))
+            .and_then(|b| b.get("x"));
+        assert_eq!(x, Some(&Tag::Byte(2)), "Java keeps the last");
+        // {q:{p:{b:{x:1b, x:2b}}}}: a `p` below the root is not the path's `p`.
+        let mut nested = vec![10, 0, 0];
+        key(&mut nested, 10, "q");
+        nested.extend(&file("p", &twice)[3..]);
+        nested.push(0);
+        let (named, _, rejected) = read_named_bounded(&nested, Limits::default(), budget).unwrap();
+        let (plain, _) = read_named(&nested, Limits::default()).unwrap();
+        assert_eq!(
+            (named, rejected),
+            (plain, 0),
+            "only the root's `p` is bounded"
+        );
     }
 }

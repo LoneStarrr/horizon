@@ -5,14 +5,16 @@ impl Game<'_> {
     /// `MinecraftServer.onTickRateChanged`, before the autosave wait is adjusted: `/tick rate`
     /// set a rate or a `/tick sprint` ended.
     pub(in crate::game) fn native_server_tick_rate_changed(&mut self) {
-        self.fire_server_tick_rate_changed();
+        crate::game::level_control_hooks::LevelControl::TickRate
+            .hear(|| self.fire_server_tick_rate_changed());
     }
 }
 
 #[cfg(test)]
 mod server_tick_rate_changed_tests {
     use crate::game::native_guest_turn_tests::with_guests;
-    use mod_api::{Hooks, ModEntry, ServerHost, ServerTickRateChangedEvent, testing::with_mods};
+    use mod_api::{Hooks, ModEntry, ServerHost, ServerTickRateChangedEvent};
+    use mod_platform::testing::with_mods;
     use std::sync::{Arc, Mutex};
 
     /// A scheduling mod: logs the rate each notification reads, and runs `retune` on the first.

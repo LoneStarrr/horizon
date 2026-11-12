@@ -1,8 +1,7 @@
 //! A mod's own advancement criteria triggers (docs/modding/src/how-to/native-mods.md,
 //! "Advancement triggers"). An advancement of a content mod or a world's data
 //! pack names a trigger of the mod's (`mymod:pipe_connected`); the tree keeps
-//! it as it keeps vanilla's, and the mod fires it where its event happens, as
-//! a NeoForge mod calls its own `SimpleCriterionTrigger.trigger`.
+//! it as it keeps vanilla's, and the mod fires it where its event happens.
 use super::{Game, advancements::item_view};
 use horizon_client::advancements::{self as adv, EntityView};
 use mod_api::{
@@ -81,6 +80,54 @@ impl Game<'_> {
         // advancement trigger, not a second predicate or awarding path.
         self.for_player(target, |g| {
             g.trigger_mod_criteria(&trigger.to_string(), test.as_ref())
+        })
+        .ok_or(TriggerCriterionError::PlayerUnavailable)?
+    }
+
+    /// Fire only `default_block_use` for a use a mod handled.
+    pub(super) fn player_trigger_block_use(
+        &mut self,
+        player: PlayerRef,
+        pos: [i32; 3],
+    ) -> Result<(), TriggerCriterionError> {
+        self.with_block_use_player(player, pos, |g| {
+            g.trigger_default_block_use(pos);
+        })
+    }
+
+    /// Fire only `item_used_on_block` against the pre-use snapshot.
+    pub(super) fn player_trigger_item_used_on_block(
+        &mut self,
+        player: PlayerRef,
+        pos: [i32; 3],
+        original: &horizon_client::items::ItemStack,
+    ) -> Result<(), TriggerCriterionError> {
+        self.with_block_use_player(player, pos, |g| {
+            g.trigger_block("minecraft:item_used_on_block", pos, original);
+        })
+    }
+
+    /// Resolve the player as `player_trigger_criterion` does, refuse an unloaded chunk, then
+    /// fire in the player's own level, so predicates read where they are.
+    fn with_block_use_player(
+        &mut self,
+        player: PlayerRef,
+        pos: [i32; 3],
+        fire: impl FnOnce(&mut Self),
+    ) -> Result<(), TriggerCriterionError> {
+        if self.remote.is_some() {
+            return Err(TriggerCriterionError::NotServer);
+        }
+        let target = self
+            .player_handle_read(player)
+            .and_then(|_| self.native_entity_target(player.entity()))
+            .ok_or(TriggerCriterionError::PlayerUnavailable)?;
+        self.for_player(target, |g| {
+            if !g.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4)) {
+                return Err(TriggerCriterionError::UnloadedChunk);
+            }
+            fire(g);
+            Ok(())
         })
         .ok_or(TriggerCriterionError::PlayerUnavailable)?
     }
@@ -200,7 +247,7 @@ mod tests {
     fn a_mods_criterion_takes_its_own_test_and_the_player_predicate() {
         crate::game::api_values::install_parts(&[]).unwrap();
         mod_api::__private::resolve_items(["minecraft:stick"]).unwrap();
-        mod_api::__private::install(Default::default());
+        mod_platform::__private::install(Default::default());
         crate::game::api_values::install_parts(&[]).unwrap();
         mod_api::__private::resolve_items(["minecraft:copper_ingot", "minecraft:iron_ingot"])
             .unwrap();

@@ -220,7 +220,18 @@ impl AttributeWrite {
     /// `finalize`, which saves its bases and permanent modifiers.
     fn apply_to_mob(self, m: &mut Mob, a: Attr) -> bool {
         let taken = |m: &Mob, id: &str| {
-            finalize::has_modifier(m, a, id) || finalize::has_transient_modifier(m, a, id)
+            finalize::has_modifier(m, a, id)
+                || finalize::has_transient_modifier(m, a, id)
+                || (id == "minecraft:baby" && finalize::transient(m, a).is_some())
+        };
+        let remove = |m: &mut Mob, id: &str| {
+            if id == "minecraft:baby" && finalize::transient(m, a).is_some() {
+                m.extra
+                    .attributes
+                    .get_or_insert_with(Box::default)
+                    .baby_speed_removed = true;
+            }
+            finalize::remove_modifier(m, a, id);
         };
         match self {
             Self::Add {
@@ -233,7 +244,7 @@ impl AttributeWrite {
                     if !replace {
                         return false;
                     }
-                    finalize::remove_modifier(m, a, id);
+                    remove(m, id);
                 }
                 let op = match modifier.operation() {
                     Operation::AddValue => Op::AddValue,
@@ -250,7 +261,7 @@ impl AttributeWrite {
             Self::Remove(id) => {
                 let had = taken(m, &id);
                 if had {
-                    finalize::remove_modifier(m, a, &id);
+                    remove(m, &id);
                 }
                 had
             }
@@ -339,6 +350,31 @@ impl Game<'_> {
                 })
                 .flatten(),
             Target::Mob(mob) => {
+                if self.sulfur_archetype_attribute(t, name) {
+                    let done = self.write_generic_attribute(t, name, id, write.clone(), default)?;
+                    // The body's map owns the command value, while bodiless physics
+                    // reads the base and permanent modifiers from finalize's cache.
+                    if done && name == "minecraft:knockback_resistance" {
+                        let m = self.mobs.iter_mut().find(|m| m.id == mob && !m.removed)?;
+                        // Admission belongs to the body's map. Its archetype changes can
+                        // remove an ID without touching finalize's mirror, so an accepted
+                        // add replaces any stale copy there rather than being refused twice.
+                        let mirror = match write {
+                            AttributeWrite::Add {
+                                modifier,
+                                permanent,
+                                ..
+                            } => AttributeWrite::Add {
+                                modifier,
+                                permanent,
+                                replace: true,
+                            },
+                            other => other,
+                        };
+                        write_own_attribute(m, Attr::KnockbackResistance, mirror);
+                    }
+                    return Some(done);
+                }
                 let m = self.mobs.iter_mut().find(|m| m.id == mob && !m.removed)?;
                 if let Some(a) = own_attribute(m, name) {
                     return Some(write_own_attribute(m, a, write));
@@ -712,14 +748,15 @@ mod tests {
             assert_eq!(values(game), (8.0, 0.0));
             // A horse's body piece armors it by its stack's rows.
             let horse_kind = game.res.mob_types().get("minecraft:horse").unwrap().clone();
-            game.mobs.push(Mob::new(15, horse_kind, Vec3::ZERO, 0.0));
-            let horse = living(game, 15);
+            // The fixture dragon owns IDs 14 through 22, including its parts.
+            game.mobs.push(Mob::new(40, horse_kind, Vec3::ZERO, 0.0));
+            let horse = living(game, 40);
             assert!(game.living_set_equipment(
                 horse,
                 EquipmentSlot::Body,
                 stack("minecraft:diamond_horse_armor")
             ));
-            let armored = armor::values(game.mobs.iter().find(|m| m.id == 15).unwrap());
+            let armored = armor::values(game.mobs.iter().find(|m| m.id == 40).unwrap());
             assert!(
                 armored.0 >= 1.0,
                 "the body piece armors the horse: {armored:?}"
@@ -1124,19 +1161,21 @@ mod tests {
             assert_eq!(read(game, 14, health), (Some(200.0), Some(200.0)));
 
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
-            let player = living(game, 20);
+            // The dragon owns its multipart IDs above 14; keep the fixture
+            // player outside that range and reserve it against later spawns.
+            game.next_entity = game.next_entity.max(100);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 100, 123);
+            let player = living(game, 100);
             assert!(player.add_attribute_modifier(
                 game,
                 health,
                 modifier("test:hearty", 0.5, AddMultipliedBase),
                 Permanent
             ));
-            assert_eq!(read(game, 20, health), (Some(30.0), Some(20.0)));
+            assert_eq!(read(game, 100, health), (Some(30.0), Some(20.0)));
             let hearty = Identifier::parse("test:hearty").unwrap();
             assert!(player.remove_attribute_modifier(game, health, &hearty));
-            assert_eq!(read(game, 20, health), (Some(20.0), Some(20.0)));
+            assert_eq!(read(game, 100, health), (Some(20.0), Some(20.0)));
             // A stale handle writes nothing.
             let zombie = living(game, 12);
             game.mobs.clear();
@@ -1173,8 +1212,11 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn a_mods_item_modifiers_reach_the_wearer() {
+        // The game's stack snapshots, which the hook needs, as its startup installs them;
+        // without this the test passes only after another test in the process installed them.
+        crate::game::api_values::install_stack_hooks();
         let mods = vec![mod_api::ModEntry::new("plated", Box::new(Plated))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 spawn(game);
                 let chestplate = stack("minecraft:netherite_chestplate");

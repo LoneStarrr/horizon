@@ -1,30 +1,19 @@
-//! Parts (arismoko/horizon#41): code a mod attaches to one block, block entity, item or mod
-//! menu type at startup. The scoped hooks ask the parts attached to the thing they are about,
-//! after every mod's `Hooks` method. Parts attached by tag are resolved by each game against its
-//! own tags, at world open and on `/reload`, into a table kept by that game's thread; that table
-//! also indexes the block parts by state, so the state-keyed hooks look theirs up without the
-//! block's name.
-use crate::BlockEntityTypeDecl;
-use crate::ticket_controller::{self, ControllerInfo};
-use crate::{
-    BlockEntityPart, BlockPart, BlockSide, Capability, CapabilityKey, EntityCapabilityKey,
-    EntityPart, EntityRef, FluidPart, HOOK_COUNT, HookId, Host, ItemCapabilityKey, ItemPart,
-    ItemPlace, MenuPart, ModEntry, PlaceProvider, ServerHost, TicketController,
-};
+//! Owned authoring and validation; lookup storage stays below the engine.
+mod_vocab::__mod_parts_authoring_imports!();
+use mod_vocab::__private::game::RegistrationContextNew;
+use mod_vocab::__private::*;
 use std::{
-    any::{Any, type_name},
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    marker::PhantomData,
+    cell::RefCell,
+    collections::HashMap,
     rc::Rc,
-    sync::{
-        Arc, LazyLock, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
-
-include!(concat!(env!("OUT_DIR"), "/parts_modules.rs"));
-
+include!(concat!(env!("OUT_DIR"), "/parts_registration_modules.rs"));
 impl Registrar for PartRegistrar {}
 
-impl CapabilityProviders for InstalledProviders {}
+pub use shared::install_parts;
+
+#[cfg(test)]
+use mod_vocab::__private::game::PartsLookup;
+#[cfg(test)]
+use std::{any::type_name, collections::HashSet};

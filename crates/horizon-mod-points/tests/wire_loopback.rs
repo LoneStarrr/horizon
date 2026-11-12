@@ -1,8 +1,11 @@
-#![cfg(feature = "wasm-guest")]
+// Generated fixtures exercise every shape; TODO(#2273): make the generator emit clippy-clean code.
+#![allow(clippy::all, unused_comparisons, unreachable_patterns, dead_code)]
+// It calls the places' dispatch itself, so it needs a build whose table has sites.
+#![cfg(all(feature = "wasm-guest", feature = "listener-fixture"))]
 
 use mod_api::wire::{Reader, Record, Writer};
 use mod_points::{
-    __private::{Forward, PointHost, RawForward, SlotListener},
+    __private::{Forward, PointHost, SlotListener},
     PointId,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,10 +39,9 @@ impl Forward for Loopback {
     fn forward(&self, id: u32, host: PointHost<'_>, record: &mut dyn Record) {
         let mut input = Writer::new();
         input.put(&self.0);
-        input.put(&matches!(
-            host,
-            PointHost::Side(mod_api::HostSide::Server(_))
-        ));
+        if let PointHost::Side(side) = host {
+            input.put(&matches!(side, mod_api::HostSide::Server(_)));
+        }
         loopback(id, input, record);
     }
 }
@@ -57,12 +59,10 @@ fn loopback(id: u32, mut input: Writer, record: &mut dyn Record) {
     let reply = unsafe { std::slice::from_raw_parts(pointer, len as usize) };
     let mut reply = Reader::new(reply);
     reply.take::<()>().unwrap();
-    let bad_return = id == 0xC000_0000 + PointId::GameServerLinksListTopReturn as u32
-        && BAD_RAW_RETURN.swap(false, Ordering::Relaxed);
-    if REJECT_READONLY.swap(false, Ordering::Relaxed) {
-        assert!(record.apply(reply.rest()).is_err());
-    } else if id & 0xC000_0000 == 0xC000_0000
-        && (BAD_RAW.swap(false, Ordering::Relaxed) || bad_return)
+    let top = id == 0x8000_0000 + PointId::GameServerLinksListTop as u32;
+    let top_return = id == 0x8000_0000 + PointId::GameServerLinksListTopReturn as u32;
+    if (top && BAD_HEAD.swap(false, Ordering::Relaxed))
+        || (top_return && BAD_RETURN.swap(false, Ordering::Relaxed))
     {
         assert!(
             record
@@ -74,73 +74,40 @@ fn loopback(id: u32, mut input: Writer, record: &mut dyn Record) {
     }
 }
 
-impl RawForward for Loopback {
-    fn forward(&self, id: u32, record: &mut dyn Record) {
-        let mut input = Writer::new();
-        input.put(&self.0);
-        loopback(id, input, record);
-    }
-}
-
-static LOOPBACK_RAW: Loopback = Loopback(2);
-static LOOPBACK_RAW_RETURN: Loopback = Loopback(3);
-static RAW: AtomicUsize = AtomicUsize::new(0);
-static BAD_RAW: AtomicBool = AtomicBool::new(false);
-static BAD_RAW_RETURN: AtomicBool = AtomicBool::new(false);
-static RAW_RETURN: AtomicUsize = AtomicUsize::new(0);
-static FORGE_READONLY: AtomicBool = AtomicBool::new(false);
-static REJECT_READONLY: AtomicBool = AtomicBool::new(false);
+static BAD_HEAD: AtomicBool = AtomicBool::new(false);
+static BAD_RETURN: AtomicBool = AtomicBool::new(false);
+static TOP: AtomicUsize = AtomicUsize::new(0);
+static TOP_RETURN: AtomicUsize = AtomicUsize::new(0);
 static BODY: AtomicUsize = AtomicUsize::new(0);
-fn raw(snapshot: mod_points::snapshot::Snapshot<'_>, args: &mut mod_api::wire::RecordPatch) {
-    assert_eq!(
-        snapshot.read::<f32>(snapshot.field(0, 0).unwrap()).unwrap(),
-        3.0
-    );
-    assert_eq!(
-        snapshot.read::<u64>(snapshot.field(0, 1).unwrap()).unwrap(),
-        7
-    );
-    let control = snapshot.field(0, 2).unwrap();
-    assert_eq!(snapshot.read::<Option<f32>>(control).unwrap(), None);
-    args.set(snapshot.field(0, 0).unwrap(), &999.0f32).unwrap();
-    args.set(snapshot.field(0, 1).unwrap(), &999u64).unwrap();
-    let result = if RAW.fetch_add(1, Ordering::Relaxed) == 1 {
-        Some(42.5f32)
-    } else {
-        None
-    };
-    args.set(control, &result).unwrap();
-}
 
-fn raw_return(snapshot: mod_points::snapshot::Snapshot<'_>, args: &mut mod_api::wire::RecordPatch) {
-    let call = RAW_RETURN.fetch_add(1, Ordering::Relaxed);
-    let control = snapshot.field(0, 2).unwrap();
-    let value = snapshot.read::<f32>(control).unwrap();
-    assert_eq!(value, if call == 1 { 10.0 } else { 1998.0 });
-    if FORGE_READONLY.swap(false, Ordering::Relaxed) {
-        args.set(snapshot.field(0, 0).unwrap(), &555.0f32).unwrap();
-        REJECT_READONLY.store(true, Ordering::Relaxed);
+/// The same listener source a native mod registers: it changes both by-value inputs, and on its
+/// second call answers at once.
+fn top(args: &mut mod_points::GameServerLinksListTopArgs) {
+    assert_eq!((args.h, args.n, args.result), (3.0, 7, None));
+    args.h = 999.0;
+    args.n = 999;
+    if TOP.fetch_add(1, Ordering::Relaxed) == 1 {
+        args.result = Some(42.5);
     }
-    args.set(control, &(value + 1.0)).unwrap();
 }
 
-#[horizon_mod_api_macros::point(name = "game_server_links_list_top", raw, free)]
+fn top_return(args: &mut mod_points::GameServerLinksListTopArgs) {
+    let call = TOP_RETURN.fetch_add(1, Ordering::Relaxed);
+    let value = args.result.unwrap();
+    assert_eq!(value, if call == 1 { 10.0 } else { 1998.0 });
+    args.result = Some(value + 1.0);
+}
+
+#[horizon_mod_api_macros::point(slot = 0, name = "game_server_links_list_top", free)]
 fn fixture_list_top(h: f32, n: usize) -> f32 {
     BODY.fetch_add(1, Ordering::Relaxed);
     h + n as f32
 }
 
-pub struct __GameServerLinksListTopRaw<'r, H, N, R> {
-    pub h: &'r mut H,
-    pub n: &'r mut N,
-    pub result: &'r mut Option<R>,
-}
-pub type __GameServerLinksListTopListener =
-    for<'r> fn(&'r mut __GameServerLinksListTopRaw<'r, f32, usize, f32>);
-pub type __GameServerLinksListTopReturnListener = fn(&mut f32);
-
 static LOOPBACK_HEAD: Loopback = Loopback(0);
 static LOOPBACK_RETURN: Loopback = Loopback(1);
+static LOOPBACK_TOP: Loopback = Loopback(2);
+static LOOPBACK_TOP_RETURN: Loopback = Loopback(3);
 
 #[test]
 fn head_and_return_share_the_hook_arena_and_native_listener_list() {
@@ -160,43 +127,39 @@ fn head_and_return_share_the_hook_arena_and_native_listener_list() {
         (PointId::Tick, &LOOPBACK_HEAD),
         (PointId::TickReturn, &LOOPBACK_RETURN),
     ] {
-        mod_points::register(&SlotListener::forwarded(
+        mod_api::__private::points::register(&SlotListener::forwarded(
             "guest",
-            place,
+            place.place(),
             endpoint,
             0x8000_0000 + place as u32,
         ))
         .unwrap();
     }
-    mod_points::guest::register_raw(&mod_points::raw_listeners::game_server_links_list_top(
-        "raw", raw,
+    mod_points::guest::register(&mod_points::listeners::game_server_links_list_top(
+        "guest", 0, "top", top,
     ))
     .unwrap();
-    mod_points::register(
-        &SlotListener::snapshot(
+    mod_points::guest::register(&mod_points::listeners::game_server_links_list_top_return(
+        "guest",
+        0,
+        "top_return",
+        top_return,
+    ))
+    .unwrap();
+    for (place, endpoint) in [
+        (PointId::GameServerLinksListTop, &LOOPBACK_TOP),
+        (PointId::GameServerLinksListTopReturn, &LOOPBACK_TOP_RETURN),
+    ] {
+        mod_api::__private::points::register(&SlotListener::forwarded(
             "guest",
-            PointId::GameServerLinksListTop,
-            &LOOPBACK_RAW,
-            0xC000_0000 + PointId::GameServerLinksListTop as u32,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    mod_points::guest::register_raw(
-        &mod_points::raw_listeners::game_server_links_list_top_return("raw_return", raw_return),
-    )
-    .unwrap();
-    mod_points::register(
-        &SlotListener::snapshot(
-            "guest",
-            PointId::GameServerLinksListTopReturn,
-            &LOOPBACK_RAW_RETURN,
-            0xC000_0000 + PointId::GameServerLinksListTopReturn as u32,
-        )
-        .unwrap(),
-    )
-    .unwrap();
+            place.place(),
+            endpoint,
+            0x8000_0000 + place as u32,
+        ))
+        .unwrap();
+    }
     mod_points::__private::seal();
+    __pointa_fixture_list_top();
     let mut args = mod_points::TickArgs::__new();
     mod_points::dispatch::tick(mod_api::HostSide::Server(&mut Quiet), &mut args);
     assert!(args.cancel);
@@ -209,45 +172,37 @@ fn head_and_return_share_the_hook_arena_and_native_listener_list() {
     assert_eq!(
         fixture_list_top(3.0, 7),
         1999.0,
-        "raw head record writes replace by-value inputs; the raw return listener changes the outcome"
+        "head writes replace by-value inputs; the return listener changes the outcome"
     );
     assert_eq!(
         fixture_list_top(3.0, 7),
         42.5,
-        "declared outcome writes cancel the body"
+        "a head result skips the body"
     );
     assert_eq!(BODY.load(Ordering::Relaxed), 1);
-    assert_eq!(RAW.load(Ordering::Relaxed), 2);
-    BAD_RAW.store(true, Ordering::Relaxed);
+    assert_eq!(TOP.load(Ordering::Relaxed), 2);
+    BAD_HEAD.store(true, Ordering::Relaxed);
     assert_eq!(
         fixture_list_top(3.0, 7),
         11.0,
-        "a rejected raw head reply applies no writes; the valid return listener still adds one"
+        "a rejected head reply applies no writes; the valid return listener still adds one"
     );
     assert_eq!(BODY.load(Ordering::Relaxed), 2);
-    BAD_RAW_RETURN.store(true, Ordering::Relaxed);
+    BAD_RETURN.store(true, Ordering::Relaxed);
     assert_eq!(
         fixture_list_top(3.0, 7),
         1998.0,
-        "a rejected raw return reply does not replace the outcome"
+        "a rejected return reply does not replace the outcome"
     );
     assert_eq!(BODY.load(Ordering::Relaxed), 3);
-    assert_eq!(RAW_RETURN.load(Ordering::Relaxed), 3);
-    FORGE_READONLY.store(true, Ordering::Relaxed);
-    assert_eq!(
-        fixture_list_top(3.0, 7),
-        1998.0,
-        "one readonly argument edit rejects the entire sparse return patch"
-    );
-    assert_eq!(BODY.load(Ordering::Relaxed), 4);
-    assert_eq!(RAW_RETURN.load(Ordering::Relaxed), 4);
+    assert_eq!(TOP_RETURN.load(Ordering::Relaxed), 3);
     mod_points::stop("guest");
     mod_points::dispatch::tick(mod_api::HostSide::Server(&mut Quiet), &mut args);
     assert!(!args.cancel);
     assert_eq!(HEAD.load(Ordering::Relaxed), 1);
     assert_eq!(fixture_list_top(3.0, 7), 10.0);
-    assert_eq!(RAW.load(Ordering::Relaxed), 5);
-    assert_eq!(RAW_RETURN.load(Ordering::Relaxed), 4);
+    assert_eq!(TOP.load(Ordering::Relaxed), 4);
+    assert_eq!(TOP_RETURN.load(Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -262,4 +217,23 @@ fn malformed_writeback_is_atomic() {
     assert!(!args.cancel);
     args.apply(&[1]).unwrap();
     assert!(args.cancel);
+}
+
+static __REPLACE: [std::sync::atomic::AtomicPtr<()>; 2] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 2];
+fn __fnr_read_slot_0() -> Option<fn(f32, usize) -> f32> {
+    let pointer = crate::__REPLACE[0].load(std::sync::atomic::Ordering::Relaxed);
+    if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), fn(f32, usize) -> f32>(pointer) })
+    }
+}
+fn __fnr_read_body_0() -> Option<fn(f32, usize) -> f32> {
+    let pointer = crate::__REPLACE[1].load(std::sync::atomic::Ordering::Relaxed);
+    if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), fn(f32, usize) -> f32>(pointer) })
+    }
 }

@@ -7,6 +7,8 @@ Enable the `testing` feature on the mod's `horizon-mod-api` test dependency. The
 It restores the previous list even if the closure panics. The test allocation is retained because dispatch exposes
 a static slice. Call `dispatch_<hook>(&mut host, args…)` inside the closure to build the event as the game does.
 
+This page is for a mod's own tests. A test inside the engine's crates (`horizon-client` and the crates under it) reaches the same helpers through the engine's `mod_platform` dependency, which is the same `horizon-mod-api` crate with its `testing` feature: `mod_platform::testing::with_mods` and `mod_platform::testing::FakeHost`, not `mod_api::testing`.
+
 `testing::FakeHost` is a server and client host built from one small fake per service, so a test runs without
 the game: `registries` (item reports, items with slots of their own, the loaded mods), `players` (who is online,
 their inventories by slot, what was given to them and shown on their action bar), `level` (blocks, block entities
@@ -59,11 +61,16 @@ let into = host.level.block_entity_at([1, 64, 0]).unwrap().items.as_ref().unwrap
 assert_eq!(into.count("minecraft:stone"), 3);
 ```
 
+Sounds and game events a hook plays in the level are kept in `host.sounds` and `host.game_events`, in order and
+outside the journal, as the game sends them at once. Fluids a test uses are resolved with
+`host.registries.resolve_fluids([...])`, and `host.registries.fluid_sounds(fluid, fill, empty)` gives one the
+bucket sounds `fluid_pickup_sound` and `fluid_empty_sound` answer.
+
 A `Host` method no fake answers panics naming it, as every `Host` method defaults to, so an unexpected call
 fails loudly. A test can still write its own double for what the fakes don't model, implementing only what its
 hook calls; `testing::FakeJournal` gives such a host the same transaction journal over its own state.
 
 If a `Host` method returns a game value a test can't build, a double can return `None` instead, as with
 `Players::acting_player() -> Option<PlayerRef>`. If the dispatch function itself takes an unconstructible value,
-such as `dispatch_perform_command`'s `&NativeServerPlayer`, test the logic beneath the hook instead. The level
+such as `dispatch_perform_command`'s `&ServerPlayer`, test the logic beneath the hook instead. The level
 hosts are small enough to implement whole. NeoForge's GameTest is the in-game counterpart.

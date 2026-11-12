@@ -6,12 +6,11 @@
 //! the time left. Vanilla has no such commands: they reach operators' command trees (completions included)
 //! as a native mod's commands do (`moderation_commands`), and the game runs them itself.
 use super::{Game, chat_filter::Reply, dedicated, lan::LanHost};
-use horizon_chat_filter::{duration_text, now_millis, parse_duration};
 use horizon_client::text::Text;
 use horizon_protocol::packets::play::{self, Clientbound as C};
 use horizon_protocol::text::translatable;
+use horizon_server_files::duration::{duration_text, now_millis, parse_duration};
 use horizon_server_files::user_lists::{BanEntry, BanList, NameAndId, format_date};
-use mod_api::NativeCommand;
 
 /// The operator level `/tempban` needs, as `/ban`'s.
 const TEMPBAN_LEVEL: u8 = 3;
@@ -22,7 +21,7 @@ pub(super) const TEMPBAN_COMMANDS: [&str; 2] = ["tempban", "tempbanlist"];
 /// Horizon's moderation commands in operators' command trees (`command_tree`'s usages, for operators of
 /// `/ban`'s level): the mute commands when the server filters chat (`chat_filter`), `/tempban` and
 /// `/tempbanlist` on a dedicated server (`dedicated`), where the game runs them.
-pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<NativeCommand> {
+pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<mod_api::Command> {
     let mut usages = Vec::new();
     if chat_filter {
         usages.extend(super::chat_filter::MUTE_USAGES);
@@ -35,7 +34,7 @@ pub(super) fn moderation_commands(chat_filter: bool, dedicated: bool) -> Vec<Nat
     }
     usages
         .into_iter()
-        .map(|usage| NativeCommand::op(usage, TEMPBAN_LEVEL))
+        .map(|usage| mod_api::Command::op(usage, TEMPBAN_LEVEL))
         .collect()
 }
 
@@ -532,6 +531,7 @@ mod tests {
             let (tree, levels, problems) = super::super::native_server::command_tree(
                 &moderation_commands(chat_filter, dedicated),
                 |_| false,
+                &std::collections::HashMap::new(),
             );
             assert!(problems.is_empty(), "{problems:?}");
             for level in levels.values() {

@@ -671,11 +671,14 @@ impl Game<'_> {
                     return Err(err("argument.dimension.invalid", &[dim]));
                 }
                 let dimension = Dim::from_id(dim);
-                let scale = Dim::teleportation_scale(s.dimension, dimension);
+                let scale = horizon_world::dimension_type::DimensionFacts::teleportation_scale(
+                    self.dimension_type_of(s.dimension),
+                    self.dimension_type_of(dimension),
+                );
                 vec![Source {
                     pos: [s.pos[0] * scale, s.pos[1], s.pos[2] * scale],
                     dimension,
-                    level: Some(super::super::Dim::from_id(dim)),
+                    level: Some(dimension),
                     ..s
                 }]
             }
@@ -1396,6 +1399,14 @@ mod passenger_relation_tests {
                 ids.push(id);
             }
             for (child, parent) in [(2, 1), (3, 2), (5, 4), (7, 6), (8, 6)] {
+                if child == 8 {
+                    // Normal admission refuses the cow's second passenger; /ride forces it.
+                    assert!(!game.start_riding_target(
+                        Target::Mob(ids[child - 1]),
+                        Target::Mob(ids[parent - 1]),
+                        false,
+                    ));
+                }
                 assert!(game.run_command(&format!(
                     "ride {} mount {}",
                     actor(child),

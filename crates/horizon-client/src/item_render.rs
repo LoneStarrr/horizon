@@ -24,7 +24,7 @@ use crate::{
 use glam::{Mat3, Mat4, Vec3};
 use horizon_assets::{
     animation::AnimationMetadata,
-    item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model},
+    item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model, bake_sprite_layer},
     item_model::{
         ClientItem, Context, DisplayContext, FoilType, ItemEnv, ItemModels, LayerContent,
         LevelState, OwnerState, SpecialModel, StackView,
@@ -750,7 +750,7 @@ impl ItemRenderer {
         library: std::result::Result<Arc<ModelLibrary>, String>,
         item_data: &horizon_world::item_defaults::ItemData,
     ) -> crate::Result<Self> {
-        Self::load_tables(root, library, true, item_data)
+        Self::load_tables(root, library, true, item_data, None)
     }
     /// What a dedicated server reads: the item prototypes (the stacks'
     /// default components) and ids, without the client item definitions,
@@ -761,13 +761,22 @@ impl ItemRenderer {
         library: std::result::Result<Arc<ModelLibrary>, String>,
         item_data: &horizon_world::item_defaults::ItemData,
     ) -> crate::Result<Self> {
-        Self::load_tables(root, library, false, item_data)
+        Self::load_tables(root, library, false, item_data, None)
+    }
+    pub fn load_with_library_and_entity_models(
+        root: &horizon_assets::resource_source::ResourceRoot,
+        library: std::result::Result<Arc<ModelLibrary>, String>,
+        document: &crate::mobs::EntityModelDocument,
+        item_data: &horizon_world::item_defaults::ItemData,
+    ) -> crate::Result<Self> {
+        Self::load_tables(root, library, true, item_data, Some(document))
     }
     fn load_tables(
         root: &ResourceRoot,
         library: std::result::Result<Arc<ModelLibrary>, String>,
         drawn: bool,
         item_data: &horizon_world::item_defaults::ItemData,
+        entity_models: Option<&crate::mobs::EntityModelDocument>,
     ) -> crate::Result<Self> {
         let prototypes = Arc::clone(item_data.prototypes()?);
         let models = ItemModels {
@@ -792,7 +801,10 @@ impl ItemRenderer {
                 .unwrap_or_default(),
         );
         let parts = if drawn {
-            special::load_parts(root.prepared())
+            entity_models.map_or_else(
+                || special::load_parts(root.prepared()),
+                special::load_parts_from_document,
+            )
         } else {
             HashMap::new()
         };
@@ -839,12 +851,23 @@ impl ItemRenderer {
     }
     /// `ModelBakery` item baking, cached per model.
     pub fn bake(&self, model: &str) -> Arc<BakedItemModel> {
+        self.baked_with(model, || {
+            bake_item_model(&self.library, &self.sprites, model)
+        })
+    }
+    /// A layer baked from something other than a model id, such as an extruded sprite,
+    /// cached under `key` (which no model id can equal: identifiers hold no NUL).
+    fn baked_with(
+        &self,
+        key: &str,
+        bake: impl FnOnce() -> std::result::Result<BakedItemModel, horizon_assets::DecodeError>,
+    ) -> Arc<BakedItemModel> {
         if let Ok(cache) = self.baked.lock()
-            && let Some(hit) = cache.get(model)
+            && let Some(hit) = cache.get(key)
         {
             return hit.clone();
         }
-        let baked = bake_item_model(&self.library, &self.sprites, model)
+        let baked = bake()
             .or_else(|_| bake_item_model(&self.library, &self.sprites, MISSING_MODEL))
             .map(Arc::new)
             .unwrap_or_else(|_| {
@@ -859,7 +882,7 @@ impl ItemRenderer {
                 })
             });
         if let Ok(mut cache) = self.baked.lock() {
-            cache.insert(model.to_owned(), baked.clone());
+            cache.insert(key.to_owned(), baked.clone());
         }
         baked
     }
@@ -938,6 +961,19 @@ impl ItemRenderer {
                             });
                         (LayerGeometry::Quads(baked.clone()), baked, extents)
                     }
+                    LayerContent::Sprite { sprite, mask } => {
+                        let key = sprite_layer_key(&sprite, mask.as_deref());
+                        let baked = self.baked_with(&key, || {
+                            bake_sprite_layer(
+                                &self.library,
+                                &self.sprites,
+                                &sprite,
+                                mask.as_deref(),
+                            )
+                        });
+                        let extents = self.quad_extents(&key, &baked);
+                        (LayerGeometry::Quads(baked.clone()), baked, extents)
+                    }
                     LayerContent::Missing => {
                         let baked = self.bake(MISSING_MODEL);
                         let extents = self.quad_extents(MISSING_MODEL, &baked);
@@ -1007,6 +1043,10 @@ impl ItemRenderer {
     pub(crate) fn part(&self, key: &str) -> Option<&ModelPart> {
         self.parts.get(key)
     }
+}
+/// A cache key for an extruded sprite layer: `\0` keeps it out of model ids' space.
+fn sprite_layer_key(sprite: &str, mask: Option<&str>) -> String {
+    format!("\0{sprite}\0{}", mask.unwrap_or_default())
 }
 /// `CuboidItemModelWrapper.computeExtents`: the distinct quad corners.
 fn corners(baked: &BakedItemModel) -> Vec<Vec3> {
@@ -1241,6 +1281,39 @@ mod tests {
     use super::*;
     use horizon_world::native_load_context::DataLoadOrigin;
     use std::fs;
+
+    /// Item definitions are read again on every load: a node of a registered type keeps its
+    /// `models` as the packs now give them, and a definition with a type no mod registered isn't
+    /// loaded, so its item draws the missing model.
+    #[test]
+    fn a_registered_item_model_type_is_read_again_on_each_load() {
+        use horizon_assets::resource_source::Resource;
+        horizon_assets::item_model::register_item_models(vec!["loadtest:cell".into()]);
+        let source = |full: &str| {
+            let cell = format!(
+                r#"{{"model":{{"type":"loadtest:cell","models":{{"full":{{"type":"minecraft:model","model":"{full}"}}}}}}}}"#
+            );
+            ResourceSource::indexed(BTreeMap::from([
+                (
+                    "assets/loadtest/items/cell.json".to_owned(),
+                    Resource::bytes(cell.into_bytes()),
+                ),
+                (
+                    "assets/loadtest/items/other.json".to_owned(),
+                    Resource::bytes(br#"{"model":{"type":"loadtest:unregistered"}}"#.to_vec()),
+                ),
+            ]))
+        };
+        let models = |full: &str| {
+            let loaded = load_definitions(&source(full));
+            assert!(!loaded.contains_key("loadtest:other"));
+            let mut models = Vec::new();
+            loaded["loadtest:cell"].model.dependencies(&mut models);
+            models
+        };
+        assert_eq!(models("loadtest:item/a"), ["loadtest:item/a"]);
+        assert_eq!(models("loadtest:item/b"), ["loadtest:item/b"]);
+    }
 
     #[test]
     #[ignore = "requires HORIZON_TEST_RESOURCES with prepared vanilla tables"]

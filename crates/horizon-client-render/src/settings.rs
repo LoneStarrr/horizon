@@ -203,6 +203,9 @@ pub struct Settings {
     pub startup_api: crate::graphics::GraphicsApi,
     /// `Monitor.videoModes` of the window's monitor, for the Video page (set by the game).
     pub video_modes: Vec<crate::window::VideoMode>,
+    /// Fullbright is held off: this window plays on another's server (set by the game, not
+    /// saved). The graphics screen hides its row; `extras.fullbright` keeps the choice.
+    pub fullbright_held: bool,
     /// Controller settings (`horizon-controller.txt`, Horizon's own).
     pub controller: crate::gamepad::PadSettings,
     /// Horizon's optional extras (`horizon-extras.txt`), all off by default.
@@ -293,6 +296,7 @@ impl Default for Settings {
             horizon: Default::default(),
             startup_api: Default::default(),
             video_modes: Vec::new(),
+            fullbright_held: false,
             controller: Default::default(),
             extras: Default::default(),
             mods: Default::default(),
@@ -337,6 +341,13 @@ impl Settings {
             .and_then(|mode| self.video_modes.iter().position(|m| *m == mode))
             .map_or(-1, |i| i as i32)
     }
+    /// Loads only the crates' settings stores (`horizon_hooks::settings`) from the files next to
+    /// `path`, into the seat whose turn it is (`horizon_hooks::seat`): a splitscreen player whose
+    /// settings were made from P1's rather than loaded.
+    pub fn load_stores(path: &Path) {
+        let dir = path.parent();
+        horizon_hooks::settings::engine::load(&mut |file| fs::read_to_string(dir?.join(file)).ok());
+    }
     pub fn load(path: &Path) -> Self {
         let mut horizon = path
             .parent()
@@ -362,12 +373,19 @@ impl Settings {
             .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
             .unwrap_or_default();
         let mut extras = crate::extras::Extras::parse(&extras_text);
+        // The settings stores of the crates above the engine: their lines of this file, or of
+        // their own (docs/layers.md, "Platform registries").
+        horizon_hooks::settings::engine::load(&mut |file| match path.parent() {
+            _ if file == crate::extras::FILE => Some(extras_text.clone()),
+            Some(dir) => fs::read_to_string(dir.join(file)).ok(),
+            None => None,
+        });
         // The enabled mods are the game folder's, shared by its players (`--player-dir`).
         let mods = path
             .parent()
             .map(|dir| crate::mod_list::ModList::load(&crate::logging::shared_dir(dir)))
             .unwrap_or_default();
-        let settings = match fs::read(path) {
+        let mut settings = match fs::read(path) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 extras.read_old_options(&extras_text, &text);
@@ -387,6 +405,15 @@ impl Settings {
                 ..Self::default()
             },
         };
+        // Horizon's own key bindings live in horizon-extras.txt, not in options.txt.
+        let emote = settings.extras.emote_key.clone();
+        settings.keys.set("key.emote", &emote);
+        // The loaded set is the active one: `keybind` text components show its keys.
+        settings.keys.sync_action_bindings();
+        // `Options.load`: `sharePresence` decides what the friends service posts.
+        crate::social::set_share_presence(crate::social::SharePresence::of(
+            settings.file.int("sharePresence").clamp(0, 2) as u8,
+        ));
         settings.describe_for_crashes();
         // Options.load: the backend asked for at startup, what a restart is measured from.
         Self {
@@ -493,6 +520,7 @@ impl Settings {
             horizon: Default::default(),
             startup_api: Default::default(),
             video_modes: Vec::new(),
+            fullbright_held: false,
             controller: Default::default(),
             extras: Default::default(),
             mods: Default::default(),
@@ -656,14 +684,17 @@ impl Settings {
     pub fn with_option(&self, key: &str, value: &str) -> Result<Self, String> {
         let mut file = self.to_file();
         file.set_text(key, value)?;
-        Ok(Self {
+        let mut next = Self {
             horizon: self.horizon.clone(),
             controller: self.controller.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
             ..Self::from_file(file)
-        })
+        };
+        // Horizon's own bindings aren't in options.txt.
+        next.keys.set("key.emote", self.keys.get("key.emote"));
+        Ok(next)
     }
     /// The `options.txt` text (Options.save).
     pub fn serialize(&self) -> String {
@@ -677,7 +708,10 @@ impl Settings {
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
             self.controller.save(dir);
-            self.extras.save(dir);
+            let mut extras = self.extras.clone();
+            extras.emote_key = self.keys.get("key.emote").to_owned();
+            extras.save(dir);
+            horizon_hooks::settings::engine::save_own(dir, &[crate::extras::FILE]);
             self.mods.save(&crate::logging::shared_dir(dir));
         }
     }
@@ -746,6 +780,8 @@ pub enum Opt {
     InvertY,
     AllowCursorChanges,
     Volume(usize),
+    /// Setting `.1` of the native mod in row `.0` of Options > Mods, a range on a slider.
+    ModSetting(u16, u16),
     SoundDevice,
     GuiScale,
     ViewBobbing,
@@ -842,8 +878,14 @@ pub enum Opt {
     PadNintendoButtons,
     PadKeyboard,
     PadGameplayGuide,
+    /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
+    PadRadialMode,
+    /// The stick the radial menu selects with (`PadSettings::radial_stick`).
+    PadRadialStick,
     /// `options.modelPart.*`: one skin layer (index into `options_file::MODEL_PARTS`).
     ModelPart(usize),
+    /// A slider of a page a crate registered (`horizon_hooks::pages`): (page, row).
+    Page(usize, usize),
     /// 3D skin layers: the player's outer layer as extruded slabs.
     SkinLayers3d,
     MainHand,
@@ -971,6 +1013,119 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn options_txt_lists_only_vanillas_key_mappings() {
+        // Options.keyMappings has the friends key, then social interactions; Horizon's emote key
+        // (#10092 put it between them) is not in the file.
+        let out = Settings::default().serialize();
+        assert!(!out.contains("emote"), "{out}");
+        assert!(out.contains(
+            "\nkey_key.friends:key.keyboard.o\nkey_key.socialInteractions:key.keyboard.p\n"
+        ));
+        let mut s = Settings::default();
+        s.keys.set("key.emote", "key.keyboard.g");
+        assert!(!s.serialize().contains("emote"));
+    }
+
+    #[test]
+    fn the_emote_key_is_kept_in_the_extras_file() {
+        let dir = scratch("emote-key");
+        let options = dir.join("options.txt");
+        // Untouched: no extras file is made for it.
+        Settings::default().save(&options);
+        assert!(!dir.join(crate::extras::FILE).exists());
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.b"
+        );
+        // Rebound in Controls: saved to horizon-extras.txt, and options.txt stays vanilla's.
+        let mut s = Settings::load(&options);
+        s.keys.set("key.emote", "key.keyboard.g");
+        s.save(&options);
+        assert!(!fs::read_to_string(&options).unwrap().contains("emote"));
+        let extras = fs::read_to_string(dir.join(crate::extras::FILE)).unwrap();
+        assert!(
+            extras.lines().any(|l| l == "emoteKey:key.keyboard.g"),
+            "{extras}"
+        );
+        let back = Settings::load(&options);
+        assert_eq!(back.keys.get("key.emote"), "key.keyboard.g");
+        // horizon-ctl options-set rebuilds from options.txt text and keeps it.
+        assert_eq!(
+            back.with_option("fov", "90").unwrap().keys.get("key.emote"),
+            "key.keyboard.g"
+        );
+        // Reset to B and back to the default: the file says so.
+        let mut s = back;
+        s.keys.set(
+            "key.emote",
+            crate::keybinds::KeyBinds::default_of("key.emote"),
+        );
+        s.save(&options);
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.b"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_emote_key_moves_from_options_txt_to_the_extras_file() {
+        // #10092 wrote `key_key.emote` into options.txt; a rebound key is kept, the next
+        // options.txt is vanilla's again.
+        let dir = scratch("emote-key-move");
+        let options = dir.join("options.txt");
+        fs::write(
+            &options,
+            "version:4000\nfov:0.5\nkey_key.emote:key.keyboard.h\nkey_key.jump:key.keyboard.j\n",
+        )
+        .unwrap();
+        let s = Settings::load(&options);
+        assert_eq!(s.keys.get("key.emote"), "key.keyboard.h");
+        assert_eq!(s.keys.get("key.jump"), "key.keyboard.j");
+        s.save(&options);
+        assert!(!fs::read_to_string(&options).unwrap().contains("emote"));
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.h"
+        );
+        // Once horizon-extras.txt has its own line, a stale options.txt one is ignored.
+        fs::write(dir.join(crate::extras::FILE), "emoteKey:key.keyboard.k\n").unwrap();
+        fs::write(&options, "version:4000\nkey_key.emote:key.keyboard.h\n").unwrap();
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.k"
+        );
+        // A value that is no key is not adopted; an unbound emote key is.
+        fs::remove_file(dir.join(crate::extras::FILE)).unwrap();
+        fs::write(&options, "version:4000\nkey_key.emote:banana\n").unwrap();
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.b"
+        );
+        fs::write(
+            &options,
+            "version:4000\nkey_key.emote:key.keyboard.unknown\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(&options).keys.get("key.emote"),
+            "key.keyboard.unknown"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_option_set_keeps_horizon_files() {
         let mut s = Settings::parse("fov:70\n");

@@ -1,9 +1,7 @@
 //! `crop_grow_pre` and `crop_grow_post` reach mods from the server's random ticks.
 use crate::game::LevelDimension;
 use horizon_core::position::BlockPos;
-use mod_api::{
-    CropGrowPostEvent, CropGrowPreEvent, Hooks, LevelRandomHost, NativeTriState, Registrar,
-};
+use mod_api::{CropGrowPostEvent, CropGrowPreEvent, Hooks, LevelRandomHost, Registrar, TriState};
 use std::sync::Mutex;
 
 static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -20,7 +18,7 @@ impl Hooks for Gardener {
             .unwrap()
             .push(format!("pre {:?} {x} {y} {z}", event.dimension));
         if x == 0 {
-            *event.result = NativeTriState::False;
+            *event.result = TriState::False;
         }
     }
     fn crop_grow_post(&self, _: &mut dyn LevelRandomHost, event: &mut CropGrowPostEvent) {
@@ -37,7 +35,7 @@ impl Hooks for Gardener {
 #[ignore = "needs prepared resources and an isolated process for native mods"]
 fn a_mod_stops_one_cane_and_hears_the_other_grow() {
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("gardener", Box::new(Gardener))].into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         super::native_guest_turn_tests::with_guests(|game| {
             game.options.dedicated = Some(Vec::new());
             game.world.chunks.insert(

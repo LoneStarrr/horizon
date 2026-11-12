@@ -9,7 +9,7 @@
 
 use super::commands::Target;
 use super::persist::ChunkKey;
-use super::{FallingBlock, Game};
+use super::{FallingBlock, Game, general::GeneralRow};
 use super::{
     boats::Boat, fireworks::Rocket, minecarts::Minecart, tnt::PrimedTnt, trident::ThrownTrident,
 };
@@ -20,7 +20,7 @@ use horizon_client::entity_rules::EntityRules;
 use horizon_client::join_seq::JoinSeq;
 use horizon_client::join_seq::Joined as _;
 use horizon_client::mobs::{Mob, Species};
-use horizon_client::projectiles::Projectile;
+use horizon_client::projectiles::{Projectile, ProjectileKind};
 use horizon_core::geometry::{Aabb, Direction, Vec3};
 use horizon_core::nbt::Tag;
 use horizon_core::position::BlockPos;
@@ -68,6 +68,10 @@ pub(super) struct Blast {
 }
 
 pub(super) trait Entity: EntityRules {
+    /// The kind's serializer overlays its object-owned attachments itself (for
+    /// recursive object trees); the common save walk must not encode them twice.
+    const SERIALIZES_ATTACHMENTS: bool = false;
+
     /// `Entity.getId`.
     fn id(&self) -> u32;
     fn position(&self) -> Vec3;
@@ -110,6 +114,7 @@ pub(super) trait Entity: EntityRules {
         uuid: Option<[i32; 4]>,
         player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag>;
 
     fn on_ground(&self) -> bool {
@@ -266,6 +271,11 @@ pub(super) trait Entity: EntityRules {
     fn portal_size(&self) -> Option<(f32, f32)> {
         None
     }
+    /// Whether [`Self::portal_size`] is Some, without working the size out (a
+    /// mob's depends on its age, scale and pose).
+    fn sweeps_portals(&self) -> bool {
+        self.portal_size().is_some()
+    }
     /// `Entity.canUsePortal(false)` for a kind in `portal_size`. A kind that
     /// cannot stays tracked, so its cooldown and process run out.
     fn can_use_portal(&self, _game: &Game<'_>) -> bool {
@@ -274,6 +284,10 @@ pub(super) trait Entity: EntityRules {
     /// A boat or minecart: the kinds whose portal pass opens the tick, before
     /// they move (`AbstractMinecart.tick` handles its portal first).
     fn is_vehicle(&self) -> bool {
+        false
+    }
+    /// Whether movement applies portal block effects before Entity's base tick.
+    fn portal_after_move(&self) -> bool {
         false
     }
     /// Where it stood at the start of its tick, for the kinds that store it
@@ -286,15 +300,28 @@ pub(super) trait Entity: EntityRules {
     fn portal_sweeps(&self) -> bool {
         true
     }
+    /// `Entity.noPhysics` between ticks: its moves pass through the blocks,
+    /// and a shulker's lid leaves it be.
+    fn no_physics(&self) -> bool {
+        false
+    }
     /// `Entity.move(MoverType.PISTON, …)` once the movement is resolved.
     fn move_by_piston(&mut self, movement: Vec3) {
         let position = self.position_mut();
         *position = position.add_vector(movement);
     }
+    /// Bounds for `AbstractArrow.shouldFall` after a non-SELF piston move.
+    fn piston_release_bounds(&self) -> Option<Aabb> {
+        None
+    }
+    fn release_after_piston(&mut self, _no_block_collision: bool) {}
     /// `setOnGroundWithMovement` at the end of a piston's or shulker lid's
     /// `Entity.move`, for the kinds that keep the flag: on a server it runs
     /// for every push, sideways ones and those the collision turned away included.
     fn set_piston_on_ground(&mut self, _on_ground: bool) {}
+    /// `Entity.setOnGround` from outside the entity's own move (`/tp`'s
+    /// `TeleportCommand.performTeleport`); kinds that keep no ground flag ignore it.
+    fn set_on_ground(&mut self, _on_ground: bool) {}
     /// `PistonMovingBlockEntity.causeBounce`: a slime block sets the velocity
     /// along the movement axis.
     fn piston_slime_bounce(&mut self, movement: Direction) {
@@ -329,7 +356,14 @@ impl RenderEntityBounds for Mob {
             self.species(),
             Species::Guardian | Species::ElderGuardian | Species::Phantom
         ) {
-            let radius = width.max(height) * 2.5 + 3.0;
+            // The model's root scales its appendages too (the elder guardian
+            // uses 2.35), so the margin must grow along with the model.
+            let root_scale = self.kind.model.pose[6..]
+                .iter()
+                .copied()
+                .map(f32::abs)
+                .fold(1.0, f32::max);
+            let radius = width.max(height) * 2.5 + 3.0 * f64::from(root_scale * self.model_scale());
             return Aabb::of_size(at, Vec3::new(radius * 2.0, radius * 2.0, radius * 2.0));
         }
 
@@ -489,6 +523,122 @@ impl RenderEntityBounds for Cushion {
     }
 }
 
+/// Whether this projectile still lives its list's tick: an arrow's state was
+/// not removed. A thrown projectile leaves its list through the batch's own
+/// keep flags, not a field of its own.
+fn shot_alive(shot: &Projectile) -> bool {
+    shot.arrow.as_ref().is_none_or(|a| !a.removed)
+}
+
+/// The item's view of the shared inside walk: its box, its life, the batch's
+/// blocks, and the part's contact, fired mid-walk over a lent level. An item
+/// has no per-block vanilla arms of its own in the walk: its fire, lava and
+/// cactus contacts are its own tick's (`ItemEntity::environment_tick`), kept
+/// where they were.
+pub(in crate::game) struct ItemInside<'a, 'g> {
+    pub(in crate::game) game: &'a mut Game<'g>,
+    pub(in crate::game) item: &'a mut ItemEntity,
+}
+
+impl horizon_client::block_contact::InsideWalk for ItemInside<'_, '_> {
+    type Error = ();
+    fn bounds_at(&self, at: Vec3) -> Aabb {
+        let b = self.item.bounds();
+        let d = at.subtract(self.item.position);
+        Aabb::new(
+            b.min_position().add_vector(d),
+            b.max_position().add_vector(d),
+        )
+    }
+    fn is_alive(&self) -> bool {
+        self.item.health > 0
+    }
+    fn block(&self, at: horizon_core::position::BlockPos) -> horizon_world::registry::BlockStateId {
+        self.game.world.block(at.x, at.y, at.z)
+    }
+    fn is_air(&self, state: horizon_world::registry::BlockStateId) -> bool {
+        self.game.pack.assets.registry.state(state).is_none_or(|d| {
+            matches!(
+                d.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            )
+        })
+    }
+    fn inside_shape(
+        &mut self,
+        _state: horizon_world::registry::BlockStateId,
+        _at: horizon_core::position::BlockPos,
+    ) -> horizon_client::block_contact::InsideShape {
+        // `getEntityInsideCollisionShape` is the whole block for every block
+        // an item meets, as the item's own sweep always treated it.
+        horizon_client::block_contact::InsideShape::Full
+    }
+    fn entity_inside(
+        &mut self,
+        at: horizon_core::position::BlockPos,
+        state: horizon_world::registry::BlockStateId,
+        _step: i32,
+        precise: bool,
+        effects: &mut mod_api::InsideEffects,
+    ) -> std::result::Result<(), ()> {
+        let id = self.item.id;
+        self.game
+            .fire_batch_inside(id as i32, "minecraft:item", state, at, precise, effects);
+        Ok(())
+    }
+}
+
+/// The projectile's view of the shared inside walk, the item's shape of it.
+pub(in crate::game) struct ProjectileInside<'a, 'g> {
+    pub(in crate::game) game: &'a mut Game<'g>,
+    pub(in crate::game) shot: &'a mut Projectile,
+}
+
+impl horizon_client::block_contact::InsideWalk for ProjectileInside<'_, '_> {
+    type Error = ();
+    fn bounds_at(&self, at: Vec3) -> Aabb {
+        let b = self.shot.bounds();
+        let d = at.subtract(self.shot.position);
+        Aabb::new(
+            b.min_position().add_vector(d),
+            b.max_position().add_vector(d),
+        )
+    }
+    fn is_alive(&self) -> bool {
+        shot_alive(self.shot)
+    }
+    fn block(&self, at: horizon_core::position::BlockPos) -> horizon_world::registry::BlockStateId {
+        self.game.world.block(at.x, at.y, at.z)
+    }
+    fn is_air(&self, state: horizon_world::registry::BlockStateId) -> bool {
+        self.game.pack.assets.registry.state(state).is_none_or(|d| {
+            matches!(
+                d.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            )
+        })
+    }
+    fn inside_shape(
+        &mut self,
+        _state: horizon_world::registry::BlockStateId,
+        _at: horizon_core::position::BlockPos,
+    ) -> horizon_client::block_contact::InsideShape {
+        horizon_client::block_contact::InsideShape::Full
+    }
+    fn entity_inside(
+        &mut self,
+        at: horizon_core::position::BlockPos,
+        state: horizon_world::registry::BlockStateId,
+        _step: i32,
+        precise: bool,
+        effects: &mut mod_api::InsideEffects,
+    ) -> std::result::Result<(), ()> {
+        let (id, kind) = (self.shot.id, self.shot.entity_type());
+        self.game
+            .fire_batch_inside(id as i32, kind, state, at, precise, effects);
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod render_bounds_tests {
     use super::*;
@@ -547,6 +697,7 @@ mod render_bounds_tests {
             invisible: false,
             check_interval: 0,
             custom_name: None,
+            random: horizon_core::random::LegacyRandom::new(0),
         };
         let bounds = frame.render_bounds(1.0);
         assert!(bounds.min_position().x <= -0.71875);
@@ -604,6 +755,184 @@ impl Game<'_> {
     /// and explicit consumption by a block-contact handler. `escape_speed`:
     /// the item is inside a block and moves without physics this tick, pushed
     /// out at this speed.
+    /// The item's `Entity.checkInsideBlocks`, run at its batch with the part's
+    /// contact fired mid-walk: the shared sweep over the item's move, the staged
+    /// fire over a lent level (as `item_fall_on` lends one), and the flush of
+    /// the queued writes into this item, its own tick. Nothing runs without a
+    /// listening part: one `any_inside` test is the whole cost.
+    pub(in crate::game) fn sweep_item_inside(&mut self, item: &mut ItemEntity) {
+        if !horizon_client::block_contact::HOOKS
+            .get()
+            .is_some_and(|hooks| (hooks.any_inside)())
+        {
+            return;
+        }
+        let mut effects = mod_api::InsideEffects::default();
+        let mut inside = ItemInside { game: self, item };
+        let movement = horizon_world::entity_move::MovementRecord {
+            from: inside.item.previous,
+            to: inside.item.position,
+            original: None,
+        };
+        let mut visited = crate::fast_hash::FxHashSet::default();
+        let _ = horizon_client::block_contact::sweep_movements(
+            &mut inside,
+            &[movement],
+            &mut visited,
+            &mut effects,
+        );
+        let ItemInside { game, item } = inside;
+        // `applyAndClear`: the writes apply in the collector's order, in this
+        // item's tick, until it is destroyed.
+        for planned in effects.take_planned() {
+            if item.health <= 0 {
+                break;
+            }
+            if let mod_api::PlannedInside::Write(write) = planned {
+                game.apply_item_write(item, write);
+            }
+        }
+    }
+
+    /// A typed entity write an `entity_inside` part queued for an item, applied
+    /// in its own tick. An item takes no effects and keeps no stuck multiplier
+    /// (its tick's friction reads none): `StuckIn` scales the movement once,
+    /// `AddEffect` is skipped, as vanilla's items keep no effect list.
+    fn apply_item_write(&mut self, item: &mut ItemEntity, write: mod_api::EntityWrite) {
+        let triple = |v: [f64; 3]| Vec3::new(v[0], v[1], v[2]);
+        match write {
+            mod_api::EntityWrite::Push(v) => {
+                item.velocity = item.velocity.add_vector(triple(v));
+            }
+            mod_api::EntityWrite::SetMovement(v) => item.velocity = triple(v),
+            mod_api::EntityWrite::StuckIn(v) => {
+                item.velocity = Vec3::new(
+                    item.velocity.x * v[0],
+                    item.velocity.y * v[1],
+                    item.velocity.z * v[2],
+                );
+            }
+            mod_api::EntityWrite::Hurt { amount, .. } => {
+                let _ = item.hurt(amount as i32);
+            }
+            mod_api::EntityWrite::ResetFallDistance => item.fall_distance = 0.0,
+            mod_api::EntityWrite::SetFireTicks(ticks) => item.fire_ticks = ticks,
+            mod_api::EntityWrite::AddEffect { .. } => {}
+        }
+    }
+
+    /// The projectile's `Entity.checkInsideBlocks`, the same batch sweep the
+    /// item's is: the shared walk over its move, the staged fire over a lent
+    /// level, and the flush into this projectile's own tick.
+    pub(in crate::game) fn sweep_projectile_inside(&mut self, shot: &mut Projectile) {
+        if !horizon_client::block_contact::HOOKS
+            .get()
+            .is_some_and(|hooks| (hooks.any_inside)())
+        {
+            return;
+        }
+        let mut effects = mod_api::InsideEffects::default();
+        let mut inside = ProjectileInside { game: self, shot };
+        let movement = horizon_world::entity_move::MovementRecord {
+            from: inside.shot.previous,
+            to: inside.shot.position,
+            original: None,
+        };
+        let mut visited = crate::fast_hash::FxHashSet::default();
+        let _ = horizon_client::block_contact::sweep_movements(
+            &mut inside,
+            &[movement],
+            &mut visited,
+            &mut effects,
+        );
+        let ProjectileInside { game, shot } = inside;
+        for planned in effects.take_planned() {
+            if !shot_alive(shot) {
+                break;
+            }
+            if let mod_api::PlannedInside::Write(write) = planned {
+                game.apply_projectile_write(shot, write);
+            }
+        }
+    }
+
+    /// A typed entity write for a projectile, applied in its own tick. A
+    /// projectile takes no effects, no damage table and keeps no stuck
+    /// multiplier: `Hurt` and `AddEffect` are skipped, `StuckIn` scales the
+    /// movement once, as vanilla's projectiles keep none of the three.
+    fn apply_projectile_write(&mut self, shot: &mut Projectile, write: mod_api::EntityWrite) {
+        let triple = |v: [f64; 3]| Vec3::new(v[0], v[1], v[2]);
+        match write {
+            mod_api::EntityWrite::Push(v) => {
+                shot.velocity = shot.velocity.add_vector(triple(v));
+            }
+            mod_api::EntityWrite::SetMovement(v) => shot.velocity = triple(v),
+            mod_api::EntityWrite::StuckIn(v) => {
+                shot.velocity = Vec3::new(
+                    shot.velocity.x * v[0],
+                    shot.velocity.y * v[1],
+                    shot.velocity.z * v[2],
+                );
+            }
+            mod_api::EntityWrite::ResetFallDistance => shot.fall_distance = 0.0,
+            mod_api::EntityWrite::SetFireTicks(ticks) => shot.fire_ticks = ticks,
+            mod_api::EntityWrite::Hurt { .. } | mod_api::EntityWrite::AddEffect { .. } => {}
+        }
+    }
+
+    /// An `entity_inside` part's contact for a kind the batch ticks, fired
+    /// mid-walk over a lent level, the whole callback staged: only an answering
+    /// callback's writes join the walk, and a panic there is contained, leaving
+    /// the batch's rows and the level as they were. The level is lent and given
+    /// back per contact, as `item_fall_on` lends its own (#2194's carrier
+    /// discipline).
+    pub(in crate::game) fn fire_batch_inside(
+        &mut self,
+        entity: i32,
+        kind: &'static str,
+        state: horizon_world::registry::BlockStateId,
+        at: horizon_core::position::BlockPos,
+        precise: bool,
+        effects: &mut mod_api::InsideEffects,
+    ) {
+        let Some(dimension) = horizon_client::block_contact::current_level() else {
+            return;
+        };
+        if !horizon_client::block_contact::HOOKS
+            .get()
+            .is_some_and(|hooks| (hooks.inside_listens)(state))
+        {
+            return;
+        }
+        let mut staged = mod_api::InsideEffects::default();
+        let mut writes = Vec::new();
+        let mut lent = horizon_client::health::LentLevel::take(&mut self.world);
+        let mut level = horizon_client::health::DamageLevel::lent(
+            &self.world,
+            self.pack.assets.registry,
+            &mut lent,
+            Some(world_items!(self)),
+            Some(&self.pack.block_registries),
+            &self.damage_hooks,
+        );
+        if let Some(hooks) = horizon_client::block_contact::HOOKS.get() {
+            (hooks.inside_fire)(
+                &mut level,
+                dimension,
+                entity,
+                kind,
+                state,
+                at,
+                precise,
+                &mut staged,
+                &mut writes,
+            );
+        }
+        lent.give_back(&mut self.world);
+        effects.absorb_step(staged);
+        horizon_client::block_contact::inside_written(state, at, writes);
+    }
+
     pub(super) fn tick_item_with_block_contacts(
         &mut self,
         item: &mut ItemEntity,
@@ -613,11 +942,14 @@ impl Game<'_> {
         splash: &mut impl FnMut(horizon_client::entities::ItemSplash),
     ) -> (bool, bool) {
         let no_physics = escape_speed.is_some();
+        // Entity.baseTick splashes before moving, except on the first tick, at
+        // the motion before the currents push it.
+        let before = item.velocity;
         let heights =
             item.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context);
-        // Entity.baseTick splashes before moving, except on the first tick.
-        item.water_entry(heights.0 > 0.0, item.ticks == 0, splash);
-        let step = item.tick_move_before_block_effects(
+        item.water_entry(heights.0 > 0.0, item.ticks == 0, before, splash);
+        item.lava_fall(heights.1 > 0.0);
+        let mut step = item.tick_move_before_block_effects(
             &self.world,
             self.res.facts(),
             self.collision,
@@ -626,13 +958,19 @@ impl Game<'_> {
             heights,
             entity_boxes,
             Some(self.border.geometry()),
+            Some(&self.res.motion().blocks),
         );
+        item.check_fall(&mut step, |fall, from, moved| {
+            self.vehicle_fall_reset(fall, from, moved)
+        });
         if !client && let Some((on, distance)) = step.landed() {
             self.item_fall_on(item.id, on, distance);
         }
-        if let Some(pos) =
-            item.vertical_contact(&self.world, self.collision, &self.res.motion().blocks, step)
-        {
+        if !client {
+            // `Entity.applyEffectsFromBlocks`' checkInsideBlocks, at the batch.
+            self.sweep_item_inside(item);
+        }
+        if let Some(pos) = step.vertical_contact {
             let state = self.world.block(pos.x, pos.y, pos.z);
             let position = item.position;
             let mut discarded = false;
@@ -676,11 +1014,18 @@ impl Game<'_> {
             self.res.facts(),
             self.collision,
         );
-        let alive = item.tick_settle(&self.world, self.res.facts(), no_physics, step);
+        let alive = item.tick_settle(
+            &self.world,
+            self.res.facts(),
+            no_physics,
+            step,
+            &self.loop_context,
+        );
         // ItemEntity.tick refreshes immersion and splashes on water entry.
+        let before = item.velocity;
         let (water, _) =
             item.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context);
-        item.water_entry(water > 0.0, false, splash);
+        item.water_entry(water > 0.0, false, before, splash);
         (alive, false)
     }
 }
@@ -702,6 +1047,7 @@ macro_rules! entity_lists {
             Projectile(Projectile) projectiles: creatures.projectiles,
             Rocket(Rocket) rockets: rockets,
             Trident(ThrownTrident) tridents: tridents,
+            General(GeneralRow) general: resident_entities.general.rows,
         }
     };
 }
@@ -1016,8 +1362,13 @@ macro_rules! save_lists {
     (($game:expr, $keys:expr, $out:expr)
      $($kind:ident($ty:ty) $field:ident: $($list:ident).+,)*) => {
         $(for i in 0..$game$(.$list)+.len() {
-            if let Some((key, tag)) = <$ty as $crate::game::entity::Entity>::save_nbt($game, i, $keys) {
+            if let Some((key, mut tag)) = <$ty as $crate::game::entity::Entity>::save_nbt($game, i, $keys) {
+                if !<$ty as $crate::game::entity::Entity>::SERIALIZES_ATTACHMENTS {
+                    $crate::game::persist::write_attachments(
+                        &mut tag, $game$(.$list)+[i].id(), &$game.entity_attachments);
+                }
                 $out.entry(key).or_default().push((
+                    $game$(.$list)+[i].id(),
                     $game$(.$list)+[i].join_seq(),
                     tag,
                 ));
@@ -1028,7 +1379,7 @@ macro_rules! save_lists {
 pub(crate) use save_lists;
 
 /// Saves every entity of every list in `entity_lists!` into `$out` by chunk,
-/// each with its join number (`$out` maps a chunk to `(JoinSeq, Tag)` pairs),
+/// each with its id and join number (`$out` maps a chunk to `(id, JoinSeq, Tag)`),
 /// each through its own `Entity::save_nbt`: one loop per list, static dispatch,
 /// nothing allocated beyond the tags. A kind added to the lists cannot be left
 /// out, since `save_nbt` has no default.
@@ -1038,11 +1389,22 @@ macro_rules! save_entities_of_every_kind {
     };
 }
 
+/// A matched kind consumes only its own explicit token; failed kind probes never do.
+macro_rules! load_with_transfer {
+    ($game:expr, $state:expr, $ordinary:ident, $transfer:ident, $($arg:expr),+ $(,)?) => {{
+        if let Some(state) = $state.take() {
+            $game.$transfer($($arg),+, Some(state));
+        } else {
+            $game.$ordinary($($arg),+);
+        }
+    }};
+}
+
 macro_rules! load_lists {
-    (($game:expr, $kind:expr, $uuid:expr, $player:expr, $tag:expr)
+    (($game:expr, $kind:expr, $uuid:expr, $player:expr, $tag:expr, $transferred:expr)
      $($kind_name:ident($ty:ty) $field:ident: $($list:ident).+,)*) => {{
         let mut tag = $tag;
-        $(match <$ty as $crate::game::entity::Entity>::load_nbt($game, $kind, $uuid, $player, tag) {
+        $(match <$ty as $crate::game::entity::Entity>::load_nbt($game, $kind, $uuid, $player, tag, $transferred) {
             Ok(()) => return Ok(()),
             Err(back) => tag = back,
         })*
@@ -1058,8 +1420,16 @@ pub(crate) use load_lists;
 /// otherwise. A kind added to the lists cannot be left out, since `load_nbt`
 /// has no default.
 macro_rules! load_entity_of_any_kind {
-    ($game:expr, $kind:expr, $uuid:expr, $player:expr, $tag:expr) => {
-        $crate::game::entity::entity_lists!(load_lists, $game, $kind, $uuid, $player, $tag)
+    ($game:expr, $kind:expr, $uuid:expr, $player:expr, $tag:expr, $transferred:expr) => {
+        $crate::game::entity::entity_lists!(
+            load_lists,
+            $game,
+            $kind,
+            $uuid,
+            $player,
+            $tag,
+            $transferred
+        )
     };
 }
 
@@ -1099,8 +1469,23 @@ impl Game<'_> {
         player_uuid: Option<[i32; 4]>,
         tag: Tag,
     ) -> Result<(), Tag> {
-        load_entity_of_any_kind!(self, kind, uuid, player_uuid, tag)
+        load_entity_of_any_kind!(self, kind, uuid, player_uuid, tag, &mut None)
     }
+    /// Restore a live portal object with its explicitly captured runtime ownership.
+    /// This dispatch covers only reconstructible portal kinds; ordinary disk loads
+    /// continue through the canonical kind walk without transfer state.
+    pub(super) fn load_listed_transferred(
+        &mut self,
+        kind: &str,
+        uuid: Option<[i32; 4]>,
+        player_uuid: Option<[i32; 4]>,
+        tag: Tag,
+        state: super::entity_initialization::TransferredEntityState,
+    ) -> Result<(), Tag> {
+        let mut state = Some(state);
+        load_entity_of_any_kind!(self, kind, uuid, player_uuid, tag, &mut state)
+    }
+
     /// The ids of the entities that are not on the walk of `entity_lists!`.
     pub(super) fn entity_ids_off_walk(&self) -> impl Iterator<Item = u32> + '_ {
         self.cushions
@@ -1113,10 +1498,21 @@ impl Game<'_> {
             .chain(self.fangs.list.iter().map(|e| e.id))
             .chain(self.crystals.iter().map(|e| e.id))
             .chain(self.dragon.iter().map(|e| e.id))
+            .chain(
+                self.dragon
+                    .iter()
+                    .filter(|dragon| dragon.id != 0)
+                    .flat_map(|dragon| {
+                        (0..dragon.parts.len())
+                            .filter_map(move |offset| dragon.id.checked_add(offset as u32 + 1))
+                    }),
+            )
             .chain(self.ominous_spawners.iter().map(|e| e.id))
+            .chain(self.resident_entities.knots.iter().map(|e| e.id))
             // Cast hooks live with their players, not in the saveable lists.
             // Keep both their identities and attachment holders until they leave.
             .chain(self.fishing_hooks_here().map(|(hook, _)| hook.id()))
+            .chain(self.natural_knot_id_iter())
     }
     /// The ids of every entity in the level that is not removed: one walk.
     pub(super) fn live_entity_ids(&self) -> HashSet<u32> {
@@ -1132,26 +1528,22 @@ impl Game<'_> {
     pub(super) fn save_every_entity(
         &mut self,
         keys: &HashSet<ChunkKey>,
-        out: &mut HashMap<ChunkKey, Vec<Tag>>,
+        out: &mut HashMap<ChunkKey, Vec<(u32, JoinSeq, Tag)>>,
     ) {
-        // Saved by chunk in the order they joined, so a reload adds them in
-        // that order (a chunk's entity list is in insertion order in vanilla).
-        let mut staged: HashMap<ChunkKey, Vec<(JoinSeq, Tag)>> = HashMap::new();
-        save_entities_of_every_kind!(self, keys, staged);
-        for (key, mut tags) in staged {
-            tags.sort_by_key(|(seq, _)| *seq);
-            out.entry(key)
-                .or_default()
-                .extend(tags.into_iter().map(|(_, tag)| tag));
-        }
+        save_entities_of_every_kind!(self, keys, out);
     }
 }
 
 impl Entity for Mob {
+    const SERIALIZES_ATTACHMENTS: bool = true;
+
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
     }
 
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     /// `Entity.move(MoverType.PISTON, ...)` ends in `setPos`, which `Shulker`
     /// overrides to snap to the block centre.
     fn move_by_piston(&mut self, movement: Vec3) {
@@ -1192,16 +1584,20 @@ impl Entity for Mob {
         _uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !game.loads_as_mob(kind) {
             return Err(tag);
         }
-        game.load_mob(tag, None);
+        load_with_transfer!(game, transferred, load_mob, load_mob_transferred, tag, None);
         Ok(())
     }
     stored_motion!();
     fn portal_size(&self) -> Option<(f32, f32)> {
         Some((self.width(), self.height()))
+    }
+    fn sweeps_portals(&self) -> bool {
+        true
     }
     fn can_use_portal(&self, game: &Game<'_>) -> bool {
         game.mob_portal_eligible(self)
@@ -1279,6 +1675,10 @@ impl Entity for ItemEntity {
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
     }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn rotation(&self) -> [f32; 2] {
         self.rotation
     }
@@ -1307,11 +1707,19 @@ impl Entity for ItemEntity {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:item") {
             return Err(tag);
         }
-        game.load_item(tag, uuid);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_item,
+            load_item_transferred,
+            tag,
+            uuid
+        );
         Ok(())
     }
     stored_motion!();
@@ -1348,6 +1756,10 @@ impl Entity for ExperienceOrb {
     fn reset_fall_distance(&mut self) {
         // An orb keeps no fall distance here.
     }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn rotation(&self) -> [f32; 2] {
         self.rotation
     }
@@ -1376,11 +1788,12 @@ impl Entity for ExperienceOrb {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:experience_orb") {
             return Err(tag);
         }
-        game.load_orb(tag, uuid);
+        load_with_transfer!(game, transferred, load_orb, load_orb_transferred, tag, uuid);
         Ok(())
     }
     stored_motion!();
@@ -1415,6 +1828,13 @@ impl Entity for Boat {
     fn reset_fall_distance(&mut self) {
         // A boat keeps no fall distance here.
     }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn rotation(&self) -> [f32; 2] {
         [self.yaw, self.pitch]
     }
@@ -1441,11 +1861,20 @@ impl Entity for Boat {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !game.loads_as_boat(kind) {
             return Err(tag);
         }
-        game.load_boat(tag, uuid, kind);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_boat,
+            load_boat_transferred,
+            tag,
+            uuid,
+            kind
+        );
         Ok(())
     }
     stored_motion!();
@@ -1487,6 +1916,13 @@ impl Entity for Minecart {
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
     }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn rotation(&self) -> [f32; 2] {
         [self.yaw, self.pitch]
     }
@@ -1513,11 +1949,20 @@ impl Entity for Minecart {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !loads_as_cart(kind) {
             return Err(tag);
         }
-        game.load_cart(tag, uuid, kind);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_cart,
+            load_cart_transferred,
+            tag,
+            uuid,
+            kind
+        );
         Ok(())
     }
     stored_motion!();
@@ -1569,6 +2014,10 @@ impl Entity for ArmorStand {
     fn reset_fall_distance(&mut self) {
         self.enchantment_fall_distance = 0.0;
     }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn rotation(&self) -> [f32; 2] {
         [self.yaw, self.pitch]
     }
@@ -1599,8 +2048,12 @@ impl Entity for ArmorStand {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:armor_stand") {
+            return Err(tag);
+        }
+        if transferred.is_some() {
             return Err(tag);
         }
         game.load_armor_stand(tag, uuid);
@@ -1665,6 +2118,10 @@ impl Entity for ArmorStand {
     fn pushed_by_explosion(&self) -> bool {
         false
     }
+    /// A marker and a NoGravity stand have no physics (`noPhysics`).
+    fn no_physics(&self) -> bool {
+        self.marker || self.no_gravity
+    }
     /// `ArmorStand.getPistonPushReaction`: a marker is ignored.
     fn get_piston_push_reaction(&self) -> PushReaction {
         if self.marker {
@@ -1678,6 +2135,10 @@ impl Entity for ArmorStand {
 impl Entity for PrimedTnt {
     fn reset_fall_distance(&mut self) {
         // Primed TNT keeps no fall distance here.
+    }
+
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn rotation(&self) -> [f32; 2] {
         self.rotation
@@ -1707,11 +2168,12 @@ impl Entity for PrimedTnt {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !loads_as_tnt(kind) {
             return Err(tag);
         }
-        game.load_tnt(tag, uuid);
+        load_with_transfer!(game, transferred, load_tnt, load_tnt_transferred, tag, uuid);
         Ok(())
     }
     stored_motion!();
@@ -1764,6 +2226,16 @@ impl Entity for FallingBlock {
         let pitch = if pitch.is_nan() { previous[1] } else { pitch };
         self.rotation = [yaw, pitch.clamp(-90.0, 90.0)];
     }
+    fn on_ground(&self) -> bool {
+        self.on_ground
+    }
+    /// `Entity.move(MoverType.PISTON)` ends in `setOnGroundWithMovement`.
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn ticks_after_projectiles(&self) -> bool {
         true
     }
@@ -1783,11 +2255,19 @@ impl Entity for FallingBlock {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:falling_block") {
             return Err(tag);
         }
-        game.load_falling(tag, uuid);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_falling,
+            load_falling_transferred,
+            tag,
+            uuid
+        );
         Ok(())
     }
     stored_motion!();
@@ -1805,6 +2285,13 @@ impl Entity for Projectile {
             arrow.fall_distance = 0.0;
         }
     }
+    fn portal_after_move(&self) -> bool {
+        !matches!(
+            self.kind,
+            horizon_client::projectiles::ProjectileKind::LlamaSpit
+                | horizon_client::projectiles::ProjectileKind::ShulkerBullet { .. }
+        )
+    }
     fn rotation(&self) -> [f32; 2] {
         [self.yaw, self.pitch]
     }
@@ -1817,8 +2304,18 @@ impl Entity for Projectile {
         self.previous_yaw = self.yaw;
         self.previous_pitch = self.pitch;
     }
+    fn on_ground(&self) -> bool {
+        self.on_ground
+    }
+    /// `Entity.move(MoverType.PISTON)` ends in `setOnGroundWithMovement`.
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
     fn native_type(&self) -> Cow<'static, str> {
-        self.kind.id().into()
+        self.entity_type().into()
     }
     fn save_nbt(
         game: &mut Game<'_>,
@@ -1833,21 +2330,55 @@ impl Entity for Projectile {
         uuid: Option<[i32; 4]>,
         player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         match kind {
             "minecraft:arrow" | "minecraft:spectral_arrow" => {
-                game.load_arrow(tag, uuid, player_uuid)
+                load_with_transfer!(
+                    game,
+                    transferred,
+                    load_arrow,
+                    load_arrow_transferred,
+                    tag,
+                    uuid,
+                    player_uuid
+                )
             }
             "minecraft:llama_spit" | "minecraft:shulker_bullet" => {
-                game.load_spit_or_bullet(tag, uuid, player_uuid)
+                load_with_transfer!(
+                    game,
+                    transferred,
+                    load_spit_or_bullet,
+                    load_spit_or_bullet_transferred,
+                    tag,
+                    uuid,
+                    player_uuid
+                )
             }
             "minecraft:fireball"
             | "minecraft:small_fireball"
+            | "minecraft:dragon_fireball"
             | "minecraft:wind_charge"
             | "minecraft:breeze_wind_charge"
-            | "minecraft:wither_skull" => game.load_fireball(tag, uuid, player_uuid),
+            | "minecraft:wither_skull" => load_with_transfer!(
+                game,
+                transferred,
+                load_fireball,
+                load_fireball_transferred,
+                tag,
+                uuid,
+                player_uuid
+            ),
             id if horizon_client::entity_nbt::throwable_kind(id).is_some() => {
-                game.load_throwable(tag, uuid, player_uuid)
+                load_with_transfer!(
+                    game,
+                    transferred,
+                    load_throwable,
+                    load_throwable_transferred,
+                    tag,
+                    uuid,
+                    player_uuid
+                )
             }
             _ => return Err(tag),
         }
@@ -1872,7 +2403,11 @@ impl Entity for Projectile {
             || horizon_client::entity_nbt::saved_with_chunk(self)
             || matches!(
                 self.kind,
-                K::LargeFireball { .. } | K::SmallFireball | K::WindCharge | K::BreezeWindCharge
+                K::LargeFireball { .. }
+                    | K::SmallFireball
+                    | K::DragonFireball
+                    | K::WindCharge
+                    | K::BreezeWindCharge
             );
         selectable.then_some(Target::Projectile(self.id))
     }
@@ -1895,13 +2430,22 @@ impl Entity for Projectile {
     fn bounds(&self) -> Aabb {
         Projectile::bounds(self)
     }
+    /// A shulker bullet's, set when it is made; an arrow's `AbstractArrow.noPhysics`.
+    fn no_physics(&self) -> bool {
+        matches!(self.kind, ProjectileKind::ShulkerBullet { .. })
+            || self.arrow.as_ref().is_some_and(|a| a.no_physics)
+    }
     fn move_by_piston(&mut self, movement: Vec3) {
-        self.position = self.position.add_vector(movement);
-        self.needs_sync = true;
+        Projectile::move_by_piston(self, movement);
+    }
+    fn piston_release_bounds(&self) -> Option<Aabb> {
+        Projectile::piston_release_bounds(self)
+    }
+    fn release_after_piston(&mut self, no_block_collision: bool) {
+        Projectile::release_after_piston(self, no_block_collision);
     }
     fn piston_slime_bounce(&mut self, movement: Direction) {
-        self.velocity = piston_push::bounce_velocity(movement, self.velocity);
-        self.needs_sync = true;
+        Projectile::piston_slime_bounce(self, movement);
     }
 }
 
@@ -1917,6 +2461,16 @@ impl Entity for Rocket {
         let yaw = if yaw.is_finite() { yaw } else { previous[0] };
         let pitch = if pitch.is_nan() { previous[1] } else { pitch };
         self.rotation = [yaw, pitch.clamp(-90.0, 90.0)];
+    }
+    fn on_ground(&self) -> bool {
+        self.on_ground
+    }
+    /// `Entity.move(MoverType.PISTON)` ends in `setOnGroundWithMovement`.
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn native_type(&self) -> Cow<'static, str> {
         "minecraft:firework_rocket".into()
@@ -1934,11 +2488,20 @@ impl Entity for Rocket {
         uuid: Option<[i32; 4]>,
         player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:firework_rocket") {
             return Err(tag);
         }
-        game.load_rocket(tag, uuid, player_uuid);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_rocket,
+            load_rocket_transferred,
+            tag,
+            uuid,
+            player_uuid
+        );
         Ok(())
     }
     stored_motion!();
@@ -1969,6 +2532,9 @@ impl Entity for ThrownTrident {
     fn reset_fall_distance(&mut self) {
         // A thrown trident keeps no fall distance here.
     }
+    fn portal_after_move(&self) -> bool {
+        true
+    }
     fn rotation(&self) -> [f32; 2] {
         [self.yaw, self.pitch]
     }
@@ -1978,6 +2544,16 @@ impl Entity for ThrownTrident {
         let pitch = if pitch.is_nan() { previous[1] } else { pitch };
         self.yaw = yaw;
         self.pitch = pitch.clamp(-90.0, 90.0);
+    }
+    fn on_ground(&self) -> bool {
+        self.on_ground
+    }
+    /// `Entity.move(MoverType.PISTON)` ends in `setOnGroundWithMovement`.
+    fn set_piston_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
+    }
+    fn set_on_ground(&mut self, on_ground: bool) {
+        self.on_ground = on_ground;
     }
     fn native_type(&self) -> Cow<'static, str> {
         "minecraft:trident".into()
@@ -1995,11 +2571,19 @@ impl Entity for ThrownTrident {
         uuid: Option<[i32; 4]>,
         _player_uuid: Option<[i32; 4]>,
         tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
     ) -> Result<(), Tag> {
         if !(kind == "minecraft:trident") {
             return Err(tag);
         }
-        game.load_trident(tag, uuid);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_trident,
+            load_trident_transferred,
+            tag,
+            uuid
+        );
         Ok(())
     }
     stored_motion!();
@@ -2029,6 +2613,22 @@ impl Entity for ThrownTrident {
             Vec3::new(p.x - 0.25, p.y, p.z - 0.25),
             Vec3::new(p.x + 0.25, p.y + 0.5, p.z + 0.25),
         )
+    }
+    /// `AbstractArrow.noPhysics`, set once a loyal trident turns back.
+    fn no_physics(&self) -> bool {
+        self.no_physics
+    }
+    fn move_by_piston(&mut self, movement: Vec3) {
+        ThrownTrident::move_by_piston(self, movement);
+    }
+    fn piston_release_bounds(&self) -> Option<Aabb> {
+        ThrownTrident::piston_release_bounds(self)
+    }
+    fn release_after_piston(&mut self, no_block_collision: bool) {
+        ThrownTrident::release_after_piston(self, no_block_collision);
+    }
+    fn piston_slime_bounce(&mut self, movement: Direction) {
+        ThrownTrident::piston_slime_bounce(self, movement);
     }
     /// `GameLevel::tick_blocks` sweeps tridents itself.
     fn sweeps_blocks_inside(&self) -> bool {
@@ -2194,6 +2794,7 @@ mod join_order_tests {
                 projectiles: &[],
                 rockets: &self.rockets,
                 tridents: &self.tridents,
+                general: &[],
             }
         }
         fn walk(&self) -> Result<Vec<EntityHandle>, JoinOrderError> {
@@ -2306,6 +2907,7 @@ mod set_rotation_tests {
     fn set_rotation_keeps_yaw_and_clamps_pitch_on_kinds_that_had_none() {
         let mut orb = ExperienceOrb {
             attachment_lifetime: Default::default(),
+            fall_distance: 0.0,
             join: Default::default(),
             no_gravity: false,
             id: 0,
@@ -2318,6 +2920,7 @@ mod set_rotation_tests {
             count: 1,
             ticks: 0,
             health: 5,
+            air: 300,
             rotation: [0.0, 0.0],
             following: None,
         };
@@ -2346,6 +2949,7 @@ mod scoped_edit_tests {
             projectiles: Default::default(),
             rockets: Default::default(),
             tridents: Default::default(),
+            general: Default::default(),
         };
         lists
             .boats

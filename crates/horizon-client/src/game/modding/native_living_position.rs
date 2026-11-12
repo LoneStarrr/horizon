@@ -149,12 +149,27 @@ impl Game<'_> {
                 super::entity::taken_pass_tests::after_take(self);
                 let w = self.mob_world_base(&[]);
                 let mut events = Vec::new();
+                let mut teleported = None;
                 let moved = mobs.iter_mut().find(|m| m.id == id).is_some_and(|m| {
-                    horizon_client::mobs::living::random_teleport(m, &w, at, avoid, &mut events)
+                    let from = m.position;
+                    let moved = horizon_client::mobs::living::random_teleport(
+                        m,
+                        &w,
+                        at,
+                        avoid,
+                        &mut events,
+                    );
+                    teleported = moved.then_some((from, m.position));
+                    moved
                 });
                 self.mobs
                     .restore(mobs, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
                 let _ = self.handle_mob_events(events);
+                // `teleportTo` is one position update, told at once.
+                if let Some((from, to)) = teleported {
+                    let (from, to) = ([from.x, from.y, from.z], [to.x, to.y, to.z]);
+                    self.entity_section_moved(id, Some(from), to);
+                }
                 moved
             }
             _ => false,
@@ -163,7 +178,7 @@ impl Game<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::game) mod tests {
     use super::super::native_entity_refs::tests::with_game;
     use super::*;
     use horizon_client::mobs::Mob;
@@ -297,7 +312,7 @@ mod tests {
 
     /// Lit empty chunks around the origin, a stone floor at y 63 over
     /// -8..8, and two zombies standing on it five blocks apart.
-    fn floor_and_zombies(game: &mut Game<'_>) {
+    pub(in crate::game) fn floor_and_zombies(game: &mut Game<'_>) {
         for (x, z) in (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))) {
             let mut chunk = horizon_client::chunk::Chunk::empty(x, z);
             chunk.lit = true;

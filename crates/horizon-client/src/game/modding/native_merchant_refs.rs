@@ -57,8 +57,22 @@ impl Game<'_> {
         index: usize,
         read: impl FnOnce(&[MerchantOffer], i32, i32) -> T,
     ) -> T {
-        let mob = &self.mobs[index];
-        if mob.species() == Species::Villager && mob.extra.profession.index().is_none() {
+        self.merchant_read_lent(&self.mobs[index], read)
+    }
+
+    /// The same read while an AI tick lends this mob out of `self.mobs`.
+    pub(super) fn merchant_read_lent<T>(
+        &self,
+        mob: &horizon_client::mobs::Mob,
+        read: impl FnOnce(&[MerchantOffer], i32, i32) -> T,
+    ) -> T {
+        if mob.species() == Species::Villager
+            && self
+                .stations()
+                .professions
+                .state_index(&mob.extra.profession)
+                .is_none()
+        {
             return read(
                 &[],
                 mob.extra.trade.as_deref().map_or(0, |t| t.xp),
@@ -89,7 +103,13 @@ impl Game<'_> {
         edit: impl FnOnce(&mut Vec<MerchantOffer>, &mut i32, &mut i32) -> bool,
     ) -> bool {
         let mob = &self.mobs[index];
-        if mob.species() == Species::Villager && mob.extra.profession.index().is_none() {
+        if mob.species() == Species::Villager
+            && self
+                .stations()
+                .professions
+                .state_index(&mob.extra.profession)
+                .is_none()
+        {
             return false;
         }
         let id = mob.id;
@@ -97,6 +117,11 @@ impl Game<'_> {
             let mut done = false;
             let sent = self.lan_trade_edit(conn, |session| {
                 done = edit(&mut session.offers, &mut session.xp, &mut session.level);
+                if done {
+                    session
+                        .events
+                        .push(horizon_client::merchant::Event::OffersRefreshed);
+                }
             });
             return sent && done;
         }
@@ -225,19 +250,23 @@ impl Game<'_> {
         };
         let Some(profession) = Identifier::parse(profession)
             .ok()
-            .filter(|id| id.namespace() == "minecraft")
-            .and_then(|id| villager::profession_index(id.path()))
+            .and_then(|id| self.stations().professions.resolve(&id.to_string()))
         else {
             return false;
         };
         let id = self.mobs[index].id;
-        if self.mobs[index].extra.profession.index().is_none()
+        if self
+            .stations()
+            .professions
+            .state_index(&self.mobs[index].extra.profession)
+            .is_none()
             || self.mobs[index].extra.flag2
             || self.lan_trade_conn(id).is_some()
         {
             return false;
         }
-        villager::set_profession(&mut self.mobs[index], profession);
+        let table = self.stations().professions.clone();
+        villager::set_profession(&mut self.mobs[index], &table, profession);
         true
     }
 
@@ -317,7 +346,7 @@ pub(super) mod tests {
     use super::*;
     use horizon_client::{items::ItemStack, merchant::ItemCost, mobs::Mob};
     use horizon_core::geometry::Vec3;
-    use mod_api::NativeWorldEpoch;
+    use mod_api::WorldEpoch;
 
     pub(in crate::game) fn offer(cost: &str, result: &str) -> MerchantOffer {
         MerchantOffer {
@@ -528,7 +557,7 @@ pub(super) mod tests {
             assert_eq!(horizon_client::entity_nbt::offers_from_nbt(&tag), saved);
 
             let stale = MerchantRef::new(EntityRef::new(
-                NativeWorldEpoch::new(villager.entity().epoch().get() + 1),
+                WorldEpoch::new(villager.entity().epoch().get() + 1),
                 villager.entity().id(),
             ));
             assert_eq!(stale.offers(game), None);

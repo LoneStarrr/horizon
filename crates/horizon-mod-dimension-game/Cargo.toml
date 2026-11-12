@@ -13,5 +13,12 @@ horizon-mod-package = { path = "../horizon-mod-package", default-features = fals
 log = "0.4"
 serde_json = "1.0.151"
 
+horizon-mod-host = { path = "../horizon-mod-host" }
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+horizon-mod-wasm = { path = "../horizon-mod-wasm", features = ["runtime-fixture"] }
+tempfile = "3"
+wat = "1.261"

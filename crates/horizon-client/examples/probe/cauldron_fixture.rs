@@ -93,6 +93,7 @@ pub fn main() -> horizon_client::Result<()> {
     let enchantments = horizon_client::enchant::Enchantments::default();
     let names = horizon_client::creative::Names::default();
     let env = Env {
+        crafting_remainder: None,
         player: None,
         player_entity_id: None,
         loop_context: &crate::test_resources::loop_context(
@@ -108,6 +109,7 @@ pub fn main() -> horizon_client::Result<()> {
         trade: None,
         maps: None,
         limited_crafting: false,
+        can_equip: None,
         known_recipes: None,
     };
     let mut out = String::new();

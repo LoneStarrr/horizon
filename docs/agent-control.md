@@ -56,6 +56,11 @@ agent's client needs one entry and one approval, whichever way the game was star
 are always those of the version the launcher selected, even for a game of another version: a
 command that game does not know answers with an error, and `game_hello` tells which game it is.
 `horizon-ctl mcp` stays available on its own, for a game started by hand or by a script.
+`horizon-ctl mcp --paced` stops a single-player world between tool calls: it opens the pause menu
+after each action and closes it before the next, so the world moves only while an action (or
+`wait`) runs, not while the agent thinks. Reading tools (`state`, `inventory`, `entities`,
+`events`...) leave it paused; a pause a person opened, another menu, a LAN or a server world are
+left alone.
 
 ## Protocol revisions
 
@@ -79,10 +84,9 @@ listing the ones it does, and a modern request missing its capabilities is malfo
 A client that speaks both probes with `server/discover` first on stdio, then falls back to
 `initialize` when the answer is not a modern one.
 
-## Inventory, before and after
+## Inventory
 
-Before is `main` at 2026-10-23, before #1342, #1343, #1344, #1345 and #1353. After is with
-them. CLI is `horizon-launcher` for the launcher and `horizon-ctl` for the game. MCP is
+What an agent can reach, by page and screen. CLI is `horizon-launcher` for the launcher and `horizon-ctl` for the game. MCP is
 `horizon-launcher mcp` (the game's tools as `game_*`) and `horizon-ctl mcp`. **part** means only
 through a generic command (`ui` and `click` by widget, or a raw socket line that horizon-ctl
 passes on without checking it).
@@ -116,40 +120,41 @@ passes on without checking it).
 
 ### Game
 
-| Capability | Screen | CLI before | MCP before | CLI after | MCP after | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| Start, wait until ready, save, quit, log | (all) | yes | yes | yes | yes | `launch`, `wait-ready`, `save`, `quit`, `logs` |
-| Every widget of every screen, by id; click, set, type | (all) | yes | yes | yes | yes | `ui`, `click ID`, `set ID VALUE`, `type`; `click-at`, `drag-at`, `scroll-at` by pixel |
-| Title menu, pause menu | Title, Pause | yes | yes | yes | yes | `ui`/`click`, `pause`, `resume` |
-| Worlds: list | Select World | part | part | yes | yes | `worlds` |
-| Worlds: create, open | Create New World | yes | yes | yes | yes | `open WORLD [SEED] [creative]` |
-| Worlds: rename, back up | Edit World | part | part | yes | yes | `world-rename`, `world-backup` |
-| Worlds: delete | Select World | part | part | yes | yes | `world-delete FOLDER --confirm`; it was possible through `click` without any confirm |
-| Servers list | Multiplayer | part | part | yes | yes | `servers` (names and addresses; reads servers.dat) |
-| Join a server or an invite code, leave | Multiplayer | part | no | yes | yes | `connect`, `disconnect` |
-| Open to LAN | Pause > Open to LAN | part | no | yes | yes | `lan open\|close\|status` |
-| Play with Friends: host, stop, status | Pause | part | no | yes | yes | `friends host\|stop\|status` |
-| Vanilla options, every page | Options | yes | part | yes | yes | `options-get`, `options-set` (all of options.txt, typed); `options PAGE` was socket-only |
-| Horizon Settings: Extras, PvP & HUD, AI Agent; the graphics screen (Video Settings); Controller (Controls) | Horizon Settings, Video Settings, Controls | part | part | yes | yes | `options horizon\|graphics\|extras\|agent...`, then `ui`/`click`/`set` |
-| Agent control on or off, status, connection details | Horizon Settings > AI Agent | no | no | yes | yes | new page (#1353) |
-| Key binds | Controls > Key Binds | yes | yes | yes | yes | `options-set key_key.jump key.keyboard.j` |
-| Resource packs | Options > Resource Packs | part | part | yes | yes | `options packs`, then `ui` rows and `click`; `options-set resourcePacks` |
-| Chat and commands | Chat | yes | yes | yes | yes | `chat`, `command`, `messages`, `chat-log` |
-| Inventory, containers, stations | Inventory, Chest... | yes | part | yes | yes | `inventory`, `screen`, `click-slot`; `container X Y Z` was socket-only |
-| Crafting, recipe book | Crafting | part | part | yes | yes | the grid by `click-slot`; the recipe book by `ui`/`click` |
-| Trading, riding, shearing (right-click an entity) | Merchant, Horse | part | no | yes | yes | `interact-entity ID`; `mouse` was CLI-only |
-| Horse, llama inventory | Horse | no | no | yes | yes | `mount-menu` |
-| Books, lecterns, signs | Book, Sign | part | part | yes | yes | `book [next\|back\|take\|done]`, `signedit X Y Z` |
-| Move, look, find a path | (playing) | yes | yes | yes | yes | `move`, `goto`, `look`, `look-at`, `turn`, `jump` |
-| Mine, place, use, attack, hotbar, drop | (playing) | yes | yes | yes | yes | `break`, `place`, `interact`, `use-item`, `attack`, `select`, `drop` |
-| Raw keys and mouse buttons | (all) | yes | part | yes | yes | `key`; `mouse`, `release` were CLI-only |
-| Controllers | (all) | yes | no | yes | yes | `pad` |
-| Respawn | Death | yes | yes | yes | yes | `respawn` |
-| Screenshots | (all) | yes | yes | yes | yes | PNG of the next frame, `--offscreen` too |
-| F3 data | F3 | yes | part | yes | yes | `key f3`; `status` (renderer, chunks, memory) was CLI-only |
-| Waits and events | (all) | yes | yes | yes | yes | `wait`, `wait-for`, `events` |
-| Effects, experience, enchantments, potions, fill | (cheats) | part | no | yes | yes | `effect`, `effects`, `xp`, `enchant`, `potion`, `fill` |
-| Benchmarks and frame stats | (all) | yes | part | yes | yes | `bench`, `stats` were CLI-only; `fly` |
+| Capability | Screen | CLI | MCP | Notes |
+| --- | --- | --- | --- | --- |
+| Start, wait until ready, save, quit, log | (all) | yes | yes | `launch`, `wait-ready`, `save`, `quit`, `logs` |
+| Every widget of every screen, by id; click, set, type | (all) | yes | yes | `ui`, `click ID`, `set ID VALUE`, `type`; `click-at`, `drag-at`, `scroll-at` by pixel |
+| Title menu, pause menu | Title, Pause | yes | yes | `ui`/`click`, `pause`, `resume` |
+| Worlds: list | Select World | yes | yes | `worlds` |
+| Worlds: create, open | Create New World | yes | yes | `open WORLD [SEED] [creative]` |
+| Worlds: rename, back up | Edit World | yes | yes | `world-rename`, `world-backup` |
+| Worlds: delete | Select World | yes | yes | `world-delete FOLDER --confirm` |
+| Servers list | Multiplayer | yes | yes | `servers` (names and addresses; reads servers.dat) |
+| Join a server or an invite code, leave | Multiplayer | yes | yes | `connect`, `disconnect` |
+| Open to LAN | Pause > Open to LAN | yes | yes | `lan open\|close\|status` |
+| Play with Friends: host, stop, status | Pause | yes | yes | `friends host\|stop\|status` |
+| Vanilla options, every page | Options | yes | yes | `options-get`, `options-set` (all of options.txt, typed) |
+| Horizon Settings: Extras, PvP & HUD, AI Agent; the graphics screen (Video Settings); Controller (Controls) | Horizon Settings, Video Settings, Controls | yes | yes | `options horizon\|graphics\|extras\|agent...`, then `ui`/`click`/`set` |
+| Agent control on or off, status, connection details | Horizon Settings > AI Agent | yes | yes | `options horizon`, the page's widgets (`ai-agent`) |
+| Key binds | Controls > Key Binds | yes | yes | `options-set key_key.jump key.keyboard.j` |
+| Resource packs | Options > Resource Packs | yes | yes | `options packs`, then `ui` rows and `click`; `options-set resourcePacks` |
+| Chat and commands | Chat | yes | yes | `chat`, `command`, `messages`, `chat-log` |
+| Inventory, containers, stations | Inventory, Chest... | yes | yes | `inventory`, `screen`, `click-slot`, `container X Y Z` |
+| Crafting, recipe book | Crafting | yes | yes | the grid by `click-slot`; the recipe book by `ui`/`click` |
+| Trading, riding, shearing (right-click an entity) | Merchant, Horse | yes | yes | `interact-entity ID` |
+| Horse, llama inventory | Horse | yes | yes | `mount-menu` |
+| Books, lecterns, signs | Book, Sign | yes | yes | `book [next\|back\|take\|done]`, `signedit X Y Z` |
+| Move, look, find a path | (playing) | yes | yes | `move`, `goto`, `look`, `look-at`, `turn`, `jump` |
+| Mine, place, use, attack, hotbar, drop | (playing) | yes | yes | `break`, `place`, `interact`, `use-item`, `attack`, `select`, `drop` |
+| Raw keys and mouse buttons | (all) | yes | yes | `key`, `mouse`, `release` |
+| Controllers | (all) | yes | yes | `pad` |
+| Respawn | Death | yes | yes | `respawn` |
+| Screenshots | (all) | yes | yes | PNG of the next frame, `--offscreen` too |
+| F3 data | F3 | yes | yes | `key f3`; `status` (renderer, chunks, memory) |
+| Waits and events | (all) | yes | yes | `wait`, `wait-for`, `events` |
+| Effects, experience, enchantments, potions, fill | (cheats) | yes | yes | `effect`, `effects`, `xp`, `enchant`, `potion`, `fill` |
+| Benchmarks and frame stats | (all) | yes | yes | `bench`, `stats`, `fly` |
+| Performance captures | `/profiler` | yes | yes | `profile [client\|server] start\|stop\|status\|mark`, `trace`; the file is read with `horizon-perf` or `horizon-perf mcp` ([perf-platform.md](perf-platform.md)), and its slow ring (the last 256 slow frames or ticks) rides in it; none of them is logged |
 
 ## No AI
 
@@ -206,6 +211,10 @@ turn the switch off.
   under control. A game the player starts from the window is not, until they turn Agent Control
   on. An open socket lets any program of that user drive the game, so it opens only when an agent
   asked for the game, or when the player chose it.
+- **The window an agent opens** comes up without the focus (on Windows and macOS; X11 focuses it
+  anyway): the person keeps their keyboard, and the game keeps its pointer grab to itself, as
+  `--offscreen` does, so the system pointer is never taken, hidden or moved. Once the person
+  clicks into the window it is an ordinary one, and that click takes the pointer.
 - **Headless:** `horizon-ctl launch --headless` (`horizon-client --headless --control`) starts a
   game with no display, no window and no GPU: it runs where no display server is (an SSH session,
   a server) and runs its own loop instead of winit's (`game/runtime/headless.rs`), one frame a tick. It
@@ -294,7 +303,8 @@ turn the switch off.
   - `set ID VALUE` moves a slider.
   - `type` types into the focused field.
 
-  After a click, the next `ui`, `click` or `set` waits for a redrawn frame.
+  After a click, the next `ui`, `click` or `set` waits for a redrawn frame. Right after
+  `launch`, they and `screen` and `click-button` wait for the first one.
 - **No new code paths in screens.** The tree is built from what the draw functions already
   register for controller navigation (`widgets.rs`).
 
@@ -303,8 +313,10 @@ turn the switch off.
 - `wait-for screen NAME|widget ID|loaded|chat TEXT|event KIND [--timeout S] [--since SEQ]`
   replies when the condition holds, or with `kind: timeout`.
 - `events [--since SEQ]` returns what happened since SEQ: screens, chat, deaths, respawns, items,
-  dimensions and worlds (the newest 256). Take `last` before an action, and wait with `--since`,
-  so the action's event can't slip in before the wait.
+  damage (`hurt`, with the damage type, the amount and what dealt it), `heal`, `food`, dimensions
+  and worlds (the newest 256). `hurt` and `death` carry the player's position: a death drops the
+  inventory there. Take `last` before an action, and wait with `--since`, so the action's event
+  can't slip in before the wait (`wait-for event hurt` wakes an agent when it is attacked).
 
 ### Input provenance
 
@@ -313,6 +325,14 @@ Every input event carries who caused it: `user` (this computer's keyboard, mouse
 itself, such as a pad menu's click). This is how an agent tells its own actions from a person
 who took over mid-test.
 
+- While a screenshot sequence, a `HORIZON_TICK_SCRIPT` scenario or a `record-replay` runs, the
+  keyboard, mouse and pad at this computer don't reach the game, and what they do isn't
+  recorded: a stray key or mouse move can't spoil the run. The run's own input (the socket, the
+  replay) still plays. Clicking into the window or away from it takes effect when the run ends,
+  and the game's pointer grab stays inside the game until then, so the system pointer is never
+  taken or moved; closing the window still ends the run. A key held as the run starts stays
+  down until it is pressed again. Outside these runs nothing is held back; a game no one at
+  the computer should touch runs `--offscreen` or `--headless`.
 - `state` and `status` have an `input` section: `last_origin`, per-origin `counts`,
   `user_since_agent` and `last_user_age_s`.
 - `input-log [--since SEQ] [--limit N] [--origin ORIGIN]` lists the newest 512 input events:
@@ -352,6 +372,8 @@ A recording is one folder, a bundle is that folder plus the logs in one zip:
   stops it and writes the bundle (the chat shows the path); **F3+E** writes the bundle of the
   newest recording. The keys are off until **Recording shortcuts** is turned on (AI Agent page);
   the page also has the two buttons and a live recording/replay line.
+- `/profiler start` and `/profiler stop` in chat start and save a capture and print its file name; add `client` or `server` for one side. `/profiler status` shows whether one is running. In the official build the saved line has `[Open]` and `[Share]` (`/profiler open [id]`, `/profiler share [id]`): Open shows the capture in the viewer from your own computer, Share uploads it and prints the link, the only upload. The local `.hzperf` and private `.hzperf.share.json` owner receipt stay in reports/. Nothing uploads unless you share, and none of this depends on the telemetry switches.
+  See [graphics.md](graphics.md) for what the capture holds.
 - `record-replay NAME [--stop] [--in-place] [--keep-world] [--timeout S]` is the best effort
   replay: it copies the recording's world into `saves/`, opens it, restores the recorded player
   position, rotation and velocity, and feeds the recorded keys, mouse, wheel, look, pad events

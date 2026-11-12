@@ -134,7 +134,7 @@ fn command_dispatch_forwards_typed_input_and_source() {
 
 #[test]
 fn advancement_progress_reports_grant_and_revoke_identity() {
-    struct Observer(Arc<Mutex<Vec<NativeProgressType>>>);
+    struct Observer(Arc<Mutex<Vec<ProgressType>>>);
     #[mod_api::__subscriptions]
     impl Hooks for Observer {
         fn player_advancement_progress(
@@ -149,7 +149,7 @@ fn advancement_progress_reports_grant_and_revoke_identity() {
             assert_eq!(event.criterion, "criterion");
             assert_eq!(
                 event.progress.done,
-                event.progress_type == NativeProgressType::Grant
+                event.progress_type == ProgressType::Grant
             );
             self.0.lock().unwrap().push(event.progress_type);
         }
@@ -161,7 +161,7 @@ fn advancement_progress_reports_grant_and_revoke_identity() {
     )];
     let mods: Arc<[ModEntry]> = mods.into();
     install(mods.clone());
-    for progress_type in [NativeProgressType::Grant, NativeProgressType::Revoke] {
+    for progress_type in [ProgressType::Grant, ProgressType::Revoke] {
         dispatch_player_advancement_progress(
             &mut TestHost,
             calls::PlayerAdvancementProgressCall {
@@ -172,14 +172,14 @@ fn advancement_progress_reports_grant_and_revoke_identity() {
                 criterion: "criterion",
                 progress_type,
                 progress: &AdvancementProgress {
-                    done: progress_type == NativeProgressType::Grant,
+                    done: progress_type == ProgressType::Grant,
                 },
             },
         );
     }
     assert_eq!(
         *observed.lock().unwrap(),
-        vec![NativeProgressType::Grant, NativeProgressType::Revoke]
+        vec![ProgressType::Grant, ProgressType::Revoke]
     );
 }
 #[test]
@@ -189,7 +189,7 @@ fn menu_button_mutates_entity_and_cursor_once() {
         block_entities: vec![part(1, &calls)],
         ..Parts::default()
     });
-    let context = generated::mod_api::menu::MenuButtonContext {
+    let context = generated::mod_api::item::menu::MenuButtonContext {
         player: 123,
         player_entity_id: 42,
         pos: [1, 2, 3],
@@ -253,7 +253,7 @@ fn slot_rules_mutate_and_item_tick_can_cancel() {
         HostSide::Server(&mut TestHost),
         &ItemStack::default(),
         None,
-        Hand,
+        Hand::Main,
         &mut duration,
         &mut canceled,
     );
@@ -271,16 +271,25 @@ fn item_finish_can_clear_vanilla_result() {
     )];
     let mods: Arc<[ModEntry]> = mods.into();
     install(mods.clone());
-    let mut result = Some(ItemStack::default());
-    dispatch_living_entity_use_item_finish(
-        &mut TestHost,
-        &ItemStack::default(),
-        None,
-        Hand,
-        0,
-        &mut result,
-    );
-    assert!(result.is_none());
+    // Both sides reach the listener, which clears the result.
+    for client in [false, true] {
+        let mut host = TestHost;
+        let side = if client {
+            HostSide::Client(&mut host)
+        } else {
+            HostSide::Server(&mut host)
+        };
+        let mut result = Some(ItemStack::default());
+        dispatch_living_entity_use_item_finish(
+            side,
+            &ItemStack::default(),
+            None,
+            Hand::Main,
+            0,
+            &mut result,
+        );
+        assert!(result.is_none(), "client={client}");
+    }
 }
 
 #[test]
@@ -345,18 +354,18 @@ fn placement_replacement_can_refuse_and_stops_later_mods() {
     let table = parts(HookId::StateForPlacement, "state_for_placement");
     assert_eq!(
         table
-            .block_key(registry_keys::block_key("test:block"))
+            .block_key(content::registry_keys::block_key("test:block"))
             .len(),
         2
     );
     assert!(
         table
-            .block_key(registry_keys::block_key("missing:block"))
+            .block_key(content::registry_keys::block_key("missing:block"))
             .is_empty()
     );
     let mut answer = None;
     for state in [
-        BlockState::new(registry_keys::block_key("test:other").unwrap(), 0),
+        BlockState::new(content::registry_keys::block_key("test:other").unwrap(), 0),
         BlockState::new(BlockKey::Test, u16::MAX),
     ] {
         dispatch_state_for_placement(
@@ -573,12 +582,12 @@ fn dispatch_contracts() {
     dispatch_modify_default_components(&Load("defaults"), "item", &mut components);
     assert_eq!(components["order"], serde_json::json!([1, 2]));
     let mut host = TestHost;
-    dispatch_level_tick_pre(&mut host, "overworld");
+    dispatch_level_tick_pre(HostSide::Server(&mut host), LevelRef);
     assert_eq!(*calls.lock().unwrap(), [1, 2]);
     calls.lock().unwrap().clear();
     let mut zoom = None;
     dispatch_zoom(&host, &mut zoom);
-    assert_eq!(zoom, Some(NativeZoom(1)));
+    assert_eq!(zoom, Some(Zoom(1)));
     assert_eq!(*calls.lock().unwrap(), [1]);
     calls.lock().unwrap().clear();
     dispatch_zoom(&host, &mut zoom);
@@ -658,7 +667,7 @@ fn dispatch_contracts() {
             stack: &ItemStack::default(),
             pos: [0; 3],
             face: [0; 3],
-            hand: Hand,
+            hand: Hand::Main,
             hit: BlockHit,
             player: 0,
             player_entity_id: 0,
@@ -674,7 +683,7 @@ fn dispatch_contracts() {
             stack: &ItemStack::default(),
             pos: [0; 3],
             face: [0; 3],
-            hand: Hand,
+            hand: Hand::Main,
             hit: BlockHit,
             player: 0,
             player_entity_id: 0,
@@ -692,9 +701,9 @@ mod stubs {
     pub(super) struct BlockId;
     pub(super) struct Ticks;
     pub(super) struct Compound;
-    pub(super) type NativeDispensed = (Option<super::ItemStack>, i32);
-    pub(super) struct NativeLootDrops<'a>(pub &'a ());
-    pub(super) struct NativeHandRender<'a>(pub &'a ());
+    pub(super) type Dispensed = (Option<super::ItemStack>, i32);
+    pub(super) struct LootDrops<'a>(pub &'a ());
+    pub(super) struct HandRender<'a>(pub &'a ());
     pub(super) struct Suggestion;
     pub(super) struct BiomeColors;
     pub(super) struct UseAnimation;
@@ -709,27 +718,29 @@ mod stubs {
         Press,
         Held,
     }
-    pub(super) struct NativeMobRender<'a>(pub &'a ());
-    pub(super) struct NativeShake;
+    pub(super) struct MobRender<'a>(pub &'a ());
+    pub(super) struct Shake;
     pub(super) struct Music;
     pub(super) struct MusicLayer;
-    pub(super) struct NativeBlockRim;
-    pub(super) struct NativeColoredLight;
-    pub(super) struct NativeMinimap;
-    pub(super) struct NativePanelEvent;
-    pub(super) struct NativeScreen;
+    pub(super) struct BlockRim;
+    pub(super) struct ColoredLight;
+    pub(super) struct Minimap;
+    pub(super) struct PanelEvent;
+    pub(super) struct Screen;
     pub(super) struct ModContainer;
     pub(super) struct MerchantOffer;
     pub(super) struct ModFluidTanks;
     pub(super) struct ModEnergyBuffer;
-    pub(super) struct NativeDataMapType;
-    pub(super) struct NativeMapDecoration;
-    pub(super) struct NativeMapInfo<'a>(pub &'a ());
-    pub(super) struct NativePlayerRender<'a>(pub &'a ());
-    pub(super) struct NativeCommand;
-    pub(super) struct NativeLifecycleContext;
+    pub(super) struct DataMapType;
+    pub(super) struct MapDecoration;
+    pub(super) struct MapInfo<'a>(pub &'a ());
+    pub(super) struct PlayerRender<'a>(pub &'a ());
+    pub(super) struct PosedParts;
+    pub(super) struct HiddenParts;
+    pub(super) struct Command;
+    pub(super) struct LifecycleContext;
     pub(super) struct Load(pub &'static str);
-    pub(super) struct NativeServerPlayer;
+    pub(super) struct ServerPlayer;
     pub(super) struct CommandSource {
         pub(super) sign: i32,
     }

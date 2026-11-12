@@ -225,6 +225,8 @@ impl Entry {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryVersion {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_binaries: Vec<super::NativeBinary>,
     pub version: String,
     /// `YYYY-MM-DD`.
     pub published: String,
@@ -406,7 +408,9 @@ pub fn project(entry: &Entry, src: &Sources) -> Result<Project, Vec<String>> {
 
 /// An icon (`folder` = `icons/`) or a screenshot (`screenshots/<id>/`) as the index lists it: an
 /// `https://` address as it is, or a file in the registry repository checked and served from the
-/// registry's site.
+/// registry's site. An icon's address ends in `?v=` and the start of its SHA-256, so a new icon
+/// is a new address: the launcher keeps images by address for a week, and would go on showing
+/// the old one.
 fn image(
     src: &Sources,
     id: &str,
@@ -439,13 +443,14 @@ fn image(
             let bytes =
                 std::fs::read(src.registry.join(path)).map_err(|e| format!("{path}: {e}"))?;
             if icon {
-                rules::check_icon(&bytes).map_err(|e| format!("{path}: {e}"))
+                rules::check_icon(&bytes).map_err(|e| format!("{path}: {e}"))?;
+                Ok(format!("?v={}", &super::sha256(&bytes)[..12]))
             } else {
-                rules::check_screenshot(name, &bytes)
+                rules::check_screenshot(name, &bytes).map(|()| String::new())
             }
         });
     match checked {
-        Ok(()) => Some(format!("{}{path}", src.site)),
+        Ok(version) => Some(format!("{}{path}{version}", src.site)),
         Err(e) => {
             errors.push(format!("{id}: {e}"));
             None
@@ -507,6 +512,7 @@ fn version_at(
         ));
     }
     Ok(Version {
+        native_binaries: v.native_binaries.clone(),
         version: v.version.clone(),
         published: v.published.clone(),
         changelog: v.changelog.clone(),
@@ -580,6 +586,7 @@ pub fn release_version(entry: &Entry, r: &Release, path: &Path) -> Result<Versio
         notes.push_str("\n\n(Cut: the full notes are on the release.)");
     }
     let v = EntryVersion {
+        native_binaries: Vec::new(),
         game: facts.game.clone().unwrap_or_else(|| r.game.to_owned()),
         file: r.asset.to_owned(),
         sha256: super::sha256_file(path)?,
@@ -686,6 +693,19 @@ pub fn check_kind(id: &str, old: &Kind, new: &Kind) -> Result<(), String> {
 /// `revoked.toml`), a project's kind never changes, and changes by someone who
 /// isn't an owner, or to owners and keys, are pointed out.
 pub fn review(base: &[Entry], head: &[Entry], author: &str) -> Review {
+    review_with_revoked(base, head, &[], author)
+}
+
+/// [`review`], where a version may leave its entry once `revoked` (the pull
+/// request's `revoked.toml`) takes its file down by hash: a project whose
+/// signing key was lost lists its next version under a new key and drops the
+/// versions the new key can't verify.
+pub fn review_with_revoked(
+    base: &[Entry],
+    head: &[Entry],
+    revoked: &[Revoked],
+    author: &str,
+) -> Review {
     let mut r = Review::default();
     for old in base {
         let Some(new) = head.iter().find(|e| e.id == old.id) else {
@@ -709,7 +729,16 @@ pub fn review(base: &[Entry], head: &[Entry], author: &str) -> Review {
             r.errors.push(error);
         }
         for v in &old.versions {
+            let taken_down = || {
+                revoked
+                    .iter()
+                    .any(|t| t.id == old.id && t.sha256.as_deref() == Some(v.sha256.as_str()))
+            };
             match new.versions.iter().find(|w| w.version == v.version) {
+                None if taken_down() => r.notes.push(format!(
+                    "{} {}: leaves the entry, taken down in {REVOKED}",
+                    old.id, v.version
+                )),
                 None => r.errors.push(format!(
                     "{} {}: removed; take it down in {REVOKED} instead",
                     old.id, v.version

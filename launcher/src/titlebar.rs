@@ -23,7 +23,7 @@ pub fn draws_brand(window: &Window) -> bool {
 
 pub fn options() -> TitlebarOptions {
     TitlebarOptions {
-        title: Some("Horizon".into()),
+        title: Some(horizon_launcher::identity::WINDOW_TITLE.into()),
         // macOS and Windows place the GPUI content under the native title bar. Linux uses
         // client-side decorations below, so its title bar is transparent by construction.
         appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
@@ -66,7 +66,7 @@ pub fn render(_theme: &Theme, _window: &Window) -> Option<Div> {
 pub fn render(theme: &Theme, window: &Window) -> Option<Div> {
     use crate::glass::{self, Kind};
     use crate::{blocks, mark};
-    use gpui::{Decorations, FontWeight, MouseButton, div, prelude::*, px};
+    use gpui::{div, prelude::*, px, Decorations, FontWeight, MouseButton};
 
     if matches!(window.window_decorations(), Decorations::Server) {
         return None;
@@ -83,7 +83,11 @@ pub fn render(theme: &Theme, window: &Window) -> Option<Div> {
         .px(px(12.))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
         .child(mark(16., theme))
-        .child(blocks::pixel(13., FontWeight::MEDIUM).child("Horizon"));
+        .child(
+            blocks::pixel(13., FontWeight::MEDIUM).child(horizon_launcher::i18n::tr(
+                horizon_launcher::identity::WINDOW_TITLE,
+            )),
+        );
 
     let mut bar = div()
         .relative()
@@ -190,7 +194,7 @@ pub fn render(theme: &Theme, window: &Window) -> Option<Div> {
 
 #[cfg(target_os = "linux")]
 pub fn resize_handles(window: &Window) -> Option<Div> {
-    use gpui::{CursorStyle, Decorations, MouseButton, ResizeEdge, div, prelude::*, px};
+    use gpui::{div, prelude::*, px, CursorStyle, Decorations, MouseButton, ResizeEdge};
 
     if matches!(window.window_decorations(), Decorations::Server) || window.is_maximized() {
         return None;
@@ -322,7 +326,7 @@ mod windows {
     use super::*;
     use crate::glass::{self, Kind};
     use crate::{blocks, mark};
-    use gpui::{FontWeight, Stateful, WindowControlArea, div, prelude::*, px};
+    use gpui::{div, prelude::*, px, FontWeight, Stateful, WindowControlArea};
 
     const HEIGHT: f32 = 32.;
     const BUTTON_WIDTH: f32 = 46.;
@@ -428,7 +432,11 @@ mod windows {
             .px(px(12.))
             .window_control_area(WindowControlArea::Drag)
             .child(mark(16., theme))
-            .child(blocks::pixel(13., FontWeight::MEDIUM).child("Horizon"));
+            .child(
+                blocks::pixel(13., FontWeight::MEDIUM).child(horizon_launcher::i18n::tr(
+                    horizon_launcher::identity::WINDOW_TITLE,
+                )),
+            );
         Some(
             div()
                 .relative()

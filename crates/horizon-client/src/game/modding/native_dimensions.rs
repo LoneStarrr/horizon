@@ -87,6 +87,28 @@ fn biome_source(settings: &DimensionSettings) -> Value {
             json!({"type": "minecraft:multi_noise", "preset": settings.biome_preset})
         }
         BiomeSourceKind::End => json!({"type": "minecraft:the_end"}),
+        BiomeSourceKind::Points => {
+            let interval = |(min, max): (f32, f32)| json!([min, max]);
+            let biomes: Vec<Value> = settings
+                .biome_points
+                .iter()
+                .map(|point| {
+                    json!({
+                        "biome": point.biome,
+                        "parameters": {
+                            "temperature": interval(point.temperature),
+                            "humidity": interval(point.humidity),
+                            "continentalness": interval(point.continentalness),
+                            "erosion": interval(point.erosion),
+                            "depth": interval(point.depth),
+                            "weirdness": interval(point.weirdness),
+                            "offset": point.offset,
+                        },
+                    })
+                })
+                .collect();
+            json!({"type": "minecraft:multi_noise", "biomes": biomes})
+        }
         _ => unreachable!("unknown API biome source"),
     }
 }
@@ -227,7 +249,7 @@ mod tests {
         assert_eq!(errors.len(), 7, "{errors:?}");
         assert!(errors[0].contains("test registered dimension test:pocket twice"));
         assert!(errors[1].contains("namespace"));
-        assert!(errors[2].contains("no name"));
+        assert!(errors[2].contains("test declares invalid identifier \"test:\""));
         assert!(errors[3].contains("test:uneven"));
         assert!(errors[4].contains("test:low_ceiling"));
         assert!(errors[5].contains("test:too_tall"));
@@ -279,8 +301,8 @@ mod tests {
         let errors = install_parts(&[ModEntry::new("test", Box::new(Invalid))]).unwrap_err();
         assert_eq!(errors.len(), 3, "{errors:?}");
         assert!(errors[0].contains("test registered chunk generator test:void twice"));
-        assert!(errors[1].contains("test registered chunk generator \"other:void\""));
-        assert!(errors[2].contains("test registered a chunk generator with no name"));
+        assert!(errors[1].contains("test declares \"other:void\" in unowned namespace \"other\""));
+        assert!(errors[2].contains("test declares invalid identifier \"test:\""));
     }
 
     /// A mod with vanilla's id can't take over every noise level.
@@ -570,7 +592,13 @@ mod main_dimension_tests {
         };
         assert!(refused(|s| s.coordinate_scale = 0.0).contains("coordinate_scale"));
         assert!(refused(|s| s.coordinate_scale = f64::NAN).contains("coordinate_scale"));
-        assert!(refused(|s| s.ambient_light = 1.5).contains("ambient_light"));
+        // below the codec's 1.0E-5, a ratio with a normal scale is infinite
+        assert!(refused(|s| s.coordinate_scale = f64::from_bits(1)).contains("coordinate_scale"));
+        assert!(refused(|s| s.coordinate_scale = 1.0e-6).contains("coordinate_scale"));
+        assert_eq!(refused(|s| s.coordinate_scale = f64::from(1.0e-5_f32)), "");
+        // the codec sets no range on the ambient light, only that it is a number
+        assert_eq!(refused(|s| s.ambient_light = 1.5), "");
+        assert!(refused(|s| s.ambient_light = f32::NAN).contains("ambient_light"));
         assert!(refused(|s| s.sky_light_level = 16.0).contains("sky_light_level"));
         assert!(
             refused(|s| s.monster_spawn_light_level = (8, 7)).contains("monster_spawn_light_level")
@@ -585,8 +613,96 @@ mod main_dimension_tests {
 }
 
 #[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    /// The day cycle names the timelines and the clock, and the game's facts read them back.
+    #[test]
+    fn the_day_cycle_reaches_the_games_facts() {
+        use horizon_world::dimension_type::DimensionFacts;
+        let facts = |cycle: &str| {
+            let settings = DimensionSettings {
+                day_cycle: cycle.into(),
+                ..Default::default()
+            };
+            assert_eq!(settings.invalid_field(), None);
+            DimensionFacts::patched(
+                DimensionFacts::overworld(),
+                "test:cycle",
+                &dimension_type(&settings),
+            )
+            .unwrap()
+        };
+        let overworld = facts("overworld");
+        assert!(overworld.has_timeline("minecraft:day"));
+        assert_eq!(
+            overworld.default_clock.as_deref(),
+            Some("minecraft:overworld")
+        );
+        let nether = facts("nether");
+        assert!(!nether.has_timeline("minecraft:day") && nether.default_clock.is_none());
+        let end = facts("end");
+        assert_eq!(end.default_clock.as_deref(), Some("minecraft:the_end"));
+        let none = facts("none");
+        assert!(none.timelines.is_empty() && none.default_clock.is_none());
+        let bad = DimensionSettings {
+            day_cycle: "forever".into(),
+            ..Default::default()
+        };
+        assert!(bad.invalid_field().unwrap().contains("day_cycle"));
+    }
+
+    /// The bed rule goes into the dimension type as vanilla's `bed_rule` attribute, and the game's
+    /// facts read it back from there.
+    #[test]
+    fn the_bed_rule_reaches_the_games_facts() {
+        use horizon_world::dimension_type::{BedRuleTest, DimensionFacts};
+        let settings = DimensionSettings {
+            bed_can_sleep: "never".into(),
+            bed_can_set_spawn: "when_dark".into(),
+            bed_destroy_on_use: true,
+            bed_destroy_on_leave: true,
+            ..Default::default()
+        };
+        assert_eq!(settings.invalid_field(), None);
+        let facts = DimensionFacts::patched(
+            DimensionFacts::overworld(),
+            "test:bedless",
+            &dimension_type(&settings),
+        )
+        .unwrap();
+        assert_eq!(facts.bed_rule.can_sleep, BedRuleTest::Never);
+        assert_eq!(facts.bed_rule.can_set_spawn, BedRuleTest::WhenDark);
+        assert!(facts.bed_rule.destroy_on_use && facts.bed_rule.destroy_on_leave);
+        // the straw bed has its own rule, vanilla's by default
+        assert_eq!(facts.straw_bed_rule.can_set_spawn, BedRuleTest::Never);
+        assert!(!facts.straw_bed_rule.destroy_on_use && facts.straw_bed_rule.destroy_on_leave);
+        let straw = DimensionSettings {
+            straw_bed_can_sleep: "always".into(),
+            straw_bed_destroy_on_use: true,
+            straw_bed_destroy_on_leave: false,
+            ..Default::default()
+        };
+        let facts = DimensionFacts::patched(
+            DimensionFacts::overworld(),
+            "test:straw",
+            &dimension_type(&straw),
+        )
+        .unwrap();
+        assert_eq!(facts.straw_bed_rule.can_sleep, BedRuleTest::Always);
+        assert!(facts.straw_bed_rule.destroy_on_use && !facts.straw_bed_rule.destroy_on_leave);
+        let bad = DimensionSettings {
+            bed_can_sleep: "sometimes".into(),
+            ..Default::default()
+        };
+        assert!(bad.invalid_field().unwrap().contains("bed_can_sleep"));
+    }
+}
+
+#[cfg(test)]
 mod biome_source_tests {
     use super::*;
+    use mod_api::BiomePoint;
 
     #[test]
     fn each_source_names_the_stem_the_data_pack_codec_reads() {
@@ -616,6 +732,35 @@ mod biome_source_tests {
         assert_eq!(
             biome_source(&settings),
             json!({"type": "minecraft:the_end"})
+        );
+        settings.biome_source = BiomeSourceKind::Points;
+        settings.biome_points = vec![BiomePoint {
+            biome: "mymod:glowing_forest".into(),
+            temperature: (-0.5, 0.25),
+            humidity: (0.5, 0.5),
+            continentalness: (-1.0, 2.0),
+            erosion: (-2.0, 0.0),
+            depth: (0.0, 1.0),
+            weirdness: (-0.5, 0.5),
+            offset: 0.25,
+        }];
+        assert_eq!(
+            biome_source(&settings),
+            json!({
+                "type": "minecraft:multi_noise",
+                "biomes": [{
+                    "biome": "mymod:glowing_forest",
+                    "parameters": {
+                        "temperature": [-0.5, 0.25],
+                        "humidity": [0.5, 0.5],
+                        "continentalness": [-1.0, 2.0],
+                        "erosion": [-2.0, 0.0],
+                        "depth": [0.0, 1.0],
+                        "weirdness": [-0.5, 0.5],
+                        "offset": 0.25
+                    }
+                }]
+            })
         );
     }
 
@@ -665,6 +810,49 @@ mod biome_source_tests {
                 s.biome_source = BiomeSourceKind::MultiNoise;
             }),
             ""
+        );
+        // A points source: at least one point, each as the climate codec reads it.
+        let point = || BiomePoint {
+            biome: "mymod:glowing_forest".into(),
+            temperature: (-2.0, 2.0),
+            humidity: (0.0, 0.0),
+            continentalness: (0.0, 0.0),
+            erosion: (0.0, 0.0),
+            depth: (0.0, 0.0),
+            weirdness: (0.0, 0.0),
+            offset: 1.0,
+        };
+        let points = |edit: fn(&mut BiomePoint)| {
+            let mut p = point();
+            edit(&mut p);
+            DimensionSettings {
+                biome_source: BiomeSourceKind::Points,
+                biome_points: vec![p],
+                ..Default::default()
+            }
+            .invalid_biome_source()
+            .unwrap_or_default()
+        };
+        assert_eq!(points(|_| {}), "");
+        assert!(refused(|s| s.biome_source = BiomeSourceKind::Points).contains("at least one"));
+        assert!(points(|p| p.temperature = (0.5, -0.5)).contains("biome point"));
+        assert!(points(|p| p.humidity = (-2.5, 0.0)).contains("biome point"));
+        assert!(points(|p| p.erosion = (0.0, 2.001)).contains("biome point"));
+        assert!(points(|p| p.depth = (f32::NAN, 0.0)).contains("biome point"));
+        assert!(points(|p| p.offset = 1.5).contains("biome point"));
+        assert!(points(|p| p.offset = -0.1).contains("biome point"));
+        assert!(points(|p| p.biome.clear()).contains("biome point"));
+        // A valid points source still refuses a chunk generator of the mod's own.
+        assert!(
+            DimensionSettings {
+                biome_source: BiomeSourceKind::Points,
+                biome_points: vec![point()],
+                generator: "mymod:void".into(),
+                ..Default::default()
+            }
+            .invalid_biome_source()
+            .unwrap_or_default()
+            .contains("fixed biome source")
         );
     }
 }

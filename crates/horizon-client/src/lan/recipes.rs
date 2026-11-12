@@ -8,7 +8,6 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    sync::{Arc, Mutex},
 };
 
 /// RecipeManager.RECIPE_PROPERTY_SETS: each set and the ingredients it takes
@@ -220,7 +219,8 @@ pub fn update_recipes(
         }
     };
     let mut w = Writer::new();
-    w.varint(PROPERTY_SETS.len() as i32);
+    let custom: BTreeMap<_, _> = additions.custom().collect();
+    w.varint((PROPERTY_SETS.len() + custom.len()) as i32);
     for (key, kind, fields) in PROPERTY_SETS {
         let mut set = BTreeSet::new();
         for recipe in &chosen {
@@ -249,6 +249,14 @@ pub fn update_recipes(
         w.string(&format!("minecraft:{key}"));
         w.varint(set.len() as i32);
         for id in set {
+            w.varint(id);
+        }
+    }
+    for (key, names) in custom {
+        let ids: BTreeSet<_> = names.iter().filter_map(|name| item(name)).collect();
+        w.string(key);
+        w.varint(ids.len() as i32);
+        for id in ids {
             w.varint(id);
         }
     }
@@ -304,6 +312,15 @@ const CONTENT_MAX: usize = 1_048_576 - 1024;
 pub struct ContentPart {
     pub recipes: Vec<(String, Value)>,
     pub last: Option<Vec<String>>,
+}
+impl ContentPart {
+    /// Decode a content part only within the same bound used by the sender.
+    pub fn decode(data: &[u8]) -> Result<Self, String> {
+        if data.len() > CONTENT_MAX {
+            return Err(format!("recipe content exceeds {CONTENT_MAX} bytes"));
+        }
+        serde_json::from_slice(data).map_err(|error| error.to_string())
+    }
 }
 
 /// The payloads for `types`' recipes among `sources` (`recipe_sources::sources`,
@@ -370,37 +387,146 @@ pub fn encode_content(types: &[String], sources: &[(String, Value)], reset: bool
     out
 }
 
-/// What the server sends its Horizon clients now (`set_content`).
-static CONTENT: Mutex<Option<Arc<Vec<Vec<u8>>>>> = Mutex::new(None);
+/// One connection's selected recipe types and encoded response. Dropped on disconnect.
+#[derive(Default)]
+pub struct PlayerRecipeSync {
+    pub types: Vec<String>,
+    pub payloads: Vec<Vec<u8>>,
+    sent: bool,
+}
 
-/// The recipe content the server sends from now on, at a join and after a
-/// `/reload` (one server per process, as `lan::sync_data`).
-pub fn set_content(payloads: Vec<Vec<u8>>) {
-    if !payloads.is_empty() {
-        SENT.store(true, std::sync::atomic::Ordering::Relaxed);
+impl PlayerRecipeSync {
+    pub fn replace(&mut self, horizon: bool, mut types: Vec<String>, sources: &[(String, Value)]) {
+        types.sort();
+        types.dedup();
+        self.payloads = if horizon {
+            encode_content(&types, sources, self.sent)
+        } else {
+            Vec::new()
+        };
+        self.sent |= !self.payloads.is_empty();
+        self.types = types;
     }
-    *CONTENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(payloads));
-}
-
-/// Whether this server sent its clients recipes before: a later load that
-/// asks for none must put them back on their own (`encode_content`'s reset).
-static SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn sent_before() -> bool {
-    SENT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The payloads to send a Horizon client; none when no mod asked.
-pub fn content() -> Arc<Vec<Vec<u8>>> {
-    CONTENT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_default()
 }
 
 /// Horizon recipe viewer transfer channel.
 pub const TRANSFER_CHANNEL: &str = "horizon:recipe_transfer";
+
+/// Decode a transfer request: container, bounded recipe id, optional all flag.
+pub fn decode_transfer_request(data: &[u8]) -> horizon_protocol::Result<(i32, String, bool)> {
+    let mut reader = horizon_protocol::buf::Reader::new(data);
+    let container = reader.varint()?;
+    let id = reader.string(512)?;
+    let all = match reader.remaining() {
+        0 => false,
+        1 => reader.u8()? == 1,
+        _ => {
+            return Err(horizon_protocol::Error::new(
+                "recipe transfer request: trailing bytes",
+            ));
+        }
+    };
+    Ok((container, id, all))
+}
+
+/// Decode a fixed-shape transfer result, or an empty feature advertisement.
+pub fn decode_transfer_reply(data: &[u8]) -> horizon_protocol::Result<Option<(i32, u8)>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = horizon_protocol::buf::Reader::new(data);
+    let reply = (reader.varint()?, reader.u8()?);
+    if reader.remaining() != 0 {
+        return Err(horizon_protocol::Error::new(
+            "recipe transfer reply: trailing bytes",
+        ));
+    }
+    Ok(Some(reply))
+}
+
+/// Horizon's check of a viewer transfer, worked out without moving anything
+/// (`Menu::check_transfer`); like `TRANSFER_CHANNEL`, an empty clientbound
+/// payload advertises it. A request is the menu id, a tag the client picks and
+/// the recipe's id; the reply is the menu id, the tag, the result as
+/// `TRANSFER_CHANNEL` sends it (`result_byte`) and, for `Missing`, the count
+/// of the recipe's cells nothing fills then each cell as a byte.
+pub const CHECK_CHANNEL: &str = "horizon:recipe_check";
+
+/// Whether `channel` is one of the recipe viewer's (`TRANSFER_CHANNEL`,
+/// `CHECK_CHANNEL`).
+pub fn viewer_channel(channel: &str) -> bool {
+    channel == TRANSFER_CHANNEL || channel == CHECK_CHANNEL
+}
+
+/// Tells a Horizon client the server answers both viewer channels: an empty
+/// payload on each.
+pub fn advertise_viewer_channels(g: &super::guest::Guest) {
+    for channel in [TRANSFER_CHANNEL, CHECK_CHANNEL] {
+        g.send(
+            &horizon_protocol::packets::play::Clientbound::CustomPayload(
+                horizon_protocol::packets::configuration::CustomPayload {
+                    channel: channel.into(),
+                    data: Vec::new(),
+                },
+            ),
+        );
+    }
+}
+
+/// A viewer transfer's result as the engine's menu gives it.
+pub fn transfer_result(
+    result: Result<(), crate::menu::place::TransferError>,
+) -> mod_api::RecipeTransferResult {
+    use crate::menu::place::TransferError;
+    use mod_api::RecipeTransferResult as R;
+    match result {
+        Ok(()) => R::Moves,
+        Err(TransferError::Missing) => R::Missing,
+        Err(TransferError::NoRoom) => R::NoRoom,
+        Err(TransferError::Unavailable) => R::NotIntoMenu,
+    }
+}
+
+/// The byte both transfer channels carry a result as.
+pub fn result_byte(result: mod_api::RecipeTransferResult) -> u8 {
+    use mod_api::RecipeTransferResult as R;
+    match result {
+        R::Moves => 0,
+        R::Missing => 1,
+        R::NoRoom => 2,
+        R::NotIntoMenu => 3,
+    }
+}
+
+/// The result a transfer channel's byte names; None for any other byte.
+pub fn byte_result(byte: u8) -> Option<mod_api::RecipeTransferResult> {
+    use mod_api::RecipeTransferResult as R;
+    Some(match byte {
+        0 => R::Moves,
+        1 => R::Missing,
+        2 => R::NoRoom,
+        3 => R::NotIntoMenu,
+        _ => return None,
+    })
+}
+
+/// The recipe content the native mods asked for (stored on this guest),
+/// to one Horizon client: none when no mod asked.
+pub fn send_content(g: &super::guest::Guest) {
+    if g.brand != "horizon" {
+        return;
+    }
+    for data in &g.recipe_sync.payloads {
+        g.send(
+            &horizon_protocol::packets::play::Clientbound::CustomPayload(
+                horizon_protocol::packets::configuration::CustomPayload {
+                    channel: CONTENT_CHANNEL.into(),
+                    data: data.clone(),
+                },
+            ),
+        );
+    }
+}
 
 #[cfg(test)]
 mod content_tests {
@@ -469,7 +595,7 @@ mod content_tests {
             "result": {"id": "minecraft:stick", "count": 1}
         });
         let sources = || vec![("aspects_test".to_owned(), recipe.clone())];
-        mod_api::testing::with_mods(mods.into(), || {
+        mod_platform::testing::with_mods(mods.into(), || {
             let server_origin = DataLoadOrigin::ServerDataLoad;
             let resolved =
                 ResolvedSources::resolve(sources(), &load(EngineDataLoadOrigin::ServerDataLoad));
@@ -554,7 +680,7 @@ mod content_tests {
             "props",
             Box::new(PropertyListener(heard.clone())),
         )];
-        mod_api::testing::with_mods(mods.into(), || {
+        mod_platform::testing::with_mods(mods.into(), || {
             let resolved =
                 ResolvedSources::resolve(Vec::new(), &load(EngineDataLoadOrigin::ServerDataLoad));
             assert_eq!(*heard.lock().unwrap(), [DataLoadOrigin::ServerDataLoad]);
@@ -610,7 +736,7 @@ mod content_tests {
         }
         recipe["key"] = json!({"a": {"type": "mymod:aspect", "aspect": "key"}});
         recipe["shapes"] = json!({"star": {"type": "mymod:aspect", "aspect": "shapes"}});
-        mod_api::testing::with_mods(mods.into(), || {
+        mod_platform::testing::with_mods(mods.into(), || {
             let resolved = ResolvedSources::resolve(
                 vec![("slots".to_owned(), recipe.clone())],
                 &load(EngineDataLoadOrigin::ServerDataLoad),
@@ -627,6 +753,15 @@ mod content_tests {
             parse(&file["key"]["a"]);
             parse(&file["shapes"]["star"]);
         });
+    }
+
+    #[test]
+    fn content_decode_bounds_before_deserializing() {
+        let mut body = br#"{"recipes":[],"last":null}"#.to_vec();
+        body.resize(1_047_552, b' ');
+        assert_eq!(ContentPart::decode(&body).unwrap().recipes, vec![]);
+        body.push(b' ');
+        assert!(ContentPart::decode(&body).unwrap_err().contains("exceeds"));
     }
 
     #[test]
@@ -693,5 +828,41 @@ mod content_tests {
         let last: ContentPart = serde_json::from_slice(&parts[1]).unwrap();
         assert!(last.recipes.is_empty());
         assert_eq!(last.last.map(|t| t.len()), Some(5000));
+    }
+}
+
+#[cfg(test)]
+mod per_player_tests {
+    use super::*;
+
+    #[test]
+    fn per_player_content_keeps_grinding_private_and_resets_only_its_owner() {
+        let sources = vec![(
+            "testmod:ore".into(),
+            serde_json::json!({"type":"testmod:grinding", "result":"minecraft:iron_ingot"}),
+        )];
+        let mut a = PlayerRecipeSync::default();
+        let mut b = PlayerRecipeSync::default();
+        let mut vanilla = PlayerRecipeSync::default();
+        a.replace(true, vec!["testmod:grinding".into()], &sources);
+        b.replace(true, vec![], &sources);
+        vanilla.replace(false, vec!["testmod:grinding".into()], &sources);
+        let part = ContentPart::decode(&a.payloads[0]).unwrap();
+        assert_eq!(part.recipes, sources);
+        assert_eq!(part.last, Some(vec!["testmod:grinding".into()]));
+        assert!(b.payloads.is_empty());
+        assert!(vanilla.payloads.is_empty());
+        a.replace(true, vec![], &sources);
+        b.replace(true, vec!["testmod:grinding".into()], &sources);
+        vanilla.replace(false, vec!["testmod:grinding".into()], &sources);
+        assert_eq!(
+            ContentPart::decode(&a.payloads[0]).unwrap().last,
+            Some(vec![])
+        );
+        assert_eq!(
+            ContentPart::decode(&b.payloads[0]).unwrap().recipes,
+            sources
+        );
+        assert!(vanilla.payloads.is_empty());
     }
 }

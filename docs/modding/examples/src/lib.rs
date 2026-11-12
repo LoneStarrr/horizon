@@ -69,11 +69,5 @@ pub mod at_a_point {
     // ANCHOR_END: points
 }
 
-/// A mod screen built from `mod_api::widgets`.
-pub mod widget_screen;
-
-/// Reload-stable custom recipe definitions.
-pub mod reload_recipes;
-
-/// Worldgen states resolved at construction and saved-piece load.
-pub mod worldgen;
+// Every standalone snippet module under src is compiled.
+include!(concat!(env!("OUT_DIR"), "/example_modules.rs"));

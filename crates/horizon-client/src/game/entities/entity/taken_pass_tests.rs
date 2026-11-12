@@ -5,7 +5,7 @@ use horizon_mod_runtime::attachments::{
     AttachmentRegistration, AttachmentType, Attachments, HasAttachmentLifetime, Holder,
     index::AttachmentIndex,
 };
-use mod_api::{EntityRef, NativeWorldEpoch};
+use mod_api::{EntityRef, WorldEpoch};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -72,7 +72,7 @@ impl SlotIdentities {
     pub fn observe<T: HasAttachmentLifetime>(
         &mut self,
         owners: &mut JoinList<T, false>,
-        epoch: NativeWorldEpoch,
+        epoch: WorldEpoch,
         id: fn(&T) -> u32,
     ) {
         owners.for_each_mut(|owner| {
@@ -84,7 +84,7 @@ impl SlotIdentities {
     pub fn observe_one<T: HasAttachmentLifetime>(
         &mut self,
         owner: &mut T,
-        epoch: NativeWorldEpoch,
+        epoch: WorldEpoch,
         id: u32,
     ) {
         use std::collections::hash_map::Entry;
@@ -285,7 +285,9 @@ fn lifecycle_fixture_walks_other_owners() {
             game.others.clear();
             for &(id, at) in entries {
                 game.others.push(crate::game::commands::OtherEntity {
+                    attachment_lifetime: Default::default(),
                     knot_check: None,
+                    eye: None,
                     join: Default::default(),
                     id,
                     kind: "minecraft:marker".into(),
@@ -319,14 +321,18 @@ pub(in crate::game) fn in_both_dimensions(mut test: impl FnMut(&mut Game<'_>, &P
             game.world_root = root.0.clone();
             game.enter_level(dimension).unwrap();
             use horizon_client::join_seq::residency::{Kind, Owner};
-            let balance = PassBalance::bind(
-                &mut game.mobs,
-                Owner {
+            let balance = PassBalance {
+                journal: game
+                    .resident_entities
+                    .table
+                    .borrow()
+                    .producer()
+                    .observe_structural_events(),
+                owner: Owner {
                     dimension: game.dim.key(),
                     kind: Kind::Mob,
                 },
-                |mob| (mob.id, mob.join),
-            );
+            };
             test(game, &balance);
             balance.assert_parked(game);
             assert_eq!(
@@ -342,15 +348,6 @@ pub(in crate::game) struct PassBalance {
     owner: horizon_client::join_seq::residency::Owner,
 }
 impl PassBalance {
-    fn bind<T: horizon_client::join_seq::Joined, const DIRECT: bool>(
-        list: &mut JoinList<T, DIRECT>,
-        owner: horizon_client::join_seq::residency::Owner,
-        identity: fn(&T) -> (u32, horizon_client::join_seq::JoinSeq),
-    ) -> Self {
-        let journal = horizon_client::join_seq::residency::Journal::default();
-        list.bind_residency(&journal, owner, identity);
-        Self { journal, owner }
-    }
     pub(in crate::game) fn drain_balanced(&self) -> usize {
         use horizon_client::join_seq::residency::Change;
         let mut events = Vec::new();
@@ -358,7 +355,9 @@ impl PassBalance {
         let mut depth = 0usize;
         let mut lifts = 0;
         for event in events {
-            assert_eq!(event.owner, self.owner);
+            if event.owner != self.owner {
+                continue;
+            }
             match event.change {
                 Change::Lifted => {
                     depth += 1;

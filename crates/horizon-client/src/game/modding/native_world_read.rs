@@ -10,7 +10,7 @@ use horizon_world::{
     registry::{BlockRegistry, BlockStateId},
 };
 use mod_api::BlockKey;
-use mod_api::{FluidKey, FluidState, LevelRef, NativeLifecycleContext, UnresolvedFluid};
+use mod_api::{FluidKey, FluidState, LevelRef, LifecycleContext, UnresolvedFluid};
 
 /// Why a server block cannot be read.
 #[allow(dead_code)]
@@ -33,11 +33,9 @@ thread_local! {
 /// Bind the world's merged tags alongside its block mappings, including the resource-only case.
 /// Never cache on Items: its string tables also serve tools and client network snapshots.
 pub(super) fn prepare_block_tags(
-    items: &Items,
+    tags: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> std::collections::HashMap<String, std::collections::HashSet<BlockKey>> {
-    items
-        .block_tags
-        .iter()
+    tags.iter()
         .map(|(tag, members)| {
             let mut set = std::collections::HashSet::<BlockKey>::default();
             for name in members {
@@ -54,6 +52,12 @@ pub(super) fn install_block_tags(
     tags: std::collections::HashMap<String, std::collections::HashSet<BlockKey>>,
 ) {
     BLOCK_TAGS.with(|snapshot| *snapshot.borrow_mut() = tags);
+}
+
+#[cfg(test)]
+pub(in crate::game) fn installed_block_tag_snapshot()
+-> std::collections::HashMap<String, std::collections::HashSet<BlockKey>> {
+    BLOCK_TAGS.with(|snapshot| snapshot.borrow().clone())
 }
 
 /// One availability check, one tag-name lookup and one API key membership test.
@@ -179,7 +183,7 @@ impl Game<'_> {
         &self,
         items: &Items,
     ) -> std::collections::HashMap<String, std::collections::HashSet<BlockKey>> {
-        prepare_block_tags(items)
+        prepare_block_tags(&items.block_tags)
     }
 
     /// Whether the resolved block is in the world's merged block tag, on a client the tag its
@@ -335,12 +339,19 @@ impl Game<'_> {
         horizon_world::level::fluid_pickup_sound(fluid_kind(fluid)?)
     }
 
+    /// The sound event a bucket plays as it empties `fluid` (`BucketItem.playEmptySound`),
+    /// `minecraft:item.bucket.empty_lava` for lava and flowing lava. None for
+    /// `minecraft:empty`, for a tank-only fluid and for a name no fluid has.
+    pub(super) fn fluid_empty_sound(&self, fluid: &str) -> Option<&'static str> {
+        horizon_world::level::fluid_empty_sound(fluid_kind(fluid)?)
+    }
+
     /// Read a loaded block in a server tick hook, without loading a chunk.
     /// The returned name and properties are owned and remain valid after the hook.
     #[allow(dead_code)]
     pub(super) fn native_server_block(
         &self,
-        context: &NativeLifecycleContext,
+        context: &LifecycleContext,
         dimension: &str,
         pos: [i32; 3],
     ) -> Result<BlockState, NativeBlockReadError> {
@@ -421,7 +432,7 @@ mod tests {
 
     #[test]
     fn fluid_state_conversion_preserves_source_and_empty_invariants() {
-        mod_api::__private::install(Default::default());
+        mod_platform::__private::install(Default::default());
         crate::game::api_values::register_game_keys([]);
         for kind in FluidKind::ALL {
             let engine =
@@ -441,8 +452,8 @@ mod tests {
 
     #[test]
     fn api_block_tags_rebind_the_merged_snapshot_without_changing_keys() {
-        use mod_api::__private::part_tests;
-        mod_api::__private::install(Default::default());
+        use mod_platform::__private::part_tests;
+        mod_platform::__private::install(Default::default());
         crate::game::api_values::register_game_keys([
             "minecraft:stone".into(),
             "test:machine".into(),
@@ -464,7 +475,7 @@ mod tests {
             // Build reordered numeric registries from the same API definitions.
             let registry = BlockRegistry::from_facts_json(facts.as_bytes()).unwrap();
             crate::game::api_values::resolve_block_definitions(&registry).unwrap();
-            install_block_tags(prepare_block_tags(&items));
+            install_block_tags(prepare_block_tags(&items.block_tags));
             assert_eq!(block_in_tag(machine, "test:machines"), Some(true));
             assert_eq!(block_in_tag(stone, "test:machines"), Some(false));
             assert_eq!(block_in_tag(stone, "base_stone_overworld"), Some(true));
@@ -479,7 +490,7 @@ mod tests {
         items
             .block_tags
             .insert("test:machines".into(), ["minecraft:stone".into()].into());
-        install_block_tags(prepare_block_tags(&items));
+        install_block_tags(prepare_block_tags(&items.block_tags));
         assert_eq!(block_in_tag(machine, "test:machines"), Some(false));
         assert_eq!(block_in_tag(stone, "test:machines"), Some(true));
         // Valid key, no owning world: never answer false using another thread's tags.
@@ -645,28 +656,28 @@ mod tests {
 
             assert_eq!(
                 game.block_in_tag(
-                    mod_api::__private::part_tests::block_key("minecraft:stone"),
+                    mod_platform::__private::part_tests::block_key("minecraft:stone"),
                     "minecraft:base_stone_overworld"
                 ),
                 Some(true)
             );
             assert_eq!(
                 game.block_in_tag(
-                    mod_api::__private::part_tests::block_key("stone"),
+                    mod_platform::__private::part_tests::block_key("stone"),
                     "base_stone_overworld"
                 ),
                 Some(true)
             );
             assert_eq!(
                 game.block_in_tag(
-                    mod_api::__private::part_tests::block_key("minecraft:stone"),
+                    mod_platform::__private::part_tests::block_key("minecraft:stone"),
                     "minecraft:logs"
                 ),
                 Some(false)
             );
             assert_eq!(
                 game.block_in_tag(
-                    mod_api::__private::part_tests::block_key("minecraft:stone"),
+                    mod_platform::__private::part_tests::block_key("minecraft:stone"),
                     "nope:missing"
                 ),
                 Some(false)
@@ -735,7 +746,7 @@ mod tests {
                 // Not an authoritative level: tags are not the server's, so they read None.
                 assert_eq!(
                     host.block_in_tag(
-                        mod_api::__private::part_tests::block_key("minecraft:stone"),
+                        mod_platform::__private::part_tests::block_key("minecraft:stone"),
                         "minecraft:base_stone_overworld"
                     ),
                     None
@@ -760,7 +771,7 @@ mod tests {
                 .try_into_api()
                 .unwrap();
             let default = game
-                .block_state_default(mod_api::__private::part_tests::block_key(
+                .block_state_default(mod_platform::__private::part_tests::block_key(
                     "minecraft:oak_slab",
                 ))
                 .try_into_api()
@@ -771,7 +782,7 @@ mod tests {
                     parsed
                 );
                 assert_eq!(
-                    host.block_state_default(mod_api::__private::part_tests::block_key(
+                    host.block_state_default(mod_platform::__private::part_tests::block_key(
                         "minecraft:oak_slab"
                     )),
                     default
@@ -787,7 +798,7 @@ mod tests {
                     parsed
                 );
                 assert_eq!(
-                    wrapped.block_state_default(mod_api::__private::part_tests::block_key(
+                    wrapped.block_state_default(mod_platform::__private::part_tests::block_key(
                         "minecraft:oak_slab"
                     )),
                     default
@@ -804,14 +815,14 @@ mod tests {
                 assert_eq!((host.min_y(), host.height()), bounds);
                 assert_eq!(
                     host.block_in_tag(
-                        mod_api::__private::part_tests::block_key("minecraft:stone"),
+                        mod_platform::__private::part_tests::block_key("minecraft:stone"),
                         "minecraft:base_stone_overworld"
                     ),
                     Some(true)
                 );
                 assert_eq!(
                     host.block_in_tag(
-                        mod_api::__private::part_tests::block_key("minecraft:stone"),
+                        mod_platform::__private::part_tests::block_key("minecraft:stone"),
                         "minecraft:logs"
                     ),
                     Some(false)
@@ -849,7 +860,7 @@ mod tests {
                     parsed
                 );
                 assert_eq!(
-                    hit.block_state_default(mod_api::__private::part_tests::block_key(
+                    hit.block_state_default(mod_platform::__private::part_tests::block_key(
                         "minecraft:oak_slab"
                     )),
                     default
@@ -862,7 +873,7 @@ mod tests {
                 assert_eq!((hit.min_y(), hit.height()), bounds);
                 assert_eq!(
                     hit.block_in_tag(
-                        mod_api::__private::part_tests::block_key("minecraft:stone"),
+                        mod_platform::__private::part_tests::block_key("minecraft:stone"),
                         "minecraft:base_stone_overworld"
                     ),
                     Some(true)
@@ -884,14 +895,14 @@ mod tests {
                     ));
                 assert_eq!(hit.block_state_id("minecraft:stone"), None);
                 assert_eq!(
-                    hit.block_state_default(mod_api::__private::part_tests::block_key(
+                    hit.block_state_default(mod_platform::__private::part_tests::block_key(
                         "minecraft:stone"
                     )),
                     None
                 );
                 assert_eq!(
                     hit.block_in_tag(
-                        mod_api::__private::part_tests::block_key("minecraft:stone"),
+                        mod_platform::__private::part_tests::block_key("minecraft:stone"),
                         "minecraft:logs"
                     ),
                     None
@@ -919,7 +930,7 @@ mod tests {
     /// pickup sound, and a name no fluid has answers nothing, through a mod's `Host`.
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn fluid_sameness_buckets_and_pickup_sounds_follow_vanilla() {
+    fn fluid_sameness_buckets_and_bucket_sounds_follow_vanilla() {
         with_game(|game| {
             let host: &dyn mod_api::Host = game;
             assert!(host.fluid_is_same("minecraft:water", "minecraft:flowing_water"));
@@ -952,6 +963,17 @@ mod tests {
             );
             assert_eq!(host.fluid_pickup_sound("minecraft:empty"), None);
             assert_eq!(host.fluid_pickup_sound("nope:missing"), None);
+
+            assert_eq!(
+                host.fluid_empty_sound("flowing_water"),
+                Some("minecraft:item.bucket.empty")
+            );
+            assert_eq!(
+                host.fluid_empty_sound("minecraft:lava"),
+                Some("minecraft:item.bucket.empty_lava")
+            );
+            assert_eq!(host.fluid_empty_sound("minecraft:empty"), None);
+            assert_eq!(host.fluid_empty_sound("nope:missing"), None);
         });
     }
 }

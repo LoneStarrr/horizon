@@ -3,6 +3,13 @@ use super::*;
 impl Game<'_> {
     /// Per tick, for every guest: dig, use items, pick up drops, die.
     pub(in crate::game) fn tick_guests(&mut self) {
+        building_cache(self.lan.as_ref());
+        self.tick_guests_inner();
+        building_cache(None);
+        self.pickup_columns = None;
+    }
+
+    fn tick_guests_inner(&mut self) {
         // `EntityEvent.Size` for the poses the guests' moves set since the last tick.
         self.native_guest_sizes();
         self.tick_guest_cameras();
@@ -38,6 +45,9 @@ impl Game<'_> {
             .filter(|g| host.hub.here(g) && g.loaded)
             .map(|g| g.conn)
             .collect();
+        // The players' pickups ask which columns items reach before
+        // scanning every item: most players stand on none.
+        self.pickup_columns = Some(Default::default());
         // The players the guests' hooks can catch.
         if host.play.values().any(|p| p.hook.is_some()) {
             self.refresh_hook_targets();
@@ -54,6 +64,7 @@ impl Game<'_> {
             let play = host.play.entry(conn).or_default();
             play.chat_spam = play.chat_spam.saturating_sub(1);
             play.command_spam = play.command_spam.saturating_sub(1);
+            play.recipe_checks = play.recipe_checks.saturating_sub(1);
             // commandSuggestionsProvider.tick: one answer a tick, to the latest request.
             play.suggestion_budget = true;
             self.guest_try_suggestions(conn);
@@ -66,6 +77,9 @@ impl Game<'_> {
             };
             if host.hub.guests[gi].dead {
                 self.guest_tick_death(gi);
+                if let Some(host) = self.lan.as_ref() {
+                    refresh_building_player(host, conn);
+                }
                 self.guest_player_tick(
                     gi,
                     conn,
@@ -83,6 +97,9 @@ impl Game<'_> {
                 // has loaded around the player or not: its respawn request
                 // is taken as soon as it comes.
                 self.guest_die(gi, conn);
+                if let Some(host) = self.lan.as_ref() {
+                    refresh_building_player(host, conn);
+                }
                 self.guest_player_tick(
                     gi,
                     conn,
@@ -182,16 +199,11 @@ impl Game<'_> {
             // Player.tick: a different main-hand item resets the attack
             // strength, and detectEquipmentUpdates gives the guest its modifiers.
             let g = &host.hub.guests[gi];
-            let held = g
-                .inventory
-                .get(g.selected)
-                .cloned()
-                .flatten()
-                .map(|s| s.item);
+            let held = crate::game::held::held_attack_item(&g.inventory, g.selected);
             let play = host.play.entry(conn).or_default();
-            if play.attack_item != held {
+            if play.attack_item.as_ref() != held {
                 play.attack_ticks = 0;
-                play.attack_item = held;
+                play.attack_item = held.cloned();
             }
             self.guest_delayed_destroy(conn);
             self.guest_server_tick(conn);
@@ -234,6 +246,9 @@ impl Game<'_> {
                 self.guest_orbs(gi);
             }
             self.guest_die(gi, conn);
+            if let Some(host) = self.lan.as_ref() {
+                refresh_building_player(host, conn);
+            }
             self.guest_player_tick(gi, conn, mod_api::HookId::PlayerTickPost, |game, player| {
                 game.native_player_tick_post(mod_api::__private::PlayerTickPostCall { player })
             });
@@ -370,6 +385,10 @@ impl Game<'_> {
             return;
         };
         let g = self.lan.as_ref().unwrap().hub.guest(conn).unwrap();
+        // Each move the player sent put it somewhere (`handleMovePlayer`'s `setPos`).
+        let (id, end) = (g.entity_id as u32, g.position);
+        self.entity_section_walked(id, end, moves.iter().map(|m| m.0));
+        let g = self.lan.as_ref().unwrap().hub.guest(conn).unwrap();
         if g.spectator() {
             // ServerPlayer.doTick runs the player's whole tick for a spectator
             // too, unless its box touches an unloaded chunk
@@ -421,6 +440,7 @@ impl Game<'_> {
         let events = self.as_guest(conn, |game| {
             let (rules, motion) = (game.world.health_rules, game.motion);
             let health = &motion.health;
+            let leather_boots = super::super::worn_boots::leather_boots(&game.armor);
             let freeze_immune = game.wears_freeze_immune();
             let burn_immune = game.wears_burn_from_stepping_immunity();
             let boat = game.riding_boat_fluid_box();
@@ -477,6 +497,7 @@ impl Game<'_> {
                     });
                 from = to;
             }
+            let _ = w.server_stuck_in_blocks(start);
             for (moved, on_ground) in moves {
                 let movement = Vec3::new(moved[0], moved[1], moved[2]);
                 let landed = (|| -> horizon_client::Result<()> {
@@ -508,6 +529,7 @@ impl Game<'_> {
             // lit campfires and grown sweet berry bushes hurt (#1305).
             w.player.shift_key_down = sneaking;
             let _ = w.player.set_sleeping(sleeping);
+            w.player.leather_boots = leather_boots;
             w.player.freeze_immune = freeze_immune;
             w.player.burn_from_stepping_immune = burn_immune;
             let _ = w.server_block_damage(start);
@@ -526,20 +548,23 @@ impl Game<'_> {
                 w.server_player_pose_tick()
             };
             let mut events = std::mem::take(&mut w.player.events);
-            // LayeredCauldronBlock.handleEntityOnFireInside along those moves.
-            for event in &events {
-                match event {
-                    MotionEvent::CauldronExtinguish { pos } => game.cauldron_extinguish(*pos),
-                    MotionEvent::PowderSnowMelt { pos } => game.powder_snow_melt(*pos),
-                    _ => {}
-                }
-            }
+            // Powder snow and cauldrons put the fire out along those moves.
+            game.block_extinguish_player(&events);
             // Entity.baseTick: rain puts out a burning player.
             game.rain_extinguish_player();
-            // WitherRoseBlock.entityInside along those moves.
+            // WitherRoseBlock.entityInside along those moves, and an
+            // `entity_inside` part's typed effect writes.
             for event in &events {
-                if matches!(event, MotionEvent::InsideWitherRose) {
-                    game.wither_rose_contact();
+                match event {
+                    MotionEvent::InsideWitherRose => game.wither_rose_contact(),
+                    MotionEvent::InsideEffect {
+                        id,
+                        duration,
+                        amplifier,
+                    } if game.remote.is_none() && game.ui.difficulty != 0 => {
+                        game.give_player_effect(id, *duration, i32::from(*amplifier));
+                    }
+                    _ => {}
                 }
             }
             // ServerGamePacketListenerImpl.handleMovePlayer:
@@ -705,7 +730,13 @@ impl Game<'_> {
                         .as_ref()
                         .and_then(|host| host.hub.guest(conn))
                         .map(|g| g.uuid);
-                    self.landing_block_updates(player, &event)
+                    // The rule's own game event goes out as the player whose
+                    // landing it was (`FarmlandBlock.turnToBaseBlock`'s change,
+                    // `TurtleEggBlock.decreaseEggs`' destroy): a sculk sensor, a
+                    // calibrated sensor and a warden hear it.
+                    if let Some(vibration) = self.landing_block_updates(player, &event) {
+                        self.as_guest(conn, |game| game.post_landing_vibration(vibration));
+                    }
                 }
                 // PowderSnowBlock.entityInside: every player around sees the
                 // snowflake (`ServerLevel.sendParticles`).
@@ -787,3 +818,7 @@ impl Game<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/building_cache.rs"]
+mod building_cache_tests;

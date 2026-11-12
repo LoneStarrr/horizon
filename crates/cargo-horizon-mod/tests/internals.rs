@@ -75,9 +75,9 @@ fn internals_add_writes_pinned_hashes_and_preserves_the_rest_of_the_manifest() {
     success(&output);
     let manifest = project.manifest();
     assert_eq!(manifest.internals.len(), 2);
-    assert_eq!(manifest.internals[0].hash, "1111");
+    assert_eq!(manifest.internals[0].hash.as_deref(), Some("1111"));
     // A guarded alternative before the unconditional entry must not shadow it.
-    assert_eq!(manifest.internals[1].hash, "7777");
+    assert_eq!(manifest.internals[1].hash.as_deref(), Some("7777"));
     assert!(
         project
             .text()
@@ -174,7 +174,7 @@ fn internals_add_refuses_missing_gated_and_shape_only_paths_without_partial_edit
 fn update_diffs_signatures_refreshes_present_hashes_and_keeps_missing_declarations() {
     let project = Project::new(
         "update",
-        "internals = [\n  { path = 'horizon_client::game::Game', hash = '1111' }, # stable\n  { path = \"horizon_client::game::Game<'_>::reach\", hash = '2222' }, # reach\n  { path = 'horizon_client::game::Game::creative', hash = '3333' }, # removed\n  { path = 'horizon_client::game::conditional', hash = '8888' }, # gated now\n  { path = 'horizon_client::game::restored', hash = '0000' }, # back again\n]\n",
+        "internals = [\n  { path = 'horizon_client::game::Game', hash = '1111' }, # stable\n  { path = \"horizon_client::game::Game<'_>::reach\" }, # reach\n  { path = 'horizon_client::game::Game::creative', hash = '3333' }, # removed\n  { path = 'horizon_client::game::conditional', hash = '8888' }, # gated now\n  { path = 'horizon_client::game::restored', hash = '0000' }, # back again\n]\n",
     );
     let report = success(&project.run(&["update", "--horizon", NEW]));
     assert!(
@@ -201,9 +201,10 @@ fn update_diffs_signatures_refreshes_present_hashes_and_keeps_missing_declaratio
         manifest
             .internals
             .iter()
-            .map(|i| i.hash.as_str())
+            .map(|i| i.hash.as_deref().unwrap_or_default())
             .collect::<Vec<_>>(),
-        ["1111", "abcd", "3333", "8888", "9999"]
+        // `reach` has no hash: it follows the pin, reported but left without one.
+        ["1111", "", "3333", "8888", "9999"]
     );
     for comment in [
         "# stable",
@@ -237,7 +238,10 @@ fn table_declarations_keep_their_format_when_adding_and_refreshing() {
         "horizon_client::game::Game",
         "horizon_client::game::Game::creative",
     ]));
-    assert_eq!(project.manifest().internals[0].hash, "1111");
+    assert_eq!(
+        project.manifest().internals[0].hash.as_deref(),
+        Some("1111")
+    );
     assert!(project.text().contains("[[internals]] # the game"));
     assert!(project.text().contains("# fingerprint"));
     let report = success(&project.run(&["update", "--horizon", NEW]));
@@ -282,7 +286,7 @@ fn internals_add_requires_kind_for_ambiguous_paths_and_update_keeps_it() {
             success(&project.run(&["internals", "add", path, "--kind", kind]));
             let declaration = &project.manifest().internals[0];
             assert_eq!(declaration.kind.as_deref(), Some(kind));
-            assert_eq!(declaration.hash, "function");
+            assert_eq!(declaration.hash.as_deref(), Some("function"));
             success(&project.run(&["internals", "add", path, "--kind", "field"]));
             let before = project.text();
             success(&project.run(&["internals", "add", "--kind", kind, path]));
@@ -295,9 +299,9 @@ fn internals_add_requires_kind_for_ambiguous_paths_and_update_keeps_it() {
             let manifest = project.manifest();
             assert_eq!(manifest.internals.len(), 2);
             assert_eq!(manifest.internals[0].kind.as_deref(), Some(kind));
-            assert_eq!(manifest.internals[0].hash, "new-function");
+            assert_eq!(manifest.internals[0].hash.as_deref(), Some("new-function"));
             assert_eq!(manifest.internals[1].kind.as_deref(), Some("field"));
-            assert_eq!(manifest.internals[1].hash, "field");
+            assert_eq!(manifest.internals[1].hash.as_deref(), Some("field"));
         }
     }
 }
@@ -323,8 +327,27 @@ fn unreadable_new_catalog_does_not_move_either_pin_or_hashes() {
 
 #[cfg(unix)]
 #[test]
-fn internals_sync_invokes_the_launcher_and_never_edits_on_failure() {
+#[ignore = "fixture writer subprocess only"]
+fn write_launcher_actor() {
     use std::os::unix::fs::PermissionsExt;
+    if let Some(destination) = std::env::var_os("HORIZON_TEST_LAUNCHER_WRITER") {
+        use std::io::Write;
+        let mut file = fs::File::create(&destination).unwrap();
+        file.write_all(
+            std::env::var("HORIZON_TEST_LAUNCHER_SCRIPT")
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn internals_sync_invokes_the_launcher_and_never_edits_on_failure() {
     let project = Project::new(
         "sync-command",
         "internals = [{ path = 'Unused', hash = 'old' }]\n",
@@ -338,24 +361,44 @@ fn internals_sync_invokes_the_launcher_and_never_edits_on_failure() {
             .output()
             .unwrap()
     };
-    fs::write(&launcher, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    // A separate, exact-test writer cannot leak writable fds into other tests'
+    // fork children. CLOEXEC would only close those descriptors at exec.
+    let write_launcher = |script: &str| {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "write_launcher_actor", "--ignored"])
+            .env("HORIZON_TEST_LAUNCHER_WRITER", &launcher)
+            .env("HORIZON_TEST_LAUNCHER_SCRIPT", script)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| {
+                    line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+                })
+        );
+    };
+    write_launcher("#!/bin/sh\nexit 1\n");
     let before = project.text();
     assert!(!invoke().status.success());
     assert_eq!(project.text(), before);
-    fs::write(&launcher, r#"#!/bin/sh
+    write_launcher(
+        r#"#!/bin/sh
 [ "$1" = native-build ] && [ "$2" = --sync-internals ] && [ "$3" = --trust-native-code ] && [ "$4" = "$PWD" ] || exit 2
 printf '%s\n' '[{"path":"Used","kind":"struct","signature":"struct Used","hash":"compiler"}]'
-"#).unwrap();
+"#,
+    );
     let report = success(&invoke());
     assert!(report.contains("added: Used (struct)"));
     assert!(report.contains("removed: Unused"));
     let manifest = project.manifest();
     assert_eq!(manifest.internals.len(), 1);
-    assert_eq!(manifest.internals[0].hash, "compiler");
+    assert_eq!(manifest.internals[0].hash.as_deref(), Some("compiler"));
     assert!(project.text().contains("# native settings"));
     let before = project.text();
-    fs::write(&launcher, "#!/bin/sh\nprintf 'not JSON'\n").unwrap();
+    write_launcher("#!/bin/sh\nprintf 'not JSON'\n");
     assert!(!invoke().status.success());
     assert_eq!(project.text(), before);
 }

@@ -14,8 +14,9 @@ pub use group::rustc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The one toolchain every wasm mod and the game's std member are built with.
-pub const TOOLCHAIN: &str = "1.99.1";
+/// The one toolchain every wasm mod and the game's std member are built with: the pin CI and the
+/// launcher's native-mod toolchain use too (`tools/ci/rust-version`).
+pub const TOOLCHAIN: &str = include_str!("../../../tools/ci/rust-version").trim_ascii();
 const TARGET: &str = "wasm32-unknown-unknown";
 /// Set when cargo runs this tool as the linker: `std` or `member`.
 pub const LINK_ENV: &str = "HORIZON_MOD_LINK";
@@ -36,7 +37,7 @@ struct Toolchain {
 
 /// `tool` (`cargo`, `rustc`) of the pinned toolchain: through rustup when there is one, else
 /// the one on `PATH`, which must then be that toolchain.
-fn pinned(tool: &str) -> Command {
+pub(crate) fn pinned(tool: &str) -> Command {
     let mut command = if rustup_found() {
         let mut c = Command::new("rustup");
         c.args(["run", TOOLCHAIN, tool]);
@@ -64,7 +65,7 @@ fn rustup_found() -> bool {
     Command::new("rustup").arg("--version").output().is_ok()
 }
 
-fn output(mut command: Command) -> Result<String, String> {
+pub(crate) fn output(mut command: Command) -> Result<String, String> {
     let out = command.output().map_err(|e| format!("{command:?}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -276,11 +277,10 @@ fn registrations(
         let points: Vec<horizon_mod_point_emit::Point> =
             serde_json::from_value(json["points"].clone())
                 .map_err(|e| format!("{}: {e}", path.display()))?;
-        let expressions = horizon_mod_point_emit::api(&parsed, &points, "crate::")?;
-        if expressions.len() != parsed.inject.len() {
-            return Err("wasm supports API head and return injections only".into());
-        }
-        let names = horizon_mod_point_emit::places(&parsed, &points)?;
+        let expressions = horizon_mod_point_emit::api(&parsed, &points, "crate::")
+            .map_err(|e| format!("{}:{e}", parsed.id))?;
+        let names = horizon_mod_point_emit::places(&parsed, &points)
+            .map_err(|e| format!("{}:{e}", parsed.id))?;
         let registrations = expressions
             .iter()
             .map(|e| {
@@ -295,13 +295,10 @@ fn registrations(
     Ok((registrations, point_names))
 }
 
-/// `build --wasm`: builds `mod.wasm` beside `horizon-mod.toml` and records it in `[wasm]`.
 pub fn build(root: &Path, catalog: Option<&Path>, additional: &[PathBuf]) -> Result<(), String> {
     group::build(root, catalog, additional)
 }
 
-/// rustc emits a synthetic allocator-shim object for every final root. Its compiler-private
-/// symbols are local implementation details, not another copy of the library API.
 fn member_export(name: &str) -> bool {
     !matches!(name, "__horizon_mod_hooks" | "__dso_handle" | "__tls_base")
         && !rustc_demangle::try_demangle(name)
@@ -309,7 +306,11 @@ fn member_export(name: &str) -> bool {
 }
 
 fn group_export(name: &str, krate: &str) -> bool {
-    if GUEST_EXPORTS.contains(&name) || name == "horizon_layout_ext" || name.starts_with("__wasm_")
+    if GUEST_EXPORTS.contains(&name)
+        || name == "horizon_layout_ext"
+        || name == "horizon_mod_points_register"
+        || name == "horizon_mod_points_seal"
+        || name.starts_with("__wasm_")
     {
         return true;
     }
@@ -323,6 +324,49 @@ fn group_export(name: &str, krate: &str) -> bool {
                 .split(">::")
                 .next()
                 .is_some_and(|receiver| receiver.contains(&format!("{krate}::"))))
+}
+
+/// One argument of the response file rustc hands the linker, one per line. On Windows rustc
+/// quotes each line the Windows way (`"D:\dir\a b.rlib"`, a quote inside as `\"`, backslashes
+/// doubled only in front of a quote); elsewhere
+/// it escapes `\` and space with a backslash.
+fn response_file_arg(line: &str) -> String {
+    let mut arg = String::new();
+    if let Some(quoted) = line
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        // A run of backslashes is literal unless a quote follows it: then each pair is one
+        // backslash and an odd one left over escapes the quote.
+        let mut backslashes = 0;
+        for c in quoted.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    arg.extend(std::iter::repeat_n('\\', backslashes / 2));
+                    arg.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    arg.extend(std::iter::repeat_n('\\', backslashes));
+                    arg.push(c);
+                    backslashes = 0;
+                }
+            }
+        }
+        // The closing quote follows these, so they were doubled too.
+        arg.extend(std::iter::repeat_n('\\', backslashes / 2));
+        return arg;
+    }
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        arg.push(if c == '\\' {
+            chars.next().unwrap_or(c)
+        } else {
+            c
+        });
+    }
+    arg
 }
 
 /// The link step, run by cargo as the linker: rust-lld linking a shared module, then rustc's
@@ -351,7 +395,7 @@ pub fn link(role: &str, args: Vec<String>) -> Result<(), String> {
         .into_iter()
         .flat_map(|arg| match arg.strip_prefix('@') {
             Some(file) => std::fs::read_to_string(file)
-                .map(|t| t.lines().map(str::to_owned).collect())
+                .map(|t| t.lines().map(response_file_arg).collect())
                 .unwrap_or_else(|_| vec![arg]),
             None => vec![arg],
         });
@@ -399,6 +443,10 @@ pub fn link(role: &str, args: Vec<String>) -> Result<(), String> {
         out.push("--export-all".to_owned());
     }
     if role != "std" {
+        // A member's own code takes its functions' addresses as table offsets, not through
+        // `GOT.func`; with `--export-all` those functions are exported, and without local
+        // binding the linker resolves such an address to slot 0, another function.
+        out.push("-Bsymbolic".to_owned());
         for name in GUEST_EXPORTS {
             out.push(format!("--export={name}"));
         }
@@ -462,8 +510,7 @@ pub fn link(role: &str, args: Vec<String>) -> Result<(), String> {
                     private_exports.push(export.name.to_owned());
                 }
                 if role != "member" || member_export(export.name) {
-                    let kind = wasm_encoder::ExportKind::try_from(export.kind)
-                        .map_err(|e| format!("{e:?}"))?;
+                    let kind = wasm_encoder::ExportKind::from(export.kind);
                     section.export(export.name, kind, export.index);
                 }
             }
@@ -525,6 +572,31 @@ pub fn link(role: &str, args: Vec<String>) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod response_file_tests {
+    use super::response_file_arg;
+    #[test]
+    fn windows_quoted_lines_lose_their_quotes_and_keep_path_backslashes() {
+        assert_eq!(response_file_arg(r#""--export""#), "--export");
+        assert_eq!(
+            response_file_arg(r#""D:\dir\a b\libx-1.rlib""#),
+            r"D:\dir\a b\libx-1.rlib"
+        );
+        assert_eq!(response_file_arg(r#""a\"b""#), r#"a"b"#);
+        assert_eq!(response_file_arg(r#""a\\\"b""#), r#"a\"b"#);
+        assert_eq!(response_file_arg(r#""dir\\""#), r"dir\");
+    }
+    #[test]
+    fn gnu_escaped_lines_lose_their_escapes() {
+        assert_eq!(response_file_arg("--export"), "--export");
+        assert_eq!(
+            response_file_arg(r"/tmp/a\ b/libx.rlib"),
+            "/tmp/a b/libx.rlib"
+        );
+        assert_eq!(response_file_arg(r"a\\b"), r"a\b");
+    }
+}
+
+#[cfg(test)]
 mod export_tests {
     use super::{group_export, member_export};
     #[test]
@@ -551,5 +623,21 @@ mod export_tests {
         let upstream = "_RNvMs2_NtNtCscdi4KFDYmTw_7mod_api5parts14block_entitiesDNtB7_9RegistrarEL_17block_entity_type";
         assert!(!group_export(upstream, "wasm_test_observer"));
         assert!(group_export("horizon_hook", "wasm_test_observer"));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    #[test]
+    fn wasm_registration_refusal_names_mod_target_and_type() {
+        let dir = std::env::temp_dir().join(format!("horizon-wire-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("points.json");
+        std::fs::write(&catalog, r#"{"points":[{"target":"game::tick","name":"tick","at_return":true,"api_refusal":"argument 1 `value` (`&RegistrationData`) has no API type yet"}]}"#).unwrap();
+        let manifest = "id = 'addon'\nname = 'Addon'\nversion = '1.0.0'\napi = '0.2'\ncapabilities = ['registries']\n[[inject]]\nid = 'before'\nat = 'game::tick'\nkind = 'head'\nwith = 'before'\nhash = 'pin'\n".parse().unwrap();
+        assert_eq!(
+            super::registrations(&manifest, Some(&catalog)).unwrap_err(),
+            "addon:before: no API listener at game::tick: argument 1 `value` (`&RegistrationData`) has no API type yet"
+        );
     }
 }

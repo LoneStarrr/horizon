@@ -12,6 +12,48 @@ pub(super) struct PlayerFacts {
 }
 
 impl Game<'_> {
+    /// Restore a saved anger target after insertion, so the target-change hook
+    /// receives a live actor and a currently resolvable living target. A
+    /// target that is absent or invalid resolves to none, as EntityReference
+    /// does while vanilla loads a neutral mob. Returns false only when the
+    /// actor cannot yet be represented by a native handle.
+    pub(in crate::game) fn native_restore_loaded_target(
+        &mut self,
+        id: u32,
+        uuid: Option<[i32; 4]>,
+    ) -> bool {
+        let Some(mob) = self.entity(id).and_then(|entity| self.mob(entity)) else {
+            return false;
+        };
+        let target = uuid.and_then(|words| {
+            let uuid = horizon_client::lan::playerdata::ints_uuid(words);
+            let entity = self
+                .player(uuid)
+                .map(|player| player.entity())
+                .or_else(|| {
+                    let target = self
+                        .persist
+                        .uuids
+                        .iter()
+                        .find_map(|(&id, found)| (*found == words).then_some(id))?;
+                    self.entity(target)
+                })?;
+            self.living(entity)
+        });
+        let target = target.filter(|target| {
+            let Some(kind) = self.native_entity_target(target.entity()) else {
+                return false;
+            };
+            self.mobs
+                .iter()
+                .find(|state| state.id == id)
+                .is_some_and(|state| self.native_mob_valid_target(state, kind))
+        });
+        // Cancellation leaves the newly loaded mob's target unchanged.
+        let _ = self.mob_set_target(mob, target);
+        true
+    }
+
     /// A player target's game mode, liveness, invulnerability (the ability,
     /// the `Invulnerable` flag or its window) and uuid.
     pub(super) fn native_player_facts(&self, target: Target) -> Option<PlayerFacts> {
@@ -234,6 +276,20 @@ impl Game<'_> {
                 return false;
             }
         }
+        let Some(target) = self.native_mob_target_event(mob, target, false) else {
+            return false;
+        };
+        if let Some(target) = target {
+            let Some(kind) = self.native_entity_target(target.entity()) else {
+                return false;
+            };
+            let Some(state) = self.mobs.iter().find(|m| m.id == id) else {
+                return false;
+            };
+            if !self.native_mob_valid_target(state, kind) {
+                return false;
+            }
+        }
         let Some(who) = self.native_mob_bind_target(id, target) else {
             return false;
         };
@@ -244,13 +300,37 @@ impl Game<'_> {
         true
     }
 
+    /// Dispatch a mod-initiated change while the mob remains in the game.
+    pub(super) fn native_mob_target_event(
+        &self,
+        mob: MobRef,
+        original_target: Option<LivingRef>,
+        is_brain: bool,
+    ) -> Option<Option<LivingRef>> {
+        if !mod_api::__private::listened(mod_api::HookId::LivingChangeTarget) {
+            return Some(original_target);
+        }
+        let mut new_target = original_target;
+        let mut cancel = false;
+        super::native_hooks::NativeHookHost { host: self }.native_living_change_target(
+            mod_api::__private::LivingChangeTargetCall {
+                mob,
+                original_target,
+                new_target: &mut new_target,
+                is_brain,
+                cancel: &mut cancel,
+            },
+        );
+        (!cancel).then_some(new_target)
+    }
+
     /// The `Who` mob `id` stores for `target`, for either target setter: a
     /// mob, or a player in the level in place. A player target binds to the
     /// mob (`mob_players`), so the mob's tick sees that player. None for a
     /// fake player (the root rule for every mob target setter), a player in
     /// another level, or anything else (an armor stand, the dragon, a stale
     /// handle).
-    fn native_mob_bind_target(
+    pub(super) fn native_mob_bind_target(
         &mut self,
         id: u32,
         target: Option<LivingRef>,
@@ -307,6 +387,9 @@ impl Game<'_> {
         if !horizon_client::mobs::ai::writes_brain_target(m) {
             return false;
         }
+        let Some(target) = self.native_mob_target_event(mob, target, true) else {
+            return false;
+        };
         let Some(who) = self.native_mob_bind_target(id, target) else {
             return false;
         };
@@ -675,12 +758,53 @@ mod tests {
     use super::*;
     use horizon_client::{entities::ArmorStand, mobs::Mob};
     use horizon_core::geometry::Vec3;
-    use mod_api::NativeWorldEpoch;
+    use mod_api::WorldEpoch;
 
     fn add_mob(game: &mut Game<'_>, id: u32, name: &str) -> MobRef {
         let kind = game.res.mob_types().get(name).unwrap().clone();
         game.mobs.push(Mob::new(id, kind, Vec3::ZERO, 0.0));
         game.mob(game.entity(id).unwrap()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn redirected_fake_target_is_refused_with_the_original_target_intact() {
+        use std::sync::{Arc, Mutex};
+        struct Redirect(Arc<Mutex<Option<LivingRef>>>);
+        #[mod_api::__subscriptions]
+        impl mod_api::Hooks for Redirect {
+            fn living_change_target(
+                &self,
+                host: &dyn mod_api::Host,
+                event: &mut mod_api::LivingChangeTargetEvent<'_>,
+            ) -> mod_api::Flow {
+                assert!(event.mob.living().health(host).is_some());
+                *event.new_target = *self.0.lock().unwrap();
+                mod_api::Flow::Continue
+            }
+        }
+        let redirect = Arc::new(Mutex::new(None));
+        let mods = vec![mod_api::ModEntry::new(
+            "target-test",
+            Box::new(Redirect(redirect.clone())),
+        )]
+        .into();
+        mod_platform::testing::with_mods(mods, || {
+            with_game(|game| {
+                super::super::native_item_places::tests::open_to_lan(game);
+                let level = game.level(game.dim.id()).unwrap();
+                let fake = game.fake_player(level, 1234, "fake").unwrap();
+                *redirect.lock().unwrap() = Some(LivingRef::new(fake.entity()));
+                let mob = add_mob(game, 12, "minecraft:zombie");
+                let existing = add_mob(game, 13, "minecraft:sheep");
+                game.mobs[0].ai.target = Some(Who::Mob(13));
+                assert!(!mob.set_target(game, None));
+                assert_eq!(
+                    game.mobs[0].ai.target,
+                    Some(Who::Mob(existing.entity().id()))
+                );
+            })
+        });
     }
 
     #[test]
@@ -786,7 +910,7 @@ mod tests {
             game.mobs[0].extra.leash = None;
             game.mobs[0].extra.leash_pending = Some(Pending::Uuid([0, 0, 0, 99]));
             assert_eq!(cow.entity().leash_holder(game), None);
-            let stale = EntityRef::new(NativeWorldEpoch::new(999), 12);
+            let stale = EntityRef::new(WorldEpoch::new(999), 12);
             assert_eq!(stale.leash_holder(game), None);
             game.enter_level(super::super::Dim::Nether).unwrap();
             assert_eq!(cow.entity().leash_holder(game), None);
@@ -818,7 +942,7 @@ mod tests {
             check(game, cow, false);
             game.riding = None;
             check(game, cow, true);
-            let stale = MobRef::new(mod_api::EntityRef::new(NativeWorldEpoch::new(999), 12));
+            let stale = MobRef::new(mod_api::EntityRef::new(WorldEpoch::new(999), 12));
             let host: &dyn mod_api::Host = game;
             assert_eq!(stale.can_use_portal(host), None);
             game.enter_command_level(super::super::Dim::Nether).unwrap();
@@ -958,7 +1082,7 @@ mod tests {
             }
             let mob = add_mob(game, 14, "minecraft:sniffer");
             let stale = MobRef::new(EntityRef::new(
-                NativeWorldEpoch::new(mob.entity().epoch().get() + 1),
+                WorldEpoch::new(mob.entity().epoch().get() + 1),
                 14,
             ));
             assert_eq!(stale.requires_custom_persistence(game), None);
@@ -1051,6 +1175,84 @@ mod tests {
             assert!(mob.set_target(game, Some(player)));
             assert_eq!(mob.target(game), Some(player));
             assert_eq!(game.lan.as_ref().unwrap().mob_players.get(&12), Some(&1));
+            // `ZombifiedPiglin.setTarget` does not impersonate a player hit:
+            // existing kill credit and its remaining lifetime are unchanged.
+            let kind = game
+                .res
+                .mob_types()
+                .get("minecraft:zombified_piglin")
+                .unwrap()
+                .clone();
+            let mut piglin_state = Mob::new(13, kind, Vec3::ZERO, 0.0);
+            piglin_state.ai.last_hurt_by_player = 42;
+            game.mobs.push(piglin_state);
+            let piglin = game.mob(game.entity(13).unwrap()).unwrap();
+            assert!(piglin.set_target(game, Some(player)));
+            assert_eq!(
+                game.mobs
+                    .iter()
+                    .find(|m| m.id == 13)
+                    .unwrap()
+                    .ai
+                    .last_hurt_by_player,
+                42
+            );
+            assert!(!game.last_hurt_by_player.contains_key(&13));
+            assert!(piglin.set_target(game, None));
+            assert_eq!(
+                game.mobs
+                    .iter()
+                    .find(|m| m.id == 13)
+                    .unwrap()
+                    .ai
+                    .last_hurt_by_player,
+                42
+            );
+            let level = game.level(game.dim.id()).unwrap();
+            let fake = game.fake_player(level, 9999, "fake").unwrap();
+            let fake_living = LivingRef::new(fake.entity());
+            assert!(!piglin.set_target(game, Some(fake_living)));
+            assert_eq!(piglin.target(game), None);
+            assert_eq!(
+                game.mobs
+                    .iter()
+                    .find(|m| m.id == 13)
+                    .unwrap()
+                    .ai
+                    .last_hurt_by_player,
+                42
+            );
+            // The alert recipient is allied with the host, not with the
+            // unteamed guest targeted by the source piglin.
+            let kind = game
+                .res
+                .mob_types()
+                .get("minecraft:zombified_piglin")
+                .unwrap()
+                .clone();
+            game.mobs.push(Mob::new(14, kind, Vec3::ZERO, 0.0));
+            game.persist.uuids.insert(14, [0, 0, 0, 14]);
+            let host_name = game.acting_player_name().to_owned();
+            game.score.board.add_team("red");
+            game.score.board.add_to_team(&host_name, "red");
+            game.score
+                .board
+                .add_to_team("00000000-0000-0000-0000-00000000000e", "red");
+            let recipient = game.mob(game.entity(14).unwrap()).unwrap();
+            assert!(piglin.set_target(game, Some(player)));
+            let alert = || {
+                mobs::MobEvent::PiglinAlertTarget(mobs::undead::PiglinAlert {
+                    mob: 14,
+                    source: 13,
+                    target: Who::Player,
+                })
+            };
+            game.handle_mob_events(vec![alert()]).unwrap();
+            assert_eq!(recipient.target(game), Some(player));
+            assert!(recipient.set_target(game, None));
+            game.score.board.add_to_team("guest", "red");
+            game.handle_mob_events(vec![alert()]).unwrap();
+            assert_eq!(recipient.target(game), None);
             {
                 let value = 1;
                 game.lan
@@ -1092,6 +1294,7 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn fox_enderman_and_zombified_piglin_take_targets_with_their_side_effects() {
+        use horizon_core::random::{LegacyRandom, RandomSource};
         with_game(|game| {
             for (id, name) in [
                 (12, "minecraft:fox"),
@@ -1115,33 +1318,115 @@ mod tests {
                 .unwrap()
                 .extra
                 .ints[0] |= mobs::fox::DEFENDING;
+            mobs::fox::add_trusted_entity(
+                game.mobs.iter_mut().find(|m| m.id == 12).unwrap(),
+                [1, 2, 3, 4],
+            );
             assert!(fox.set_target(game, Some(other)));
             assert_eq!(fox.target(game), Some(other));
             assert!(mobs::fox::flag(&state(game, 12), mobs::fox::DEFENDING));
             assert!(fox.set_target(game, None));
             assert_eq!(fox.target(game), None);
             assert!(!mobs::fox::flag(&state(game, 12), mobs::fox::DEFENDING));
+            assert!(mobs::fox::trusts(&state(game, 12), [1, 2, 3, 4]));
 
             // Enderman.setTarget: the open mouth, targetChangeTime and the
             // attack speed modifier follow the target.
-            game.mobs.iter_mut().find(|m| m.id == 13).unwrap().age = 1234;
+            let enderman_state = game.mobs.iter_mut().find(|m| m.id == 13).unwrap();
+            enderman_state.age = 1234;
+            enderman_state.extra.flag2 = true;
+            game.audio.capture = Some(Vec::new());
             assert!(enderman.set_target(game, Some(other)));
+            let events =
+                std::mem::take(&mut game.mobs.iter_mut().find(|m| m.id == 13).unwrap().outbox);
+            game.handle_mob_events(events).unwrap();
+            assert_eq!(
+                game.audio.heard.get("minecraft:entity.enderman.stare"),
+                Some(&1)
+            );
+            assert!(
+                game.audio.capture.as_ref().unwrap().is_empty(),
+                "stare stays client-local"
+            );
             let m = state(game, 13);
             assert!(m.extra.flag, "DATA_CREEPY");
             assert_eq!(m.extra.counter, 1234, "targetChangeTime");
             assert!(mobs::enderman::attacking_speed(&m) > 0.0);
+            assert!(m.extra.flag2, "retargeting preserves DATA_STARED_AT");
+            assert!(m.movement_speed() > f64::from(0.3f32));
             assert!(enderman.set_target(game, None));
             let m = state(game, 13);
             assert!(!m.extra.flag);
             assert_eq!(m.extra.counter, 0);
+            assert!(!m.extra.flag2, "clearing resets DATA_STARED_AT");
             assert_eq!(mobs::enderman::attacking_speed(&m), 0.0);
 
-            // ZombifiedPiglin.setTarget: stored; its anger, sound delay and
-            // alert interval start on the AI step that first sees it.
+            // ZombifiedPiglin.setTarget samples both delays immediately;
+            // changing a nonempty target does not resample either.
+            let mut expected = LegacyRandom::new(2026);
+            let sound_delay = expected.next_int_bound(21).unwrap();
+            let alert_delay = 80 + expected.next_int_bound(41).unwrap();
+            game.mobs.iter_mut().find(|m| m.id == 14).unwrap().random = LegacyRandom::new(2026);
             assert!(piglin.set_target(game, Some(other)));
             assert_eq!(piglin.target(game), Some(other));
+            let first = state(game, 14);
+            assert_eq!(first.extra.counter, sound_delay);
+            assert_eq!(first.extra.counter2, alert_delay);
+            assert!(piglin.set_target(game, Some(other)));
+            let changed = state(game, 14);
+            assert_eq!(changed.extra.counter, first.extra.counter);
+            assert_eq!(changed.extra.counter2, first.extra.counter2);
             assert!(piglin.set_target(game, None));
             assert_eq!(piglin.target(game), None);
+        });
+    }
+
+    /// `ZombifiedPiglin.setTarget`, `customServerAiStep`, and `alertOthers`:
+    /// a host write is consumed by real mob ticks, audible to the player and
+    /// propagated to another piglin. Seed selection fixes the first sound at
+    /// one tick; advancing the alert timer avoids waiting four seconds.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn piglin_target_write_drives_anger_sound_and_alert() {
+        use horizon_core::random::{LegacyRandom, RandomSource};
+        with_game(|game| {
+            for (x, z) in (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))) {
+                let mut chunk = horizon_client::chunk::Chunk::empty(x, z);
+                chunk.lit = true;
+                game.world.chunks.insert((x, z), std::sync::Arc::new(chunk));
+            }
+            for (id, kind, x) in [
+                (12, "minecraft:zombified_piglin", 0.0),
+                (13, "minecraft:zombified_piglin", 2.0),
+                (14, "minecraft:iron_golem", 8.0),
+            ] {
+                let kind = game.res.mob_types().get(kind).unwrap().clone();
+                let mut mob = Mob::new(id, kind, Vec3::new(x, 100.0, 0.0), 0.0);
+                mobs::ai::register(&mut mob);
+                game.mobs.push(mob);
+            }
+            let seed = (0..10_000)
+                .find(|&seed| LegacyRandom::new(seed).next_int_bound(21) == Ok(1))
+                .unwrap();
+            game.mobs[0].random = LegacyRandom::new(seed);
+            let actor = game.mob(game.entity(12).unwrap()).unwrap();
+            let other = game.mob(game.entity(13).unwrap()).unwrap();
+            let target = game.living(game.entity(14).unwrap()).unwrap();
+            assert!(actor.set_target(game, Some(target)));
+            assert_eq!(game.mobs[0].extra.counter, 1);
+            game.mobs[0].extra.counter2 = 0;
+            game.audio.capture = Some(Vec::new());
+            game.tick_mobs().unwrap();
+            assert_eq!(other.target(game), Some(target));
+            game.tick_mobs().unwrap();
+            assert!(
+                game.audio
+                    .capture
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|sound| sound.event == "minecraft:entity.zombified_piglin.angry")
+            );
         });
     }
 
@@ -1239,10 +1524,11 @@ mod tests {
             game.mobs.push(Mob::new(13, zombie, Vec3::ZERO, 0.0));
             game.armor_stands.push(ArmorStand::new(14, Vec3::ZERO, 0.0));
             let mut dragon = super::super::dragon::Dragon::new(Vec3::ZERO, 0.0, 0);
-            dragon.id = 15;
+            // Reserve the dragon's eight consecutive part IDs away from the mobs.
+            dragon.id = 40;
             game.dragon.replace(dragon);
             assert!(
-                game.mob(game.entity(15).unwrap()).is_some(),
+                game.mob(game.entity(40).unwrap()).is_some(),
                 "the dragon is a Mob"
             );
             let entity = game.entity(12).unwrap();
@@ -1303,7 +1589,7 @@ mod tests {
             assert!(!game.mob_set_target(mob, Some(stand)));
             assert_eq!(game.mob_target(mob), Some(other));
             let stale = MobRef::new(EntityRef::new(
-                NativeWorldEpoch::new(entity.epoch().get() + 1),
+                WorldEpoch::new(entity.epoch().get() + 1),
                 12,
             ));
             assert!(game.mob(stale.entity()).is_none());
@@ -1513,7 +1799,7 @@ mod tests {
             assert_eq!(game.mob_has_restriction(dragon), None);
             // A stale handle changes no other entity.
             let stale = MobRef::new(EntityRef::new(
-                NativeWorldEpoch::new(entity.epoch().get() + 1),
+                WorldEpoch::new(entity.epoch().get() + 1),
                 12,
             ));
             assert_eq!(game.mob_left_handed(stale), None);

@@ -29,6 +29,7 @@ impl Game<'_> {
             facts: self.res.facts(),
             collision: self.collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         self.particles.tick(&level);
     }
@@ -128,8 +129,7 @@ impl Game<'_> {
         let mut vertices = Vec::new();
         self.particles.render(
             glam::DVec3::from_array(at),
-            0.0,
-            0.0,
+            glam::Quat::IDENTITY,
             1.0,
             &|_| 15,
             &mut vertices,
@@ -170,8 +170,7 @@ impl Game<'_> {
         vertices.clear();
         self.particles.render(
             glam::DVec3::from_array(at),
-            0.0,
-            0.0,
+            glam::Quat::IDENTITY,
             1.0,
             &|_| 15,
             &mut vertices,

@@ -1,14 +1,13 @@
 //! Events, explosions and lightning in a level for native server mods,
 //! through a `LevelRef` (docs/modding/src/how-to/native-mods.md, "Entity and level handles"):
-//! `Level.levelEvent`, `Level.gameEvent`, `Level.explode` and a summoned
-//! lightning bolt. Like the level's block writes, they act on the level in
-//! place, the one the hook runs in; a parked level, a stale handle or a
-//! client returns false. Reaching a parked level, as `play_sound` and the
+//! `Level.levelEvent`, `Level.gameEvent`, `ServerLevel.blockEvent`,
+//! `Level.explode` and a summoned lightning bolt. Like the level's block
+//! writes, they act on the level in place, the one the hook runs in; a parked
+//! level, a stale handle or a client returns false. Reaching a parked level, as `play_sound` and the
 //! reads do through `native_level_world`, is a follow-up.
 use super::{Game, GameLevel, native_explosions::NativeBlast};
-use horizon_client::sculk::Context;
-use horizon_world::level::LevelEvent;
-use mod_api::{LevelRef, NativeExplosionInteraction};
+use horizon_world::level::{BlockEventData, LevelEvent};
+use mod_api::{BlockKey, ExplosionInteraction, LevelRef};
 
 /// A position inside the world's horizontal and vertical bounds.
 fn in_bounds(at: [f64; 3]) -> bool {
@@ -70,17 +69,49 @@ impl Game<'_> {
         true
     }
     /// Sends game event `event` (`minecraft:block_change`...) from `at`, as
-    /// `Level.gameEvent(null, event, at)` does: sculk sensors, shriekers,
-    /// wardens and allays in range hear it. False for an event vanilla
-    /// doesn't have.
-    pub(super) fn level_game_event(&mut self, level: LevelRef, event: &str, at: [f64; 3]) -> bool {
+    /// `Level.gameEvent(event, at, context)`, with validated source and state.
+    pub(super) fn level_game_event(
+        &mut self,
+        level: LevelRef,
+        event: &str,
+        at: [f64; 3],
+        context: mod_api::GameEventContext,
+    ) -> bool {
         let Some(event) = horizon_client::sculk::intern(event) else {
             return false;
         };
         if !self.level_in_place(level) || !in_bounds(at) {
             return false;
         }
-        self.post_game_event(event, at, Context::default());
+        self.post_contextual_game_event(event, at, context)
+    }
+    /// Queues block event `a`, `b` for `block` at `pos` in the level in place
+    /// (`ServerLevel.blockEvent`): `run_block_events` hands it to the block's
+    /// `triggerEvent` after this tick's scheduled ticks if `pos` still holds
+    /// `block`. False for an unresolved block key, a position outside the
+    /// build height (it could never reach a block), a parked level, a stale
+    /// handle or a client.
+    pub(super) fn level_block_event(
+        &mut self,
+        level: LevelRef,
+        pos: [i32; 3],
+        block: BlockKey,
+        a: i32,
+        b: i32,
+    ) -> bool {
+        let Some(block) = super::api_values::behavior_block(block, self.res.behaviours()) else {
+            return false;
+        };
+        if !self.level_in_place(level) || !self.world.shape.contains_y(pos[1]) {
+            return false;
+        }
+        self.block_ticks.queue_block_event(BlockEventData {
+            pos: horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]),
+            block,
+            param_a: a,
+            param_b: b,
+            note_override: None,
+        });
         true
     }
     /// Explodes at `center` with no source entity, as `Level.explode(null,
@@ -95,16 +126,16 @@ impl Game<'_> {
         center: [f64; 3],
         radius: f32,
         fire: bool,
-        interaction: NativeExplosionInteraction,
+        interaction: ExplosionInteraction,
     ) -> bool {
         if !self.level_in_place(level) {
             return false;
         }
         let blast = match interaction {
-            NativeExplosionInteraction::None => NativeBlast::Keep,
-            NativeExplosionInteraction::Block => NativeBlast::Block,
-            NativeExplosionInteraction::Tnt => NativeBlast::Tnt,
-            _ => unreachable!("NativeExplosionInteraction: unhandled variant"),
+            ExplosionInteraction::None => NativeBlast::Keep,
+            ExplosionInteraction::Block => NativeBlast::Block,
+            ExplosionInteraction::Tnt => NativeBlast::Tnt,
+            _ => unreachable!("ExplosionInteraction: unhandled variant"),
         };
         self.native_explode(level.dimension_id(), center, radius, fire, blast)
     }
@@ -173,12 +204,79 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_queued_block_event_runs_the_blocks_trigger_once() {
+        use horizon_core::position::BlockPos;
+        use mod_api::{LevelRef, WorldEpoch};
+        use mod_platform::__private::part_tests::block_key;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            let stale = LevelRef::new(WorldEpoch::new(level.epoch().get() + 1), level.dimension());
+            let nether = LevelRef::new(level.epoch(), mod_api::DimensionKey::NETHER);
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            let note = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:note_block")
+                .unwrap();
+            game.world.set(0, 64, 0, note).unwrap();
+            let (note_key, stone_key) = (block_key("minecraft:note_block"), block_key("stone"));
+
+            // Queued twice, it runs once; one queued for a block `pos` no longer holds is
+            // dropped when it runs, as `runBlockEvents` checks the block.
+            assert!(level.block_event(game, [0, 64, 0], note_key, 0, 0));
+            assert!(level.block_event(game, [0, 64, 0], note_key, 0, 0));
+            assert!(level.block_event(game, [0, 64, 0], stone_key, 0, 0));
+            assert_eq!(game.block_ticks.block_events.len(), 2);
+            let (bottom, height) = level.height(game).unwrap();
+            assert!(!level.block_event(game, [0, bottom - 1, 0], note_key, 0, 0));
+            assert!(
+                !level.block_event(game, [0, bottom + height, 0], note_key, 0, 0),
+                "above the build height"
+            );
+            assert!(!stale.block_event(game, [0, 64, 0], note_key, 0, 0));
+            assert!(
+                !nether.block_event(game, [0, 64, 0], note_key, 0, 0),
+                "a level not in place"
+            );
+            assert_eq!(
+                game.block_ticks.block_events.len(),
+                2,
+                "refusals queue nothing"
+            );
+
+            game.level_events.clear();
+            game.with_level(|b, level, ticks| b.run_block_events(level, ticks));
+            assert!(game.block_ticks.block_events.is_empty());
+            let handled: Vec<_> = game
+                .level_events
+                .iter()
+                .filter(|e| matches!(e, LevelEvent::BlockEntityEvent { .. }))
+                .collect();
+            assert_eq!(
+                handled,
+                [&LevelEvent::BlockEntityEvent {
+                    pos: BlockPos::new(0, 64, 0),
+                    state: note,
+                    a: 0,
+                    b: 0,
+                }],
+                "the note block's triggerEvent handled it once, for its players"
+            );
+        });
+    }
+
+    #[test]
     #[ignore = "needs prepared resources and an isolated process for native mods"]
     fn a_level_event_in_a_write_hook_joins_the_events_in_order() {
         let mods: mod_api::Mods =
             vec![mod_api::ModEntry::new("level-events", Box::new(EventsMod))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_guest_turn_tests::with_guests(|game| {
                 game.options.dedicated = Some(Vec::new());
                 game.world.chunks.insert(

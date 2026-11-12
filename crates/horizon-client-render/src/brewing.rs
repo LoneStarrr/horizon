@@ -14,7 +14,7 @@ use std::{collections::HashSet, path::Path};
 pub use horizon_client_core::potions::{
     BASE_POTION_COLOR, Category, EFFECTS, EffectDef, POTIONS, PotionDef, all_effects,
     description_id, effect, is_mod_effect, mod_effects, namespaced, potion, potion_color,
-    register_mod_effects,
+    register_mod_effects, set_pack_colors,
 };
 /// `MobEffectUtil.formatDuration` at 20 TPS.
 pub fn format_duration(ticks: i32) -> String {
@@ -83,6 +83,71 @@ pub fn contents_effects(stack: &ItemStack) -> Vec<(&'static str, i32, i32)> {
                 .filter_map(|(id, duration, amp)| Some((effect(id)?.id, *duration, *amp))),
         )
         .collect()
+}
+/// `PotionContents.getAllEffects`, retaining each custom instance's flags.
+pub fn contents_instances(stack: &ItemStack) -> Vec<crate::effects::EffectInstance> {
+    use horizon_client_core::nbt_value::{number, text};
+    use horizon_core::nbt::Tag;
+    let mut effects: Vec<_> = stack
+        .potion()
+        .and_then(potion)
+        .map_or(&[][..], |p| p.effects)
+        .iter()
+        .map(|(id, duration, amp)| crate::effects::EffectInstance::new(id, *duration, *amp))
+        .collect();
+    if let Some((_, Tag::List(custom))) = stack
+        .data()
+        .and_then(|d| d.potion_extra.iter().find(|(k, _)| k == "custom_effects"))
+    {
+        for e in custom {
+            let Some(def) = text(e.get("id")).and_then(|id| effect(&id)) else {
+                continue;
+            };
+            let mut instance = crate::effects::EffectInstance::new(
+                def.id,
+                number(e.get("duration")).unwrap_or(0) as i32,
+                number(e.get("amplifier")).unwrap_or(0).clamp(0, 255) as i32,
+            );
+            instance.ambient = number(e.get("ambient")).unwrap_or(0) != 0;
+            instance.visible = number(e.get("show_particles")) != Some(0);
+            effects.push(instance);
+        }
+    }
+    effects
+}
+/// `PotionContents.getColor`: an explicit colour wins; otherwise mix only
+/// visible base and custom effects, with their amplifier weights.
+pub fn contents_color(stack: &ItemStack) -> u32 {
+    use horizon_client_core::nbt_value::number;
+    if let Some(color) = stack
+        .data()
+        .and_then(|d| d.potion_extra.iter().find(|(k, _)| k == "custom_color"))
+        .and_then(|(_, v)| number(Some(v)))
+    {
+        return color as u32;
+    }
+    0xFF00_0000
+        | horizon_client_core::potions::effects_color(
+            contents_instances(stack)
+                .iter()
+                .filter(|e| e.visible)
+                .map(|e| (e.id, e.amplifier)),
+        )
+}
+/// `PotionContents.equals(EMPTY)`: colour and custom name also make contents
+/// nonempty, even when there is no registered potion or custom effect.
+pub fn contents_empty(stack: &ItemStack) -> bool {
+    use horizon_core::nbt::Tag;
+    stack.potion().is_none()
+        && stack.data().is_none_or(|d| {
+            d.potion_extra
+                .iter()
+                .all(|(key, value)| match key.as_str() {
+                    "custom_effects" => matches!(value, Tag::List(list) if list.is_empty()),
+                    "custom_color" | "custom_name" => false,
+                    _ => true,
+                })
+        })
 }
 /// Roman amplifier suffix (`potion.potency.N`) and duration lines of a potion.
 pub fn tooltip(
@@ -297,10 +362,16 @@ impl BrewingStand {
             .any(|b| brewing.find(b, ingredient).is_some())
     }
     /// `BrewingStandBlockEntity.serverTick`.
-    pub fn tick(&mut self, brewing: &Brewing, items: &Items, providers: &Providers) -> BrewTick {
-        let (mut out, due) = self.tick_to_brew(brewing, items, providers);
+    pub fn tick(
+        &mut self,
+        brewing: &Brewing,
+        items: &Items,
+        providers: &Providers,
+        remainder: &dyn Fn(&ItemStack) -> Option<ItemStack>,
+    ) -> BrewTick {
+        let (mut out, due) = self.tick_to_brew(brewing, items, providers, remainder);
         if due {
-            self.brew(brewing, items, &mut out);
+            self.brew(brewing, remainder, &mut out);
         }
         self.sync_bottles(&mut out);
         out
@@ -313,6 +384,7 @@ impl BrewingStand {
         brewing: &Brewing,
         items: &Items,
         providers: &Providers,
+        remainder: &dyn Fn(&ItemStack) -> Option<ItemStack>,
     ) -> (BrewTick, bool) {
         let mut out = BrewTick::default();
         if self.fuel <= 0
@@ -322,12 +394,12 @@ impl BrewingStand {
             self.fuel = providers.int_value(&uses);
             self.total_fuel = self.fuel;
             self.speed = providers.float_value(&speed, 1.0);
-            let remainder = items.get(&fuel.item).and_then(|i| i.remainder.clone());
+            let remainder = remainder(fuel);
             fuel.count -= 1;
             if fuel.count == 0 {
-                self.items[4] = remainder.map(|r| ItemStack::new(&r, 1));
+                self.items[4] = remainder;
             } else if let Some(r) = remainder {
-                out.drops.push(ItemStack::new(&r, 1));
+                out.drops.push(r);
             }
         }
         let brewable = self.brewable(brewing);
@@ -382,16 +454,21 @@ impl BrewingStand {
         &mut self,
         asked: Option<([Option<ItemStack>; 5], bool)>,
         brewing: &Brewing,
-        items: &Items,
+        remainder: &dyn Fn(&ItemStack) -> Option<ItemStack>,
         out: &mut BrewTick,
     ) {
         match asked {
             Some((stacks, true)) => self.items = stacks,
-            _ => self.brew(brewing, items, out),
+            _ => self.brew(brewing, remainder, out),
         }
     }
     /// `BrewingStandBlockEntity.doBrew`.
-    pub fn brew(&mut self, brewing: &Brewing, items: &Items, out: &mut BrewTick) {
+    pub fn brew(
+        &mut self,
+        brewing: &Brewing,
+        remainder: &dyn Fn(&ItemStack) -> Option<ItemStack>,
+        out: &mut BrewTick,
+    ) {
         let Some(ingredient) = self.items[3].clone() else {
             return;
         };
@@ -402,15 +479,13 @@ impl BrewingStand {
                 self.items[slot] = Some(r.output.clone());
             }
         }
-        let remainder = items
-            .get(&ingredient.item)
-            .and_then(|i| i.remainder.clone());
+        let remainder = remainder(&ingredient);
         if let Some(i) = self.items[3].as_mut() {
             i.count -= 1;
             if i.count == 0 {
-                self.items[3] = remainder.map(|r| ItemStack::new(&r, 1));
+                self.items[3] = remainder;
             } else if let Some(r) = remainder {
-                out.drops.push(ItemStack::new(&r, 1));
+                out.drops.push(r);
             }
         }
         out.brewed = true;
@@ -424,11 +499,17 @@ pub fn brewing_fuel(items: &Items, stack: &ItemStack) -> Option<(Value, Value)> 
             return None;
         }
         if let Some(own) = data.other("minecraft:brewing_fuel") {
-            let component = horizon_client_core::scoreboard::tag_to_json(own);
-            return Some((
-                component["uses"].clone(),
-                component["speed_multiplier"].clone(),
-            ));
+            use horizon_core::nbt::Tag;
+            let uses = match own.get("uses")? {
+                Tag::Byte(n) => Value::from(*n),
+                Tag::Short(n) => Value::from(*n),
+                Tag::Int(n) => Value::from(*n),
+                Tag::Long(n) => Value::from(*n),
+                // Named and structured providers remain supported.
+                provider => horizon_core::json_nbt::tag_to_json(provider).ok()?,
+            };
+            let speed = horizon_core::json_nbt::tag_to_json(own.get("speed_multiplier")?).ok()?;
+            return Some((uses, speed));
         }
     }
     items.get(&stack.item).and_then(|i| i.brewing_fuel.clone())
@@ -436,6 +517,14 @@ pub fn brewing_fuel(items: &Items, stack: &ItemStack) -> Option<(Value, Value)> 
 
 #[cfg(test)]
 mod tests {
+    fn data_remainder(items: &super::Items, stack: &super::ItemStack) -> Option<super::ItemStack> {
+        items
+            .get(&stack.item)?
+            .crafting_remainder
+            .as_deref()
+            .map(|id| super::ItemStack::new(id, 1))
+    }
+
     use super::*;
 
     fn content_brewing_root(name: &str, condition: &str) -> std::path::PathBuf {
@@ -453,6 +542,55 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("data/example/recipe/brewing/test.json"), format!(r#"{{"type":"minecraft:brewing","input":{{"item":"minecraft:potion"}},"reagent":{{"item":"minecraft:nether_wart"}},"output":{{"id":"minecraft:diamond"}}{condition}}}"#)).unwrap();
         root
+    }
+
+    #[test]
+    fn crafting_remainder_brewing_fuel_and_ingredient_use_current_stack() {
+        use horizon_core::nbt::Tag;
+        let items = Items::for_tests(Default::default());
+        let brewing = Brewing {
+            recipes: Vec::new(),
+            reagents: HashSet::new(),
+            inputs: HashSet::new(),
+        };
+        let mut fuel = ItemStack {
+            damage: 2,
+            ..ItemStack::new("test:tool", 1)
+        };
+        fuel.data_mut().set_loot_component(
+            "minecraft:brewing_fuel",
+            &Some(Tag::compound([
+                ("uses", Tag::Int(7)),
+                ("speed_multiplier", Tag::Float(1.0_f32.to_bits())),
+            ])),
+        );
+        let worn = |s: &ItemStack| {
+            Some(ItemStack {
+                count: 1,
+                damage: s.damage + 1,
+                ..s.clone()
+            })
+        };
+        let mut stand = BrewingStand::new();
+        stand.items[4] = Some(fuel);
+        stand.tick_to_brew(&brewing, &items, &Providers::empty(), &worn);
+        assert_eq!(
+            stand.items[4].as_ref().map(|s| (s.damage, s.count)),
+            Some((3, 1))
+        );
+        assert_eq!(stand.fuel, 7);
+        stand.items[3] = Some(ItemStack {
+            damage: 2,
+            ..ItemStack::new("test:tool", 1)
+        });
+        let mut out = BrewTick::default();
+        stand.brew(&brewing, &worn, &mut out);
+        assert_eq!(
+            stand.items[3].as_ref().map(|s| (s.damage, s.count)),
+            Some((3, 1))
+        );
+        assert!(out.brewed);
+        assert!(out.drops.is_empty());
     }
 
     #[test]
@@ -514,34 +652,44 @@ mod tests {
                 output: ItemStack::new("minecraft:potion", 1).with_potion("minecraft:awkward"),
             }],
         };
-        let mut fuel = ItemStack::new("minecraft:stone", 2);
-        fuel.data_mut().set_loot_component(
-            "minecraft:brewing_fuel",
-            &Some(
-                horizon_core::json_nbt::json_to_tag(
-                    &serde_json::json!({"uses": 7, "speed_multiplier": 2.5}),
-                )
-                .unwrap(),
-            ),
-        );
-        let mut stand = BrewingStand::new();
-        stand.items[0] = Some(ItemStack::new("minecraft:potion", 1).with_potion("minecraft:water"));
-        stand.items[3] = Some(ItemStack::new("minecraft:nether_wart", 1));
-        stand.items[4] = Some(fuel);
-        let providers = Providers::empty();
-        stand.tick(&brewing, &items, &providers);
-        assert_eq!((stand.brew_time, stand.fuel, stand.total_fuel), (160, 6, 7));
-        assert_eq!(stand.items[4].as_ref().unwrap().count, 1);
-        for _ in 1..160 {
-            assert!(!stand.tick(&brewing, &items, &providers).brewed);
+        use horizon_core::nbt::Tag;
+        for uses in [Tag::Byte(7), Tag::Short(7), Tag::Int(7), Tag::Long(7)] {
+            let mut fuel = ItemStack::new("minecraft:stone", 2);
+            fuel.data_mut().set_loot_component(
+                "minecraft:brewing_fuel",
+                &Some(Tag::compound([
+                    ("uses", uses),
+                    ("speed_multiplier", Tag::Float(2.5_f32.to_bits())),
+                ])),
+            );
+            let mut stand = BrewingStand::new();
+            stand.items[0] =
+                Some(ItemStack::new("minecraft:potion", 1).with_potion("minecraft:water"));
+            stand.items[3] = Some(ItemStack::new("minecraft:nether_wart", 1));
+            stand.items[4] = Some(fuel);
+            let providers = Providers::empty();
+            stand.tick(&brewing, &items, &providers, &|s| data_remainder(&items, s));
+            assert_eq!((stand.brew_time, stand.fuel, stand.total_fuel), (160, 6, 7));
+            assert_eq!(stand.items[4].as_ref().unwrap().count, 1);
+            for _ in 1..160 {
+                assert!(
+                    !stand
+                        .tick(&brewing, &items, &providers, &|s| data_remainder(&items, s))
+                        .brewed
+                );
+            }
+            assert!(
+                stand
+                    .tick(&brewing, &items, &providers, &|s| data_remainder(&items, s))
+                    .brewed
+            );
+            assert_eq!(
+                stand.items[0].as_ref().unwrap().potion(),
+                Some("minecraft:awkward")
+            );
+            assert_eq!(stand.fuel, 6);
+            assert_eq!(stand.items[4].as_ref().unwrap().count, 1);
         }
-        assert!(stand.tick(&brewing, &items, &providers).brewed);
-        assert_eq!(
-            stand.items[0].as_ref().unwrap().potion(),
-            Some("minecraft:awkward")
-        );
-        assert_eq!(stand.fuel, 6);
-        assert_eq!(stand.items[4].as_ref().unwrap().count, 1);
     }
 
     #[test]
@@ -634,12 +782,15 @@ mod tests {
         stand.items[2] =
             Some(ItemStack::new("minecraft:potion", 1).with_potion("minecraft:awkward"));
         stand.items[3] = Some(ItemStack::new("minecraft:nether_wart", 2));
-        let first = stand.tick(&brewing, &items, &providers);
+        let first = stand.tick(&brewing, &items, &providers, &|s| data_remainder(&items, s));
         assert_eq!(first.bottles, Some([true, false, true]));
         assert_eq!((stand.brew_time, stand.fuel), (400, 0));
         let mut brewed_at = 0;
         for t in 1..=400 {
-            if stand.tick(&brewing, &items, &providers).brewed {
+            if stand
+                .tick(&brewing, &items, &providers, &|s| data_remainder(&items, s))
+                .brewed
+            {
                 brewed_at = t;
             }
         }
@@ -655,7 +806,7 @@ mod tests {
         );
         assert_eq!(stand.items[3].as_ref().unwrap().count, 1);
         // No fuel left: nothing more brews.
-        stand.tick(&brewing, &items, &providers);
+        stand.tick(&brewing, &items, &providers, &|s| data_remainder(&items, s));
         assert_eq!(stand.brew_time, 0);
     }
 
@@ -724,7 +875,7 @@ mod tests {
             assert!(before.idle(), "{before:?}");
             let mut after = before.clone();
             assert_eq!(
-                after.tick(&brewing, &items, &providers),
+                after.tick(&brewing, &items, &providers, &|s| data_remainder(&items, s)),
                 BrewTick::default()
             );
             assert_eq!(format!("{after:?}"), format!("{before:?}"));
@@ -733,7 +884,7 @@ mod tests {
         let mut brewing_now = stand(true, 5, false);
         brewing_now.items[3] = Some(ItemStack::new("minecraft:nether_wart", 1));
         assert!(!brewing_now.idle());
-        brewing_now.tick(&brewing, &items, &providers);
+        brewing_now.tick(&brewing, &items, &providers, &|s| data_remainder(&items, s));
         assert_eq!(brewing_now.brew_time, 400);
     }
 
@@ -791,7 +942,12 @@ mod tests {
             let mut edited = stand.items.clone();
             edited[0] = Some(ItemStack::new("minecraft:diamond", 1));
             let mut out = BrewTick::default();
-            stand.brew_after_pre(Some((edited, cancel)), &brewing, &items, &mut out);
+            stand.brew_after_pre(
+                Some((edited, cancel)),
+                &brewing,
+                &|s| data_remainder(&items, s),
+                &mut out,
+            );
             assert_eq!(out.brewed, !cancel);
             assert_eq!(
                 stand.items[0],
@@ -818,5 +974,40 @@ mod tests {
         assert_eq!(lines[0].0, "resistance (∞)");
         let lines = effect_lines([("minecraft:resistance", 15, 0)], 1.0, &translate);
         assert_eq!(lines[0].0, "resistance");
+    }
+    #[test]
+    fn custom_contents_color_and_empty_semantics() {
+        use horizon_core::nbt::Tag;
+        let mut stack = ItemStack::new("minecraft:tipped_arrow", 1);
+        assert!(contents_empty(&stack));
+        stack
+            .data_mut()
+            .potion_extra
+            .push(("custom_effects".into(), Tag::List(Vec::new())));
+        assert!(contents_empty(&stack));
+        stack.data_mut().potion_extra = vec![(
+            "custom_effects".into(),
+            Tag::List(vec![
+                Tag::compound([
+                    ("id", Tag::String("minecraft:glowing".into())),
+                    ("amplifier", Tag::Int(1)),
+                ]),
+                Tag::compound([
+                    ("id", Tag::String("minecraft:poison".into())),
+                    ("show_particles", Tag::Byte(0)),
+                ]),
+            ]),
+        )];
+        assert!(!contents_empty(&stack));
+        // Glowing's colour; hidden poison contributes no weight.
+        assert_eq!(contents_color(&stack), 0xFF94_A061);
+        stack
+            .data_mut()
+            .potion_extra
+            .push(("custom_color".into(), Tag::Int(123456)));
+        assert_eq!(contents_color(&stack), 123456);
+        stack.data_mut().potion_extra = vec![("custom_name".into(), Tag::String("test".into()))];
+        assert!(!contents_empty(&stack));
+        assert_eq!(contents_color(&stack), 0xFF38_5DC6);
     }
 }

@@ -1,5 +1,42 @@
 # Horizon launcher
 
+## arismoko fork builds
+
+**Horizon Fork Launcher (arismoko)** is not the official Horizon launcher. Fork
+builds start with empty settings and accounts; they do not import official tokens.
+Their launcher and game data live under `horizon-fork-arismoko/launcher` and
+`horizon-fork-arismoko/game`. Relocation metadata and the OS keychain service are
+separate. Explicit home overrides still work for developers.
+
+A source-built launcher can install fork builds today. Configured Microsoft
+sign-in and signed Nightly Play arrive with the fork launcher; no release date is
+announced. Upstream has authorized use of its Microsoft application ID, supplied
+through the fork repository's `HORIZON_MSA_CLIENT_ID` variable rather than
+hard-coded in the fork. Accounts and tokens remain in this fork's separate
+storage; nothing is imported from the official launcher. A build without a
+configured ID cannot sign in. Unsigned local developer builds retain the explicit
+offline single-player switch. Signed builds retain account and ownership checks.
+
+Windows builds are **not Authenticode-signed**. Windows may show “Windows protected
+your PC” or an unknown-publisher warning. Signed checksums do not remove SmartScreen
+warnings. macOS packages are **ad-hoc signed**, without an Apple Developer ID and
+**not notarized**. Gatekeeper may block them or say Apple cannot check them for
+malicious software. No OS trust bypass is implied by a checksum signature.
+
+Build identity defaults to `arismoko/horizon`, consistently with the fork's release
+repository. Set `HORIZON_LAUNCHER_REPOSITORY=horizon-rust/horizon` at build time to
+retain upstream identity. Other values fail the build. Stage packaging with
+`python3 tools/stage_launcher_packaging.py OUTPUT --repository REPOSITORY` using
+the same repository selection. The original packaging templates and icons are
+left unchanged. The workflow passes `github.repository` to the real build selector
+and generates the corresponding build matrix. Existing signing, signature
+verification and publication gates are retained: dry runs use an ephemeral key,
+while publication uses the fork's existing signing key and still requires separate
+approval. The workflow must remain disabled until root authorizes a dispatch.
+Linux x86_64 and Windows x64 are the initial package targets; Windows ARM64 and
+macOS packages are not produced by this dry-run workflow. Any future macOS job
+must use GitHub-hosted runners, never the upstream private runner.
+
 A small desktop app that installs Horizon builds, prepares them from your own copy of
 Minecraft, and starts the client or a dedicated server. Built with [GPUI Fast](https://github.com/longbridge/gpui-fast),
 a fork of Zed's UI framework [GPUI](https://www.gpui.rs) that draws unchanged views from the last frame;
@@ -13,8 +50,8 @@ The opening, then Play ([clip](docs/opening.webm)):
 
 ## What it does
 
-- **Versions**: lists game builds published by arismoko/horizon, when available,
-  installs the build for this platform into its own
+- **Versions**: lists the published builds of horizon-rust/horizon (the current Nightly, the last
+  week's, then the releases from before), installs the build for this platform into its own
   folder, and removes it again. **Import a game build…** takes a `horizon-client` you have (one
   built on your fork's Actions, or the zip holding it) and installs it as `imported-<date>-<sha>`:
   a copy of the selected release or Nightly's folder, game files included, with that program as the
@@ -160,15 +197,11 @@ The opening, then Play ([clip](docs/opening.webm)):
   (`horizon_launcher::shortcut`). **Remove shortcut** moves it to the trash; it is found by the
   instance id inside it, so a rename doesn't lose it. `horizon-launcher instance shortcut
   [instance] [--remove]`; `HORIZON_LAUNCHER_DESKTOP` points it at another folder.
-- **Accounts and quick switch**: the top bar's account chip opens a menu of everyone who can play:
-  each signed-in Microsoft account, the offline names the player keeps, and the name the game
-  made up (`horizon-player.txt`). Picking one plays as it from the next Play. Offline names play
-  only while an account that owns the game is signed in ([Microsoft accounts](#microsoft-accounts));
-  signing the last one out keeps them, unplayable until one is back. Settings > Account
-  adds offline names (3 to 16 letters, digits or `_`; the game gets `--name`) and forgets them,
-  skin and cape files included, and rolls the game's made-up name for a new one; the Console's
-  Share log takes the names out of the log too. `horizon-launcher account offline
-  [NAME]`, `account select <name>` (an account or an offline name), `account forget-offline
+- **Accounts and quick switch**: the top bar's account chip opens a menu of the signed-in
+  Microsoft accounts. Picking one plays as it from the next Play; that account must own the game
+  ([Microsoft accounts](#microsoft-accounts)). There are no offline names: the project decided
+  that Horizon plays only with a Microsoft account that owns Minecraft: Java Edition. The
+  Console's Share log takes the account names out of the log. `horizon-launcher account select
   <name>`.
 - **Accent and Home background**: on top of Dark, Light or System, Settings > Launcher picks an
   accent (Horizon's violet, blue, teal, green, amber, red or pink, any hue, or any colour typed as
@@ -185,13 +218,6 @@ The opening, then Play ([clip](docs/opening.webm)):
   `launcher/lang/<code>.json`, English text to its translation, Horizon's own; a test fails when
   the code asks `tr("…")` for a string a table lacks, or a table keeps one the code dropped.
   `horizon-launcher settings language system|en|fr|ru|de|zh|es|uk|pl`.
-- **Skin and cape**: each offline name's **Skin…** in Settings > Account shows the front of its
-  skin and cape, takes a skin PNG (64×64, or the older 64×32) and a cape PNG (64×32), and picks
-  classic or slim arms. The launcher keeps copies in its `skins/` folder and gives the game
-  `HORIZON_OFFLINE_SKIN`, `HORIZON_OFFLINE_SKIN_MODEL` and `HORIZON_OFFLINE_CAPE` when that name
-  plays; the game draws the default skins until it reads them. A Microsoft account's skin and
-  cape: coming soon, with sign-in. `horizon-launcher account skin <name> [FILE] [--model
-  classic|slim] [--cape FILE] [--no-skin] [--no-cape]`.
 - **Console**: Home's Console shows the game's output of this run as it comes: a search (every
   word, any case), Follow to keep the newest line in view, Copy, and Open logs folder. Warnings
   and errors stand out. **Share log…** uploads the log to [mclo.gs](https://mclo.gs), a paste
@@ -235,7 +261,7 @@ The opening, then Play ([clip](docs/opening.webm)):
   keeping every field the launcher doesn't show and the servers joined with Direct Connection. The
   same from the command line: `horizon-launcher multiplayer [list|add|remove] [--instance <name>]`
   and `horizon-launcher play --server <address or name>`.
-- **Patch notes**: each release's notes, newest first, with no ads. Quiet "Roadmap", "Documentation" and "Website" links sit in the sidebar footer.
+- **Patch notes**: each release's notes, newest first, with a link to GitHub Sponsors. Quiet "Sponsor", "Discord" and "Website" links sit in the sidebar footer.
 
 Data lives in the platform's data directory (`~/.local/share/horizon-launcher` on Linux,
 `~/Library/Application Support/horizon-launcher` on macOS, `%APPDATA%\horizon-launcher` on
@@ -280,8 +306,8 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   Without one, `HTTPS_PROXY` and `HTTP_PROXY` are used when the launcher is started with them, and
   `NO_PROXY` names the hosts to reach directly, a modpack import's jars included. A server on this
   computer never goes through it.
-- **Links**: the website, the roadmap and the documentation come from `launcher/links.json` on this fork's main
-  (`{"website": "...", "roadmap": "...", "docs": "..."}`), so they change without a launcher release. Offline,
+- **Links**: the Discord invite, the Sponsors page and the website come from `launcher/links.json` on main
+  (`{"discord": "...", "sponsor": "...", "website": "..."}`), so they change without a launcher release. Offline,
   the launcher uses the same values built in; an empty address hides its button.
 
 Long pages, dialogs, the server console and data previews have a visible scrollbar when
@@ -391,7 +417,7 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     horizon-launcher play [--version <tag>] [--instance <name>] [--arg <ARG>]...   start the client; --arg passes an extra argument through (repeatable)
     horizon-launcher server [--dir <dir>] [--version <tag>] [--accept-eula]
     horizon-launcher notes [<tag>]                  patch notes as plain text
-    horizon-launcher links                          the website, roadmap and documentation links
+    horizon-launcher links                          the Discord, sponsor and website links
     horizon-launcher game-args [<line>]             show or set the extra arguments the game starts with
     horizon-launcher update [--check]               Horizon and the launcher
     horizon-launcher logs [--lines N] [--crash]     the end of the game's log, or its newest crash report
@@ -399,7 +425,6 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     horizon-launcher account sign-in                sign in in your browser with a code
     horizon-launcher account sign-out <name>
     horizon-launcher account select <name>          play as this account
-    horizon-launcher account offline                play without an account
     horizon-launcher instance [list]                the instances and their game folders (* = Play starts it)
     horizon-launcher instance create <name> [--copy <instance>]   empty, or a copy of one's worlds, options and packs
     horizon-launcher instance create <name> --minecraft <1.21.4|latest|latest-snapshot>   a Minecraft: Java Edition instance
@@ -435,7 +460,12 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     horizon-launcher servers run <server> -- <horizon-server command>   for example: servers run "My server" -- start
     horizon-launcher servers forget <server>        take it off the list (its folder stays)
     horizon-launcher benchmark [--repeats N]        measure the launcher (see Performance log)
-    horizon-launcher bug-report "<text>" [--log]    write a bug report file to attach by hand (nothing is sent)
+    horizon-launcher data [status]                  what data collection is allowed, the install ID, what waits
+    horizon-launcher data allow|deny <kinds|all>    performance, crashes, bugs, benchmarks
+    horizon-launcher data show                      exactly what would be sent
+    horizon-launcher data delete                    delete what was sent and what waits; new install ID
+    horizon-launcher data bug "<text>" [--log]      a bug report, printed for you to confirm first
+    horizon-launcher data benchmark <report.json>   upload a benchmark report, printed first
 
 `--json` prints JSON where there is something to report (`versions`, `install`, `notes`,
 `next`, `links`, `game-args`, `update --check`, `logs`, `account`, `benchmark`, `data`, `modpack`). Errors go to stderr with exit code 1. `server` runs in the terminal,
@@ -456,9 +486,9 @@ command that adds it; for Claude Code:
 (with the full path to the binary if it is not on your `PATH`). Every CLI command is a tool of the
 same name and arguments, generated from the CLI's definition (`src/cli_tools.rs`): `versions`,
 `install`, `remove`, `prepare`, `settings`, `mods_search`, `mods_install`, `modpack_import`,
-`servers_create`, `bug_report`... A call runs that command with `--json` and returns its
+`servers_create`, `data_status`... A call runs that command with `--json` and returns its
 output. Tools that delete something (`remove`, `mods_remove`, `modpack_remove`,
-`servers_forget`, `account_sign_out`) need `confirm: true`. The session runs a few
+`servers_forget`, `account_sign_out`, `data_delete`) need `confirm: true`. The session runs a few
 itself, under the CLI's names: `play`, `server` with `server_command`, `server_log` and
 `server_stop`, `account_list` and `account_sign_in` (returns the link and code for the player;
 the sign-in finishes in the background). A server started through MCP stops (cleanly, with
@@ -487,8 +517,8 @@ MCP's `play`) says "Sign in with a Microsoft account that owns Minecraft: Java E
 and starts nothing. Settings → Accounts signs in: the launcher shows a code, you enter it at
 microsoft.com/link, and the launcher checks that the account owns the game. It asks again at every
 Play, with the token renewal; with no network the last answer stands, and a "doesn't own" blocks
-at once. The account also plays online-mode servers under your own name and skin; offline names
-play LAN and offline-mode servers beside it. The game binary started directly (`horizon-client`,
+at once. The account that plays must own the game itself, and it plays online-mode servers under
+your own name and skin, LAN and offline-mode servers too. The game binary started directly (`horizon-client`,
 `horizon-ctl launch`), the harnesses and the servers don't go through this check. Tokens live in the system keychain (Keychain,
 Credential Manager, or the Secret Service on Linux), never in a log or the command line;
 `accounts.json` in the data folder keeps only names and UUIDs. On Linux without a keychain they go
@@ -509,14 +539,19 @@ The game writes its log to `logs/latest.log` in the game folder (`HORIZON_HOME`,
 archives the previous one at start as `logs/<date>-<n>.log.gz`, as Minecraft does. When it
 crashes it writes `crash-reports/crash-<date>_<time>-client.txt` beside them. When a game the
 launcher started crashes, the Play page says so, with buttons to open or copy the report, open the
-logs folder and report it on GitHub; Settings has the logs folder too. A crash report leaves the
+logs folder and report it on Discord; Settings has the logs folder too. A crash report leaves the
 machine only if you turn on crash reports (below).
 
 ## Data collection
 
-None. The launcher and the game send nothing about you or your machine (see
-[docs/telemetry.md](../docs/telemetry.md)). `horizon-launcher bug-report "text" [--log]` writes a bug report
-to a file you attach to your issue by hand.
+The first time it opens, the launcher asks whether you want to send performance statistics,
+crash reports, bug reports and benchmark uploads, each on its own switch and all off until you
+turn one on ("Send nothing" is one click). Settings → Data collection changes them any time, shows
+exactly what would be sent (the JSON), and deletes everything sent from your install. It asks
+again only when what is collected changes. The game obeys the same answer, kept in
+`telemetry/consent.json` in the game folder. What waits is sent when the launcher starts and
+closes. Every field, the caps and the format: [docs/telemetry.md](../docs/telemetry.md).
+
 
 ## Performance log
 
@@ -528,8 +563,9 @@ and OS (read on a thread after the first frame: on Windows those queries take se
 to an issue about the launcher being slow. `horizon-launcher benchmark` measures on purpose: it starts the launcher `--repeats` times (5; the first start is the cold one, as far
 as the OS's file cache allows), switches pages for a few seconds in each, rests 3 seconds to
 measure idle CPU, fetches the release list 3 times, and writes one report there with means and
-95% confidence intervals. Its window has to be on a screen that is awake. Session logs and benchmark reports stay on
-your machine ([data collection](../docs/telemetry.md)).
+95% confidence intervals. Its window has to be on a screen that is awake. Session logs stay on
+your machine; a `benchmark` report is uploaded, dated to the day, only if you allowed benchmark
+uploads ([data collection](../docs/telemetry.md)).
 
 Long lists on Mods (results, installed entries, coverage reports and project versions), Versions
 and Patch notes build only nearby rows, including on their first frame. Variable row heights

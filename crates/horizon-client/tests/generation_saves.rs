@@ -421,7 +421,7 @@ fn saved_proto_chunks_restore_exactly() {
     )]);
     extras.attachments =
         horizon_mod_runtime::attachments::Attachments::from_nbt(attachment.clone());
-    save.save_protos(&[seeded], assets.registry, &generator.biomes)
+    save.save_protos(vec![seeded], assets.registry, &generator.biomes)
         .unwrap();
     save.flush().unwrap();
     let mut restored: [Proto; 9] = std::array::from_fn(|i| {

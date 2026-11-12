@@ -64,27 +64,12 @@ pub(super) fn attackable(p: &Projectile) -> bool {
 }
 
 /// Its box for the crosshair: the entity's (a fireball 1 x 1, a wind charge or a
-/// shulker bullet 0.3125, from its feet up) grown by the pick radius, which only
-/// `AbstractHurtingProjectile` has (`getPickRadius`: 1; a shulker bullet's is 0).
+/// shulker bullet 0.3125, a wind charge's 0.15 below its feet) grown by the pick
+/// radius, which only `AbstractHurtingProjectile` has (`getPickRadius`: 1; a
+/// shulker bullet's is 0).
 fn pick_box(p: &Projectile) -> Aabb {
-    let size = match p.kind {
-        ProjectileKind::LargeFireball { .. } => 1.0,
-        _ => 0.3125,
-    };
     let radius = pick_radius(p);
-    let half = size / 2.0 + radius;
-    Aabb::new(
-        Vec3::new(
-            p.position.x - half,
-            p.position.y - radius,
-            p.position.z - half,
-        ),
-        Vec3::new(
-            p.position.x + half,
-            p.position.y + size + radius,
-            p.position.z + half,
-        ),
-    )
+    p.bounds().inflate(Vec3::new(radius, radius, radius))
 }
 
 impl Game<'_> {
@@ -138,7 +123,11 @@ impl Game<'_> {
     /// particles (`sendParticles`, spread 0.2) and `destroy`. The blow is
     /// `Player.attack` on a target that is not a mob: its sounds, then the swing.
     pub(super) fn hit_shulker_bullet(&mut self, i: usize) {
-        let (_, _, _, magic) = self.melee_damage("minecraft:shulker_bullet", false);
+        let (_, _, _, magic) = self.melee_damage(
+            "minecraft:shulker_bullet",
+            false,
+            Some(self.creatures.projectiles[i].id),
+        );
         let sweep = self.sweep_before_hit("minecraft:shulker_bullet", false);
         let p = self.creatures.projectiles.remove(i);
         let at = [p.position.x, p.position.y, p.position.z];
@@ -273,6 +262,7 @@ mod tests {
         assert_eq!(b.max_position().y, 66.0);
     }
 
+    /// A wind charge past its first five ticks (`noDeflectTicks` run out).
     fn wind_charge() -> Projectile {
         let mut p = Projectile::new(
             ProjectileKind::WindCharge,

@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[2]
 # 279s, horizon-client-lib 189s, 16m53s wall); horizon-world and horizon-items joined when every library
 # test started running with the data, not only the #[ignore]d ones. Rebalance by editing this tuple only.
 SHARDS = ("horizon-client", "horizon-client-lib", "horizon-client-render", "horizon-world", "horizon-items")
+# A package too big for one test process's memory runs as several legs, `PACKAGE#NofM` (tools/ci/ignored_tests.py
+# gives each test to exactly one leg). horizon-client's single process was killed (signal 9) on three main runs.
+LEGS = {"horizon-client": 2}
 
 # Files at the repository root that every package's build reads.
 ROOT_WIDE_FILES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml"}
@@ -37,6 +40,15 @@ ROOT_WIDE_FILES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.t
 SHARED_SOURCES = {"horizon-client": ("horizon-client", "horizon-client-lib")}
 # Workspaces of their own: nothing under them builds the shard packages.
 SEPARATE_WORKSPACES = ("launcher/",)
+
+
+def expand(packages):
+    """The matrix entries for these shard packages: a package with legs becomes one entry per leg."""
+    return [
+        f"{package}#{number}of{LEGS[package]}" if package in LEGS else package
+        for package in packages
+        for number in range(1, LEGS.get(package, 1) + 1)
+    ]
 
 
 def workspace_dependencies():
@@ -92,9 +104,9 @@ if __name__ == "__main__":
     every = arguments[:2] == ["--matrix", "--all"]
     selected = len(arguments) == 3 and arguments[0] == "--matrix"
     if every:
-        shards = list(SHARDS)
+        shards = expand(SHARDS)
     elif selected:
-        shards = select(rust_changes.changed_paths(arguments[1], arguments[2]), workspace_dependencies())
+        shards = expand(select(rust_changes.changed_paths(arguments[1], arguments[2]), workspace_dependencies()))
     else:
         sys.exit(__doc__)
     print("matrix=" + json.dumps({"shard": shards}))

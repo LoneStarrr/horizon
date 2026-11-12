@@ -363,6 +363,7 @@ impl Hub {
                 mod_type,
                 craft: None,
                 links: Vec::new(),
+                asks_still_valid: super::menu::asks_still_valid(mod_type, menu_kind),
             });
         });
         self.send_menu_content(i, items);
@@ -422,6 +423,7 @@ impl Hub {
                 mod_type: None,
                 craft: None,
                 links: Vec::new(),
+                asks_still_valid: false,
             });
             window
         });
@@ -629,7 +631,7 @@ impl Hub {
         }
         // A menu that is no longer valid takes no clicks.
         if let Some(m) = self.guests[i].menu.as_ref().filter(|_| in_menu)
-            && !m.slots.still_valid(world, &self.guests[i], m.pos)
+            && !m.still_valid(&self.loop_context, world, &self.guests[i])
         {
             return Vec::new();
         }
@@ -667,10 +669,14 @@ impl Hub {
             if in_menu && items.is_none() {
                 return None;
             }
+            let container_limits = source
+                .map(|source| source.stack_limits(world, items.as_ref().map_or(0, Vec::len)))
+                .unwrap_or_default();
             let mut view = View {
                 guest,
                 container: items.as_deref_mut(),
                 shulker,
+                container_limits,
                 hidden: &hidden,
                 loop_context,
             };

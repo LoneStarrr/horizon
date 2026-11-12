@@ -25,30 +25,31 @@ impl Aabb {
             && self.lo.z < o.hi.z && self.hi.z > o.lo.z
     }
 }
-struct ExperienceOrb { id: u32, join: u32, x: f64, value: u32, count: u32, age: u32, ticks: u32 }
-trait Locate { fn locate(&self, join: u32) -> Option<usize>; }
-impl Locate for Vec<ExperienceOrb> {
-    fn locate(&self, join: u32) -> Option<usize> { self.iter().position(|orb| orb.join == join) }
-}
+struct ExperienceOrb { join: u32, id: u32, x: f64, value: i32, count: u32, age: u32, ticks: u32 }
 impl ExperienceOrb {
     fn bounds(&self) -> Aabb {
         Aabb::new(Vec3::new(self.x - 0.25, 0.0, -0.25), Vec3::new(self.x + 0.25, 0.5, 0.25))
     }
-    fn can_merge(&self, id: u32, value: u32) -> bool {
+    fn can_merge(&self, id: u32, value: i32) -> bool {
         self.value == value && (self.id as i32).wrapping_sub(id as i32) % 40 == 0
     }
+    fn points(&self) -> u32 { self.value.max(0) as u32 }
+}
+trait Locate { fn locate(&self, join: u32) -> Option<usize>; }
+impl Locate for Vec<ExperienceOrb> {
+    fn locate(&self, join: u32) -> Option<usize> { self.iter().position(|o| o.join == join) }
 }
 struct Dim;
 impl Dim { fn id(&self) -> &'static str { "minecraft:overworld" } }
 struct Game { orbs: Vec<ExperienceOrb>, remote: Option<()>, dim: Dim, added: Vec<u32>,
-              flip: bool, cancel: bool, asked: Vec<(u32, u32, u32, u32)>, merged: Vec<(u32, u32)> }
+              flip: bool, cancel: bool, asked: Vec<(u32, u32, i32, i32)>, merged: Vec<(u32, u32)> }
 impl Game {
-    fn native_experience_orb_can_merge(&mut self, _: &str, into: u32, from: u32, iv: u32, fv: u32,
+    fn native_experience_orb_can_merge(&mut self, _: &str, into: u32, from: u32, iv: i32, fv: i32,
                                        can_merge: &mut bool) {
         self.asked.push((into, from, iv, fv));
         if self.flip { *can_merge = !*can_merge; }
     }
-    fn native_experience_orb_merge(&mut self, _: &str, into: u32, from: u32, _fv: u32,
+    fn native_experience_orb_merge(&mut self, _: &str, into: u32, from: u32, _fv: i32,
                                    canceled: &mut bool) {
         self.merged.push((into, from));
         *canceled = self.cancel;
@@ -59,8 +60,8 @@ impl Game {
     MERGE_NEW_ORB
     MERGE_ORB
 }
-fn orb(id: u32, x: f64, value: u32, ticks: u32) -> ExperienceOrb {
-    ExperienceOrb { id, join: id, x, value, count: 1, age: 10, ticks }
+fn orb(id: u32, x: f64, value: i32, ticks: u32) -> ExperienceOrb {
+    ExperienceOrb { join: id, id, x, value, count: 1, age: 10, ticks }
 }
 fn game(orbs: Vec<ExperienceOrb>, flip: bool, cancel: bool) -> Game {
     Game { orbs, remote: None, dim: Dim, added: vec![], flip, cancel, asked: vec![], merged: vec![] }
@@ -97,6 +98,13 @@ fn tick_merge_is_vanilla_unless_a_mod_decides() {
     g.merge_orb(0);
     assert_eq!((g.orbs.len(), g.orbs[0].count, g.orbs[0].age), (1, 2, 10));
     assert_eq!(g.asked, [(1, 41, 3, 3)]);
+    // Hooks see the signed value, including values which yield no pickup points.
+    for value in [-7, 0] {
+        let mut g = game(vec![orb(1, 0.0, value, 0), orb(41, 0.2, value, 0)], false, false);
+        g.merge_orb(0);
+        assert_eq!(g.asked, [(1, 41, value, value)]);
+        assert_eq!((g.orbs.len(), g.orbs[0].count), (1, 2));
+    }
     // only an orb on its scan tick asks: tickCount 20 is not the cadence
     let mut g = game(two(19, 0), false, false);
     g.merge_orb(0);

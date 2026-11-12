@@ -16,7 +16,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRECTORY = Path("crates/horizon-client/src/game/native_hooks")
-CATALOG = Path("crates/horizon-mod-api/src/hooks")
+CATALOG = Path("crates/horizon-mod-vocab/src/hooks")
 
 
 def run(*args, source=None):

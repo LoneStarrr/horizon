@@ -7,9 +7,9 @@
 //! has `native_player_submit` (`RenderPlayerEvent.Pre`), and every mob and
 //! player in view gets `native_mob_layer` after its vanilla model
 //! (`EntityRenderersEvent.AddLayers`), in the same frame.
-pub use mod_api::game::{NativeMobRender, NativePlayerRender};
+pub use mod_api::game::{MobRender, PlayerRender};
 
-use super::{Dim, Game, native_block_entity_draw::BlockEntityDraw};
+use super::{Game, native_block_entity_draw::BlockEntityDraw};
 use glam::{DVec3, Mat4};
 use horizon_client::{
     block_entity_render::diffuse_lights,
@@ -18,13 +18,13 @@ use horizon_client::{
 };
 
 /// The render state of `m` at `partial` (`LivingEntityRenderer.extractRenderState`).
-pub(super) fn mob_render<'a>(m: &'a Mob, partial: f32) -> NativeMobRender<'a> {
+pub(super) fn mob_render<'a>(m: &'a Mob, partial: f32) -> MobRender<'a> {
     let body = anim::body_rot(m, partial);
     // The walk cycle, head turn and age as the vanilla models read them:
     // no walking while riding or dead, a baby's legs three times as far
     // (`WalkAnimationState.position(partial)`, `positionScale`).
     let pose = anim::state(m, partial);
-    NativeMobRender {
+    MobRender {
         id: m.id,
         kind: &m.kind.id,
         custom_name: m.custom_name.as_deref(),
@@ -52,8 +52,9 @@ pub(super) fn mob_pose(at: DVec3, body_yaw: f32) -> Mat4 {
 impl Game<'_> {
     /// `native_mob_submit` for `mob`, lit by `light` (packed as the entity
     /// pass packs it): true when a mod drew it, and its vanilla model, armour
-    /// and held items are left out. The name tag, shadow, fire and a glowing
-    /// outline still draw as for any mob.
+    /// and held items are left out; else the parts of the vanilla model mods
+    /// hid. The name tag, shadow, fire and a glowing outline still draw as for
+    /// any mob.
     pub(super) fn mod_mob_geometry(
         &self,
         mob: &Mob,
@@ -61,56 +62,66 @@ impl Game<'_> {
         camera: DVec3,
         light: u32,
         out: &mut Vec<Vertex>,
-    ) -> bool {
-        self.mod_entity_draw(mob, partial, camera, light, out, |render, draw| {
+    ) -> (bool, mod_api::HiddenParts) {
+        let mut hidden = mod_api::HiddenParts::default();
+        let drawn = self.mod_entity_draw(mob, partial, camera, light, out, |render, draw| {
             let mut drawn = false;
-            self.native_mob_submit(render, draw, &mut drawn);
+            self.native_mob_submit(render, draw, &mut hidden, &mut drawn);
             drawn
-        })
+        });
+        (drawn, hidden)
     }
     /// `native_player_submit` for the player `mob` (`who` says which): true
     /// when a mod drew it and the vanilla model, armour, held items, cape and
-    /// other layers are left out.
+    /// other layers are left out; else the parts of the vanilla model mods hid.
     pub(super) fn mod_player_geometry(
         &self,
         mob: &Mob,
-        who: NativePlayerRender<'_>,
+        who: PlayerRender<'_>,
         partial: f32,
         camera: DVec3,
         light: u32,
         out: &mut Vec<Vertex>,
-    ) -> bool {
+    ) -> (bool, mod_api::HiddenParts) {
         // Posing a player for the mods costs, each frame: only when one listens.
+        if !self.mob_render_listened() {
+            return (false, mod_api::HiddenParts::default());
+        }
+        let mut hidden = mod_api::HiddenParts::default();
+        let drawn = self.mod_entity_draw(mob, partial, camera, light, out, |render, draw| {
+            let mut drawn = false;
+            self.native_player_submit(render, &who, draw, &mut hidden, &mut drawn);
+            drawn
+        });
+        (drawn, hidden)
+    }
+    /// Whether a mod listens to the mob and player render hooks this frame: the
+    /// draw keeps what they read (`mob_layer`'s posed parts) only then.
+    pub(super) fn mob_render_listened(&self) -> bool {
         let mut listened = false;
         self.native_player_render_listened(&mut listened);
-        if !listened {
-            return false;
-        }
-        self.mod_entity_draw(mob, partial, camera, light, out, |render, draw| {
-            let mut drawn = false;
-            self.native_player_submit(render, &who, draw, &mut drawn);
-            drawn
-        })
+        listened
     }
     /// `native_mob_layer` for `mob` (`who` set for a player): what a mod adds
-    /// is kept, drawn after the vanilla model and its layers.
+    /// is kept, drawn after the vanilla model and its layers. `parts` are the
+    /// humanoid parts as the vanilla draw posed them this frame, kept by it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn mod_mob_layer_geometry(
         &self,
         mob: &Mob,
-        who: Option<NativePlayerRender<'_>>,
+        who: Option<PlayerRender<'_>>,
+        parts: Option<mod_api::PosedParts>,
         partial: f32,
         camera: DVec3,
         light: u32,
         out: &mut Vec<Vertex>,
     ) {
         // Every mob in view each frame: only when a mod listens.
-        let mut listened = false;
-        self.native_player_render_listened(&mut listened);
-        if !listened {
+        if !self.mob_render_listened() {
             return;
         }
         self.mod_entity_draw(mob, partial, camera, light, out, |render, draw| {
-            self.native_mob_layer(render, who.as_ref(), draw);
+            self.native_mob_layer(render, who.as_ref(), parts.as_ref(), draw);
             true
         });
     }
@@ -123,7 +134,7 @@ impl Game<'_> {
         camera: DVec3,
         light: u32,
         out: &mut Vec<Vertex>,
-        hook: impl FnOnce(&NativeMobRender<'_>, &mut BlockEntityDraw) -> bool,
+        hook: impl FnOnce(&MobRender<'_>, &mut BlockEntityDraw) -> bool,
     ) -> bool {
         let render = mob_render(mob, partial);
         let a = f64::from(partial);
@@ -136,9 +147,10 @@ impl Game<'_> {
             light,
             [feet.x, feet.y, feet.z].map(|c| c.floor() as i32),
             mob_pose(feet - camera, render.body_yaw),
-            diffuse_lights(self.dim == Dim::Nether),
+            diffuse_lights(self.nether_lighting()),
             std::mem::take(out),
-        );
+        )
+        .animated(self.animation_time());
         let keep = hook(&render, &mut draw);
         *out = draw.into_vertices();
         if !keep {

@@ -1,12 +1,12 @@
 //! The glass look's controls ("Glass" in `docs/design-system.md`): the parts of the mockup's
 //! `components/launcher/launcher-ui.tsx` and its shell (`launcher-app.tsx`), at its sizes. White
 //! text and fills at a few opacities over [`glass`](crate::glass) plates; Geist throughout.
-use crate::{Kind, hover_fade, hover_is, keyboard, note_hover, theme::Theme, track_hover};
+use crate::{hover_fade, hover_is, keyboard, note_hover, theme::Theme, track_hover, Kind};
 use gpui::{
-    App, ClickEvent, Div, FontWeight, Hsla, SharedString, Stateful, Svg, TextRun, Window, div,
-    prelude::*, px, rgb, rgba, svg,
+    div, prelude::*, px, rgb, rgba, svg, App, ClickEvent, Div, FontWeight, Hsla, SharedString,
+    Stateful, Svg, TextRun, Window,
 };
-use horizon_theme::glass::{Glass, fill, ink, radius};
+use horizon_theme::glass::{fill, ink, radius, Glass};
 use std::cell::Cell;
 
 thread_local! {
@@ -36,12 +36,20 @@ pub fn light() -> bool {
 
 /// A solid control's fill (`SOLID`'s white, the sliders' knob): white, or the ink in light.
 pub fn paper() -> Hsla {
-    if light() { color(INK) } else { gpui::white() }
+    if light() {
+        color(INK)
+    } else {
+        gpui::white()
+    }
 }
 
 /// Text on [`paper`].
 pub fn on_paper() -> Hsla {
-    if light() { gpui::white() } else { color(INK) }
+    if light() {
+        gpui::white()
+    } else {
+        color(INK)
+    }
 }
 
 /// The look's green (`--live`): darker in light, to read on white plates.
@@ -580,9 +588,13 @@ pub fn solid(
             .items_center()
             .justify_center()
             .gap(px(8.))
-            .h(px(h))
+            // `h` is the least height: a label that wraps in a narrow button (a long translation)
+            // grows it instead of spilling out of it.
+            .min_h(px(h))
+            .py(px(4.))
             .px(px(16.))
             .rounded(px(radius::CONTROL))
+            .text_center()
             .bg(paper())
             .cursor_pointer()
             .hover(|s| s.opacity(0.9))

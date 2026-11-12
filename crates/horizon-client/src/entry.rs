@@ -1,110 +1,127 @@
 //! Startup shared by the gameplay library and its executable.
+#[path = "horizon_look.rs"]
+mod horizon_look;
 use crate::{crash, game, logging};
 use horizon_mod_package::selection::{Argument, LaunchArguments};
-use mod_api::__private::game::*;
 
-/// Start the game. The executable supplies the allocator and retains the mod API marker.
-pub fn main() {
-    main_with(Vec::new(), &[], &[]);
+/// Validated startup state. No native hooks or workers may run before prepare returns.
+pub struct Startup {
+    launch: LaunchArguments,
+    options: game::Options,
+    _capture: Option<horizon_mod_package::output::Capture>,
 }
 
-/// A native function slot, checked against its place's exact type before erasure.
-pub use mod_points::__private::SlotListener as NativeSlot;
-
-/// The places raw listeners register at, named by the generated `main`.
-#[doc(hidden)]
-pub use mod_points::PointId;
-
-/// Start with named mods and their function slots in installed dependency order.
-pub fn main_with(
-    mods: Vec<mod_api::ModEntry>,
-    slots: &[NativeSlot],
-    built: &'static [horizon_mod_package::runtime::BuiltMod],
-) {
-    let exe = std::env::current_exe();
-    let native: crate::Result<_> = exe
-        .as_ref()
-        .map_err(|e| e.to_string().into())
-        .and_then(|exe| {
-            horizon_mod_package::runtime::Runtime::load(exe, built).map_err(Into::into)
-        });
-    let native = match native {
-        Ok(native) => native,
-        Err(error) => {
-            eprintln!("Horizon: {error}");
-            std::process::exit(game::exit_code::ERROR);
-        }
-    };
-    horizon_threads::configure_allocator();
-    horizon_client::spans::startup::init(std::time::Instant::now());
-    horizon_client::spans::trace::start_from_env();
-    let launch: crate::Result<_> = std::env::current_dir().map_err(Into::into).and_then(|cwd| {
-        Ok(LaunchArguments::parse(
-            std::env::args().skip(1),
-            &cwd,
-            &logging::game_home(),
-            std::env::var_os("HORIZON_HOME").as_deref(),
-        )?)
-    });
-    let launch = match launch {
-        Ok(launch) => launch,
-        Err(error) => {
-            eprintln!("Horizon: {error}");
-            std::process::exit(game::exit_code::USAGE);
-        }
-    };
-    let wasm = horizon_mod_wasm::load_installed(&launch.context.game_dir, &launch.context.dev_mods);
-    let mut mods = mods;
-    mods.extend(wasm.mods);
-    // One installed dispatch order for both targets; ties retain bundle order.
-    let manifests: Vec<_> = native
-        .packages()
-        .iter()
-        .map(|p| &p.manifest)
-        .chain(wasm.manifests.iter())
-        .filter(|m| mods.iter().any(|entry| entry.fields().id == m.id))
-        .collect();
-    assert_eq!(
-        manifests.len(),
-        mods.len(),
-        "loaded code has checked manifests"
-    );
-    let declared: Vec<_> = manifests
-        .iter()
-        .map(|m| horizon_mod_package::dependencies::from_manifest(&m.dependencies))
-        .collect();
-    let inputs: Vec<_> = manifests
-        .iter()
-        .zip(&declared)
-        .map(|(m, dependencies)| horizon_mod_package::dependencies::Mod {
-            id: &m.id,
-            version: &m.version,
-            has_api: true,
-            dependencies,
-        })
-        .collect();
-    let order = horizon_mod_package::dependencies::resolve(&inputs)
-        .unwrap_or_else(|error| panic!("mod load refused: {error}"));
-    let mut entries: std::collections::BTreeMap<_, _> = mods
-        .into_iter()
-        .map(|entry| (entry.fields().id, entry))
-        .collect();
-    let mods: Vec<_> = order
-        .order
-        .into_iter()
-        .map(|i| entries.remove(manifests[i].id.as_str()).unwrap())
-        .collect();
-    let ids: Vec<_> = mods.iter().map(|entry| entry.fields().id).collect();
-    mod_api::__private::install(mods.into());
-    for id in ids {
-        for slot in slots.iter().filter(|slot| slot.id() == id) {
-            if let Err(error) = mod_points::register(slot) {
-                eprintln!("Horizon: {id}: {error}");
-                std::process::exit(game::exit_code::ERROR);
-            }
-        }
+impl Startup {
+    /// Validated launch context used by the platform's code loader.
+    pub fn launch(&self) -> &LaunchArguments {
+        &self.launch
     }
-    let help = launch.is_information_request();
+}
+
+/// Holder mode runs first. The game's sole Options validation reads arguments/environment
+/// and resource marker metadata only: no logging, account loading, mods or worker threads.
+/// Account IO, cwd changes and command registration remain in Options::read, after leases.
+pub fn prepare() -> Startup {
+    horizon_mod_package::holder::enter();
+    let result: crate::Result<_> = (|| {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command.args(std::env::args_os().skip(1));
+        let launch = LaunchArguments::for_command(&command)?;
+        let options = game::Options::validate(launch.clone())?;
+        Ok((launch, options))
+    })();
+    let (launch, options) = result.unwrap_or_else(|error| {
+        eprintln!("Horizon: {error}");
+        std::process::exit(game::exit_code::USAGE);
+    });
+    let Some(options) = options else {
+        std::process::exit(0);
+    };
+    let capture = horizon_mod_package::holder::acquire(&launch);
+    Startup {
+        launch,
+        options,
+        _capture: capture,
+    }
+}
+
+/// Refuse startup if any merged copy could not be installed, before loading any mod.
+/// Cells cannot roll back: each copy merges all requesting rows, so stopping the whole
+/// start is how we ensure none of a refused mod's rows run.
+pub fn installed(patched: &[(&str, &[&str], bool)]) {
+    let refusals = installation_refusals(patched);
+    for line in &refusals {
+        eprintln!("{line}");
+    }
+    if !refusals.is_empty() {
+        std::process::exit(game::exit_code::ERROR);
+    }
+}
+
+fn installation_refusals(patched: &[(&str, &[&str], bool)]) -> Vec<String> {
+    patched.iter().filter(|(_, _, installed)| !installed).map(|(target, mods, _)| {
+        format!("Horizon: {}: {target}: a patched copy was already installed; the game was not started", mods.join(", "))
+    }).collect()
+}
+
+/// Code-runtime services supplied by the platform at startup.
+pub struct CodeRuntime {
+    pub initialize: fn(&[mod_api::PackageInfo]),
+    pub refusal: fn(&str) -> Option<String>,
+    pub startup_refused: fn(&str) -> bool,
+}
+static CODE_RUNTIME: std::sync::OnceLock<CodeRuntime> = std::sync::OnceLock::new();
+pub(crate) fn initialize_code(inventory: &[mod_api::PackageInfo]) {
+    let runtime = CODE_RUNTIME
+        .get()
+        .expect("code initialization requires entry::start");
+    (runtime.initialize)(inventory);
+}
+pub(crate) fn code_startup_refused(id: &str) -> bool {
+    CODE_RUNTIME
+        .get()
+        .is_some_and(|runtime| (runtime.startup_refused)(id))
+}
+pub(crate) fn code_refusal(id: &str) -> Option<String> {
+    CODE_RUNTIME.get().and_then(|runtime| (runtime.refusal)(id))
+}
+
+/// Start the engine with dependency-ordered code supplied by the host.
+pub fn start<G>(
+    native: horizon_mod_package::runtime::Runtime,
+    load: impl FnOnce(
+        &horizon_mod_package::runtime::Runtime,
+        &LaunchArguments,
+    ) -> (Vec<&'static str>, G),
+    code: CodeRuntime,
+    startup: Startup,
+) {
+    let _ = CODE_RUNTIME.set(code);
+    let Startup {
+        launch,
+        options,
+        _capture,
+    } = startup;
+    horizon_threads::configure_allocator();
+    horizon_chat_filter::install();
+    horizon_look::give();
+    // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
+    horizon_client::pack_formats::install();
+    // horizon-extras (docs/forking.md): without the feature, no Horizon Settings or Mods page.
+    if !cfg!(feature = "horizon-extras") {
+        horizon_client::options_ui::HORIZON_EXTRAS
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    horizon_client::telemetry::mark_start();
+    // Opt-in telemetry keeps each crash report (docs/telemetry.md), whatever the mode.
+    crash::on_report(horizon_client::telemetry::keep_crash);
+    // Crates above the engine registered their hooks before this (horizon-official's `main`),
+    // then the Horizon parts still in this crate; none registers after this point.
+    game::player_hooks::register();
+    horizon_hooks::engine::seal();
+    // The text crates ship (`horizon_hooks::lang`), loaded with the game's own languages.
+    horizon_client::lang::install_crate_files(horizon_hooks::lang::engine::all());
+    horizon_client::spans::startup::init(std::time::Instant::now());
     logging::set_game_home(launch.context.home.clone());
     // The dedicated server logs in its own folder, as vanilla's does; the game in its home.
     let (home, side, thread) = if launch
@@ -123,15 +140,15 @@ pub fn main_with(
         }
         (launch.context.home.clone(), "client", "Render thread")
     };
-    if !help {
-        logging::init(
-            logging::player_dir_override().unwrap_or(home.as_path()),
-            thread,
-        );
-        // The log's first line names the build, so a bug report that carries the log says which one it was.
-        log::info!("Horizon {}", crash::version());
-        crash::install(home.clone(), side);
-    }
+    logging::init(
+        logging::player_dir_override().unwrap_or(home.as_path()),
+        thread,
+    );
+    // The log's first line names the build, so a bug report that carries the log says which one it was.
+    log::info!("Horizon {}", crash::version());
+    // Mod loading emits refusals; both client and dedicated logs must exist first.
+    let (_ids, _loaded_code) = load(&native, &launch);
+    crash::install(home.clone(), side);
     if horizon_world::native_load_hooks::install(
         horizon_world::native_load_hooks::NativeLoadHooks {
             loot_table_load: |context, id, table| {
@@ -153,11 +170,11 @@ pub fn main_with(
                 let context = reader.context();
                 mod_api::dispatch_modify_default_components(&context, item, components);
             },
-            loot_function: |kind, data, ctx, stack| {
-                crate::game::api_values::dispatch_loot_function(kind, data, ctx, stack);
+            loot_function: |kind, data, ctx, stack, tags| {
+                crate::game::api_values::dispatch_loot_function(kind, data, ctx, stack, tags);
             },
-            loot_condition: |kind, data, ctx, holds| {
-                crate::game::api_values::dispatch_loot_condition(kind, data, ctx, holds);
+            loot_condition: |kind, data, ctx, holds, tags| {
+                crate::game::api_values::dispatch_loot_condition(kind, data, ctx, holds, tags);
             },
         },
     )
@@ -167,7 +184,7 @@ pub fn main_with(
     }
     if horizon_world::native_worldgen_hooks::install(
         horizon_world::native_worldgen_hooks::NativeWorldgenHooks {
-            alter_ground: mod_api::ground::alter_ground,
+            alter_ground: crate::game::api_values::alter_ground,
         },
     )
     .is_err()
@@ -183,13 +200,13 @@ pub fn main_with(
     }
     install_client_hooks();
     raise_open_file_limit();
-    if let Err(error) = game::run_with(launch, native) {
+    if let Err(error) = game::run_with(options, native) {
         // A bad command line is the caller's mistake, not a crash: no report.
         let usage = error.is::<game::UsageError>();
         log::error!("Horizon: {error}");
         logging::flush();
         // The report's path is the last line on stderr (crash::SAVED_LINE).
-        if !help && !usage {
+        if !usage {
             crash::report_error(&home, side, &*error);
         }
         // Started from Explorer, the console window closes with the game:
@@ -205,6 +222,7 @@ pub fn main_with(
             game::exit_code::ERROR
         });
     }
+    horizon_hooks::engine::shutdown();
     logging::flush();
 }
 
@@ -212,6 +230,10 @@ pub(crate) fn install_client_hooks() {
     game::api_values::install_stack_hooks();
     if !crate::native_client_hooks::install(crate::native_client_hooks::NativeClientHooks {
         menu_slot_rules: game::api_values::menu_slot_rules,
+        menu_still_valid: game::api_values::menu_still_valid,
+        menu_still_valid_listens: |menu| {
+            mod_api::__private::menu_listens(mod_api::HookId::MenuStillValid, menu)
+        },
         item_stacked_on_other: |context, event, canceled| {
             game::api_values::stacked_on_other(context, event, canceled);
         },
@@ -325,6 +347,12 @@ pub(crate) fn install_client_hooks() {
         block_speed_factor: |context, state, factor| {
             crate::game::block_speed_factor(context, state, factor);
         },
+        is_ladder: |context, entity, pos, state, ladder| {
+            crate::game::is_ladder(context, entity, pos, state, ladder);
+        },
+        friction: |context, entity, kind, pos, state, friction| {
+            crate::game::native_surface::friction(context, entity, kind, pos, state, friction);
+        },
         player_stays_on_ground_surface: |context, entity, staying| {
             if !mod_api::__private::listened(mod_api::HookId::PlayerStaysOnGroundSurface) {
                 return;
@@ -348,6 +376,9 @@ pub(crate) fn install_client_hooks() {
             let reader = horizon_client_render::api_context::LoopReader(context);
             let context = reader.context();
             mod_api::dispatch_fluid_flow(&context, fluid, pos, flow);
+        },
+        sound_type: |context, pos, state, entity, cause, sound| {
+            crate::game::native_block_sounds::sound_type(context, pos, state, entity, cause, sound);
         },
     }) {
         log::warn!("Native client hooks already installed; keeping the first callbacks");
@@ -387,5 +418,22 @@ fn raise_open_file_limit() {
                 Err(e) => log::warn!("Open file limit stays at {:?}: {e}", limit.current),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod installation_tests {
+    #[test]
+    fn refused_install_names_all_mods_and_only_failed_targets() {
+        assert_eq!(
+            super::installation_refusals(&[
+                ("game::tick", &["first", "second"], false),
+                ("game::other", &["third"], true)
+            ]),
+            vec![
+                "Horizon: first, second: game::tick: a patched copy was already installed; the game was not started"
+            ]
+        );
+        assert!(super::installation_refusals(&[]).is_empty());
     }
 }

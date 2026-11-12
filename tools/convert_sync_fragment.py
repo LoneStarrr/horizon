@@ -67,7 +67,7 @@ def convert(path, out):
     if unknown or src.get("draw_contexts"):
         raise ValueError(
             f"unsupported fragment fields: {sorted(unknown)} or draw contexts; "
-            "helpers are host methods now, written by hand in crates/horizon-mod-api/src/host/<area>.rs"
+            "helpers are host methods now, written by hand in crates/horizon-mod-vocab/src/host/<area>.rs"
         )
     stem = path.stem.replace("-", "_")
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", stem):

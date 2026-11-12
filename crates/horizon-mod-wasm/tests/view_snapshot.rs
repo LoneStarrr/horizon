@@ -1,4 +1,8 @@
 //! Compare the generated borrowed encoder with the owned snapshot conversion.
+// Generated fixtures exercise every shape; TODO(#2273): make the generator emit clippy-clean code.
+#![allow(clippy::all, unused_comparisons, unreachable_patterns, dead_code)]
+#[path = "support/no_hooks.rs"]
+mod no_hooks;
 use api::wire::Writer;
 use mod_api as api;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -42,6 +46,7 @@ fn count(f: impl FnOnce()) -> usize {
 }
 #[test]
 fn borrowed_snapshot_matches_owned_without_clone_allocations() {
+    mod_api::__private::initialize().unwrap();
     use horizon_core::nbt::Tag;
     let mut entity = api::ModBlockEntity::default();
     entity.nbt.insert("progress".into(), Tag::Int(7));
@@ -60,7 +65,9 @@ fn borrowed_snapshot_matches_owned_without_clone_allocations() {
     let old = count(|| {
         for _ in 0..1000 {
             owned.clear();
-            owned.put(&api::containers::ModBlockEntitySnapshot::from(&entity));
+            owned.put(&api::item::containers::ModBlockEntitySnapshot::from(
+                &entity,
+            ));
         }
     });
     let new = count(|| {
@@ -80,7 +87,9 @@ fn borrowed_snapshot_matches_owned_without_clone_allocations() {
         for _ in 0..1000 {
             let decoded: api::ModBlockEntity = api::wire::Reader::new(&input).take().unwrap();
             owned.clear();
-            owned.put(&api::containers::ModBlockEntitySnapshot::from(&decoded));
+            owned.put(&api::item::containers::ModBlockEntitySnapshot::from(
+                &decoded,
+            ));
         }
     });
     let new_roundtrip = count(|| {
@@ -104,6 +113,7 @@ fn borrowed_snapshot_matches_owned_without_clone_allocations() {
 }
 #[test]
 fn static_string_id_reply_decodes_without_allocating() {
+    mod_api::__private::initialize().unwrap();
     use api::wire::{Reader, guest};
     use std::rc::Rc;
     guest::reset_static_strings();

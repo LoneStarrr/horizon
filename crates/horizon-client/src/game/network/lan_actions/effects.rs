@@ -15,12 +15,20 @@ impl Game<'_> {
             .to_vec();
         let facts = self.res.facts();
         // BlockItem.place: `playSound(player, ...)`, for the others only. The
-        // placer's client plays it as its block appears.
+        // placer's client plays it as its block appears. The place sound is the
+        // one the block's parts answered the placement with (`place_sound_type`).
+        let placer = self
+            .lan
+            .as_ref()
+            .and_then(|host| host.hub.guest(conn))
+            .map(|g| (g.entity_id as u32, "minecraft:player"));
         let placed: Vec<([f64; 3], String)> = changed
             .iter()
             .map(|&(x, y, z)| {
                 let at = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
-                let name = &facts.get(self.world.block(x, y, z)).sounds.place;
+                let state = self.world.block(x, y, z);
+                let place = mod_api::BlockSoundCause::Place;
+                let name = self.block_sound_type([x, y, z], state, placer, place).place;
                 (at, name.trim_start_matches("minecraft:").to_owned())
             })
             .collect();
@@ -183,15 +191,20 @@ impl Game<'_> {
         });
     }
 
-    /// The guests' items in use, for the players around (`LivingEntity.startUsingItem`
-    /// and `stopUsingItem` set DATA_LIVING_ENTITY_FLAGS).
+    /// The guests' items in use and Riptide spins, for the players around
+    /// (`LivingEntity.startUsingItem`, `stopUsingItem` and `startAutoSpinAttack`
+    /// set DATA_LIVING_ENTITY_FLAGS).
     pub(in crate::game) fn lan_living_flags(&mut self) {
         let Some(host) = self.lan.as_mut() else {
             return;
         };
         host.hub.guests.update_all(|g| {
             let using = host.play.get(&g.conn).and_then(GuestPlay::using);
-            g.living_flags = crate::game::lan::living_flags(using);
+            let spinning = g
+                .motion
+                .as_ref()
+                .is_some_and(|m| m.auto_spin_attack_ticks > 0);
+            g.living_flags = crate::game::lan::living_flags(using, spinning);
         });
     }
 

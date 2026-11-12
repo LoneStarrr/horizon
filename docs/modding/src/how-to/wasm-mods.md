@@ -2,22 +2,81 @@
 
 ## Boundary benchmark
 
-After building the shared std and the test fixture, run the release benchmark with their paths:
+From the root of the worktree containing the fixture and runtime to measure, build the tool, fixture,
+and shared std, then run the release benchmark. This requires `rust-src` and the
+`wasm32-unknown-unknown` target for the pinned wasm toolchain:
 
 ```sh
-HORIZON_WASM_STD="$PWD/target/horizon-wasm-std.wasm" HORIZON_WASM_FIXTURE="$PWD/crates/horizon-mod-wasm/tests/fixture/target/horizon-mod/wasm_fixture.hmod" cargo test --release -p horizon-mod-wasm --test bench block_entity_ticks -- --ignored --nocapture
+cargo build -p cargo-horizon-mod
+(cd crates/horizon-mod-wasm/tests/fixture && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod build --wasm --catalog points.json && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod wasm-std "$OLDPWD/target/horizon-wasm-std.wasm" --catalog points.json)
+HORIZON_WASM_STD="$PWD/target/horizon-wasm-std.wasm" HORIZON_WASM_FIXTURE="$PWD/crates/horizon-mod-wasm/tests/fixture/target/horizon-mod/wasm_fixture.hmod" cargo test --release -p horizon-mod-wasm --features listener-fixture --test bench empty_subscribed_listener -- --ignored --exact --nocapture
 ```
 
-It measures 1,000 block entity ticks against an in-memory host, both without and with two host reads per tick; it is not a full game-world benchmark. The `wasm-mods` workflow runs it only on manual dispatch.
+Building the fixture rewrites `crates/horizon-mod-wasm/tests/fixture/horizon-mod.toml` with the
+generated wasm hash and toolchain identity. Inspect and discard those generated manifest changes
+after measurement rather than committing toolchain-specific hashes; preserve any intended edits.
+Keep the machine, build profile and conditions consistent when comparing revisions.
+
+The empty-listener benchmark dispatches the same subscribed `server_stopped` listener natively and
+in wasm. It reports 100 samples of 100,000 dispatches after 20 warm-up samples, with loading,
+initialization, subscription installation and the in-memory host outside timing. It is not a
+server teardown or world tick. The existing `block_entity_ticks` case measures 1,000 in-memory
+block entity ticks per sample, with and without two host reads per tick; replace
+`empty_subscribed_listener` with `block_entity_ticks` in the command to run it. The `wasm-mods`
+workflow runs that case only on manual dispatch.
+
+For an outer wasm call, an immediately available group lock does not start the busy timer. On
+contention, non-worker calls wait up to five seconds from the first failed lock attempt; they
+return busy immediately if the group is lent to another thread. Worker calls continue waiting
+instead of using that timeout or lending refusal. A synchronous same-thread reentrant call uses
+the lent context and its enclosing deadline; frame, resource and trap cleanup still apply.
 
 A mod written against `mod_api` builds either way from the same source: native, compiled into
 the game by the launcher ([Native mods](native-mods.md)), or to `mod.wasm`, which any game with
 the same mod API runs with no rebuild. Only the build step differs: the hooks, Parts,
 `[dependencies]` and the manifest mean the same for both.
 
+The example counts ticks with the `server_tick` hook, so it also works on plain game builds.
+
 ```rust,ignore
 {{#include ../../examples/wasm-hello/src/lib.rs:mod}}
 ```
+
+## Owned values and `Wire`
+
+Native and wasm use the same owned-value encoding. A mod chooses which of its own
+values may cross that boundary by explicitly deriving `mod_api::Wire`:
+
+```rust
+#[derive(mod_api::Wire)]
+struct CounterUpdate {
+    counter: mod_api::Identifier,
+    value: u32,
+}
+```
+
+Records write fields in declaration order; enum tags are zero-based declaration
+indices, not Rust discriminants. Each field must have a Wire form. Borrowed hook
+arguments are call-table views, not owned Wire values; a borrowed record cannot
+use this derive. The derive is never added automatically to a mod's types.
+
+For a value with checked construction, `#[wire(via = SomeOwnedType)]` uses
+`From<&Self>` to encode and `TryFrom<SomeOwnedType>` to decode. A failed conversion
+refuses the value rather than constructing unchecked state. This also lets a type
+retain a deliberately chosen encoding instead of exposing its Rust fields.
+
+The API's own plain values use this same derive, including particle options,
+package descriptions, handles and reload file collections. Checked registry keys
+and item stacks retain codecs that validate host registry slots, nonzero stack
+counts and component patches. A declaration retaining a handwritten codec states
+its particular validation, projection or nonstandard byte format; merely having a
+handwritten codec is not an exception to the explicit Wire policy.
+
+The loader compares composed encoding layouts, including nested fields and
+recursive shapes. Equivalent standard representations share one encoding:
+`Vec<T>` and `Box<[T]>`, for example, are both lists, while `Box<T>` is transparent.
+Changing a field's encoded form changes its callers' layout too. Layouts are
+computed once at load; they are not per-tick work.
 
 ## Build
 
@@ -52,7 +111,7 @@ together.
 
 The state is 32 words, zeroed, exported by the std member as `horizon_group_state`: the handler table, the cache budget, and
 29 slots for eviction callbacks. A member's allocator is `mod_api`'s `#[global_allocator]` on wasm32. When an allocation
-fails because the group's memory (256 MiB) is full, it calls every callback registered with
+fails because the group's memory is full (see [Memory](#memory)), it calls every callback registered with
 `mod_api::wire::guest::register_eviction(fn())` once and retries once; if that frees nothing the allocation fails as
 usual (`try_reserve` returns an error, an infallible allocation ends the call with a trap). Register a callback to
 give back what a cache can rebuild. It must free memory and must not allocate. Registering the same function twice is
@@ -95,31 +154,14 @@ load, and `if_installed!` keeps the mod from calling it.
 ## Injection points
 
 API-typed `[[inject]]` listeners use the same generated `mod_points` records and constructors as
-native listeners. The wasm build takes the pinned game's staged `points.json` as an explicit
-`--points` input when injections are declared. Only the declared places' guest codecs and dispatch
-functions are compiled into the member; the complete catalog still determines its layout hash.
+native listeners. When injections are declared, the wasm build requires the pinned game's staged
+`points.json`, supplied via `--catalog` or beside the configured std member.
 Listeners register in the host's ordinary point list, with the same priority, dependency order,
 owner enable flag and stop behavior as native listeners. Mixins remain native-only.
 
-Raw listeners read an owned per-call snapshot, never engine addresses or Rust memory layouts.
-Rows identify a node, its parent, a declaration-order field/index, a generated 64-bit type key
-and a plain Wire value. Every generated raw constructor accepts the same
-`fn(mod_points::snapshot::Snapshot<'_>, &mut mod_api::wire::RecordPatch)` listener signature.
-Reads cannot mutate the snapshot. The head outcome cell uses `Option<T>` for cancellation with a
-replacement result; the return outcome cell contains `T` directly, like the native return listener.
-Declared mutable raw-record fields, including
-by-value arguments which native raw records expose as `&mut`, use checked, atomic writeback.
-Rejected replies apply no argument or outcome writes. The initial generated readers cover free
-functions with primitive arguments and unit/primitive returns; engine receivers, nominal types,
-callbacks and borrowed returns need staged catalog readers and are refused until those exist.
-
-The shared `RowPages` resource interface returns owned windows, with a node, starting index,
-row count and child-depth bound. Native borrowed providers check their marked call's lifetime
-before every read and resolve movable elements afresh. Retaining or transferring a provider does
-not keep its native root alive: expired and wrong-thread reads are refused, while rows already
-returned remain owned and usable. This interface alone does not enable the missing nominal readers
-above. Sparse `wire::RecordPatch` records likewise carry only field ids and ordinary Wire values;
-the receiving schema validates every edit before committing any field.
+A point's record is a copy of every parameter as an API value, `&mut` parameters copied back
+after the listener, exactly as for a native listener; a point with a parameter that has no API type
+yet refuses an `api` listener at registration, naming it. The removed `access` key on `[[inject]]` is refused by name on both targets. Native code needing game internals uses `[[native.mixin]]`; wasm cannot declare `[[internals]]` or native transformations.
 
 ## ABI reference
 
@@ -150,8 +192,8 @@ Pointers and lengths below are wasm32 `u32` values. The game provides these impo
 Each guest exports:
 
 - `horizon_layout() -> u64`: the generated layout hash. A mismatch is refused.
-- `horizon_layout_ext() -> u64`, when `mod_points` is linked: the full point catalog and row-schema
-  layout hash. The loader checks it before accepting any listener.
+- `horizon_layout_ext() -> u64`, when `mod_points` is linked: the full point catalog's layout
+  hash. The loader checks it before accepting any listener.
 - `horizon_in(len) -> ptr`: the buffer into which the game writes the next call's input.
 - `horizon_hook(id) -> u64`: runs the generated export ID after the input is written. The high
   32 bits are the reply pointer and the low 32 bits its length; `u32::MAX` as the length denotes
@@ -164,17 +206,11 @@ The reserved IDs are `INIT = 0xFFFF_FF00` (guest package-list initialization),
 Other IDs index the generated import or export table. A hook reply
 contains its return value followed by writable arguments in field order.
 
-Points use that same hook export, call arena and execution budget. API place IDs are
-`0x8000_0000 + place`; raw place IDs are `0xC000_0000 + place`. The subscription query
-`0xBFFF_FFFF` returns `(place, injection_id)` pairs, with bit 30 of the place marking raw access.
-Point call input starts with the `u32` subscription index. An API `HostSide` point then carries a
-server/client boolean, followed by its listener record. A raw record contains the owned rows,
-an optional ordinary `RowPages` resource and an initially empty `RecordPatch`; there is no separate
-raw row prefix or API-typed argument proxy. API calls reply with unit and their record; raw calls
-reply with unit and a sparse `RecordPatch`. The host validates the complete patch before applying
-any producer-authorized argument or outcome writes; return argument edits are rejected.
-Raw snapshots are
-bounded to 65,536 rows and 1 MiB of encoded plain values, independently of runtime group limits.
+Points use that same hook export, call arena and execution budget. Place IDs are
+`0x8000_0000 + place`. The subscription query `0xBFFF_FFFF` returns `(place, injection_id)`
+pairs. Point call input starts with the `u32` subscription index. A `HostSide` point then carries
+a server/client boolean, followed by its listener record. Calls reply with unit and the record,
+which the host decodes completely before writing any field back.
 
 Wire values use little-endian numbers; lengths and collection counts are `u32`, strings are a
 byte length followed by UTF-8 bytes, options have a byte tag (`0` or `1`), enums have a `u32`
@@ -192,3 +228,67 @@ and named on the Mods page.
 
 The game limits execution time, memory and table usage. A trap or limit hit disables the affected
 group. APIs marked `Not on wasm` in their Rust documentation cannot be used by wasm mods.
+
+### Memory
+
+A group's members share one linear memory: their heaps, stacks and static data together. Its limit is
+1 GiB, or the largest `wasm_memory_mib` a member's `horizon-mod.toml` declares (1 to 4096 MiB, wasm32's 4 GiB),
+so a library declares what it and its addons need. The limit is a ceiling, not memory taken: the group
+uses what it grows to. Past the limit, or past what the system gives, `memory.grow` answers -1 inside the
+guest and the call goes on; Rust's allocator then reports the failure as usual (`try_reserve` returns an
+error; an infallible allocation ends the call with a trap and the log names the group and its limit).
+
+Each instance caps every group with `wasm.memory_cap_mib:<MiB>` in `horizon-mods.txt`, beside `options.txt`:
+4096 unless the player lowers it. A group whose members declare more than the cap is refused at load, and
+the Mods page names the group, what it declares and the cap.
+
+## Compiled module cache
+
+The game caches compiled wasm modules in `<game_dir>/.horizon-cache/wasm/`, keyed by the
+wasm bytes, Wasmtime compatibility and engine settings. Hits map the compiled file into memory;
+files shipped beside a mod are never loaded as compiled code.
+
+On Unix, a cache miss compiles in a short-lived child of the game executable, returning
+compiler memory to the operating system when the child exits. The internal entry runs before
+game initialization, with closed standard streams and an empty environment. It receives a
+private input file and the expected cache key, refuses changed input, and writes through the
+same atomic cache writer. The parent accepts only its expected entry through the verified
+opened-file loader. Startup failure, a crash, a non-zero exit, an invalid entry or a timeout
+falls back to in-process compilation with a log message. A timed-out child is killed and
+reaped before fallback; its input and unfinished writer files are removed. This child path
+is Unix-only; Windows continues to compile in process with persistent caching disabled.
+
+On Unix, the game creates the cache folder with mode 0700 and entries with mode 0600. It checks
+folder ownership and permissions, then checks each opened entry is a regular file owned by the
+current user, not writable by group or others, and has only one hard link. Symlink entries are
+refused. On Windows, persistent caching is disabled until owner, DACL and inheritance trust
+can be verified for the cache folder and opened entries. Modules compile from wasm instead,
+with one warning explaining the fallback. The player's account is the trust boundary.
+
+At startup, the game removes regular `.cwasm` files from other engine configurations or
+Wasmtime versions, along with malformed and old-format cache names. It never follows symlinks
+for cleanup. Current-engine entries have a 1 GiB startup budget: when their combined size
+exceeds it, entries are removed oldest first by modification time until within the budget.
+Current entries are not removed just because they are old. Entries written during this launch
+are retained until a later startup. The proposed budget allows 30 copies of the largest
+measured compiled module (34,039,320 bytes) plus headroom; the 30-module allowance awaits
+maintainer confirmation and does not represent a measured pack.
+
+A failed check logs the reason once per launch. Unavailable, corrupt or incompatible entries
+fall back to compiling the wasm. Writes replace entries atomically without changing files that
+running modules have mapped. Deleting the cache is always safe: the next launch rebuilds it.
+
+## Guest stack
+
+Every wasm mod has the same 128 MiB guest stack limit; manifests cannot change it.
+At the reporter's measured ceiling of about 1.8 KB per frame, this covers about
+70,000 plain frames (Java's deepest reported case was about 59,000). Frame sizes
+vary with compiled code. Guest overflow still traps and names the mod.
+Guest-entering threads reserve another 8 MiB for host frames. Linux raises the
+main stack limit and re-execs before initialization, or refuses startup with
+`GuestStackUnavailable` when the hard limit is too low. Windows and macOS use
+executable linker stack reservations. These reserve address space; resident
+memory grows as stack pages are touched.
+
+Wasm runtime tests reserve their guest stack through a shared test helper;
+local `cargo test` and CI need no `RUST_MIN_STACK` setting.

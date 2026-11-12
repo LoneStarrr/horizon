@@ -69,12 +69,15 @@ impl Game<'_> {
         };
         let data = stack.data();
         let mut animation = fixed.unwrap_or_else(|| {
-            if let Some(consumable) = stack.consumable(info) {
+            if let Some(consumable) = self.consumable(stack) {
                 consumable.animation
-            } else if data.is_some_and(|d| d.other("minecraft:blocks_attacks").is_some())
-                || (data.is_none_or(|d| d.other("!minecraft:blocks_attacks").is_none())
-                    && info.is_some_and(|i| i.blocks_attacks.is_some()))
-            {
+            } else if self.stack_can_perform(
+                stack,
+                super::item_abilities::ability::SHIELD_BLOCK,
+                data.is_some_and(|d| d.other("minecraft:blocks_attacks").is_some())
+                    || (data.is_none_or(|d| d.other("!minecraft:blocks_attacks").is_none())
+                        && info.is_some_and(|i| i.blocks_attacks.is_some())),
+            ) {
                 UseAnimation::Block
             } else if kinetic.is_some() {
                 UseAnimation::Spear
@@ -120,9 +123,12 @@ impl Game<'_> {
     }
     /// `ItemStack.getUseDuration`: a consumable's time, 72000 for what is
     /// held until let go, the fixed times of brushes, bundles, spyglasses and
-    /// goat horns, 0 for the rest, then a mod's answer.
+    /// goat horns, 0 for the rest, then a mod's answer. A `consumable` or
+    /// `blocks_attacks` the server's patch adds counts as the item's own
+    /// (`Item.getUseDuration` reads the stack's components).
     pub(super) fn use_duration(&self, stack: &ItemStack) -> i32 {
         let info = self.items().get(&stack.item);
+        let (patched_ticks, patched_blocks) = horizon_client::item_sync::patched_use(stack);
         let mut duration = match &*stack.item {
             "minecraft:bow" | "minecraft:crossbow" | "minecraft:trident" => 72_000,
             "minecraft:spyglass" => 1200,
@@ -131,9 +137,12 @@ impl Game<'_> {
             "minecraft:ender_eye" => 0,
             "minecraft:goat_horn" => self.native_item_instrument_duration(stack),
             _ => {
-                if let Some(consumable) = stack.consumable(info) {
+                if let Some(ticks) = patched_ticks {
+                    ticks
+                } else if let Some(consumable) = self.consumable(stack) {
                     consumable.ticks()
-                } else if stack.carries_component(info, "minecraft:blocks_attacks")
+                } else if patched_blocks
+                    || self.stack_carries_blocks_attacks(stack, info)
                     || stack.carries_component(info, "minecraft:kinetic_weapon")
                 {
                     72_000
@@ -152,8 +161,8 @@ impl Game<'_> {
         let info = self.items().get(&stack.item);
         !stack.item.starts_with("minecraft:")
             && info.is_some()
-            && stack.consumable(info).is_none()
-            && !stack.carries_component(info, "minecraft:blocks_attacks")
+            && self.consumable(stack).is_none()
+            && !self.stack_carries_blocks_attacks(stack, info)
             && !stack.carries_component(info, "minecraft:kinetic_weapon")
             && self.use_duration(stack) > 0
     }
@@ -195,8 +204,8 @@ impl Game<'_> {
         self.using = None;
         self.send_use_item_complete();
         self.apply_use_cooldown(stack);
-        if let Some(consumable) = stack.consumable(Some(info)) {
-            self.finish_consuming(info, consumable, stack);
+        if let Some(consumable) = self.consumable(stack) {
+            self.finish_consuming(info, &consumable, stack);
         } else if &*stack.item == "minecraft:spyglass" {
             self.stop_spyglass();
         }
@@ -214,6 +223,48 @@ impl Game<'_> {
         if result != before {
             *self.held_mut() = result.filter(|s| s.count > 0);
         }
+    }
+    /// `LivingEntityUseItemEvent.Finish` on a server's client, whose
+    /// `completeUsingItem` (`handleEntityEvent(9)`) ran for `stack` in `slot`.
+    /// `ItemStack.finishUsingItem` runs first, as on the client: the use
+    /// cooldown, then the hand holds `finish_result`. A mod's result is put in
+    /// the slot; the server's inventory update replaces either. Finishing a use
+    /// sends no creative packet in vanilla (its inventory-slot edits go out
+    /// through the open creative screen's `CreativeInventoryListener`), so the
+    /// slot counts as synced for this client's creative sync.
+    pub(super) fn remote_use_item_finished(
+        &mut self,
+        slot: usize,
+        stack: &ItemStack,
+        info: &ItemInfo,
+    ) {
+        self.apply_use_cooldown(stack);
+        let mut result = self.finish_result(stack, info);
+        let hand = hand_of(Some((slot, 0))).unwrap_or(self.hand);
+        self.native_living_entity_use_item_finish(stack, None, hand, 0, &mut result);
+        let before = self.creative_stacks();
+        *self.stack_in_mut(slot) = result.filter(|s| s.count > 0);
+        self.remote_synced_since(&before);
+    }
+    /// What `Item.finishUsingItem` leaves in the hand on a server's client: a
+    /// stack that is not a consumable stays as it is (a spyglass); a
+    /// consumable loses one (`ItemStack.consume`), and once that empties the
+    /// hand, its `use_remainder` takes the hand
+    /// (`UseRemainder.convertIntoRemainder`). Neither in creative mode. A
+    /// remainder of a stack that is not emptied goes to the inventory on the
+    /// server and arrives with its inventory update.
+    pub(super) fn finish_result(&self, stack: &ItemStack, info: &ItemInfo) -> Option<ItemStack> {
+        if self.creative || self.consumable(stack).is_none() {
+            return Some(stack.clone());
+        }
+        let mut left = stack.clone();
+        left.count = left.count.saturating_sub(1);
+        if left.count > 0 {
+            return Some(left);
+        }
+        info.use_remainder
+            .as_deref()
+            .map(|remainder| ItemStack::new(remainder, 1))
     }
     /// `LivingEntityUseItemEvent.Tick` for `stack` in use `ticks` so far, as
     /// `updatingUsingItem` starts: a mod may change the ticks left, which
@@ -365,6 +416,41 @@ impl Game<'_> {
         }
         started
     }
+    /// `LivingEntity.getUseItemRemainingTicks` of mob `id`: the use's duration
+    /// less the ticks its counter has run, 0 when it uses nothing (an admiring
+    /// piglin and a drinking witch use none). None for a mob that is gone.
+    pub(super) fn mob_item_use_remaining(&self, id: u32) -> Option<i32> {
+        let mob = self.mobs.iter().find(|m| m.id == id)?;
+        if !spear_use::is_using_item(mob) {
+            return Some(0);
+        }
+        let stack = self.mob_hand_stack(id, mob.extra.using_off_hand);
+        Some(stack.map_or(0, |stack| {
+            ticks_left(
+                self.use_duration(&stack),
+                mob.extra.using_item.unsigned_abs() - 1,
+            )
+        }))
+    }
+    /// `LivingEntity.useItemRemaining` of mob `id` set to `remaining`: its use
+    /// counter moves to where that many ticks are left. A mob's use never
+    /// runs out, so nothing else changes. False when it uses nothing.
+    pub(super) fn mob_set_item_use_remaining(&mut self, id: u32, remaining: i32) -> bool {
+        let Some(mob) = self.mobs.iter().find(|m| m.id == id) else {
+            return false;
+        };
+        if !spear_use::is_using_item(mob) {
+            return false;
+        }
+        let Some(stack) = self.mob_hand_stack(id, mob.extra.using_off_hand) else {
+            return false;
+        };
+        let counter = use_counter_leaving(self.use_duration(&stack), remaining);
+        if let Some(mob) = self.mobs.iter_mut().find(|m| m.id == id) {
+            mob.extra.using_item = counter;
+        }
+        true
+    }
     /// `LivingEntity.releaseUsingItem` of mob `id`: a mod's `Stop` and
     /// `Item.releaseUsing`, the use over before them as for a player. A bow's
     /// and a trident's own release ask for a player, and a use cooldown too
@@ -395,7 +481,7 @@ impl Game<'_> {
     }
     /// `Player.canEat(canAlwaysEat)` for `stack`, food that is eaten only
     /// when hungry, then a mod's answer.
-    pub(super) fn can_eat(&self, stack: &ItemStack, can_always_eat: bool) -> bool {
+    pub(super) fn can_eat(&self, stack: Option<&ItemStack>, can_always_eat: bool) -> bool {
         let vanilla = can_always_eat
             || self.creative
             || self
@@ -408,7 +494,7 @@ impl Game<'_> {
     }
 }
 
-/// The ticks left after a mod's `Tick`, a cancel being NeoForge's -1, and
+/// The ticks left after a mod's `Tick`, a cancel leaving -1, and
 /// whether a mod ever set this use's: once one did, the use goes on only
 /// while some are left, else it ran out. A use no mod touched goes on as
 /// vanilla's own do (an eye of ender's has none from the start).
@@ -483,10 +569,16 @@ pub(super) fn duration_leaving(ticks: u32, remaining: i32) -> i32 {
     remaining.saturating_add_unsigned(ticks)
 }
 
+/// The use counter of a mob (1 on the tick its use starts) that leaves
+/// `remaining` ticks of a use of `own`, none past the use's whole duration.
+fn use_counter_leaving(own: i32, remaining: i32) -> i32 {
+    i32::try_from(held(own, remaining).saturating_add(1)).unwrap_or(i32::MAX)
+}
+
 /// What a `Start` left of a use of `own` ticks: None refused (a cancel, or
-/// a time below 0, as NeoForge's `startUsingItem` returns), else whether a
+/// a time below 0), else whether a
 /// mod set the ticks left to none. Such a use runs out on its first tick
-/// (`tick_left`), as NeoForge's `--useItemRemaining <= 0` completes it, while
+/// (`tick_left`), while
 /// an item's own 0 (an eye of ender) is held until let go, as vanilla's.
 fn start_of(own: i32, duration: i32, canceled: bool) -> Option<bool> {
     (!canceled && duration >= 0).then_some(duration == 0 && own != 0)
@@ -535,10 +627,42 @@ pub(super) fn use_pose(
 mod tests {
     use super::{
         bow_release_power, consumes_at_once, count_down, duration_leaving, held, release_parts,
-        start_of, tick_left, ticks_left, use_pose,
+        start_of, tick_left, ticks_left, use_counter_leaving, use_pose,
     };
     use horizon_client::first_person::ItemPose;
     use horizon_core::use_animation::UseAnimation;
+
+    /// A mob's use counter is 1 on the tick it starts and a bow's use lasts
+    /// 72000 ticks: 71995 left is 5 ticks in, counter 6 (what releasing
+    /// reports back as 71995), and more than the whole use is no ticks in.
+    #[test]
+    fn a_mobs_use_counter_leaves_the_remaining_ticks() {
+        for (own, remaining, counter) in [
+            (72_000, 71_995, 6),
+            (72_000, 72_000, 1),
+            (72_000, 1, 72_000),
+            (72_000, 0, 72_001),
+            (32, 40, 1),
+            (32, -3, 36),
+            (i32::MAX, i32::MIN, i32::MAX),
+            // The extremes a mod may set on a 72000 tick use, which
+            // `spear_use`'s tick test runs on.
+            (72_000, i32::MIN, i32::MAX),
+            (72_000, i32::MAX, 1),
+            (72_000, -5, 72_006),
+            (i32::MIN, i32::MIN, 1),
+            (i32::MIN, i32::MAX, 1),
+        ] {
+            let got = use_counter_leaving(own, remaining);
+            assert_eq!(got, counter, "{own} {remaining}");
+            if remaining <= own && got < i32::MAX {
+                // Read back the way a use reads its ticks left.
+                assert_eq!(ticks_left(own, got.unsigned_abs() - 1), remaining);
+            }
+            // Reading the ticks left back never overflows either.
+            ticks_left(own, got.unsigned_abs() - 1);
+        }
+    }
 
     #[test]
     #[ignore = "needs prepared resources"]
@@ -650,7 +774,7 @@ mod tests {
         let mut overridden_geometry = None;
         let mods: Mods = vec![ModEntry::new("animation", Box::new(Mod(calls.clone())))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_client_game(|game| {
                 for id in [
                     "minecraft:bow",
@@ -751,6 +875,132 @@ mod tests {
         });
     }
 
+    /// `render_hand` draws in a hand that holds an item, where `render_arm`
+    /// never fires. What the mod drew is in the hand's vertices, in a run of
+    /// its own ahead of vanilla's, and it stays when the mod leaves vanilla's
+    /// hand out. The pose the mod sets moves vanilla's hand, not what it
+    /// drew. The empty off hand is asked too.
+    #[test]
+    #[ignore = "needs prepared resources"]
+    fn a_mod_draws_in_a_hand_that_holds_an_item() {
+        use mod_api::{ClientHost, Flow, Hand, Hooks, ModEntry, Mods, RenderHandEvent};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        // One quad a block wide, a block in front of the eyes.
+        const MARK: [[f32; 3]; 4] = [
+            [0.0, 1.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [1.0, 0.0, -1.0],
+            [1.0, 1.0, -1.0],
+        ];
+        struct Mod {
+            cancel: Arc<AtomicBool>,
+            shift: Arc<AtomicBool>,
+            asked: Arc<Mutex<Vec<(Hand, bool)>>>,
+        }
+        #[mod_api::__subscriptions]
+        impl Hooks for Mod {
+            fn render_hand(&self, _: &dyn ClientHost, event: &mut RenderHandEvent<'_, '_>) -> Flow {
+                let holds_an_item = event.render.stack.is_some();
+                self.asked
+                    .lock()
+                    .unwrap()
+                    .push((event.render.hand, holds_an_item));
+                if self.shift.load(Ordering::Relaxed) {
+                    event.render.translation[0] += 1.0;
+                }
+                // Draw in the hand that holds the sword only.
+                if holds_an_item {
+                    let uv = [0.0, 0.0, 16.0, 16.0];
+                    assert!(event.draw.quad("block/stone", MARK, uv, 0xFF_FF_FF));
+                }
+                if self.cancel.load(Ordering::Relaxed) {
+                    Flow::Cancel
+                } else {
+                    Flow::Continue
+                }
+            }
+        }
+        fn hold_a_sword(game: &mut crate::game::Game<'_>) {
+            game.player = Some(
+                horizon_client::motion::PlayerMotion::new(
+                    game.motion,
+                    horizon_core::geometry::Vec3::ZERO,
+                )
+                .unwrap(),
+            );
+            game.inventory[game.selected] = Some(horizon_client::items::ItemStack::new(
+                "minecraft:iron_sword",
+                1,
+            ));
+            game.tick_player_model();
+            game.visible_hands[0].1 = game.inventory[game.selected].clone();
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shift = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let hooks = Mod {
+            cancel: cancel.clone(),
+            shift: shift.clone(),
+            asked: asked.clone(),
+        };
+        let mods: Mods = vec![ModEntry::new("hand", Box::new(hooks))].into();
+        crate::game::api_values::install_parts(&mods).unwrap();
+        let mut drawn = None;
+        mod_platform::testing::with_mods(mods, || {
+            super::super::native_entity_refs::tests::with_client_game(|game| {
+                hold_a_sword(game);
+                let kept = game.hand_geometry(0.0);
+                shift.store(true, Ordering::Relaxed);
+                let posed = game.hand_geometry(0.0).0;
+                shift.store(false, Ordering::Relaxed);
+                cancel.store(true, Ordering::Relaxed);
+                drawn = Some((kept, posed, game.hand_geometry(0.0)));
+            });
+        });
+        let ((kept, kept_runs), posed, (alone, alone_runs)) = drawn.unwrap();
+        // Each frame both hands were asked, the empty off hand included.
+        let frame = [(Hand::Main, true), (Hand::Off, false)];
+        assert_eq!(*asked.lock().unwrap(), [frame, frame, frame].concat());
+        // Cancelled: only the mod's quad, in a run with no rendered item id.
+        assert!(!alone.is_empty());
+        assert_eq!(alone_runs, [(0, 0)]);
+        // The pose the mod set is not under its draw: the quad stays, and
+        // vanilla's hand moves by the block asked along the view's x.
+        assert_eq!(posed.len(), kept.len());
+        let (quad, hand) = posed.split_at(alone.len());
+        assert!(quad.iter().zip(&alone).all(|(a, b)| a.pos == b.pos));
+        for (moved, still) in hand.iter().zip(&kept[alone.len()..]) {
+            let by = (0..3)
+                .map(|i| (moved.pos[i] - still.pos[i]).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!((by - 1.0).abs() < 1e-4, "moved by {by}");
+        }
+
+        // The unmodified comparison owns a new resource graph and Parts snapshot.
+        crate::game::api_values::install_parts(&[]).unwrap();
+        super::super::native_entity_refs::tests::with_client_game(|game| {
+            hold_a_sword(game);
+            let (vanilla, vanilla_runs) = game.hand_geometry(0.0);
+            assert!(!vanilla.is_empty());
+            // Kept: the same quad first, then vanilla's hand exactly as without a mod.
+            assert_eq!(kept.len(), alone.len() + vanilla.len());
+            assert!(kept.iter().zip(&alone).all(|(a, b)| a.pos == b.pos));
+            let hand = &kept[alone.len()..];
+            assert!(hand.iter().zip(&vanilla).all(|(a, b)| a.pos == b.pos));
+            let shifted = vanilla_runs
+                .iter()
+                .map(|&(start, id)| (start + alone.len() as u32, id));
+            let runs = std::iter::once((0, 0)).chain(shifted).collect::<Vec<_>>();
+            assert_eq!(kept_runs, runs);
+        });
+    }
+
     #[test]
     fn a_use_runs_out_on_its_last_tick() {
         // a 32 tick food: ticks 0 to 30 go on, the 32nd tick finishes it.
@@ -826,7 +1076,7 @@ mod tests {
         assert!(!goes_on(tick_left(20, -1, false, false)));
         // a use a mod ran out stays out on the next ticks (a crossbow frozen).
         assert!(!goes_on(tick_left(-1, -1, false, true)));
-        // and goes on again if a mod gives it ticks back, as NeoForge's.
+        // and goes on again if a mod gives it ticks back.
         assert!(goes_on(tick_left(-1, 10, false, true)));
     }
 
@@ -917,7 +1167,7 @@ pub(super) mod interact_vibration_tests {
 
     type RecordedEvent = (&'static str, [f64; 3], Option<horizon_client::mobs::Who>);
     thread_local! {
-        static EVENTS: std::cell::RefCell<Vec<RecordedEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+        pub(in crate::game) static EVENTS: std::cell::RefCell<Vec<RecordedEvent>> = const { std::cell::RefCell::new(Vec::new()) };
         static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
@@ -934,7 +1184,10 @@ pub(super) mod interact_vibration_tests {
     /// Runs `f` on a windowless game built from the prepared resources with
     /// `held` in the main hand and returns the game events it posted;
     /// `None` without the resources.
-    fn with_game(held: &str, f: impl FnOnce(&mut Game<'_>)) -> Option<Vec<String>> {
+    pub(in crate::game) fn with_game(
+        held: &str,
+        f: impl FnOnce(&mut Game<'_>),
+    ) -> Option<Vec<String>> {
         use crate::game::{Audio, Options, Progress, Settings, load_resources};
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES")?);
         let settings = Settings::default();
@@ -1016,6 +1269,110 @@ pub(super) mod interact_vibration_tests {
     }
 
     #[test]
+    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    fn cake_context_uses_can_eat_instead_of_raw_hunger() {
+        use mod_api::{CanEatEvent, Hooks};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Reverse(Arc<AtomicUsize>);
+        #[mod_api::__subscriptions]
+        impl Hooks for Reverse {
+            fn can_eat(
+                &self,
+                host: &dyn mod_api::Host,
+                event: &mut CanEatEvent<'_>,
+            ) -> Option<bool> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                if let Some(stack) = event.stack {
+                    assert_eq!(stack.item().id(host), "minecraft:stick");
+                }
+                Some(!event.vanilla_can_eat)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
+            "cake-refusal",
+            Box::new(Reverse(calls.clone())),
+        )]
+        .into();
+        mod_platform::testing::with_mods(mods, || {
+            with_game("minecraft:stick", |game| {
+                let use_block = |game: &mut Game<'_>, name: &str| {
+                    let player = game.use_context();
+                    game.with_block_use_level(|b, level, ticks| {
+                        let state = b.table.default_state(b.table.block_by_name(name).unwrap());
+                        b.use_without_item(
+                            level,
+                            ticks,
+                            state,
+                            horizon_core::geometry::BlockHit {
+                                block: horizon_core::position::BlockPos::new(0, 64, 0),
+                                direction: horizon_core::geometry::Direction::Up,
+                                location: horizon_core::geometry::Vec3::new(0.5, 65.0, 0.5),
+                                inside: false,
+                            },
+                            player,
+                        )
+                    })
+                };
+                game.creative = true;
+                use_block(game, "minecraft:stone");
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    use_block(game, "minecraft:cake"),
+                    horizon_world::level::InteractionResult::Pass
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                *game.held_mut() = None;
+                assert_eq!(
+                    use_block(game, "minecraft:candle_cake"),
+                    horizon_world::level::InteractionResult::Pass
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
+                game.creative = false;
+                game.player.as_mut().unwrap().health.food.food = 20;
+                assert_eq!(
+                    use_block(game, "minecraft:cake"),
+                    horizon_world::level::InteractionResult::Success
+                );
+                assert_eq!(calls.load(Ordering::Relaxed), 3);
+                game.world
+                    .chunks
+                    .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+                game.with_level(|b, level, _| {
+                    let cake = b
+                        .table
+                        .default_state(b.table.block_by_name("minecraft:cake").unwrap());
+                    assert!(
+                        horizon_world::level::LevelAccess::set_raw(
+                            level,
+                            horizon_core::position::BlockPos::new(0, 64, 0),
+                            cake,
+                        )
+                        .is_some()
+                    );
+                });
+                let hit = super::super::Hit {
+                    pos: [0, 64, 0],
+                    face: [0, 1, 0],
+                    point: [0.5, 65.0, 0.5],
+                    inside: false,
+                };
+                let (result, _) = game.remote_block_template(&hit, None, true);
+                assert_eq!(result, horizon_world::level::InteractionResult::Success);
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    4,
+                    "client dry-level path asks the hook"
+                );
+            })
+            .expect("HORIZON_TEST_RESOURCES must name prepared resources");
+        });
+    }
+
+    #[test]
     fn stack_use_effects_patch_controls_vibrations() {
         let mut rod = ItemStack::new("minecraft:fishing_rod", 1);
         assert!(interact_vibrations(&rod, Some(true)));
@@ -1040,6 +1397,92 @@ pub(super) mod interact_vibration_tests {
             Some(horizon_core::nbt::Tag::Compound(Default::default())),
         );
         assert!(!interact_vibrations(&rod, Some(true)));
+    }
+
+    /// `FishingRodItem.use` and the cast model's `FishingRodCast` take a
+    /// content mod's item copied from the rod (`ItemInfo::is`) as a rod: it
+    /// casts, is drawn cast while its hook is out, and reels in. Another item
+    /// is not a rod.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_content_mods_rod_casts_and_reels_in() {
+        let Some(_) = with_game("minecraft:stick", |game| {
+            // A world with a data pack has tables of its own, which take the mod's item.
+            let dir =
+                std::env::temp_dir().join(format!("horizon-content-rod-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let tags = dir.join("datapacks/rods/data/ruby/tags/item");
+            std::fs::create_dir_all(&tags).unwrap();
+            std::fs::write(
+                dir.join("datapacks/rods/pack.mcmeta"),
+                r#"{"pack":{"description":"fixture"}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                tags.join("rods.json"),
+                r#"{"values":["minecraft:fishing_rod"]}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("datapacks.json"),
+                r#"{"enabled":["file/rods"],"disabled":[]}"#,
+            )
+            .unwrap();
+            game.world_root = dir.clone();
+            let stack = game.reload_datapacks(false, &[]).unwrap();
+            let root = game.options.resources.clone();
+            game.world_tables = game
+                .build_world_tables(&stack, false, &root, game.mods.data_switched)
+                .unwrap()
+                .0;
+            let items = &mut game.world_tables.as_mut().unwrap().items.items;
+            let mut info = items["minecraft:fishing_rod"].clone();
+            info.id = std::sync::Arc::from("ruby:rod");
+            info.template = Some(std::sync::Arc::from("minecraft:fishing_rod"));
+            assert!(
+                super::super::remote::item_has_use(&info),
+                "remote use accepts content rods"
+            );
+            items.insert(info.id.clone(), info);
+
+            let items = &mut game.world_tables.as_mut().unwrap().items.items;
+            let mut stick_info = items["minecraft:stick"].clone();
+            stick_info.id = std::sync::Arc::from("ruby:stick");
+            stick_info.template = Some(std::sync::Arc::from("minecraft:stick"));
+            items.insert(stick_info.id.clone(), stick_info);
+            let stick = ItemStack::new("ruby:stick", 1);
+            assert!(!game.use_fishing_rod(&stick), "a content stick is no rod");
+            assert!(game.hook.is_none());
+            let rod = ItemStack::new("ruby:rod", 1);
+            *game.held_mut() = Some(rod.clone());
+            assert!(game.main_hand_rod());
+            let used_before = game.stats.get("used", "ruby:rod");
+            let vanilla_before = game.stats.get("used", "minecraft:fishing_rod");
+            assert!(game.use_fishing_rod(&rod), "the mod's rod casts");
+            assert_eq!(game.stats.get("used", "ruby:rod"), used_before + 1);
+            assert_eq!(
+                game.stats.get("used", "minecraft:fishing_rod"),
+                vanilla_before
+            );
+            assert!(game.hook.is_some());
+            assert_eq!(game.cast_rod(), Some(&rod), "drawn cast");
+            game.tick_fishing();
+            assert!(
+                game.hook.is_some(),
+                "the content rod keeps its hook when ticked"
+            );
+            assert!(game.use_fishing_rod(&rod), "and reels in");
+            assert_eq!(game.stats.get("used", "ruby:rod"), used_before + 1);
+            assert_eq!(
+                game.stats.get("used", "minecraft:fishing_rod"),
+                vanilla_before
+            );
+            assert!(game.hook.is_none());
+            assert_eq!(game.cast_rod(), None);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }) else {
+            panic!("prepared resources failed to load")
+        };
     }
 
     #[test]

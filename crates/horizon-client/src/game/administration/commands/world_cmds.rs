@@ -113,6 +113,9 @@ impl Game<'_> {
         let index = &world_stations!(self).recipe_index;
         let removed = self.level.recipe_book.remove_recipes(index, recipes);
         let count = removed.len() as i32;
+        if count != 0 {
+            self.invalidate_mod_book_placement_knowledge();
+        }
         // A network player's client drops them from its book.
         if self.lan_acting.is_some() && !removed.is_empty() {
             self.guest_packets.push(C::RecipeBookRemove(
@@ -286,9 +289,6 @@ impl Game<'_> {
                 let attack = self.current_attack();
                 self.for_player(target, |g| {
                     g.with_attack(attack, |g| {
-                        if g.spectator() {
-                            return false;
-                        }
                         if let Some(name) = named {
                             g.note_direct_entity(ty, name);
                         }
@@ -338,9 +338,9 @@ impl Game<'_> {
                     self.command_damage_mob(id, amount, damage)
                 }
             }
-            Target::Item(id) => self.command_damage_item(id, amount, ty, cause.or(by)),
+            Target::Item(id) => self.command_damage_item(id, amount, ty, by, cause.or(by), from),
             Target::Boat(_) | Target::Cart(_) => {
-                self.command_damage_vehicle(target, amount, ty, cause.or(by))
+                self.command_damage_vehicle(target, amount, ty, by, cause.or(by), from)
             }
             Target::Dragon(id) => self.command_damage_dragon(
                 id,
@@ -357,8 +357,11 @@ impl Game<'_> {
                 id,
                 ty,
                 Self::damage_kind(&self.motion.health.damage, ty),
+                by,
                 cause.or(by),
+                from,
             ),
+            Target::Stand(id) => self.command_damage_stand(id, ty, cause.or(by)),
             _ => false,
         }
     }
@@ -369,7 +372,9 @@ impl Game<'_> {
         target: Target,
         amount: f32,
         damage_type: &str,
+        direct: Option<Target>,
         causing: Option<Target>,
+        position: Option<[f64; 3]>,
     ) -> bool {
         let registry = &self.motion.health.damage;
         let Some(kind) = registry.id(damage_type) else {
@@ -380,17 +385,45 @@ impl Game<'_> {
             Target::Boat(id) | Target::Cart(id) => id,
             _ => return false,
         };
-        let invulnerable = self
-            .persist
-            .raw
-            .get(&id)
-            .is_some_and(|tag| horizon_client::entity_nbt::flag(tag, "Invulnerable"));
-        if invulnerable && !creative && !registry.in_tag(kind, "minecraft:bypasses_invulnerability")
-        {
-            return false;
-        }
+        let vanilla = self.saved_refuses_damage(id, damage_type, creative);
         let ignites = registry.in_tag(kind, "minecraft:is_fire")
             || registry.in_tag(kind, "minecraft:is_explosion");
+        let entity_kind = match target {
+            Target::Boat(_) => self
+                .boats
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| b.entity_type()),
+            Target::Cart(_) => self
+                .carts
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.kind.id().to_owned()),
+            _ => None,
+        };
+        let Some(entity_kind) = entity_kind else {
+            return false;
+        };
+        let entity_id = |target| match target {
+            Some(Target::Player) => self.own_entity_id(),
+            Some(Target::Guest(conn)) => self.command_guest(conn).map_or(0, |g| g.entity_id),
+            Some(target) => {
+                crate::game::native_entities::target_id(target).map_or(0, |id| id as i32)
+            }
+            None => 0,
+        };
+        let source = horizon_client::health::HurtSource {
+            damage_type,
+            causing: entity_id(causing),
+            direct: entity_id(direct),
+            position,
+        };
+        if crate::game::entity::damage_level_of!(self, scoped).invulnerability_check(
+            horizon_client::health::Hurting::Entity(id as i32, &entity_kind, source),
+            vanilla,
+        ) {
+            return false;
+        }
         match target {
             Target::Boat(_) => self
                 .boats
@@ -412,67 +445,54 @@ impl Game<'_> {
         id: u32,
         amount: f32,
         damage_type: &str,
+        direct: Option<Target>,
         causing: Option<Target>,
+        position: Option<[f64; 3]>,
     ) -> bool {
         let Some(index) = self.dropped.iter().position(|item| item.id == id) else {
             return false;
         };
-        let registry = &self.motion.health.damage;
-        let Some(kind) = registry.id(damage_type) else {
+        let Some(kind) = self.motion.health.damage.id(damage_type) else {
             return false;
         };
         let creative = self.creative_source_of(causing);
-        if self.saved_refuses_damage(id, damage_type, creative)
-            || !self
-                .ui
-                .rules
-                .bool_at(horizon_client::gamerules::vanilla::MOB_GRIEFING)
-                && matches!(causing, Some(Target::Mob(_)))
+        let vanilla = self.saved_refuses_damage(id, damage_type, creative);
+        let entity_id = |target| match target {
+            Some(Target::Player) => self.own_entity_id(),
+            Some(Target::Guest(conn)) => self.command_guest(conn).map_or(0, |g| g.entity_id),
+            Some(target) => {
+                crate::game::native_entities::target_id(target).map_or(0, |id| id as i32)
+            }
+            None => 0,
+        };
+        let causing_id = entity_id(causing);
+        let source = horizon_client::health::HurtSource {
+            damage_type,
+            causing: causing_id,
+            direct: entity_id(direct),
+            position,
+        };
+        if crate::game::entity::damage_level_of!(self, scoped).invulnerability_check(
+            horizon_client::health::Hurting::Entity(id as i32, "minecraft:item", source),
+            vanilla,
+        ) {
+            return false;
+        }
+        let registry = &self.motion.health.damage;
+        if !self
+            .ui
+            .rules
+            .bool_at(horizon_client::gamerules::vanilla::MOB_GRIEFING)
+            && matches!(causing, Some(Target::Mob(_)))
             || registry.in_tag(kind, "minecraft:is_fall")
                 && self.entity_tag_matches("minecraft:fall_damage_immune", "minecraft:item")
         {
             return false;
         }
-        // Use the same defaults and stack patch as the component resolver,
-        // including defaults changed by native mods and removed components.
-        let components =
-            self.pack
-                .item_renderer
-                .models
-                .components(&horizon_client::item_render::stack_view(
-                    &self.dropped[index].stack,
-                ));
-        let resistant = |source: &str| {
-            let matches = |value: &str| {
-                let (tag, value) = value
-                    .strip_prefix('#')
-                    .map_or((false, value), |v| (true, v));
-                let name = if value.contains(':') {
-                    value.to_owned()
-                } else {
-                    format!("minecraft:{value}")
-                };
-                if tag {
-                    registry
-                        .id(source)
-                        .is_some_and(|id| registry.in_tag(id, &name))
-                } else {
-                    source == name
-                }
-            };
-            match components
-                .get("minecraft:damage_resistant")
-                .and_then(|v| v.get("types"))
-            {
-                Some(serde_json::Value::String(value)) => matches(value),
-                Some(serde_json::Value::Array(values)) => {
-                    values.iter().any(|v| v.as_str().is_some_and(matches))
-                }
-                _ => false,
-            }
-        };
-        if resistant(damage_type)
-            || registry.in_tag(kind, "minecraft:is_fire") && resistant("minecraft:in_fire")
+        if self.stack_can_be_hurt_by(&self.dropped[index].stack, damage_type) == Some(false)
+            || registry.in_tag(kind, "minecraft:is_fire")
+                && self.stack_can_be_hurt_by(&self.dropped[index].stack, "minecraft:in_fire")
+                    == Some(false)
         {
             return false;
         }
@@ -552,18 +572,19 @@ impl Game<'_> {
     // ---- /rotate and /swing -----------------------------------------------------------
 
     pub(super) fn cmd_rotate(&mut self, ctx: &Context) -> R<i32> {
-        let targets = self.entities(ctx, "target", false)?;
+        let targets = super::without_knots(self.entities(ctx, "target", false)?)?;
         let Some(t) = targets.first().copied() else {
             return Ok(0);
         };
         let Some(pos) = self.target_position(t) else {
             return Ok(0);
         };
-        let current = self.target_rotation(t);
         let mut look_at_target = None;
         let rot = if let Some(Arg::Coords(c)) = ctx.get("rotation") {
-            // Relative parts are offsets from the entity's own rotation.
-            c.rotation(current)
+            // RotateCommand.rotate: relative parts are offsets from the command
+            // source's rotation (WorldCoordinates.getRotation); the entity's own
+            // rotation cancels out in Entity.forceSetRotation.
+            c.rotation(self.source_rotation())
         } else {
             let mut faced_entity = None;
             let to = if ctx.has("entity") {
@@ -1457,7 +1478,7 @@ impl Game<'_> {
     }
     /// A sulfur cube's body archetype attributes live on its own map, beside
     /// the archetype's transient modifiers.
-    fn sulfur_archetype_attribute(&self, t: Target, attribute: &str) -> bool {
+    pub(in crate::game) fn sulfur_archetype_attribute(&self, t: Target, attribute: &str) -> bool {
         let Target::Mob(id) = t else {
             return false;
         };
@@ -1466,48 +1487,6 @@ impl Game<'_> {
                 .mobs
                 .iter()
                 .any(|m| m.id == id && m.species() == horizon_client::mobs::Species::SulfurCube)
-    }
-    /// A sulfur cube's command-set knockback base and permanent modifiers also
-    /// go to the `finalize` store its physics read without a body (never the
-    /// archetype's transient modifiers).
-    fn mirror_sulfur_knockback(
-        &mut self,
-        target: Target,
-        id: &str,
-        attribute: &str,
-        (value_arg, modifier_id, op): (f64, &str, &str),
-    ) {
-        let Target::Mob(mob_id) = target else {
-            return;
-        };
-        if attribute != "minecraft:knockback_resistance"
-            || !self.sulfur_archetype_attribute(target, attribute)
-        {
-            return;
-        }
-        let Some(m) = self.mobs.iter_mut().find(|m| m.id == mob_id) else {
-            return;
-        };
-        let Some(attr) = finalize::command_attr("knockback_resistance") else {
-            return;
-        };
-        match id {
-            "attribute.base.set" => finalize::set_base(m, attr, value_arg),
-            "attribute.base.reset" => {
-                let default = finalize::default_value(m, attr).unwrap_or_default();
-                finalize::set_base(m, attr, default);
-            }
-            "attribute.modifier.add" => {
-                let op = match op {
-                    "add_multiplied_base" => finalize::Op::AddMultipliedBase,
-                    "add_multiplied_total" => finalize::Op::AddMultipliedTotal,
-                    _ => finalize::Op::AddValue,
-                };
-                finalize::add_modifier(m, attr, modifier_id.to_string(), value_arg, op);
-            }
-            "attribute.modifier.remove" => finalize::remove_modifier(m, attr, modifier_id),
-            _ => {}
-        }
     }
     /// AttributeCommand on a living entity through its generic attribute map.
     fn generic_attribute(
@@ -1657,7 +1636,6 @@ impl Game<'_> {
                 )
             }
         };
-        self.mirror_sulfur_knockback(target, id, attribute, (value_arg, modifier_id, op));
         Ok((result, Text::translate(message, &args)))
     }
 
@@ -1801,50 +1779,144 @@ impl Game<'_> {
     /// (Entity.removePassenger), then to where the vehicle lets it out
     /// (LivingEntity.dismountVehicle).
     pub(in crate::game) fn dismount_mob(&mut self, rider: u32) {
-        let Some(i) = self.mobs.iter().position(|m| m.id == rider) else {
+        self.dismount_mob_with_cart(rider, None, None, false);
+    }
+
+    pub(in crate::game) fn dismount_mob_from_cart(
+        &mut self,
+        rider: u32,
+        cart: &super::super::minecarts::Minecart,
+    ) {
+        self.dismount_mob_with_cart(rider, Some(cart), None, false);
+    }
+
+    pub(in crate::game) fn dismount_mob_reentrant(&mut self, rider: u32) {
+        self.dismount_mob_with_cart(rider, None, None, true);
+    }
+
+    pub(in crate::game) fn dismount_mob_from_removed_vehicle(&mut self, rider: u32, y: f64) {
+        self.dismount_mob_with_cart(rider, None, Some(y), false);
+    }
+
+    fn dismount_mob_with_cart(
+        &mut self,
+        rider: u32,
+        cart: Option<&super::super::minecarts::Minecart>,
+        removed_y: Option<f64>,
+        notified: bool,
+    ) {
+        let Some(v) = self
+            .mob_object(rider)
+            .filter(|mob| !mob.removed)
+            .and_then(|mob| mob.extra.mount)
+        else {
             return;
         };
-        let Some(v) = self.mobs[i].extra.mount else {
-            return;
-        };
-        if !self.native_mob_may_ride(rider, v, false) {
+        if cart.is_some_and(|cart| cart.id != v) {
             return;
         }
-        self.mobs[i].extra.mount = None;
+        if !notified && !self.native_mob_may_ride(rider, v, false) {
+            return;
+        }
+        // A callback can remove or remount the rider. Do not overwrite its decision.
+        if self
+            .mob_object(rider)
+            .is_none_or(|mob| mob.removed || mob.extra.mount != Some(v))
+        {
+            return;
+        }
+        if let Some(mob) = self.mob_object_mut(rider) {
+            mob.extra.mount = None;
+        }
         let remaining = self
-            .mobs
-            .iter()
+            .mob_objects()
             .filter(|m| m.extra.mount == Some(v))
-            .min_by_key(|m| m.extra.vehicle_order)
+            .min_by_key(|m| (m.extra.vehicle_order, m.id))
             .map(|m| m.id);
-        if let Some(vehicle) = self.mobs.iter_mut().find(|m| m.id == v) {
+        if let Some(vehicle) = self.mob_object_mut(v) {
             vehicle.extra.rider = remaining;
         }
-        let at = self
-            .mob_dismount_point(v, i)
-            .unwrap_or(self.mobs[i].position);
-        let m = &mut self.mobs[i];
+        let at = if let Some(y) = removed_y {
+            self.mob_object(rider).map(|mob| {
+                self.removed_vehicle_dismount_point(
+                    mob.position,
+                    f64::from(mob.width()),
+                    f64::from(mob.height()),
+                    y,
+                )
+            })
+        } else {
+            match cart.filter(|cart| cart.id == v) {
+                Some(cart) => self
+                    .mob_object(rider)
+                    .and_then(|rider| self.cart_dismount_point_from(cart, rider)),
+                None => self.mob_dismount_point(v, rider),
+            }
+        };
+        let Some(m) = self.mob_object_mut(rider) else {
+            return;
+        };
+        let at = at.unwrap_or(m.position);
         m.extra.passenger = false;
         m.extra.boarding_cooldown = super::super::boat_passengers::BOARDING_COOLDOWN;
         m.position = at;
         m.previous = at;
+        self.snap_mob_passengers(rider);
+        self.release_removed_vehicle(v);
     }
-    /// Where `dismount_mob` sets the mob at index `rider` down off the vehicle `v`: None when
+    /// Where `dismount_mob` sets object `rider` down off the vehicle `v`: None when
     /// `v` is no boat, cart or mob.
     pub(in crate::game) fn mob_dismount_point(
         &self,
         v: u32,
-        rider: usize,
+        rider: u32,
     ) -> Option<horizon_core::geometry::Vec3> {
-        let (width, yaw) = (f64::from(self.mobs[rider].width()), self.mobs[rider].yaw);
-        if let Some(b) = self.boats.iter().position(|b| b.id == v) {
+        let mob = self.mob_object(rider)?;
+        if let Some(vehicle) = self.mob_object(v).filter(|vehicle| vehicle.removed) {
+            return Some(self.removed_vehicle_dismount_point(
+                mob.position,
+                f64::from(mob.width()),
+                f64::from(mob.height()),
+                vehicle.position.y,
+            ));
+        }
+        let removed_y = self
+            .persist
+            .removed_vehicles
+            .get(&v)
+            .map(|vehicle| vehicle.position().y)
+            .or_else(|| {
+                self.persist
+                    .removals
+                    .iter()
+                    .chain(self.persist.destroying_vehicles.iter())
+                    .find_map(|target| match *target {
+                        Target::Boat(id) if id == v => {
+                            self.boats.iter().find(|b| b.id == v).map(|b| b.position.y)
+                        }
+                        Target::Cart(id) if id == v => {
+                            self.carts.iter().find(|c| c.id == v).map(|c| c.position.y)
+                        }
+                        _ => None,
+                    })
+            });
+        if let Some(y) = removed_y {
+            return Some(self.removed_vehicle_dismount_point(
+                mob.position,
+                f64::from(mob.width()),
+                f64::from(mob.height()),
+                y,
+            ));
+        }
+        let (width, yaw) = (f64::from(mob.width()), mob.yaw);
+        if let Some(b) = self.boat_object(v) {
             return Some(self.boat_dismount_target(b, width, yaw));
         }
         self.horse_dismount_point(v, rider)
             .or_else(|| self.cart_dismount_point(v, rider))
             .or_else(|| {
                 // Entity.getDismountLocationForPassenger: on top of the vehicle.
-                let vehicle = self.mobs.iter().find(|m| m.id == v)?;
+                let vehicle = self.mob_object(v)?;
                 Some(super::super::mounts::on_top(vehicle))
             })
     }
@@ -1871,7 +1943,7 @@ impl Game<'_> {
                 &[&max_y, &self.world.bottom_y()],
             ));
         }
-        let targets = self.entities(ctx, "targets", false)?;
+        let targets = super::without_knots(self.entities(ctx, "targets", false)?)?;
         if targets.is_empty() {
             return Err(err("argument.entity.notfound.entity", &[]));
         }
@@ -2047,6 +2119,7 @@ impl Game<'_> {
             }
             if !skip {
                 self.teleport_to(t, to, None, false);
+                self.teleport_stops(t);
             }
             let closest = points
                 .iter()
@@ -2611,6 +2684,7 @@ mod vehicle_damage_command_tests {
         use horizon_core::geometry::Vec3;
         with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
+            crate::game::native_entity_refs::tests::bind_local_player(game, 1, 99);
             game.creative = true;
             assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
             assert!(game.run_command("attribute @s minecraft:armor base set 2"));
@@ -2737,6 +2811,7 @@ mod vehicle_damage_command_tests {
         use horizon_core::geometry::Vec3;
         with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 200.0, 4.5)).unwrap());
+            crate::game::native_entity_refs::tests::bind_local_player(game, 1, 99);
             assert!(
                 game.run_command("summon pig 6.5 200 4.5 {UUID:[I;82,0,0,1],NoAI:1b,NoGravity:1b}")
             );
@@ -2773,5 +2848,14 @@ mod vehicle_damage_command_tests {
                 }
             }
         });
+    }
+}
+
+impl Game<'_> {
+    /// `PoiTypes`: the point of interest type of a block state.
+    pub(super) fn poi_type(&self, state: horizon_world::registry::BlockStateId) -> Option<&str> {
+        let table = &self.stations().professions;
+        let state = self.pack.assets.registry.state(state)?;
+        table.pois.name(table.pois.classify(state)?)
     }
 }

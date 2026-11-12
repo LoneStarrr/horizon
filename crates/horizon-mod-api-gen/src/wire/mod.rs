@@ -2,10 +2,11 @@
 //! the backends, the drawing contexts) and every method it implements (`Hooks`, the parts, the
 //! capability handlers), through one shared-memory boundary and the glue on both sides of it.
 mod append;
+mod borrowed;
 mod calls;
-mod emit;
 mod host;
-pub use host::generate_host;
+pub use host::{generate_coverage, generate_host};
+mod trait_roles;
 mod ty;
 
 use crate::capability_providers::key_shapes;
@@ -40,7 +41,7 @@ pub(super) const IMPORTS: &[&str] = &[
     "RenderAssets",
     "InstanceGroups",
     "Tags",
-    "menu::SlotView",
+    "item::menu::SlotView",
     "Registrar",
     "CapabilityProviders",
     "TicketValidation",
@@ -55,7 +56,17 @@ pub(super) const IMPORTS: &[&str] = &[
     "GameTests",
     "ClientReloadListeners",
     "PackFinders",
+    "ColorResolvers",
     "BlockTintSources",
+    "CauldronInteractions",
+    "SectionGeometryRenderers",
+    "SectionGeometryContext",
+    "ParticleProviders",
+    "EnchantmentDamageEffects",
+    "PoiTypeExtensions",
+    "VillagerProfessions",
+    "LoadConditions",
+    "CauldronFluidContents",
     "BlockAndTintGetter",
     "GroundLevel",
     "BlockMetadata",
@@ -74,11 +85,6 @@ pub(super) const REACHED: &[(&str, &str, &str)] = &[
     ("ClientSession", "client_host", "Ok(h.client_session())"),
     ("RenderAssets", "client_host", "Ok(h.render_assets())"),
     ("InstanceGroups", "client_host", "Ok(h.instance_groups())"),
-    (
-        "Tags",
-        "",
-        "level_host().map(|h| h.tags()).or_else(|_| host().map(|h| h.tags()))",
-    ),
     // A level hook's host first: inside a level write it is the one the call hands over.
     (
         "AttachmentStore",
@@ -117,6 +123,7 @@ pub(super) const REACHED: &[(&str, &str, &str)] = &[
 const EXPORTS: &[&str] = &[
     "Hooks",
     "ReloadApply",
+    "BlockEntityTransform",
     "StructureType",
     "StructurePiece",
     "BlockPart",
@@ -125,30 +132,39 @@ const EXPORTS: &[&str] = &[
     "MenuPart",
     "FluidPart",
     "ServerReloadListener",
+    "LoadCondition",
     "GameTestFunction",
     "ClientReloadListener",
+    "BiomeColorResolver",
     "BlockTintSource",
+    "Interaction",
+    "SectionGeometry",
+    "ParticleProvider",
+    "EnchantmentDamageEffect",
+    "CommandArgumentType",
     "GroundStateProvider",
     "PlaceProvider",
     "TooltipAppender",
     "CriterionTest",
-    "RowPages",
-    "RowFunction",
 ];
 
 /// Every exported trait: [`EXPORTS`], then the handler traits `mod_api`'s capability keys name
 /// (`ResourceHandler<ItemResource>`), each instance of a generic one its own export. Set once,
 /// by `surface`.
 pub(super) fn exports() -> &'static [&'static str] {
-    EXPORTED.get().map_or(EXPORTS, Vec::as_slice)
+    trait_roles::exports()
+}
+
+/// All imported traits, including discovered per-item declarations.
+pub(super) fn imports() -> &'static [&'static str] {
+    trait_roles::imports()
 }
 
 /// Whether the game also hands a mod objects of exported trait `owner` (a capability's handler,
 /// another mod's provider): the mod calls one through the `held-<interface>` imports, by the
 /// index the game keeps it under.
 pub(super) fn held(owner: &str) -> bool {
-    ["PlaceProvider", "RowPages", "RowFunction"].contains(&owner)
-        || (exports().contains(&owner) && !EXPORTS.contains(&owner))
+    owner == "PlaceProvider" || (exports().contains(&owner) && !EXPORTS.contains(&owner))
 }
 
 /// The contexts of the load phase: the catalog's registration and data-load contexts and a
@@ -162,9 +178,16 @@ const LOAD_CONTEXTS: &[&str] = &[
 ];
 
 /// The traits the game calls on its worker threads: a mod's structure types and their pieces on
-/// the worldgen workers, its block tint sources on the meshing workers. They keep no mutable
-/// state and get no `Host`.
-const WORKERS: &[&str] = &["StructureType", "StructurePiece", "BlockTintSource"];
+/// the worldgen workers, its block tint sources, colour resolvers and section geometry on the
+/// meshing workers. They keep no mutable state and get no `Host`.
+const WORKERS: &[&str] = &[
+    "BlockEntityTransform",
+    "StructureType",
+    "StructurePiece",
+    "BlockTintSource",
+    "BiomeColorResolver",
+    "SectionGeometry",
+];
 
 /// What a call of `method` is to the runtime, for its limits and its wait.
 pub(super) fn call_class(types: &ty::Types<'_>, method: &Method) -> &'static str {
@@ -197,8 +220,6 @@ fn loads(types: &ty::Types<'_>, method: &Method) -> bool {
 /// A trait object that crosses without methods: a provider of a mod's own handler type,
 /// erased (`Arc<dyn Any + Send + Sync>`), which only mods of its group take back.
 pub(super) const ERASED: &str = "Any";
-
-static EXPORTED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
 
 /// An owner as written (`ResourceHandler<ItemResource>`): the trait's path, and its type arguments.
 fn owner_parts(owner: &str) -> Result<(Vec<String>, Vec<syn::Type>), String> {
@@ -248,6 +269,7 @@ pub(super) struct Method {
     /// The area trait that declares it, when it is a part of `owner` (`host::items::ItemsHost`).
     pub(super) via: Option<String>,
     pub(super) name: String,
+    pub(super) access: Option<String>,
     /// `Some(mutable)` for a `self` receiver.
     pub(super) receiver: Option<bool>,
     pub(super) params: Vec<(String, Ty)>,
@@ -306,21 +328,22 @@ pub(super) fn surface<'a>(
 ) -> Result<Surface<'a>, String> {
     let mut types = Types::new(Index::new(root, included))?;
     let api = types.index.module("mod_api", &[])?;
-    let mut exported: Vec<&'static str> = EXPORTS.to_vec();
+    let (imported, mut exported, paths) = trait_roles::declared(root)?;
+    types.index.read.borrow_mut().extend(paths);
     for shape in key_shapes(&mut types.index)? {
         for owner in [shape.handler.clone(), shape.provider()] {
-            if !exported.iter().any(|e| *e == owner) {
-                exported.push(Box::leak(owner.into_boxed_str()));
+            if !exported.contains(&owner) {
+                exported.push(owner);
             }
         }
     }
-    let _ = EXPORTED.set(exported);
+    trait_roles::select(imported, exported);
     let mut methods = Vec::new();
     let mut unbound = Vec::new();
     let mut excused = Vec::new();
     let mut parts = Vec::new();
     let hooks = hook_ids(&mut types)?;
-    for owner in IMPORTS.iter().chain(exports()) {
+    for owner in imports().iter().chain(exports()) {
         let (path, args) = owner_parts(owner)?;
         let Found::Item(id) = types.index.resolve_path(api, &path)? else {
             return Err(format!("{owner} is not a mod_api trait"));
@@ -395,9 +418,11 @@ pub(super) fn surface<'a>(
     let target = root.join("target");
     std::fs::create_dir_all(&target).map_err(|e| format!("creating wire report directory: {e}"))?;
     let dropped = excused_methods;
-    // The type emitter respects checked, hand-written Wire impls even when a shape
-    // becomes derivable after a new generic borrowing/resource rule is added.
-    types.index.module("mod_api", &["wire_types".into()])?;
+    // Track the source of checked codecs as a build-script dependency. Module
+    // lookup loads it into Index even though call generation never parses its fields.
+    types
+        .index
+        .module("mod_api", &["wire".into(), "wire_types".into()])?;
     for owner in exports() {
         let (path, _) = owner_parts(owner)?;
         let Found::Item(id) = types.index.resolve_path(api, &path)? else {
@@ -432,8 +457,26 @@ pub(super) fn surface<'a>(
 /// guest needs no wire call. Its trait methods are the actual imports.
 pub(super) fn frame_accessor(method: &Method) -> bool {
     method.params.is_empty()
-        && IMPORTS.contains(&method.owner)
-        && matches!(&method.ret, Ty::Dyn(name, _) if IMPORTS.iter().any(|owner| owner.rsplit("::").next() == Some(name.as_str())))
+        && imports().contains(&method.owner)
+        && matches!(&method.ret, Ty::Dyn(name, _) if imports().iter().any(|owner| owner.rsplit("::").next() == Some(name.as_str())))
+}
+
+/// A fallible borrowed frame getter sends only its availability result across
+/// Wire. The actual borrowed host remains in the synchronous native call frame.
+pub(super) fn fallible_frame_accessor(method: &Method) -> Option<(&str, bool, &Ty)> {
+    if !method.params.is_empty() || !imports().contains(&method.owner) {
+        return None;
+    }
+    let Ty::Result(ok, error) = &method.ret else {
+        return None;
+    };
+    let Ty::Dyn(name, mutable) = &**ok else {
+        return None;
+    };
+    imports()
+        .iter()
+        .any(|owner| owner.rsplit("::").next() == Some(name.as_str()))
+        .then_some((name.as_str(), *mutable, &**error))
 }
 
 /// The coverage check: every method of the bound traits crosses to wasm, or its doc says why
@@ -530,6 +573,13 @@ fn method(
         owner,
         via: None,
         name: sig.ident.to_string(),
+        access: function
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("access"))
+            .map(|a| a.parse_args::<syn::Ident>().map(|i| i.to_string()))
+            .transpose()
+            .map_err(|e| e.to_string())?,
         receiver,
         params,
         ret,
@@ -558,7 +608,7 @@ pub fn generate(root: &Path, included: &[(&str, &str)]) -> Result<Generated, Str
     with_providers.push(("capability_providers_generated.rs", providers.as_str()));
     let surface = surface(root, &with_providers)?;
     coverage(&surface)?;
-    let mut wire = emit::types(&surface.types);
+    let mut wire = borrowed::calls(&surface.types);
     let mut guest = calls::guest(
         &surface.types,
         &surface.methods,
@@ -570,14 +620,180 @@ pub fn generate(root: &Path, included: &[(&str, &str)]) -> Result<Generated, Str
     guest.push_str(&calls::dispatch(&surface.types, &surface.methods).0);
     let _ = writeln!(
         wire,
-        "#[doc(hidden)]\npub const WIRE_LAYOUT: u64 = {:#x};",
-        layout(&surface)
+        "#[doc(hidden)]\npub static WIRE_LAYOUT: ::std::sync::LazyLock<u64> = ::std::sync::LazyLock::new(|| {{ let mut hash = {:#x}; {layouts} hash }});",
+        layout(&surface),
+        layouts = surface.types.defs.iter().filter(|def| def.lifetimes == 0).map(|def| format!("hash = crate::wire::layout_mix(hash, <{} as crate::wire::Wire>::layout(&mut vec![]));", def.rust.replace("mod_api::", "crate::"))).collect::<String>()
     );
     let sources = surface.types.index.read.take();
     Ok(Generated {
         wire,
         guest,
         sources,
+    })
+}
+
+/// Public owned API values available to point records, without inspecting their fields.
+/// The generated record's Wire bounds check its members; Clone permits copying a borrowed
+/// argument, while a live capability such as Transaction remains non-copyable.
+pub(crate) fn owned_types(
+    root: &Path,
+    included: &[(&str, &str)],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let providers = crate::capability_providers::generate(root, included)?.0;
+    let mut with_providers = included.to_vec();
+    with_providers.push(("capability_providers_generated.rs", providers.as_str()));
+    let mut surface = surface(root, &with_providers)?;
+    // Every owned signature def appears in generated WIRE_LAYOUT with a Wire bound.
+    // That compile-time guarantee covers macro-generated slot keys/handle codecs too;
+    // no owned field traversal or second Wire-implementation discovery is needed.
+    let mut clones = std::collections::HashSet::new();
+    let implementations = surface
+        .types
+        .index
+        .modules
+        .iter()
+        .enumerate()
+        .flat_map(|(module, source)| {
+            source.items.iter().filter_map(move |item| match item {
+                Item::Impl(item)
+                    if item.trait_.as_ref().is_some_and(|(_, path, _)| {
+                        path.segments.last().is_some_and(|s| s.ident == "Clone")
+                    }) =>
+                {
+                    Some((module, item.self_ty.clone()))
+                }
+                _ => None,
+            })
+        })
+        .collect::<Vec<_>>();
+    for (module, ty) in implementations {
+        let syn::Type::Path(path) = *ty else {
+            continue;
+        };
+        let path = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>();
+        if let Ok(Found::Item(id)) = surface.types.index.resolve_path(module, &path) {
+            clones.insert(id);
+        }
+    }
+    let cloned =
+        |index: &Index<'_>, id| ty::derives(index.item(id), "Clone") || clones.contains(&id);
+    let mut allowed = std::collections::BTreeSet::new();
+    for (def, value) in surface
+        .types
+        .defs
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.lifetimes == 0)
+    {
+        let item = surface
+            .types
+            .by_item
+            .iter()
+            .find_map(|(item, d)| (*d == def).then_some(*item));
+        if item.map_or(value.rust.starts_with("serde_json::"), |id| {
+            cloned(&surface.types.index, id)
+        }) {
+            allowed.insert(value.rust.replace(' ', ""));
+        }
+    }
+    // Index both the public boundary reexports and checked codec declarations.
+    // These lookups load source files; they do not classify any owned fields.
+    surface.types.index.module("mod_api", &["wire".into()])?;
+    let codec = surface
+        .types
+        .index
+        .module("mod_api", &["wire".into(), "wire_types".into()])?;
+    let mut codecs = std::collections::HashSet::new();
+    for item in surface.types.index.modules[codec].items.clone() {
+        let Item::Impl(item) = item else {
+            continue;
+        };
+        // wire_types imports precisely crate::wire::Wire. Its direct impl targets
+        // include foreign reexports such as ConnectionKind, which cannot derive here.
+        if !item
+            .trait_
+            .as_ref()
+            .is_some_and(|(_, p, _)| p.segments.last().is_some_and(|s| s.ident == "Wire"))
+        {
+            continue;
+        }
+        let syn::Type::Path(path) = &*item.self_ty else {
+            continue;
+        };
+        let path = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>();
+        if let Ok(Found::Item(id)) = surface.types.index.resolve_path(codec, &path) {
+            codecs.insert(id);
+        }
+    }
+    // Reuse the parsed module inventory. Extra declarations need an explicit
+    // derive or checked codec; Clone alone (or a no-Wire reason) is never proof.
+    let modules = surface
+        .types
+        .index
+        .modules
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.krate == "mod_api")
+        .map(|(module, m)| (module, m.path.clone(), m.items.clone()))
+        .collect::<Vec<_>>();
+    for (module, prefix, items) in modules {
+        for item in items {
+            let names = match item {
+                Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    crate::capability_providers::use_names(&item.tree)
+                }
+                Item::Struct(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    vec![item.ident.to_string()]
+                }
+                Item::Enum(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    vec![item.ident.to_string()]
+                }
+                _ => continue,
+            };
+            for name in names {
+                let Ok(Found::Item(id)) = surface.types.index.resolve(module, &name) else {
+                    continue;
+                };
+                let declaration = surface.types.index.item(id);
+                let generics = match declaration {
+                    Item::Struct(item) => &item.generics,
+                    Item::Enum(item) => &item.generics,
+                    _ => continue,
+                };
+                if generics.params.is_empty()
+                    && (ty::derives(declaration, "Wire") || codecs.contains(&id))
+                    && cloned(&surface.types.index, id)
+                {
+                    let path = std::iter::once("mod_api")
+                        .chain(prefix.iter().map(String::as_str))
+                        .chain(std::iter::once(name.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    if public_path(&surface.types.index, &path) {
+                        allowed.insert(path);
+                    }
+                }
+            }
+        }
+    }
+    Ok(allowed)
+}
+
+/// A defining path is usable by generated records only through public modules.
+fn public_path(index: &Index<'_>, path: &str) -> bool {
+    let segments = path.split("::").skip(1).collect::<Vec<_>>();
+    (0..segments.len().saturating_sub(1)).all(|depth| {
+        index.modules.iter().find(|m| m.krate == "mod_api" && m.path.iter().map(String::as_str).eq(segments[..depth].iter().copied())).is_some_and(|m| m.items.iter().any(|item| matches!(item, Item::Mod(child) if child.ident == segments[depth] && matches!(child.vis, syn::Visibility::Public(_)))))
     })
 }
 
@@ -600,12 +816,13 @@ fn layout(surface: &Surface<'_>) -> u64 {
         "group state: 32 words in the std member's horizon_group_state; 0 handler table, 1 cache budget, 2 eviction guard, 3.. eviction callbacks; members allocate through an evicting global allocator",
     );
     feed("static replies: bounded acknowledged ids or uncached text");
+    feed("Hooks::subscribed: Vec<(hook name, i32 priority, bool receive_cancelled)>");
     for method in &surface.methods {
         feed(&format!("{method:?}"));
     }
     for def in &surface.types.defs {
         // Private borrowed descriptors also define bytes and checked writeback policy.
-        // Hash the complete definition so a new transport shape cannot hide behind Opaque.
+        // Hash the complete definition so private writeback contracts affect compatibility.
         feed(&format!("{def:?}"));
     }
     feed(&format!("{:?}", surface.hooks));
@@ -616,6 +833,43 @@ fn layout(surface: &Surface<'_>) -> u64 {
 mod tests {
     /// The generated impls depend on the hand-written `Wire` impls the generator skips, so an
     /// edit to that file must rerun the build script.
+    #[test]
+    fn enchantment_damage_registrar_and_callback_cross_to_wire() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                let generated = crate::sources(&root, crate::FillMode::Require).unwrap();
+                let included = [
+                    ("mod_api_generated.rs", generated.hooks.as_str()),
+                    ("mod_api_generated_host.rs", generated.host.as_str()),
+                    ("mod_api_host_areas.rs", generated.areas.as_str()),
+                ];
+                let providers = crate::capability_providers::generate(&root, &included)
+                    .unwrap()
+                    .0;
+                let mut surface_included = included.to_vec();
+                surface_included.push(("capability_providers_generated.rs", providers.as_str()));
+                let surface = super::surface(&root, &surface_included).unwrap();
+                for (owner, name) in [
+                    ("EnchantmentDamageEffects", "register"),
+                    ("EnchantmentDamageEffect", "apply"),
+                    ("Hooks", "register_enchantment_damage_effects"),
+                ] {
+                    assert!(
+                        surface
+                            .methods
+                            .iter()
+                            .any(|method| method.owner == owner && method.name == name)
+                    );
+                }
+                super::generate(&root, &included).unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn the_hand_written_wire_impls_are_tracked_sources() {
         std::thread::Builder::new()
@@ -632,7 +886,7 @@ mod tests {
                 assert!(
                     sources
                         .iter()
-                        .any(|p| p.ends_with("crates/horizon-mod-api/src/wire_types.rs"))
+                        .any(|p| p.ends_with("crates/horizon-mod-vocab/src/wire/wire_types.rs"))
                 );
             })
             .unwrap()
@@ -653,6 +907,15 @@ mod tests {
             ];
             let mut surface = super::surface(&root, &included).unwrap();
             let baseline = super::layout(&surface);
+            assert!(
+                surface
+                    .types
+                    .defs
+                    .iter()
+                    .filter(|def| def.lifetimes == 0)
+                    .all(|def| matches!(def.borrowed, super::ty::BorrowedShape::None)),
+                "owned fields must not be classified by the call generator"
+            );
             let append = surface
                 .types
                 .defs
@@ -660,8 +923,8 @@ mod tests {
                 .position(|d| d.append.is_some())
                 .unwrap();
             assert!(matches!(
-                surface.types.defs[append].kind,
-                super::ty::Kind::Opaque
+                surface.types.defs[append].borrowed,
+                super::ty::BorrowedShape::None
             ));
             surface.types.defs[append].append.as_mut().unwrap().field += 1;
             assert_ne!(baseline, super::layout(&surface));
@@ -672,9 +935,29 @@ mod tests {
                 .iter_mut()
                 .find(|d| d.projection.is_some())
                 .unwrap();
-            assert!(matches!(projection.kind, super::ty::Kind::Opaque));
+            assert!(matches!(
+                projection.borrowed,
+                super::ty::BorrowedShape::None
+            ));
             projection.projection.as_mut().unwrap()[0].ty = super::ty::Ty::Unit;
             assert_ne!(baseline, super::layout(&surface));
+            let before_borrowed = super::layout(&surface);
+            let borrowed = surface
+                .types
+                .defs
+                .iter_mut()
+                .find_map(|def| {
+                    if def.lifetimes == 0 {
+                        return None;
+                    }
+                    match &mut def.borrowed {
+                        super::ty::BorrowedShape::Record(fields) => fields.first_mut(),
+                        _ => None,
+                    }
+                })
+                .expect("a borrowed call record");
+            borrowed.ty = super::ty::Ty::Unit;
+            assert_ne!(before_borrowed, super::layout(&surface));
         };
         std::thread::Builder::new()
             .stack_size(64 << 20)
@@ -683,15 +966,56 @@ mod tests {
             .join()
             .unwrap();
     }
+    /// The book renders the coverage page from the generator at build time; what the page
+    /// promises is checked here, against the generator itself.
     #[test]
-    fn coverage_document_is_current() {
-        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
-            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-            super::generate_host(&root).unwrap();
-            let actual = std::fs::read_to_string(root.join("target/wire-coverage.md")).unwrap();
-            let checked_in = std::fs::read_to_string(root.join("docs/modding/src/wasm-coverage.md")).unwrap();
-            assert_eq!(actual, checked_in, "regenerate with HORIZON_UPDATE_WIRE_COVERAGE=1 cargo test -p horizon-mod-api-gen coverage_document_is_current");
-            assert!(actual.contains("Required gap total: 0."), "required boundary methods must not silently lose coverage");
-        }).unwrap().join().unwrap();
+    fn coverage_page_is_well_formed() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                let page = super::generate_coverage(&root).unwrap();
+                let mut lines = page.lines();
+                assert_eq!(lines.next(), Some("# Wire boundary coverage"));
+                let header = "| Method | Status | Reason |";
+                let rows: Vec<Vec<&str>> = page
+                    .lines()
+                    .skip_while(|line| *line != header)
+                    .skip(2)
+                    .take_while(|line| line.starts_with('|'))
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.trim_matches('|').split(" | ").map(str::trim).collect())
+                    .collect();
+                assert!(
+                    rows.len() > 100,
+                    "the table lists the surface: {} rows",
+                    rows.len()
+                );
+                let mut methods = std::collections::BTreeSet::new();
+                for row in &rows {
+                    assert_eq!(row.len(), 3, "three cells: {row:?}");
+                    assert!(
+                        row.iter().all(|cell| !cell.is_empty()),
+                        "no empty cell: {row:?}"
+                    );
+                    assert!(matches!(row[1], "crosses" | "gap"), "a status: {row:?}");
+                    assert!(methods.insert(row[0]), "each method once: {}", row[0]);
+                }
+                for owner in ["Host", "ServerHost", "ClientHost", "Registrar"] {
+                    assert!(
+                        methods
+                            .iter()
+                            .any(|m| m.starts_with(&format!("`{owner}::"))),
+                        "the page lists {owner}'s methods"
+                    );
+                }
+                assert!(
+                    page.contains("Required gap total: 0."),
+                    "required boundary methods must not silently lose coverage"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -7,6 +7,7 @@ use crate::{
     Error, Result,
     packets::configuration::{RegistryData, UpdateTags},
 };
+use horizon_core::identifier::Identifier;
 use horizon_core::nbt::{JavaString, Tag};
 use std::{collections::HashMap, path::Path};
 
@@ -62,6 +63,44 @@ impl crate::item::Names for SyncedNames<'_> {
     }
 }
 
+impl SyncedNames<'_> {
+    /// The network id of `name` in `registry`, the reverse of `Names::name`: the built-in
+    /// registries first, then those the server synced, then the custom data component types.
+    /// None for an unknown registry or name. Compares the identifiers' parts in place: nothing is
+    /// allocated, and a gap in a built-in report (an empty name) matches nothing.
+    pub fn id(&self, registry: &Identifier, name: &Identifier) -> Option<i32> {
+        let index = |i: usize| i32::try_from(i).ok();
+        self.builtin
+            .registries
+            .iter()
+            .find(|(r, _)| names(r, registry))
+            .and_then(|(_, ids)| ids.names.iter().position(|n| names(n, name)))
+            .and_then(index)
+            .or_else(|| {
+                self.dynamic
+                    .registries
+                    .iter()
+                    .find(|(r, _)| names(r, registry))
+                    .and_then(|(_, entries)| entries.iter().position(|(n, _)| names(n, name)))
+                    .and_then(index)
+            })
+            .or_else(|| {
+                (self.dynamic.custom_components && names("minecraft:data_component_type", registry))
+                    .then(|| {
+                        crate::item::custom::entries()
+                            .find(|(_, n)| names(n, name))
+                            .map(|(id, _)| id)
+                    })
+                    .flatten()
+            })
+    }
+}
+
+/// Whether the full id `text` (`namespace:path`) is `id`.
+fn names(text: &str, id: &Identifier) -> bool {
+    text.split_once(':') == Some((id.namespace(), id.path()))
+}
+
 impl Builtin {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -85,8 +124,19 @@ impl Builtin {
                     .as_u64()
                     .ok_or_else(|| Error::new(format!("{entry}: no protocol_id")))?
                     as usize;
+                // No registry has a million entries; an id beyond that is
+                // a crafted report, and resizing to it would allocate
+                // gigabytes for one entry.
+                if id > 1_000_000 {
+                    return Err(Error::new(format!(
+                        "{entry}: protocol_id {id} out of range"
+                    )));
+                }
                 if id >= names.len() {
                     names.resize(id + 1, String::new());
+                }
+                if !names[id].is_empty() {
+                    return Err(Error::new(format!("{entry}: duplicate protocol_id {id}")));
                 }
                 names[id] = entry.clone();
             }
@@ -124,6 +174,49 @@ pub struct Dynamic {
 pub const MAX_TAG_REGISTRIES: usize = 512;
 
 impl Dynamic {
+    /// Retained heap charge for a frozen configuration snapshot built by
+    /// [`Self::add`] and [`Self::add_tags`] with insertion/replacement only.
+    ///
+    /// All outer and nested hash tables must be fresh, with no erasure history.
+    /// This method does not enforce that builder precondition on public fields.
+    /// It charges conservative hash table storage plus actual owned string/vector
+    /// capacities and recursive NBT allocations. It excludes inline `Dynamic`
+    /// storage, a containing Arc header and allocator metadata. Builtin registries
+    /// and other global caches are not traversed. This is not an allocator census.
+    pub fn fresh_owned_heap_bytes(&self) -> usize {
+        use crate::retained::{OwnedHeap, fresh_hash_table_bytes};
+        let Self {
+            registries,
+            tags,
+            custom_components: _,
+        } = self;
+        let registry_bytes = registries.iter().fold(
+            fresh_hash_table_bytes::<(String, Vec<(String, Option<Tag>)>)>(registries.capacity()),
+            |sum, (name, entries)| {
+                sum.saturating_add(name.owned_heap_bytes())
+                    .saturating_add(entries.owned_heap_bytes())
+            },
+        );
+        tags.iter().fold(
+            registry_bytes
+                .saturating_add(
+                    fresh_hash_table_bytes::<(String, HashMap<String, Vec<i32>>)>(tags.capacity()),
+                ),
+            |sum, (registry, entries)| {
+                entries.iter().fold(
+                    sum.saturating_add(registry.owned_heap_bytes())
+                        .saturating_add(fresh_hash_table_bytes::<(String, Vec<i32>)>(
+                            entries.capacity(),
+                        )),
+                    |sum, (name, ids)| {
+                        sum.saturating_add(name.owned_heap_bytes())
+                            .saturating_add(ids.owned_heap_bytes())
+                    },
+                )
+            },
+        )
+    }
+
     /// A `ClientboundUpdateTagsPacket`: the registries it names replace their
     /// tags, the others keep theirs. A registry beyond [`MAX_TAG_REGISTRIES`] is dropped.
     pub fn add_tags(&mut self, packet: &UpdateTags) {
@@ -416,6 +509,68 @@ mod tests {
     }
 
     #[test]
+    fn synced_names_look_up_builtin_then_synced_registries() {
+        use crate::item::Names;
+        let report = r#"{"minecraft:item":{"default":"minecraft:air","entries":{"minecraft:stone":{"protocol_id":1},"minecraft:air":{"protocol_id":0}},"protocol_id":5}}"#;
+        let builtin = Builtin::parse(report).unwrap();
+        let dynamic = Dynamic::default();
+        let names = SyncedNames {
+            builtin: &builtin,
+            dynamic: &dynamic,
+        };
+        assert_eq!(
+            names.name("minecraft:item", 1).as_deref(),
+            Some("minecraft:stone")
+        );
+        assert_eq!(names.name("minecraft:item", 2), None);
+        assert_eq!(names.name("minecraft:item", -1), None);
+        assert_eq!(names.name("minecraft:unknown", 0), None);
+    }
+
+    #[test]
+    fn synced_ids_are_the_reverse_of_synced_names() {
+        let id = |text: &str| Identifier::parse_namespaced(text).unwrap();
+        // Ids 0, 1, 2 and 4 are gaps: their empty names must not answer an id.
+        let report = r#"{"minecraft:particle_type":{"entries":{"minecraft:flame":{"protocol_id":3},"mymod:spark":{"protocol_id":5}}}}"#;
+        let builtin = Builtin::parse(report).unwrap();
+        let mut dynamic = Dynamic::default();
+        let names = SyncedNames {
+            builtin: &builtin,
+            dynamic: &dynamic,
+        };
+        let particles = id("minecraft:particle_type");
+        let damage = id("minecraft:damage_type");
+        assert_eq!(names.id(&particles, &id("minecraft:flame")), Some(3));
+        assert_eq!(names.id(&particles, &id("mymod:spark")), Some(5));
+        assert_eq!(names.id(&particles, &id("minecraft:unknown")), None);
+        assert_eq!(
+            names.id(&id("minecraft:unknown"), &id("minecraft:flame")),
+            None
+        );
+        // Before the server synced it, a data registry answers nothing.
+        assert_eq!(names.id(&damage, &id("minecraft:cactus")), None);
+        // Synced out of alphabetical order: the ids are the order sent.
+        dynamic.add(RegistryData {
+            registry: "minecraft:damage_type".into(),
+            entries: ["minecraft:in_fire", "minecraft:cactus", "minecraft:arrow"]
+                .into_iter()
+                .map(|name| RegistryEntry {
+                    id: name.into(),
+                    data: None,
+                })
+                .collect(),
+        });
+        let names = SyncedNames {
+            builtin: &builtin,
+            dynamic: &dynamic,
+        };
+        assert_eq!(names.id(&damage, &id("minecraft:in_fire")), Some(0));
+        assert_eq!(names.id(&damage, &id("minecraft:cactus")), Some(1));
+        assert_eq!(names.id(&damage, &id("minecraft:arrow")), Some(2));
+        assert_eq!(names.id(&damage, &id("minecraft:unknown")), None);
+    }
+
+    #[test]
     fn parses_registry_reports() {
         let report = r#"{"minecraft:item":{"default":"minecraft:air","entries":{"minecraft:stone":{"protocol_id":1},"minecraft:air":{"protocol_id":0}},"protocol_id":5}}"#;
         let b = Builtin::parse(report).unwrap();
@@ -423,6 +578,23 @@ mod tests {
         assert_eq!(items.name(1), Some("minecraft:stone"));
         assert_eq!(items.id("minecraft:air"), Some(0));
         assert_eq!(items.name(2), None);
+    }
+
+    /// A crafted huge protocol_id must error instead of allocating a
+    /// name table of that size, and duplicate ids must error instead of
+    /// silently overwriting.
+    #[test]
+    fn huge_or_duplicate_protocol_ids_are_rejected() {
+        let huge =
+            r#"{"minecraft:item":{"entries":{"minecraft:stone":{"protocol_id":2000000000}}}}"#;
+        assert!(Builtin::parse(huge).is_err());
+        let dup = r#"{"minecraft:item":{"entries":{"minecraft:stone":{"protocol_id":1},"minecraft:air":{"protocol_id":1}}}}"#;
+        assert!(Builtin::parse(dup).is_err());
+        // Sparse but sane ids (1 and 7, as LAN tests use) still parse.
+        let sparse = r#"{"minecraft:block_entity_type":{"entries":{"minecraft:chest":{"protocol_id":1},"minecraft:sign":{"protocol_id":7}}}}"#;
+        let b = Builtin::parse(sparse).unwrap();
+        let x = b.get("minecraft:block_entity_type").unwrap();
+        assert_eq!(x.name(7), Some("minecraft:sign"));
     }
 
     #[test]

@@ -1,14 +1,203 @@
 use mod_api::Hooks;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static ENTITY_PRE_CALLS: AtomicU32 = AtomicU32::new(0);
+static ENTITY_POST_CALLS: AtomicU32 = AtomicU32::new(0);
+
+pub mod area_macros;
+pub mod datapack;
+pub mod game_payload;
+pub mod interaction;
+pub mod lending;
+pub mod matrix;
+pub mod projectile_owner;
+pub mod replace;
+pub mod selector_command;
+pub mod turn;
+pub use matrix::{mirrors, sum_return};
+pub mod shutdown;
+pub use replace::own_average;
+pub use shutdown::on_shutdown;
+pub use turn::turn_angle;
 
 #[derive(Default)]
 pub struct Mod;
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
+    fn server_tick(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        _: &mut mod_api::ServerTickEvent<'_>,
+    ) {
+        host.messages()
+            .broadcast(mod_api::Text::literal("wasm tick phase regression"))
+            .unwrap();
+    }
+
+    fn right_click_block(
+        &self,
+        host: mod_api::HostSide<'_>,
+        event: &mut mod_api::RightClickBlockEvent<'_>,
+    ) -> mod_api::Flow {
+        interaction::right_click_block(host, event)
+    }
+
+    fn use_item_on_block(
+        &self,
+        host: mod_api::HostSide<'_>,
+        event: &mut mod_api::UseItemOnBlockEvent<'_>,
+    ) -> mod_api::Flow {
+        interaction::use_item_on_block(host, event)
+    }
+
+    fn interaction_key_mapping_triggered(
+        &self,
+        _: &mut dyn mod_api::ClientHost,
+        event: &mut mod_api::InteractionKeyMappingTriggeredEvent,
+    ) -> mod_api::Flow {
+        event.swing_hand = event.attempt == mod_api::InteractionAttempt::Held;
+        if event.hand == mod_api::Hand::Off {
+            mod_api::Flow::Cancel
+        } else {
+            mod_api::Flow::Continue
+        }
+    }
+
+    fn register_commands(
+        &self,
+        _: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::RegisterCommandsEvent<'_>,
+    ) {
+        event.commands.extend([
+            mod_api::Command::new("wasmheal <targets:players>"),
+            mod_api::Command::new("wasmentity <target:entity>"),
+            mod_api::Command::new("wasmentities <targets:entities>"),
+            mod_api::Command::new("wasmplayer <target:player>"),
+        ]);
+    }
+
+    fn run_mod_command(
+        &self,
+        _: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::RunModCommandEvent<'_>,
+    ) -> mod_api::Flow {
+        selector_command::run(event)
+    }
+
+    fn recipe_sources(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::RecipeSourcesEvent<'_>,
+    ) {
+        lending::Lender.recipe_sources(host, event);
+    }
+
+    fn menu_links(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::MenuLinksEvent<'_>,
+    ) {
+        lending::Lender.menu_links(host, event);
+    }
+
+    fn register_json_animation_types(
+        &self,
+        _: &mod_api::RegistrationContext,
+        event: &mut mod_api::RegisterJsonAnimationTypesEvent<'_>,
+    ) {
+        // The guest pushes a plain batch; the host names this mod on each entry.
+        assert!(
+            event.types.is_empty(),
+            "the guest starts from its own batch"
+        );
+        event.types.push(mod_api::JsonAnimationType::Target(
+            mod_api::Identifier::parse("wasm_fixture:pulse").unwrap(),
+        ));
+    }
+
+    fn entity_tick_listened(
+        &self,
+        _: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::EntityTickListenedEvent,
+    ) {
+        event.listened = true;
+    }
+
+    fn entity_tick_pre(
+        &self,
+        _: &mut dyn mod_api::ServerHost,
+        _: &mut mod_api::EntityTickPreEvent<'_>,
+    ) -> mod_api::Flow {
+        ENTITY_PRE_CALLS.fetch_add(1, Ordering::Relaxed);
+        mod_api::Flow::Continue
+    }
+
+    fn entity_tick_post(
+        &self,
+        _: &mut dyn mod_api::ServerHost,
+        _: &mut mod_api::EntityTickPostEvent<'_>,
+    ) {
+        ENTITY_POST_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[listener(priority = 37)]
     fn server_stopped(&self, _: &mut dyn mod_api::ServerHost, _: &mut mod_api::ServerStoppedEvent) {
     }
 
-    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+    fn server_started(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        _: &mut mod_api::ServerStartedEvent,
+    ) {
+        if host.is_loaded("datapack_fixture") {
+            datapack::read(host);
+        }
+    }
+
+    #[listener(priority = -12, receive_cancelled)]
+    fn render_gui_pre(
+        &self,
+        _: &dyn mod_api::ClientHost,
+        event: &mut mod_api::RenderGuiPreEvent,
+    ) -> mod_api::Flow {
+        event.cancelled = false;
+        mod_api::Flow::Continue
+    }
+
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, cx: &mod_api::RegistrationContext) {
+        game_payload::register(registrar);
+        interaction::register(registrar);
+        registrar
+            .declare_datapack_registry(
+                "spell",
+                mod_api::DatapackRegistrySync::ServerOnly,
+                vec![mod_api::DatapackField::required(
+                    "power",
+                    mod_api::DatapackFieldKind::Int { min: 0, max: 100 },
+                )],
+            )
+            .unwrap();
+        if cx.mods().get("refuse_registration").is_some() {
+            registrar.declare_fluid("before_refusal");
+            let kind = registrar
+                .block_entity_type("discarded_callback")
+                .blocks(&[])
+                .build();
+            registrar.block_entity_part(&kind, Counter).unwrap();
+            cx.refuse("guest bootstrap failed: café\nmissing recipe bridge");
+            cx.refuse("must not replace the first diagnostic");
+            registrar.declare_fluid("foreign:after_refusal");
+            return;
+        }
+        registrar.item_key("minecraft:snowball");
+        let launch = registrar
+            .block_entity_type("owner_launch")
+            .blocks(&[])
+            .build();
+        registrar
+            .block_entity_part(&launch, projectile_owner::OwnerLaunch)
+            .unwrap();
         let kind = registrar.block_entity_type("counter").blocks(&[]).build();
         registrar.block_entity_part(&kind, Counter).unwrap();
         let reads = registrar
@@ -19,6 +208,8 @@ impl Hooks for Mod {
     }
 }
 
+// Only the guest ABI exports reach this fixture function; the bench target does not call it.
+#[allow(dead_code)]
 pub fn on_tick(_: mod_api::HostSide<'_>, args: &mut mod_points::TickArgs) {
     args.cancel = true;
 }
@@ -61,6 +252,14 @@ impl mod_api::BlockEntityPart for Counter {
             .entity
             .nbt
             .insert("counter".into(), mod_api::Tag::Int(17));
+        event.entity.nbt.insert(
+            "entity_pre_calls".into(),
+            mod_api::Tag::Int(ENTITY_PRE_CALLS.load(Ordering::Relaxed) as i32),
+        );
+        event.entity.nbt.insert(
+            "entity_post_calls".into(),
+            mod_api::Tag::Int(ENTITY_POST_CALLS.load(Ordering::Relaxed) as i32),
+        );
         event.entity.data = vec![23];
         event.entity.items.clear();
     }

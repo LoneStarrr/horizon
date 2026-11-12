@@ -46,7 +46,7 @@ pub struct Cx<'a, 'w, 'l> {
     pub level: &'a mut crate::health::DamageLevel<'l>,
     pub events: &'a mut Vec<MobEvent>,
 }
-pub trait Goal: std::fmt::Debug {
+pub trait Goal: std::fmt::Debug + Send + Sync {
     fn flags(&self) -> u8;
     /// A goal that draws its first start delay in its constructor (a schooling fish's
     /// `FollowFlockLeaderGoal`): the delay again, when the mob's random is seeded afterwards.
@@ -824,12 +824,11 @@ impl Mob {
     /// player (`LivingEntity.canAttack`, `TargetingConditions.test`: combat
     /// conditions fail when the difficulty is PEACEFUL).
     pub fn spares_players(&self, w: &MobWorld) -> bool {
-        (w.difficulty.base == 0 && w.player.is_some())
+        (w.difficulty.base == 0 && w.selected_player().is_some())
             || self.built_by_player()
             || (self.is_tamable_animal()
                 && self.extra.tame
-                && w.player
-                    .as_ref()
+                && w.selected_player()
                     .is_some_and(|p| super::tame::owned_by(self.extra.owner, p.uuid)))
     }
     /// `canAttack` of any target: the player rules above, and
@@ -844,8 +843,10 @@ impl Mob {
         match who {
             Who::Player => self.spares_players(w),
             Who::Mob(id) => {
-                self.species() == Species::IronGolem
-                    && w.seen(id).is_some_and(|s| s.species == Species::Creeper)
+                // `Mob.canAttack` refuses a Ghast for every mob.
+                w.seen(id).is_some_and(|s| s.species == Species::Ghast)
+                    || (self.species() == Species::IronGolem
+                        && w.seen(id).is_some_and(|s| s.species == Species::Creeper))
             }
         }
     }
@@ -856,30 +857,14 @@ impl Mob {
     pub fn refuses_set_target(&self) -> bool {
         super::ai::brain_target(self).is_some()
     }
-    /// `Mob.setTarget` with the species overrides' side effects (#933), for an
-    /// already validated target — what the write handle and a goal tick's
-    /// `set_target` store:
-    /// - `Fox.setTarget`: clearing the target ends its defending.
-    /// - `Enderman.setTarget`: a target opens the mouth (`DATA_CREEPY`) and
-    ///   stamps `targetChangeTime` (the daylight teleport waits 600 ticks from
-    ///   it); none closes the mouth and zeroes it. Its attack speed modifier
-    ///   follows the target itself ([`super::enderman::attacking_speed`]).
-    /// - `ZombifiedPiglin.setTarget`: a first target samples the first-anger
-    ///   sound delay and the alert interval; the AI step samples them, with
-    ///   the anger, on the tick it first sees the target, as for every other
-    ///   way the piglin gains one.
-    pub fn set_target(&mut self, target: Option<Who>) {
-        match self.species() {
-            Species::Fox if target.is_none() => {
-                super::fox::set_flag(self, super::fox::DEFENDING, false);
-            }
-            Species::Enderman => {
-                self.extra.flag = target.is_some();
-                self.extra.counter = if target.is_some() { self.age as i32 } else { 0 };
-            }
-            _ => {}
+    /// Apply an AI target change after listeners have had a chance to alter it.
+    pub fn set_ai_target(&mut self, w: &MobWorld, target: Option<Who>) -> super::TargetChange {
+        let is_brain = super::ai::brain_target(self).is_some();
+        let change = w.change_target(self, is_brain, target);
+        if let super::TargetChange::Set(target) = change {
+            self.set_target(target);
         }
-        self.ai.target = target;
+        change
     }
     /// `Mob.asValidTarget` and the modeled `canAttack` overrides over the
     /// target's facts (#1175): one rule set both the write handle and a goal
@@ -946,7 +931,9 @@ impl Mob {
     /// TargetingConditions.forCombat().test for the player: alive, not
     /// creative, within range scaled by visibility, optionally visible.
     pub fn can_target_player(&mut self, w: &MobWorld, range: f64, check_sight: bool) -> bool {
-        let Some(p) = &w.player else { return false };
+        let Some(p) = w.selected_player() else {
+            return false;
+        };
         if self.spares_players(w) {
             return false;
         }
@@ -959,7 +946,9 @@ impl Mob {
     /// forCombat().ignoreInvisibilityTesting() for the player: the check for
     /// a target the mob already has, which ignores the visibility scaling.
     pub fn can_keep_target_player(&mut self, w: &MobWorld, range: f64) -> bool {
-        let Some(p) = &w.player else { return false };
+        let Some(p) = w.selected_player() else {
+            return false;
+        };
         if self.spares_players(w) {
             return false;
         }
@@ -987,7 +976,9 @@ impl Mob {
         check_sight: bool,
         scale: bool,
     ) -> bool {
-        let Some(p) = &w.player else { return false };
+        let Some(p) = w.selected_player() else {
+            return false;
+        };
         if !p.alive || p.spectator {
             return false;
         }
@@ -1016,7 +1007,7 @@ impl Goal for Float {
         JUMP
     }
     fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
-        m.fluids.water > m.fluid_jump_threshold() || m.fluids.in_lava
+        m.floats()
     }
     fn every_tick(&self) -> bool {
         true
@@ -1393,8 +1384,7 @@ impl LookAtPlayer {
     fn look_target(&self, w: &MobWorld) -> Option<(Vec3, f64)> {
         match self.look_at? {
             Who::Player => w
-                .player
-                .as_ref()
+                .selected_player()
                 .filter(|p| p.alive)
                 .map(|p| (p.position, p.eye[1])),
             Who::Mob(id) => w
@@ -1610,7 +1600,7 @@ impl Goal for MeleeAttack {
         ];
         m.ai.home
             .is_none_or(|(center, radius)| within_home(center, radius, target_block))
-            && !(t.is_player && (t.creative || cx.w.player.as_ref().is_some_and(|p| p.spectator)))
+            && !(t.is_player && (t.creative || cx.w.selected_player().is_some_and(|p| p.spectator)))
     }
     fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
         let path = m.ai.pending_path.take();
@@ -1625,7 +1615,7 @@ impl Goal for MeleeAttack {
             && t.is_player
             && t.creative
         {
-            m.ai.target = None;
+            m.set_ai_target(cx.w, None);
         }
         m.ai.aggressive = false;
         m.nav_stop();
@@ -1892,6 +1882,7 @@ pub fn target_continue(st: &mut TargetState, must_see: bool, m: &mut Mob, cx: &m
             }
         }
     }
+    m.set_ai_target(cx.w, Some(who));
     true
 }
 impl Goal for NearestTarget {
@@ -1964,12 +1955,12 @@ impl Goal for NearestTarget {
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         target_continue(&mut self.target_goal, self.must_see, m, cx)
     }
-    fn start(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = self.found;
+    fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
+        m.set_ai_target(cx.w, self.found);
         self.target_goal.unseen = 0;
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = None;
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        m.set_ai_target(cx.w, None);
     }
 }
 /// HurtByTargetGoal (optionally alerting others of the same species).
@@ -2055,6 +2046,11 @@ impl Goal for HurtByTarget {
         if m.ai.last_hurt_by_time == self.timestamp {
             return false;
         }
+        // `HurtByTargetGoal.canUse`: with universal anger on, a player's hit
+        // is left to the anger goals, never a direct retaliation.
+        if by == Who::Player && cx.w.universal_anger {
+            return false;
+        }
         if let Who::Mob(id) = by
             && cx
                 .w
@@ -2071,6 +2067,8 @@ impl Goal for HurtByTarget {
             && !(t.is_player && t.creative)
             // HurtByTargetGoal.canUse ends with canAttack(lastHurtByMob).
             && !m.spares_target(cx.w, by)
+            // TargetGoal.canAttack: Mob.isWithinHome(target.blockPosition()).
+            && m.within_home_at(t.position)
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         if self.bee && !super::bee::angry(m, cx.w) {
@@ -2079,7 +2077,7 @@ impl Goal for HurtByTarget {
         target_continue(&mut self.st, true, m, cx)
     }
     fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
-        m.ai.target = m.ai.last_hurt_by;
+        m.set_ai_target(cx.w, m.ai.last_hurt_by);
         self.timestamp = m.ai.last_hurt_by_time;
         self.st.unseen_memory = 300;
         self.st.unseen = 0;
@@ -2096,7 +2094,7 @@ impl Goal for HurtByTarget {
             // whether it is a pet at all.
             let tamable = m.is_tamable_animal();
             let owner = m.extra.tame.then_some(m.extra.owner).flatten();
-            let player = cx.w.player.as_ref().map(|p| p.uuid);
+            let player = cx.w.selected_player().map(|p| p.uuid);
             let ids: Vec<u32> =
                 cx.w.others
                     .iter()
@@ -2140,11 +2138,11 @@ impl Goal for HurtByTarget {
             }
         }
         if cub {
-            m.ai.target = None;
+            m.set_ai_target(cx.w, None);
         }
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = None;
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        m.set_ai_target(cx.w, None);
     }
 }
 /// What an AvoidEntityGoal flees from.
@@ -2207,7 +2205,7 @@ impl AvoidEntity {
     fn avoid_target(&mut self, m: &mut Mob, cx: &mut Cx) -> Option<Vec3> {
         let max = f64::from(self.max_dist);
         if matches!(self.what, Avoid::Player) {
-            let wanted = cx.w.player.as_ref().is_none_or(|p| {
+            let wanted = cx.w.selected_player().is_none_or(|p| {
                 self.player_when.is_none_or(|f| f(m, p))
                     && (p.position.y - m.position.y).abs() <= max + 3.0
             });
@@ -2215,7 +2213,7 @@ impl AvoidEntity {
             if !wanted || !m.can_target_player(cx.w, max, true) {
                 return None;
             }
-            return cx.w.player.as_ref().map(|p| p.position);
+            return cx.w.selected_player().map(|p| p.position);
         }
         let Avoid::Species(list) = &self.what else {
             return None;
@@ -2290,8 +2288,7 @@ impl Goal for AvoidEntity {
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
         let from = match &self.what {
             Avoid::Player => {
-                cx.w.player
-                    .as_ref()
+                cx.w.selected_player()
                     .map(|p| p.position)
                     .unwrap_or(self.from)
             }
@@ -2342,15 +2339,19 @@ impl Goal for Tempt {
             self.calm_down -= 1;
             return false;
         }
-        let Some(p) = &cx.w.player else { return false };
-        // Attributes.TEMPT_RANGE default 10.
+        let Some(p) = cx.w.selected_player() else {
+            return false;
+        };
+        let range =
+            cx.w.player_visibility(p, m.id, p.visibility_percent(m.species()));
         p.alive
+            && !p.spectator
             && (self.wants(&p.main_hand) || self.wants(&p.off_hand))
-            && m.distance_sqr(p.position) <= 100.0
+            && m.distance_sqr(p.position) <= (10.0 * range).max(2.0).powi(2)
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         if self.can_scare
-            && let Some(p) = &cx.w.player
+            && let Some(p) = cx.w.selected_player()
         {
             if m.distance_sqr(p.position) < 36.0 {
                 let moved = (p.position.x - self.p[0]).powi(2)
@@ -2372,7 +2373,7 @@ impl Goal for Tempt {
         self.can_use(m, cx)
     }
     fn start(&mut self, _: &mut Mob, cx: &mut Cx) {
-        if let Some(p) = &cx.w.player {
+        if let Some(p) = cx.w.selected_player() {
             self.p = [p.position.x, p.position.y, p.position.z];
         }
     }
@@ -2381,7 +2382,9 @@ impl Goal for Tempt {
         self.calm_down = reduced(100);
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        let Some(p) = cx.w.player.clone() else { return };
+        let Some(p) = cx.w.selected_player().cloned() else {
+            return;
+        };
         let (y, x) = (m.kind.max_head_y_rot + 20.0, m.max_head_x_rot());
         m.look_at_speed(p.eye, y, x);
         if m.distance_sqr(p.position) < self.stop_distance * self.stop_distance {
@@ -2481,15 +2484,18 @@ impl Goal for Breed {
                     // AbstractHorse.canParent of the partner.
                     && (!(equine || camel) || s.tame && !s.ridden && s.health >= s.stats[0] as f32)
                     && (!sniffer || super::sniffer::can_mate_state(s.variant))
+                    // BreedGoal.getFreePartner: `!potentialPartner.isPanicking()`.
+                    && !s.panicking
             })
-            .map(|s| s.id)
-            .next();
+            .find(|s| m.distance_sqr(s.position) <= 64.0)
+            .map(|s| s.id);
         self.partner.is_some()
     }
     fn can_continue(&mut self, _: &mut Mob, cx: &mut Cx) -> bool {
         self.partner
             .and_then(|p| cx.w.seen(p))
-            .is_some_and(|s| s.alive && s.in_love)
+            // BreedGoal.canContinueToUse: `!this.partner.isPanicking()`.
+            .is_some_and(|s| s.alive && s.in_love && !s.panicking)
             && self.love_time < 60
     }
     fn stop(&mut self, _: &mut Mob, _: &mut Cx) {
@@ -2513,14 +2519,11 @@ impl Goal for Breed {
             let equine = super::equine::breed_offspring(m, &p).map(Box::new);
             let parent_variant =
                 super::draws_parent_variant(m.species()).then(|| m.random.next_boolean());
-            let experience = if (equine.is_some() || parent_variant.is_some())
-                && !cx.w.asks_baby_spawn
-                && !super::orb_after_child(m.species())
-            {
-                super::BreedExperience::Drawn(super::breeding_experience(m, cx.w.mob_drops))
-            } else {
-                super::BreedExperience::Deferred
-            };
+            let (wolf_voice, experience) = super::breeding::voice_and_experience(
+                m,
+                cx.w,
+                equine.is_some() || parent_variant.is_some(),
+            );
             m.extra.in_love = 0;
             m.extra.age = 6000;
             // TurtleBreedGoal.breed: the mother carries an egg, not a baby.
@@ -2536,6 +2539,7 @@ impl Goal for Breed {
                 partner: p.id,
                 equine,
                 parent_variant,
+                wolf_voice,
                 experience,
             });
         }
@@ -2665,13 +2669,10 @@ impl Goal for FollowMob {
         let area = m
             .bounds()
             .inflate(Vec3::new(self.area, self.area, self.area));
-        let found = cx
-            .w
-            .others_near(area)
-            .find(|s| {
-                s.species != species && s.bounds.intersects(area) && !s.has_effect("invisibility")
-            })
-            .map(|s| s.id);
+        let found =
+            cx.w.others_near(area)
+                .find(|s| s.species != species && s.bounds.intersects(area) && !s.invisible)
+                .map(|s| s.id);
         self.following = found;
         found.is_some()
     }
@@ -3321,13 +3322,25 @@ mod breeding_variant_tests {
                         if ask_mods || id == "minecraft:fox" {
                             BreedExperience::Deferred
                         } else {
-                            BreedExperience::Drawn(mob_drops.then_some(3))
+                            // Computed with an independent implementation of the documented
+                            // java.util.Random algorithm, not from the game's output.
+                            // Seed 0: coat is draw 1, wolf voice draw 2,
+                            // XP draw 3 (bits31 = 516548029, remainder 4).
+                            BreedExperience::Drawn(mob_drops.then_some(if id == "minecraft:wolf" {
+                                5
+                            } else {
+                                3
+                            }))
                         },
                         "{id}"
                     );
                     assert_eq!(
                         parent.random.state(),
-                        if !ask_mods && mob_drops && id != "minecraft:fox" {
+                        if !ask_mods && id == "minecraft:wolf" && mob_drops {
+                            67_704_983_304_270 // Java LCG seed 0, draw 3.
+                        } else if !ask_mods
+                            && (id == "minecraft:wolf" || (mob_drops && id != "minecraft:fox"))
+                        {
                             234_029_835_660_143
                         } else {
                             205_749_139_540_596
@@ -3337,7 +3350,11 @@ mod breeding_variant_tests {
                     if !ask_mods && mob_drops && id != "minecraft:fox" {
                         assert_eq!(
                             parent.random.next_int(),
-                            1_033_096_058,
+                            if id == "minecraft:wolf" {
+                                -1_690_734_402 // Java LCG seed 0, signed upper 32 bits of draw 4.
+                            } else {
+                                1_033_096_058
+                            },
                             "{id}: same-tick later draw"
                         );
                     }
@@ -3628,12 +3645,11 @@ mod remove_all_tests {
         assert!(ran, "the test world's resources are missing");
     }
 }
-
 #[cfg(test)]
 mod avoid_entity_targeting_tests {
     use super::*;
     use crate::mobs::world::test_player;
-    use crate::mobs::world::with_built_test_world;
+    use crate::mobs::world::{with_built_test_world, with_test_world};
     use std::sync::Arc;
 
     /// `(the player is inside the plain distance range, the goal picks them)`.
@@ -3722,6 +3738,97 @@ mod avoid_entity_targeting_tests {
             assert!(picked, "the rabbit ignored a player in the open");
         }
     }
+
+    /// Upstream's visibility regression, also through the selected-guest path.
+    #[test]
+    fn an_invisible_player_tempts_only_within_two_blocks() {
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:cow"].clone());
+            for guest in [false, true] {
+                for (invisible, x) in [(false, 5.5), (true, 5.5), (true, 1.5)] {
+                    let mut world = w.clone();
+                    let mut p = test_player(Vec3::new(x, 64.0, 0.5));
+                    p.main_hand = Some("minecraft:wheat".into());
+                    p.invisible = invisible;
+                    let selection = super::super::player_selection::PlayerSelection::new(
+                        vec![super::super::player_selection::TickPlayer {
+                            entity_id: 42,
+                            connection: Some(7),
+                            view: p.clone(),
+                        }],
+                        Some(42),
+                    )
+                    .unwrap();
+                    world.player = Some(if guest {
+                        test_player(Vec3::new(100.0, 64.0, 0.5))
+                    } else {
+                        p
+                    });
+                    world.player_selection = guest.then_some(&selection);
+                    let mut m = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                    m.ai.goals.add(
+                        3,
+                        Tempt::new(1.25, Arc::from(vec!["minecraft:wheat".to_string()]), false),
+                    );
+                    let mut level = crate::health::TestLevel::new(0);
+                    let mut events = Vec::new();
+                    let mut cx = Cx {
+                        w: &world,
+                        level: &mut level.level(),
+                        events: &mut events,
+                    };
+                    let mut goals = std::mem::take(&mut m.ai.goals);
+                    goals.tick(&mut m, &mut cx);
+                    outcomes.push(goals.is_running("Tempt"));
+                }
+            }
+        }) {
+            return;
+        }
+        assert_eq!(outcomes, vec![true, false, true, true, false, true]);
+    }
+
+    /// `TemptGoal` finds its player with `TargetingConditions.forNonCombat()`,
+    /// which never picks a spectator: a spectator holding wheat does not tempt
+    /// an animal.
+    #[test]
+    fn a_spectator_does_not_tempt_an_animal() {
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:cow"].clone());
+            for spectator in [false, true] {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(2.5, 64.0, 0.5));
+                p.main_hand = Some("minecraft:wheat".into());
+                p.spectator = spectator;
+                world.player = Some(p);
+                let mut m = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                m.ai.goals.add(
+                    3,
+                    Tempt::new(1.25, Arc::from(vec!["minecraft:wheat".to_string()]), false),
+                );
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("Tempt"));
+                m.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a survival player tempts; a spectator does not"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3768,6 +3875,45 @@ mod peaceful_targets_tests {
             );
             assert!(!wolf.can_target_player(&peaceful, 16.0, false), "peaceful");
             assert!(!wolf.can_keep_target_player(&peaceful, 16.0), "peaceful");
+        });
+    }
+
+    /// `Mob.canAttack` refuses a Ghast, and `HurtByTargetGoal.canUse` ends
+    /// with `canAttack(lastHurtByMob)`: a ghast's fireball is not retaliated.
+    #[test]
+    fn a_hurt_mob_does_not_retaliate_against_a_ghast() {
+        let mut seen = None;
+        with_test_world(&[], |_, types| {
+            let mob = |id: u32, name: &str, at: Vec3| {
+                Mob::new(id, Arc::new(types.types[name].clone()), at, 0.0)
+            };
+            let ghast = mob(2, "minecraft:ghast", Vec3::new(2.5, 64.0, 0.5));
+            let zombie = mob(3, "minecraft:zombie", Vec3::new(3.5, 64.0, 0.5));
+            seen = Some([ghast.seen(None), zombie.seen(None)]);
+        });
+        let Some(seen) = seen else { return };
+        with_test_world(&seen, |w, types| {
+            let kind = Arc::new(types.types["minecraft:cow"].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+            let mut lr = crate::health::TestLevel::new(0);
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut lr.level(),
+                events: &mut events,
+            };
+            m.ai.last_hurt_by = Some(Who::Mob(2));
+            m.ai.last_hurt_by_time = 5;
+            assert!(
+                !HurtByTarget::default().can_use(&mut m, &mut cx),
+                "a ghast is not a valid attacker to retaliate against"
+            );
+            m.ai.last_hurt_by = Some(Who::Mob(3));
+            m.ai.last_hurt_by_time = 6;
+            assert!(
+                HurtByTarget::default().can_use(&mut m, &mut cx),
+                "a zombie attacker is retaliated against"
+            );
         });
     }
 }
@@ -3905,6 +4051,79 @@ mod visibility_hook_tests {
 }
 
 #[cfg(test)]
+mod target_change_hook_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use crate::mobs::{MobHooks, PlayerView, TargetChange};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Cancel(AtomicUsize);
+    impl MobHooks for Cancel {
+        fn enderman_anger_suppressed(&self, _: u32, _: &PlayerView) -> bool {
+            false
+        }
+        fn can_grief(&self, _: u32, rule: bool) -> bool {
+            rule
+        }
+        fn grief_hooked(&self) -> bool {
+            false
+        }
+        fn living_visibility(&self, _: &PlayerView, _: u32, v: f64) -> f64 {
+            v
+        }
+        fn living_change_target(
+            &self,
+            _: &mut Mob,
+            _: &MobWorld<'_>,
+            brain: bool,
+            target: Option<Who>,
+        ) -> TargetChange {
+            assert!(!brain);
+            assert_eq!(target, Some(Who::Player));
+            self.0.fetch_add(1, Ordering::Relaxed);
+            TargetChange::Keep
+        }
+    }
+
+    #[test]
+    #[ignore = "requires prepared entity resources in .local/horizon-client"]
+    fn nearest_target_goal_respects_cancellation() {
+        assert!(
+            with_test_world(&[], |world, types| {
+                let hook = Cancel(AtomicUsize::new(0));
+                let mut world = world.clone();
+                world.player = Some(test_player(Vec3::new(1.5, 64.0, 0.5)));
+                world.mob_hooks = Some(&hook);
+                let kind = Arc::new(types.types["minecraft:zombie"].clone());
+                let mut mob = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                let mut goal = NearestTarget::player(false);
+                goal.found = Some(Who::Player);
+                let mut level = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut level.level(),
+                    events: &mut events,
+                };
+                goal.start(&mut mob, &mut cx);
+                assert_eq!(mob.ai.target, None);
+                assert_eq!(hook.0.load(Ordering::Relaxed), 1);
+                mob.ai.target = Some(Who::Player);
+                assert!(target_continue(
+                    &mut goal.target_goal,
+                    false,
+                    &mut mob,
+                    &mut cx
+                ));
+                assert_eq!(hook.0.load(Ordering::Relaxed), 2);
+                assert_eq!(mob.ai.target, Some(Who::Player));
+            }),
+            "prepared entity resources are required"
+        );
+    }
+}
+
+#[cfg(test)]
 mod breed_xp_tests {
     use super::*;
 
@@ -4011,6 +4230,10 @@ mod breed_xp_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "breed_partner_range_tests.rs"]
+mod breed_partner_range_tests;
 
 #[cfg(test)]
 mod within_home_tests {
@@ -4226,5 +4449,132 @@ mod breath_air_tests {
         }
         // One block above the 9-block columns: not searched.
         assert_eq!(BreathAir::air_position(origin, |p| p == [10, 29, 30]), None);
+    }
+}
+
+#[cfg(test)]
+mod hurt_by_anger_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// `HurtByTargetGoal.canUse` refuses a player when the `universal_anger`
+    /// game rule is on: the anger target goals handle that hit instead.
+    #[test]
+    fn universal_anger_leaves_the_players_hit_to_the_anger_goals() {
+        let mut outcomes = None;
+        if !with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:cow"].clone());
+            let mut truth = Vec::new();
+            for rule in [false, true] {
+                let mut world = w.clone();
+                world.player = Some(test_player(Vec3::new(2.5, 64.0, 0.5)));
+                world.universal_anger = rule;
+                let mut m = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                m.ai.last_hurt_by = Some(Who::Player);
+                m.ai.last_hurt_by_time = 1;
+                m.ai.goals.add(1, HurtByTarget::new());
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                truth.push(goals.is_running("HurtByTarget"));
+                m.ai.goals = goals;
+            }
+            outcomes = Some(truth);
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            Some(vec![true, false]),
+            "a hit is retaliated with the rule off and left to the anger goals with it on"
+        );
+    }
+}
+
+impl Mob {
+    /// `Mob.isWithinHome(BlockPos.containing(at))`; true with no home.
+    pub(super) fn within_home_at(&self, at: horizon_core::geometry::Vec3) -> bool {
+        let block = [
+            at.x.floor() as i32,
+            at.y.floor() as i32,
+            at.z.floor() as i32,
+        ];
+        self.ai
+            .home
+            .is_none_or(|(center, radius)| within_home(center, radius, block))
+    }
+}
+
+#[cfg(test)]
+mod breed_continue_tests {
+    use super::*;
+    use crate::mobs::world::with_test_world;
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// `BreedGoal.canContinueToUse` refuses a partner that is panicking. The
+    /// goal starts with a calm partner and must stop when the partner panics.
+    #[test]
+    fn a_breed_goal_stops_when_the_partner_panics() {
+        let mut kind = None;
+        if !with_test_world(&[], |_, types| {
+            kind = Some(Arc::new(types.types["minecraft:cow"].clone()));
+        }) {
+            return;
+        }
+        let Some(kind) = kind else { return };
+        let mut partner = Mob::new(2, kind.clone(), Vec3::new(2.5, 64.0, 0.5), 0.0);
+        partner.extra.in_love = 600;
+        let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+        m.extra.in_love = 600;
+        m.ai.goals.add(1, Breed::new(1.0));
+        let mut started = None;
+        let calm = [partner.seen(None)];
+        if !with_test_world(&calm, |w, _| {
+            let mut damage = crate::health::TestLevel::new(0);
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut damage.level(),
+                events: &mut events,
+            };
+            let mut goals = std::mem::take(&mut m.ai.goals);
+            goals.tick(&mut m, &mut cx);
+            started = Some(goals.is_running("Breed"));
+            m.ai.goals = goals;
+        }) {
+            return;
+        }
+        partner.ai.panicking = true;
+        let panicking = [partner.seen(None)];
+        let mut stopped = None;
+        if !with_test_world(&panicking, |w, _| {
+            let mut damage = crate::health::TestLevel::new(0);
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut damage.level(),
+                events: &mut events,
+            };
+            let mut goals = std::mem::take(&mut m.ai.goals);
+            goals.tick(&mut m, &mut cx);
+            stopped = Some(!goals.is_running("Breed"));
+            m.ai.goals = goals;
+        }) {
+            return;
+        }
+        assert_eq!(
+            (started, stopped),
+            (Some(true), Some(true)),
+            "the breed goal starts for a calm partner and stops when it panics"
+        );
     }
 }

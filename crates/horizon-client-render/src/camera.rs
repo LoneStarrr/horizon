@@ -30,7 +30,7 @@
 //! The float arithmetic follows vanilla and JOML's default (non-FMA,
 //! non-fast-math) code paths operation by operation.
 use horizon_core::geometry::trig;
-pub use mod_api::camera::{
+pub use mod_api::client::camera::{
     CameraEntity, CameraType, FovPlayer, LivingCamera, UseItem, lerp, wrap_degrees,
 };
 
@@ -476,12 +476,22 @@ pub fn view_rotation_matrix(yaw: f32, pitch: f32) -> (glam::Mat4, glam::Mat4) {
 }
 
 /// Camera-relative world view used by terrain, sky and the first-person hand.
+#[horizon_mod_api_macros::replaceable]
 pub fn view_matrix(yaw: f32, pitch: f32) -> glam::Mat4 {
     // Vanilla uses the conjugate of Camera.rotation, not a world-up look-at.
     let q = Quat::rotation_yxz(PI - yaw * DEG_TO_RAD, -pitch * DEG_TO_RAD, 0.0);
     glam::Mat4::from_quat(glam::Quat::from_xyzw(-q.x, -q.y, -q.z, q.w))
 }
 
+/// `view_matrix` with a roll about the view direction, in degrees.
+pub fn view_matrix_rolled(yaw: f32, pitch: f32, roll: f32) -> glam::Mat4 {
+    let q = Quat::rotation_yxz(
+        PI - yaw * DEG_TO_RAD,
+        -pitch * DEG_TO_RAD,
+        -roll * DEG_TO_RAD,
+    );
+    glam::Mat4::from_quat(glam::Quat::from_xyzw(-q.x, -q.y, -q.z, q.w))
+}
 /// `AbstractClientPlayer.getFieldOfViewModifier(firstPerson, effectScale)`.
 pub fn field_of_view_modifier(p: &FovPlayer, first_person: bool, effect_scale: f32) -> f32 {
     let mut modifier = 1.0f32;

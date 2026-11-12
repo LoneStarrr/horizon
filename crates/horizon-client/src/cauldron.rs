@@ -44,6 +44,10 @@ pub struct Interaction {
     pub stat: Option<&'static str>,
     /// `lowerFillLevel` posts BLOCK_CHANGE with the new state.
     pub lower_fill_level: bool,
+    /// The `Level.gameEvent` the interaction ends with, after its sound:
+    /// `FLUID_PICKUP` from `fillBucket` and the glass bottle, `FLUID_PLACE`
+    /// from `emptyBucket` and a water potion. Washing posts none.
+    pub fluid_event: Option<&'static str>,
 }
 
 fn state(name: &str, level: Option<u8>) -> BlockState {
@@ -63,6 +67,15 @@ fn pass() -> Interaction {
         sound: None,
         stat: None,
         lower_fill_level: false,
+        fluid_event: None,
+    }
+}
+
+/// `InteractionResult.CONSUME`: a lava or powder snow bucket under water.
+fn consume() -> Interaction {
+    Interaction {
+        outcome: Outcome::Consume,
+        ..pass()
     }
 }
 
@@ -133,6 +146,7 @@ fn changed(block: BlockState, sound: Option<&'static str>, stat: &'static str) -
         sound,
         stat: Some(stat),
         lower_fill_level: false,
+        fluid_event: None,
     }
 }
 
@@ -144,6 +158,14 @@ fn changed_lowered(
     let mut result = changed(lowered(cauldron), sound, stat);
     result.lower_fill_level = true;
     result
+}
+
+impl Interaction {
+    /// The same answer, ending with the interaction's `Level.gameEvent`.
+    fn with_event(mut self, event: &'static str) -> Self {
+        self.fluid_event = Some(event);
+        self
+    }
 }
 
 const COLORS: [&str; 16] = [
@@ -166,7 +188,7 @@ const COLORS: [&str; 16] = [
 ];
 
 #[derive(Clone, Copy)]
-enum Action {
+pub enum Action {
     EmptyLava,
     EmptyWater,
     EmptySnow,
@@ -180,39 +202,7 @@ enum Action {
     CleanShulker,
 }
 
-/// Vanilla's per-cauldron item dispatch, built once and shared by all views.
-fn interactions() -> &'static [std::collections::HashMap<String, Action>; 4] {
-    use Action::*;
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[std::collections::HashMap<String, Action>; 4]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut maps = std::array::from_fn::<_, 4, _>(|_| std::collections::HashMap::new());
-        for map in &mut maps {
-            for (item, action) in [
-                ("lava_bucket", EmptyLava),
-                ("water_bucket", EmptyWater),
-                ("powder_snow_bucket", EmptySnow),
-            ] {
-                map.insert(format!("minecraft:{item}"), action);
-            }
-        }
-        for (kind, item, action) in [
-            (0, "potion", EmptyPotion),
-            (1, "bucket", FillWater),
-            (1, "glass_bottle", FillBottle),
-            (1, "potion", TopUpPotion),
-            (2, "bucket", FillLava),
-            (3, "bucket", FillSnow),
-        ] {
-            maps[kind].insert(format!("minecraft:{item}"), action);
-        }
-        for color in COLORS {
-            maps[1].insert(format!("minecraft:{color}_banner"), CleanBanner);
-            maps[1].insert(format!("minecraft:{color}_shulker_box"), CleanShulker);
-        }
-        maps
-    })
-}
+pub mod interactions;
 
 /// The cauldron interaction of the held item (`useItemOn`); the hand stack is
 /// changed through `player`. `removes_dye` is whether the held item is in the
@@ -223,25 +213,30 @@ pub fn interact(
     removes_dye: bool,
     player: &mut dyn Player,
 ) -> Interaction {
+    let entry = player.hand().as_ref().and_then(|held| {
+        interactions::Dispatcher::vanilla().select(&cauldron.name, &held.item, removes_dye)
+    });
+    interact_selected(cauldron, under_water, entry.as_ref(), player)
+}
+
+/// Apply an already selected vanilla entry; mod callbacks are handled by the action owner.
+pub fn interact_selected<H>(
+    cauldron: &BlockState,
+    under_water: bool,
+    entry: Option<&interactions::Entry<H>>,
+    player: &mut dyn Player,
+) -> Interaction {
     let Some(held) = player.hand().clone() else {
         return pass();
-    };
-    let kind = match cauldron.name.as_str() {
-        "minecraft:cauldron" => 0,
-        "minecraft:water_cauldron" => 1,
-        "minecraft:lava_cauldron" => 2,
-        "minecraft:powder_snow_cauldron" => 3,
-        _ => return pass(),
     };
     let level: u8 = cauldron
         .properties
         .get("level")
         .and_then(|l| l.parse().ok())
         .unwrap_or(0);
-    let item = &*held.item;
     let water_potion = held.data().and_then(|d| d.potion.as_deref()) == Some("minecraft:water");
     // Dispatcher.get: tags first, then the item map.
-    if kind == 1 && removes_dye {
+    if matches!(entry, Some(interactions::Entry::Dye)) {
         if held.data().and_then(|d| d.dyed_color).is_none() {
             return pass();
         }
@@ -261,24 +256,19 @@ pub fn interact(
             Some(sound),
             "use_cauldron",
         )
+        .with_event("minecraft:fluid_pickup")
     };
     let empty_bucket = |player: &mut dyn Player, block: BlockState, sound| {
         create_filled_result(player, ItemStack::new("minecraft:bucket", 1), true);
-        changed(block, Some(sound), "fill_cauldron")
+        changed(block, Some(sound), "fill_cauldron").with_event("minecraft:fluid_place")
     };
-    let Some(action) = interactions()[kind].get(item) else {
+    let Some(interactions::Entry::Vanilla(action)) = entry else {
         return pass();
     };
     match action {
         Action::EmptyLava => {
             if under_water {
-                Interaction {
-                    outcome: Outcome::Consume,
-                    block: None,
-                    sound: None,
-                    stat: None,
-                    lower_fill_level: false,
-                }
+                consume()
             } else {
                 empty_bucket(
                     player,
@@ -294,13 +284,7 @@ pub fn interact(
         ),
         Action::EmptySnow => {
             if under_water {
-                Interaction {
-                    outcome: Outcome::Consume,
-                    block: None,
-                    sound: None,
-                    stat: None,
-                    lower_fill_level: false,
-                }
+                consume()
             } else {
                 empty_bucket(
                     player,
@@ -319,6 +303,7 @@ pub fn interact(
                 Some("minecraft:item.bottle.empty"),
                 "use_cauldron",
             )
+            .with_event("minecraft:fluid_place")
         }
         Action::FillWater => fill_bucket(
             player,
@@ -333,6 +318,7 @@ pub fn interact(
                 true,
             );
             changed_lowered(cauldron, Some("minecraft:item.bottle.fill"), "use_cauldron")
+                .with_event("minecraft:fluid_pickup")
         }
         Action::TopUpPotion => {
             if level == 3 || !water_potion {
@@ -344,6 +330,7 @@ pub fn interact(
             next.properties
                 .insert("level".into(), (level % 3 + 1).to_string());
             changed(next, Some("minecraft:item.bottle.empty"), "use_cauldron")
+                .with_event("minecraft:fluid_place")
         }
         Action::CleanBanner => {
             let layers = held.data().map_or(0, |d| d.banner_patterns.len());
@@ -568,3 +555,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cauldron/interaction_tests.rs"]
+mod interaction_tests;

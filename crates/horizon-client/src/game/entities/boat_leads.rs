@@ -16,6 +16,7 @@ use horizon_client::actions::Action;
 use horizon_client::mobs::leash::{self, Holder, HolderState, Pending};
 use horizon_core::geometry::Vec3;
 use horizon_core::nbt::Tag;
+use horizon_core::position::BlockPos;
 
 /// `AbstractBoat`'s `getBbWidth` and `getBbHeight`.
 const WIDTH: f32 = 1.375;
@@ -82,7 +83,7 @@ impl Game<'_> {
                     }
                     let bounds = g.bounds();
                     let (lo, hi) = (bounds.min_position(), bounds.max_position());
-                    let moved = [0, 1, 2].map(|k| g.position[k] - g.previous_position[k]);
+                    let moved = g.known_movement;
                     return Held::At(
                         HolderState {
                             position: Vec3::new(g.position[0], g.position[1], g.position[2]),
@@ -178,19 +179,26 @@ impl Game<'_> {
     }
 
     fn release_boat_leash(&mut self, b: &mut Boat, drop: bool) {
-        if let Some(at) = Self::take_boat_leash(b, drop) {
+        let holder = b.leash;
+        let at = Self::take_boat_leash(b, drop);
+        self.notify_knot_leashee_removed(holder, b.id);
+        if let Some(at) = at {
             self.drop_lead_item(at);
         }
     }
 
     pub(super) fn release_stored_boat_leash(&mut self, i: usize, drop: bool) {
-        if let Some(at) = self.boats.update(i, |b| Self::take_boat_leash(b, drop)) {
+        let (holder, id) = (self.boats[i].leash, self.boats[i].id);
+        let at = self.boats.update(i, |b| Self::take_boat_leash(b, drop));
+        self.notify_knot_leashee_removed(holder, id);
+        if let Some(at) = at {
             self.drop_lead_item(at);
         }
     }
 
     /// `AbstractBoat.remove`: a boat that is destroyed drops its lead.
     pub(super) fn boat_removed(&mut self, b: &Boat) {
+        self.notify_knot_leashee_removed(b.leash, b.id);
         let mut b = b.clone();
         let pending = b.leash_pending.take().is_some();
         if b.leash.is_some() || pending {
@@ -268,7 +276,9 @@ impl Game<'_> {
         if b.on_ground {
             let (x, z) = (b.position.x.floor() as i32, b.position.z.floor() as i32);
             let y = (b.position.y - 0.500_001).floor() as i32;
-            self.res.facts().get(self.world.block(x, y, z)).friction * 0.91
+            let state = self.world.block(x, y, z);
+            let own = self.res.facts().get(state).friction;
+            self.boat_friction(b, BlockPos::new(x, y, z), state, own) * 0.91
         } else if b.in_liquid() {
             0.8
         } else {
@@ -295,10 +305,17 @@ impl Game<'_> {
                     self.mob_by_uuid(u)
                         .map(|id| (Holder::Mob(id), None))
                         .or_else(|| self.boat_by_uuid(u).map(|id| (Holder::Boat(id), None)))
+                        .or_else(|| self.knot_by_uuid(u).map(|p| (Holder::Knot(p), None)))
                 }
             }
         };
         if let Some((holder, player)) = found {
+            // The boat is out of the list while it ticks: its own knot is
+            // made here, not found by `lead_fences`.
+            if let Holder::Knot(fence) = holder {
+                self.forget_untied_knots();
+                self.tie_knot(fence);
+            }
             b.leash = Some(holder);
             b.leash_player = player;
             b.leash_pending = None;
@@ -345,8 +362,27 @@ impl Game<'_> {
         self.persist
             .uuids
             .iter()
-            .find(|(id, u)| **u == uuid && self.boats.iter().any(|b| b.id == **id))
+            .find(|(id, u)| {
+                **u == uuid
+                    && self.boats.iter().any(|b| b.id == **id)
+                    && self.resident_source_target_visible(
+                        self.dim.key(),
+                        super::commands::Target::Boat(**id),
+                    )
+            })
             .map(|(id, _)| *id)
+    }
+
+    /// The fence post of the leash knot with this UUID (`ServerLevel.getEntity`):
+    /// a summoned or loaded `minecraft:leash_knot`, which sits on its block.
+    pub(super) fn knot_by_uuid(&self, uuid: [i32; 4]) -> Option<[i32; 3]> {
+        self.others
+            .iter()
+            .find(|o| o.kind == "minecraft:leash_knot" && self.persist.uuid_of(o.id) == Some(uuid))
+            .map(|o| {
+                let block = horizon_core::position::BlockPos::containing(o.position);
+                [block.x, block.y, block.z]
+            })
     }
 
     /// The boats on the acting player's lead within 32 blocks of a point
@@ -409,6 +445,7 @@ impl Game<'_> {
                 any = true;
             }
         }
+        self.notify_knot_leashee_removed(Some(Holder::Knot(knot)), 0);
         any
     }
 
@@ -585,5 +622,44 @@ mod tests {
     fn distances_are_euclidean() {
         let d = distance(Vec3::new(0.0, 0.0, 0.0), Vec3::new(3.0, 4.0, 0.0));
         assert!((d - 5.0).abs() < 1e-12);
+    }
+    #[test]
+    #[ignore = "needs prepared resources and isolated homes/cwd"]
+    fn non_guest_holder_branches_keep_their_existing_velocity_sources() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        game.build_registries();
+        game.set_allow_commands(true);
+        assert!(game.run_command("summon oak_boat 6.5 100 4.5 {UUID:[I;327,1,0,1]}"));
+        let (id, expected) = game.boats.update(0, |boat| {
+            boat.velocity = Vec3::new(0.25, -0.125, 0.5);
+            (boat.id, boat.velocity)
+        });
+        let Held::At(state, quad) = game.boat_holder(Holder::Boat(id), None) else {
+            panic!("actual boat holder must resolve");
+        };
+        assert_eq!(state.velocity, expected);
+        assert!(!quad);
+        assert!(game.run_command("summon pig 4.5 100 4.5 {UUID:[I;327,2,0,1],NoAI:1b}"));
+        let mob = &mut game.mobs[0];
+        mob.velocity = Vec3::new(-0.5, 0.25, 0.125);
+        let (id, expected) = (mob.id, mob.velocity);
+        let Held::At(state, quad) = game.boat_holder(Holder::Mob(id), None) else {
+            panic!("actual mob holder must resolve");
+        };
+        assert_eq!(state.velocity, expected);
+        assert!(!quad);
+        assert!(matches!(
+            game.boat_holder(Holder::Player, Some([327, 3, 0, 1])),
+            Held::Gone
+        ));
+        assert!(matches!(
+            game.boat_holder(Holder::Boat(u32::MAX), None),
+            Held::Gone
+        ));
+        assert!(matches!(
+            game.boat_holder(Holder::Knot([0, 100, 0]), None),
+            Held::Gone
+        ));
     }
 }

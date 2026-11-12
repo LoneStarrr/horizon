@@ -1,3 +1,4 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
 use super::*;
 
 impl PartRegistrar {
@@ -10,31 +11,13 @@ impl PartRegistrar {
         if crate::Identifier::parse_namespaced(&id).is_none() {
             return Err(crate::GameRuleError::InvalidId);
         }
-        if id.split_once(':').unwrap().0 != self.mod_id {
+        if !owns_namespace(self.mod_id, id.split_once(':').unwrap().0) {
             return Err(crate::GameRuleError::ForeignNamespace);
         }
         Ok(id)
     }
 }
 
-/// The immutable declarations installed after schema validation.
-// hidden: the game builds engine registries from the installed declaration snapshot.
-#[doc(hidden)]
-pub fn game_rules() -> &'static [crate::GameRuleDecl] {
-    installed().map_or(&[], |parts| &parts.game_rules)
-}
-/// The immutable category declarations installed by mods.
-// hidden: the game builds engine registries from the installed category snapshot.
-#[doc(hidden)]
-pub fn game_rule_categories() -> &'static [String] {
-    installed().map_or(&[], |parts| &parts.game_rule_categories)
-}
-/// Dense position for a validated rule key.
-// hidden: the game resolves load-owned keys to dense positions.
-#[doc(hidden)]
-pub fn game_rule_bool_slot(key: crate::BoolGameRuleKey) -> Option<u32> {
-    installed()?.game_rule_slots.get(key.0 as usize).copied()
-}
 /// Fixtures that tests of other crates use to install Parts.
 #[cfg(any(test, feature = "testing"))]
 pub mod tests {
@@ -133,8 +116,18 @@ pub mod tests {
             .unwrap();
         good.game_rule_category("machines").unwrap();
         super::install_registrar(good, &crate::parts::tests::rule_schema()).unwrap();
-        assert!(crate::BoolGameRuleKey::from_slot(key.0).is_ok());
-        assert!(crate::BoolGameRuleKey::from_slot(key.0 + 1).is_err());
+        assert!(
+            mod_vocab::__private::parts_installation::validate_bool_game_rule_key(
+                mod_vocab::__private::parts_installation::bool_game_rule_key_slot(key)
+            )
+            .is_ok()
+        );
+        assert!(
+            mod_vocab::__private::parts_installation::validate_bool_game_rule_key(
+                mod_vocab::__private::parts_installation::bool_game_rule_key_slot(key) + 1
+            )
+            .is_err()
+        );
         assert!(super::game_rule_bool_slot(key).is_some());
     }
 
@@ -164,24 +157,6 @@ pub mod tests {
         );
         assert!(super::install_registrar(duplicate, &crate::parts::tests::rule_schema()).is_err());
     }
-}
-
-/// Registrar operations for game rules.
-pub trait GameRulesRegistrar {
-    /// Declare a game rule category in the calling mod's namespace. Invalid,
-    /// foreign or duplicate IDs refuse mod loading even if the error is ignored.
-    /// Categories appear in the host's game rules screen; remote clients do not
-    /// receive them in this version.
-    fn game_rule_category(&mut self, id: &str) -> Result<(), crate::GameRuleError>;
-
-    /// Declare a boolean game rule in this mod's namespace. Category references are
-    /// resolved after all mods register; an unknown category refuses installation then.
-    fn game_rule_bool(
-        &mut self,
-        id: &str,
-        category: &str,
-        default: bool,
-    ) -> Result<crate::BoolGameRuleKey, crate::GameRuleError>;
 }
 
 impl GameRulesRegistrar for PartRegistrar {
@@ -218,12 +193,14 @@ impl GameRulesRegistrar for PartRegistrar {
                 .game_rules
                 .request(self.mod_id, &id)
                 .map_err(|_| crate::GameRuleError::InvalidId)?;
-            self.game_rules.push(crate::GameRuleDecl {
-                name: id,
-                category: category.into(),
-                default,
-            });
-            Ok(crate::BoolGameRuleKey(slot))
+            self.game_rules.push(
+                mod_vocab::__private::parts_installation::game_rule_declaration(
+                    id,
+                    category.into(),
+                    default,
+                ),
+            );
+            Ok(mod_vocab::__private::parts_installation::bool_game_rule_key(slot))
         })();
         if let Err(error) = &result {
             self.refused

@@ -21,12 +21,13 @@ use horizon_world::{
     server_player_damage::ServerDamageEnvironment,
     synced_floats::{FloatValue, Observer, SyncedFloats},
 };
-pub use mod_api::health::{HurtSource, ShieldBlock, Victim};
+pub use mod_api::entity::health::{HurtSource, ShieldBlock, Victim};
 use std::{fs, io, path::Path};
 pub(crate) type Attributes = LiveAttributes<Box<dyn horizon_world::attributes::live::Identities>>;
 pub(crate) type State = HurtState<DamageTypeId>;
 
 pub use crate::world::HealthRules;
+mod hit_attempt;
 /// What `LivingEntity.hurtServer` is about to hurt, for [`DamageHooks::incoming`], or
 /// `LivingEntity.knockback` to push, for [`DamageHooks::knockback`]: the entity and the
 /// hit's source.
@@ -39,12 +40,16 @@ pub enum Hurting<'a> {
     Dragon(i32, HurtSource<'a>),
     /// An armor stand, by its entity id, for sweep knockback.
     ArmorStand(i32, HurtSource<'a>),
+    /// A non-living entity, by its entity id and registry type.
+    Entity(i32, &'a str, HurtSource<'a>),
 }
 pub use horizon_world::living_damage::{DamageContainer, Reduction};
 /// The native hooks a hit runs, owned by the game and lent to the level the hit lands in
 /// ([`DamageLevel`]), so no hook is a global. A table with no entry (`NONE`) runs none.
 #[derive(Clone, Copy)]
 pub struct DamageHooks {
+    /// Override vanilla's per-source entity immunity decision.
+    pub invulnerable: Option<fn(DamageLevel<'_>, Hurting<'_>, bool) -> bool>,
     /// `native_living_incoming_damage`: `LivingEntity.hurtServer` once its guards passed. It
     /// may change the container's new damage and post-attack invulnerability ticks; true
     /// cancels the hit.
@@ -72,6 +77,7 @@ pub struct DamageHooks {
 impl DamageHooks {
     /// No hooks: what tests of the vanilla behaviour hit through.
     pub const NONE: Self = Self {
+        invulnerable: None,
         incoming: None,
         pre: None,
         post: None,
@@ -98,6 +104,8 @@ pub struct DamageLevel<'a> {
     hooks: Option<&'a DamageHooks>,
     /// Who attacks in this hit and what they hold: the facts of the site that built the level.
     attack: &'a Attack,
+    /// Whether this is a client's level, for a hook asked on both sides ([`Self::on_client`]).
+    client_side: bool,
 }
 impl<'a> DamageLevel<'a> {
     /// The level of `world`, whose blocks `registry` names.
@@ -129,6 +137,7 @@ impl<'a> DamageLevel<'a> {
             attachment_syncs,
             hooks: Some(hooks),
             attack: &NO_ATTACK,
+            client_side: false,
         }
     }
     /// The level of `world`, with the random and attachments `lent` took out of it.
@@ -152,6 +161,7 @@ impl<'a> DamageLevel<'a> {
             attachment_syncs: &mut lent.attachment_syncs,
             hooks: Some(hooks),
             attack: &NO_ATTACK,
+            client_side: false,
         }
     }
     /// The same level on a client predicting a mob it rides: no damage hooks fire.
@@ -175,7 +185,20 @@ impl<'a> DamageLevel<'a> {
             attachment_syncs: self.attachment_syncs,
             hooks: self.hooks,
             attack: self.attack,
+            client_side: self.client_side,
         }
+    }
+    /// The same level, on a client when `client_side`: a hook asked on both sides tells its
+    /// listener so.
+    pub fn on_client(self, client_side: bool) -> Self {
+        Self {
+            client_side,
+            ..self
+        }
+    }
+    /// Whether this is a client's level ([`Self::on_client`]).
+    pub fn client_side(&self) -> bool {
+        self.client_side
     }
     /// The same level for the hit `attack` describes.
     pub fn attacked_by(self, attack: &'a Attack) -> Self {
@@ -228,6 +251,13 @@ impl<'a> DamageLevel<'a> {
         self.attachment_syncs.insert(holder);
         Ok(self.attachments)
     }
+    /// Return the server hook's immunity decision, or vanilla's without a listener.
+    pub fn invulnerability_check(&mut self, hurting: Hurting<'_>, vanilla: bool) -> bool {
+        match self.hooks.and_then(|hooks| hooks.invulnerable) {
+            Some(hook) => hook(self.reborrow(), hurting, vanilla),
+            None => vanilla,
+        }
+    }
     /// Whether `LivingIncomingDamageEvent` canceled the hit on `hurting`, standing as
     /// `victim` says ([`DamageHooks::incoming`]; never without it).
     pub fn incoming_canceled(
@@ -265,7 +295,7 @@ impl LentLevel {
     pub fn take(world: &mut crate::world::World) -> Self {
         Self {
             random: std::mem::replace(
-                &mut world.random,
+                &mut *world.random,
                 horizon_core::random::LegacyRandom::new(0),
             ),
             attachments: std::mem::take(&mut world.attachments),
@@ -274,7 +304,7 @@ impl LentLevel {
     }
     /// Put them back into `world`.
     pub fn give_back(self, world: &mut crate::world::World) {
-        world.random = self.random;
+        *world.random = self.random;
         world.attachments = self.attachments;
         world.attachment_syncs = self.attachment_syncs;
     }
@@ -858,12 +888,16 @@ impl PlayerMotion {
             causing,
             creative_source,
             false,
+            true,
         )?;
         self.finish_hurt(level, resources, rules, hit)
     }
     /// `hurtServer` up to `hurtHelmet`, for a player who wears a `helmet`; the arguments are
     /// `hurt_caused_by`'s. The caller has the player and the level back to wear the helmet
     /// with ([`PausedHurt::helmet_damage`]), and ends the hit with [`Self::finish_hurt`].
+    /// `can_harm_player` is the server PvP decision, applied after the invulnerability
+    /// observation. Non-PvP damage passes true. The base observation is retained across
+    /// all continuations belonging to this hit.
     pub fn start_hurt(
         &mut self,
         level: &mut DamageLevel<'_>,
@@ -876,9 +910,12 @@ impl PlayerMotion {
         causing: i32,
         creative_source: bool,
         helmet: bool,
+        can_harm_player: bool,
     ) -> Result<PausedHurt> {
         let mut hit = PausedHurt {
             pending: None,
+            invulnerability_checked: None,
+            can_harm_player,
             selected: None,
             inner: None,
             source,
@@ -898,6 +935,7 @@ impl PlayerMotion {
             blocking,
             blocked: 0.0,
             shield_damage: 0,
+            blocking_item_used: false,
             fully_blocked: false,
             block_sound: false,
             knocked: false,
@@ -978,6 +1016,7 @@ impl PlayerMotion {
             hurt,
             blocked: hit.blocked,
             shield_damage: hit.shield_damage,
+            blocking_item_used: hit.blocking_item_used,
             fully_blocked: hit.fully_blocked,
             sound: hit.block_sound,
             knockback: hit.knocked,
@@ -1053,6 +1092,8 @@ impl PlayerMotion {
         let h = &mut self.health;
         let mut environment = Environment {
             level: level.reborrow(),
+            invulnerability_checked: hit.invulnerability_checked,
+            can_harm_player: hit.can_harm_player,
             entity: self.entity_id,
             victim,
             causing: hit.causing,
@@ -1073,6 +1114,7 @@ impl PlayerMotion {
             blocking: hit.blocking.take(),
             blocked: hit.blocked,
             shield_damage: hit.shield_damage,
+            blocking_item_used: hit.blocking_item_used,
             fully_blocked: hit.fully_blocked,
             block_sound: hit.block_sound,
             knocked: hit.knocked,
@@ -1092,9 +1134,11 @@ impl PlayerMotion {
             )?,
             &mut h.hurt,
         )?;
+        hit.invulnerability_checked = environment.invulnerability_checked;
         hit.blocking = environment.blocking;
         hit.blocked = environment.blocked;
         hit.shield_damage = environment.shield_damage;
+        hit.blocking_item_used = environment.blocking_item_used;
         hit.fully_blocked = environment.fully_blocked;
         hit.block_sound = environment.block_sound;
         hit.knocked = environment.knocked;
@@ -1122,6 +1166,8 @@ impl PlayerMotion {
     }
 }
 pub(crate) struct Environment<'a> {
+    pub(crate) invulnerability_checked: Option<bool>,
+    pub(crate) can_harm_player: bool,
     /// The level the hit lands in, for the damage hooks.
     pub(crate) level: DamageLevel<'a>,
     /// The player's entity id, and the causing entity's (0: none or not known).
@@ -1159,6 +1205,7 @@ pub(crate) struct Environment<'a> {
     pub(crate) blocked: f32,
     /// The durability the blocking item loses.
     pub(crate) shield_damage: i32,
+    pub(crate) blocking_item_used: bool,
     /// What it blocked covers the whole hit, as difficulty scaled it.
     pub(crate) fully_blocked: bool,
     pub(crate) block_sound: bool,
@@ -1179,6 +1226,8 @@ pub(crate) struct Environment<'a> {
 /// Everything the player and level hold is read again when it resumes.
 #[derive(Debug)]
 pub struct PausedHurt {
+    invulnerability_checked: Option<bool>,
+    can_harm_player: bool,
     /// None for a hit refused before `hurtHelmet`.
     selected: Option<horizon_world::living_hurt::SelectedHurt<()>>,
     inner: Option<bool>,
@@ -1203,6 +1252,7 @@ pub struct PausedHurt {
     blocking: Option<Blocking>,
     blocked: f32,
     shield_damage: i32,
+    blocking_item_used: bool,
     fully_blocked: bool,
     block_sound: bool,
     knocked: bool,
@@ -1227,6 +1277,18 @@ pub struct Blocking {
     pub pierce: bool,
     /// Angle between the head's view and the source position (pi without one).
     pub angle: f64,
+}
+impl Blocking {
+    /// `BlocksAttacks.resolveBlockedDamage`: what the item stops of `damage`,
+    /// nothing for a source it bypasses or an arrow that pierces it.
+    pub fn blocked(&self, damage: f32) -> f32 {
+        if damage <= 0.0 || self.bypassed || self.pierce {
+            return 0.0;
+        }
+        self.rules
+            .resolve(&mut MatchedSets, damage, self.angle)
+            .unwrap_or(0.0)
+    }
 }
 /// How many hurts `PlayerMotion::hurt_log` keeps.
 const HURT_LOG: usize = 64;
@@ -1273,6 +1335,8 @@ pub struct AttackRecord {
 /// The outcome of a hurt with a raised blocking item.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockOutcome {
+    /// `hurtBlockingItem` ran, including when reductions resolve to zero.
+    pub blocking_item_used: bool,
     pub hurt: bool,
     pub blocked: f32,
     /// The durability the blocking item loses (`ItemDamageFunction`, or what a
@@ -1478,6 +1542,9 @@ impl ImmunityWorld for Environment<'_> {
     fn client_loaded(&mut self) -> io::Result<bool> {
         Ok(self.client_loaded)
     }
+    fn invulnerability_check(&mut self, vanilla: bool) -> io::Result<bool> {
+        Ok(self.observe_hit_invulnerability(vanilla))
+    }
 }
 impl HurtWorld for Environment<'_> {
     type Error = io::Error;
@@ -1573,6 +1640,7 @@ impl HurtWorld for Environment<'_> {
         else {
             return Ok(0.0);
         };
+        self.blocking_item_used = true;
         self.blocked = block.blocked_damage;
         // `setShieldDamage` is what the item loses if `blocked` holds, whatever
         // `blocked_damage` says; below 0, the item's own `itemDamage` of what is stopped.
@@ -1735,13 +1803,17 @@ impl ServerPlayerHurtWorld for Environment<'_> {
     type Player = ();
     type Arrow = ();
     fn causing_entity(&mut self, _: &mut State) -> io::Result<CausingEntity<(), ()>> {
-        Ok(CausingEntity::Other)
+        Ok(if self.can_harm_player {
+            CausingEntity::Other
+        } else {
+            CausingEntity::Player(())
+        })
     }
     fn arrow_player_owner(&mut self, _: &mut State, _: ()) -> io::Result<Option<()>> {
         Ok(None)
     }
     fn can_harm_player(&mut self, _: &mut State, _: ()) -> io::Result<bool> {
-        Ok(true)
+        Ok(self.can_harm_player)
     }
 }
 
@@ -1751,6 +1823,33 @@ mod datapack_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_hook_can_refuse_one_damage_type_and_allow_another() {
+        use crate::mobs::{Damage, DamageKind, Mob};
+        fn immune_to_generic(_: DamageLevel<'_>, hurting: Hurting<'_>, vanilla: bool) -> bool {
+            match hurting {
+                Hurting::Mob(_, hit) if matches!(hit.kind, DamageKind::Generic) => true,
+                _ => vanilla,
+            }
+        }
+        let hooks = DamageHooks {
+            invulnerable: Some(immune_to_generic),
+            ..DamageHooks::NONE
+        };
+        let mut test_level = TestLevel::with_hooks(0, hooks);
+        let level = &mut test_level.level();
+        let mut mob = Mob::new(
+            9201,
+            crate::mobs::sensor_scan_tests::kind(),
+            Default::default(),
+            0.0,
+        );
+        assert!(!mob.damage(level, 2.0, Damage::of(DamageKind::Generic)));
+        assert_eq!(mob.health, 10.0);
+        assert!(mob.damage(level, 2.0, Damage::of(DamageKind::Fall)));
+        assert_eq!(mob.health, 8.0);
+    }
+
     #[test]
     fn the_weapon_is_the_attackers_main_hand_only_for_its_own_hit() {
         let sword = crate::items::ItemStack::new("minecraft:iron_sword", 1);
@@ -2065,9 +2164,10 @@ mod tests {
             container: &mut DamageContainer,
         ) -> bool {
             let (entity, seen) = match hurting {
-                Hurting::Player(e, s) | Hurting::Dragon(e, s) | Hurting::ArmorStand(e, s) => {
-                    (e, format!("{} {}", s.damage_type, s.causing))
-                }
+                Hurting::Player(e, s)
+                | Hurting::Dragon(e, s)
+                | Hurting::ArmorStand(e, s)
+                | Hurting::Entity(e, _, s) => (e, format!("{} {}", s.damage_type, s.causing)),
                 Hurting::Mob(mob, source) => (mob.id as i32, format!("{:?}", source.kind)),
             };
             if !matches!(entity, 9001..=9005 | 9011..=9013) {
@@ -2142,11 +2242,13 @@ mod tests {
         // goes on. The hearts would take their 1.5; half of it is 0.75, so 5.25 reaches the
         // health (10 - 5.25) and 0.75 hearts are left.
         let mut modified = mob(9005);
+        modified.add_effect("absorption", 600, 0);
         modified.absorption = 1.5;
         assert!(modified.damage(level, 8.0, hit));
         assert_eq!((modified.health, modified.absorption), (4.75, 0.75));
         // The same hit with no modifier: 8 less the 1.5 hearts.
         let mut plain = mob(9006);
+        plain.add_effect("absorption", 600, 0);
         plain.absorption = 1.5;
         assert!(plain.damage(level, 8.0, hit));
         assert_eq!((plain.health, plain.absorption), (3.5, 0.0));
@@ -2254,7 +2356,7 @@ mod tests {
             m.on_ground = true;
             m.attrs.knockback_resistance = own;
             m.gear_knockback_resistance = gear;
-            m.knockback(level, 0.4, 3.0, 0.0, &hit);
+            m.knockback(level, 0.4, 3.0, 0.0, &hit, 0.0);
             m.velocity.x
         };
         assert_eq!(pushed(None, 0.0), -0.4);
@@ -2291,7 +2393,7 @@ mod tests {
         let hit = Damage::player([3.0, 0.0, 0.0]);
         let mut push = |id, resistance| {
             let mut m = mob(id, resistance);
-            m.knockback(level, 0.4, 3.0, 0.0, &hit);
+            m.knockback(level, 0.4, 3.0, 0.0, &hit, 0.0);
             m
         };
         // No mod in the way (the hook leaves 9100 alone): vanilla's push, away from x = 3.

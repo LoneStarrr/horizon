@@ -626,9 +626,7 @@ impl Snapshot {
                 if wire.shape < -1 || wire.shape >= shapes.len() as i32 {
                     return Err(invalid("cached shape index out of range"));
                 }
-                let fluid_kind = FluidKind::ALL
-                    .get(wire.fluid_kind as usize)
-                    .copied()
+                let fluid_kind = FluidKind::from_tick_id(wire.fluid_kind.into())
                     .ok_or_else(|| invalid("cached fluid kind out of range"))?;
                 let fluid = registry
                     .state(BlockStateId(id as u32))
@@ -648,6 +646,9 @@ impl Snapshot {
                     dampening: wire.dampening,
                     hardness: wire.hardness,
                     push: push(wire.push)?,
+                    resolved_push: super::super::piston_reactions::CachedReaction::new(push(
+                        wire.push,
+                    )?),
                     instrument: wire.instrument,
                     shape: wire.shape,
                 })

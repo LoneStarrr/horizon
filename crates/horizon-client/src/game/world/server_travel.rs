@@ -9,6 +9,7 @@
 
 use super::end::GatewayJob;
 use super::nether_portal::{PLAYER_DELAY, Plan};
+use super::persist::OffLevel;
 use super::respawn_anchor::RespawnConfig;
 use super::respawn_position::Respawn;
 use super::{Dim, Game, Mob, boats, lan::LanHost, minecarts};
@@ -154,6 +155,7 @@ macro_rules! server_ctx {
             next_entity: &mut $s.next_entity,
             spawn,
             spawn_angle: $s.level.world_spawn_angle,
+            sea_level: $s.end.locator().map_or(63, |terrain| terrain.sea_level()),
             difficulty: i32::from($s.ui.difficulty),
             difficulty_locked: $s.level.difficulty_locked,
             clock_rate,
@@ -175,7 +177,7 @@ macro_rules! server_ctx {
 /// the blocks of the level the guest arrives in.
 fn drop_hook(host: &mut LanHost, conn: u32) {
     if let Some(play) = host.play.get_mut(&conn) {
-        play.hook = None;
+        play.hook.discard();
     }
 }
 
@@ -417,6 +419,16 @@ impl Game<'_> {
     /// id its handle names) may travel to the level `to`, asked before
     /// anything of it moves. Only a server asks, and only when a mod listens.
     pub(super) fn entity_may_travel(&mut self, id: u32, to: Dim, cause: TravelCause) -> bool {
+        self.entity_tree_may_travel(id, to, cause, &mut Vec::new())
+    }
+
+    fn entity_tree_may_travel(
+        &mut self,
+        id: u32,
+        to: Dim,
+        cause: TravelCause,
+        visited: &mut Vec<u32>,
+    ) -> bool {
         if !self.native_authoritative()
             || !mod_api::__private::listened(mod_api::HookId::EntityTravelToDimension)
         {
@@ -425,6 +437,19 @@ impl Game<'_> {
         let Some(epoch) = self.native_lifecycle.epoch() else {
             return true;
         };
+        if visited.contains(&id)
+            || (!self.held_out.contains(&id)
+                && self
+                    .native_entity_target(mod_api::EntityRef::new(epoch, id))
+                    .is_none())
+        {
+            return false;
+        }
+        let entity = mod_api::EntityRef::new(epoch, id);
+        // A callback can reparent a participant into a later subtree.
+        // Keep the whole transition's visited set, not only its active path.
+        visited.push(id);
+        let riders = self.entity_passengers(entity).unwrap_or_default();
         let mut cancel = false;
         self.native_entity_travel_to_dimension(
             mod_api::EntityRef::new(epoch, id),
@@ -432,11 +457,54 @@ impl Game<'_> {
             cause.id(),
             &mut cancel,
         );
-        !cancel
+        // A discard hides the handle immediately, even when physical removal
+        // waits for the entity sweep. Never serialize that deferred copy.
+        // Falling blocks tick held out of the level and cannot be addressed
+        // through a handle during this callback.
+        if cancel {
+            return false;
+        }
+        if self.held_out.contains(&id) {
+            return true;
+        }
+        if self
+            .native_entity_target(mod_api::EntityRef::new(epoch, id))
+            .is_none()
+        {
+            return false;
+        }
+        // One snapshot in the shared player/mob boarding order. Ejection can
+        // itself call mods; refuse changed edges instead of overriding them.
+        for &rider in riders.iter().rev() {
+            if self.entity_vehicle(rider) != Some(entity) {
+                continue;
+            }
+            if !self.entity_stop_riding(rider) && self.entity_vehicle(rider) == Some(entity) {
+                return false;
+            }
+        }
+        let accepted: Vec<_> = riders
+            .into_iter()
+            .filter(|rider| {
+                self.entity_is_passenger(*rider) == Some(false)
+                    && self.entity_tree_may_travel(rider.id(), to, cause, visited)
+            })
+            .collect();
+        for rider in accepted {
+            if self.entity_is_passenger(rider) == Some(false)
+                && !self.mobs.iter().any(|m| m.id == rider.id() && !m.alive())
+            {
+                // Reject callback topology changes: the shared mount path
+                // checks live handles, dimension, cycles and vehicle capacity.
+                self.entity_start_riding(rider, entity, true);
+            }
+        }
+        self.native_entity_target(mod_api::EntityRef::new(epoch, id))
+            .is_some()
     }
 
     /// `Entity.handlePortal` for one player, whose portal state is in place.
-    fn handle_server_portal(&mut self, conn: u32) {
+    pub(super) fn handle_server_portal(&mut self, conn: u32) {
         let Some(host) = self.lan.as_ref() else {
             return;
         };
@@ -486,7 +554,11 @@ impl Game<'_> {
                 // PlayerEvent.Clone with `wasDeath` false.
                 if let Some(g) = host.hub.guest(conn) {
                     let (uuid, name) = (g.uuid, g.name.clone());
-                    self.native_player_clone(uuid, &name, false);
+                    if let Some(original) = self.capture_original_player(conn) {
+                        self.with_original_player(original, |game, original| {
+                            game.native_player_clone(uuid, &name, false, original);
+                        });
+                    }
                 }
                 self.start_server_trip(conn, Dim::Overworld, None, true);
                 self.portals.player.cooldown = 10;
@@ -605,7 +677,11 @@ impl Game<'_> {
                 .hub
                 .guests
                 .iter()
-                .filter(|g| g.vehicle == Some(vehicle) && !self.on_server_trip(g.conn))
+                .filter(|g| {
+                    g.vehicle
+                        .is_some_and(|mount| self.vehicle_tree_contains_mount(vehicle, mount))
+                        && !self.on_server_trip(g.conn)
+                })
                 .map(|g| g.conn)
                 .collect();
             // Entity.canTeleport: out of the End, every rider has seen the
@@ -618,19 +694,26 @@ impl Game<'_> {
             {
                 continue;
             }
-            // The vehicle and each rider are asked; one cancel keeps them all.
+            // Refused passengers are detached and stay in the source level.
             let cause = TravelCause::of_plan(&plan);
-            if !self.entity_may_travel(vehicle, plan.dim, cause)
-                || !riders
-                    .iter()
-                    .all(|&conn| self.server_player_travel_allowed(conn, plan.dim, cause))
-            {
+            if !self.entity_may_travel(vehicle, plan.dim, cause) {
                 continue;
             }
             // An End portal's exit is found as a player's (its own respawn
             // point out of the End).
             let (target, plan) = (plan.dim, (!plan.end).then_some(plan));
             for conn in riders {
+                if !self
+                    .lan
+                    .as_ref()
+                    .and_then(|h| h.hub.guest(conn))
+                    .is_some_and(|g| {
+                        g.vehicle
+                            .is_some_and(|mount| self.vehicle_tree_contains_mount(vehicle, mount))
+                    })
+                {
+                    continue;
+                }
                 self.start_server_trip(conn, target, plan, false);
             }
         }
@@ -679,8 +762,9 @@ impl Game<'_> {
         // passenger, and the vehicle is recreated in the other dimension,
         // where they ride it again (`Entity.teleportCrossDimension`). It
         // keeps its entity id, so the ride is never broken.
-        let vehicle = g.vehicle.filter(|id| {
-            self.mobs.iter().any(|m| m.id == *id)
+        let direct_vehicle = g.vehicle;
+        let vehicle = direct_vehicle.filter(|id| {
+            self.mob_object(*id).is_some_and(|mob| !mob.removed)
                 || self.boats.iter().any(|b| b.id == *id)
                 || self.carts.iter().any(|c| c.id == *id)
         });
@@ -691,7 +775,10 @@ impl Game<'_> {
         let scale = if end {
             1.0
         } else {
-            Dim::teleportation_scale(source, target)
+            horizon_world::dimension_type::DimensionFacts::teleportation_scale(
+                self.dimension_type_of(source),
+                self.dimension_type_of(target),
+            )
         };
         self.end_portal_travel = end;
         // Leaving the End: the player's own respawn point.
@@ -729,7 +816,10 @@ impl Game<'_> {
         }
         self.bind_player_attachments(conn, false);
         self.as_guest(conn, |g| {
-            g.trigger_dimension(source, target, [from.x, from.y, from.z])
+            g.trigger_dimension(source, target, [from.x, from.y, from.z]);
+            if source != target && !credits_respawn {
+                g.stop_active_item_use();
+            }
         });
         self.server_trips.push(Trip {
             conn,
@@ -778,11 +868,14 @@ impl Game<'_> {
     /// in the level in place: where it stands up, facing the anchor (with
     /// the deplete sound) or the bed; else the point is forgotten, and the
     /// caller tells the player (`Hub::missing_respawn_block`).
-    pub(super) fn resolve_server_respawn(&mut self, config: RespawnConfig) -> Option<(Vec3, f32)> {
+    pub(super) fn resolve_server_respawn(
+        &mut self,
+        config: RespawnConfig,
+    ) -> Option<(Vec3, f32, f32)> {
         let [x, y, z] = config.pos;
         let anchor = self.is_anchor(self.world.block(x, y, z));
         match self.find_respawn_and_use(config, true) {
-            Ok(Some((at, yaw))) => {
+            Ok(Some((at, yaw, pitch))) => {
                 if !config.forced && anchor {
                     let [x, y, z] = config.pos.map(f64::from);
                     self.audio.play(
@@ -798,7 +891,7 @@ impl Game<'_> {
                 if self.spawn_point_change(config.dim, Some(config.pos), config.forced) {
                     self.respawn_config = None;
                 }
-                Some((at, yaw))
+                Some((at, yaw, pitch))
             }
             Ok(None) | Err(_) => {
                 // The block is gone: `PlayerList.respawn` skips
@@ -937,7 +1030,12 @@ impl Game<'_> {
             let (position, yaw) = if let Some(config) = trip.respawn {
                 let found = self.as_guest(trip.conn, |g| g.resolve_server_respawn(config));
                 match found {
-                    Some(Some(found)) => found,
+                    Some(Some((at, yaw, pitch))) => {
+                        if let Some(host) = self.lan.as_mut() {
+                            host.hub.guests.update(i, |guest| guest.pitch = pitch);
+                        }
+                        (at, yaw)
+                    }
                     _ => {
                         if let Some(host) = self.lan.as_mut() {
                             host.hub.missing_respawn_block(trip.conn);
@@ -1104,32 +1202,76 @@ impl Game<'_> {
     /// (`Entity.teleportCrossDimension` recreates the vehicle in the other
     /// dimension, and its passengers ride it again).
     fn arrive_vehicle(&mut self, source: Dim, id: u32, at: Vec3, yaw: f32) {
+        let Some(id) = self.parked_vehicle_root(source, id) else {
+            return;
+        };
         let motion = self
             .portals
             .carried_motion
             .remove(&id)
             .unwrap_or(Vec3::ZERO);
+        let carried = self.portals.carried_cooldown.remove(&id);
         let Some(parked) = self.levels.parked_mut(source) else {
             return;
         };
-        if let Some(mut b) = take_vehicle(&mut parked.boats, id, at, yaw, motion) {
-            self.rebind_transferred_entity(source, id, &mut b);
-            self.boats.push(b);
-        } else if let Some(mut c) = take_vehicle(&mut parked.carts, id, at, yaw, motion) {
-            self.rebind_transferred_entity(source, id, &mut c);
-            self.carts.push(c);
-        } else if let Some(mut m) = take_vehicle(&mut parked.mobs, id, at, yaw, motion) {
-            self.rebind_transferred_entity(source, id, &mut m);
-            self.mobs.push(m);
+        let before = parked
+            .boats
+            .iter()
+            .find(|body| body.id == id)
+            .map(|body| (body.position, [body.yaw, 0.0]))
+            .or_else(|| {
+                parked
+                    .carts
+                    .iter()
+                    .find(|body| body.id == id)
+                    .map(|body| (body.position, [body.yaw, 0.0]))
+            })
+            .or_else(|| {
+                parked
+                    .mobs
+                    .iter()
+                    .find(|body| body.id == id)
+                    .map(|body| (body.position, [body.yaw, body.head_pitch]))
+            });
+        let Some((from, rotation)) = before else {
+            return;
+        };
+        // Keep the root out of both levels until its passengers have been
+        // admitted: teleportCrossDimension copies passengers before the root.
+        let vehicle = if let Some(body) = take_vehicle(&mut parked.boats, id, at, yaw, motion) {
+            OffLevel::Boat(body)
+        } else if let Some(body) = take_vehicle(&mut parked.carts, id, at, yaw, motion) {
+            OffLevel::Cart(body)
+        } else if let Some(body) = take_vehicle(&mut parked.mobs, id, at, yaw, motion) {
+            OffLevel::Mob(body)
         } else {
             return;
+        };
+        let left = parked
+            .portal_states
+            .remove(&id)
+            .map_or(0, |state| state.cooldown);
+        // All object-owned metadata moves, including rejected intermediate bodies;
+        // ordinary destination queries still expose only admitted objects.
+        for mut mob in self.move_entity_memory(source, id) {
+            mob.position = super::vehicle_teleport::passenger_destination(from, at, mob.position);
+            mob.previous = mob.position;
+            let [turned_yaw, pitch] = super::vehicle_teleport::passenger_rotation(
+                rotation,
+                [yaw, rotation[1]],
+                [mob.yaw, mob.head_pitch],
+            );
+            mob.yaw = turned_yaw;
+            mob.previous_yaw = turned_yaw;
+            mob.body_yaw = turned_yaw;
+            mob.head_yaw = turned_yaw;
+            mob.head_pitch = pitch;
+            mob.previous_head_pitch = pitch;
+            self.admit_transferred_object(OffLevel::Mob(mob));
         }
-        // Its memory (its UUID and the compound it was loaded with) moves
-        // with it, so it is saved in this level as it was in the other.
-        self.move_entity_memory(source, id);
-        // The vehicle that came through a portal does not go back through it
-        // for a while (`Entity.setPortalCooldown`).
-        self.set_portal_cooldown(id);
+        self.admit_transferred_object(vehicle);
+        // The source may have ticked while the player's destination was loading.
+        self.portals.entities.entry(id).or_default().cooldown = carried.unwrap_or(left);
     }
 
     /// Tells the mods of the teleports a command made inside a level, with
@@ -1267,6 +1409,7 @@ impl Game<'_> {
         let spawn = self.world_spawn_position();
         let clock_rate = self.network_clock_rate();
         TickCtx {
+            sea_level: self.end.locator().map_or(63, |terrain| terrain.sea_level()),
             world: &mut self.world,
             entities: &[],
             next_entity: &mut self.next_entity,
@@ -1367,7 +1510,7 @@ mod tests {
             Box::new(Observer(joins.clone())),
         )]
         .into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 game.native_joins_skip();
                 let base = game.next_entity;
@@ -1377,6 +1520,15 @@ mod tests {
                     minecarts::CartKind::Rideable,
                     Vec3::ZERO,
                 ));
+                let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
+                let mut child = Mob::new(base + 10, kind, Vec3::ZERO, 0.0);
+                child.extra.mount = Some(base + 1);
+                game.persist
+                    .off_level
+                    .insert(base + 10, super::super::persist::OffLevel::Mob(child));
+                // It left with 7; the source level has run it down to 3 since.
+                game.portals.entities.entry(base + 1).or_default().cooldown = 3;
+                game.portals.carried_cooldown.insert(base + 1, 7);
                 let source = game.dim;
                 game.enter_level(Dim::Nether).unwrap();
                 game.carts.push(minecarts::Minecart::new(
@@ -1386,10 +1538,257 @@ mod tests {
                 ));
                 game.native_joins_flush(false, 0);
                 game.arrive_vehicle(source, base + 1, Vec3::ZERO, 0.0);
+                assert!(
+                    game.mob_object(base + 10).is_some(),
+                    "natural carrier arrival must transfer retained passenger"
+                );
+                assert_eq!(game.portals.entities[&(base + 1)].cooldown, 7);
+                assert!(
+                    !game
+                        .levels
+                        .parked_mut(source)
+                        .unwrap()
+                        .portal_states
+                        .contains_key(&(base + 1))
+                );
                 game.native_joins_flush(false, 0);
                 game.native_joins_flush(false, 0);
-                assert_eq!(*joins.lock().unwrap(), vec![base + 2, base + 1]);
+                assert_eq!(*joins.lock().unwrap(), vec![base + 2, base + 10, base + 1]);
             });
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn natural_carrier_moves_full_objects_and_readmits_the_tree_in_order() {
+        use mod_api::{AttachmentType, EntityConstructingEvent, Holder, Hooks, HostSide};
+        use std::sync::Mutex;
+        const STATE: AttachmentType<i32> = AttachmentType {
+            namespace: "natural_tree",
+            name: "state",
+            default: || 0,
+            codec: None,
+            copy_on_death: false,
+            sync: false,
+        };
+        struct Constructed(Arc<Mutex<Vec<Holder>>>);
+        #[mod_api::__subscriptions]
+        impl Hooks for Constructed {
+            fn entity_constructing(&self, host: HostSide<'_>, event: &mut EntityConstructingEvent) {
+                self.0.lock().unwrap().push(event.holder);
+                if let HostSide::Server(host) = host {
+                    STATE.set(host, event.holder, 41).unwrap();
+                }
+            }
+        }
+        for conflict in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
+                "natural_tree",
+                Box::new(Constructed(calls.clone())),
+            )]
+            .into();
+            mod_platform::testing::with_mods(mods, || {
+                super::super::native_entity_refs::tests::with_game(|game| {
+                    game.options.dedicated = Some(Vec::new());
+                    let tag = horizon_core::nbt::parse_snbt(r#"{
+                    id:"minecraft:pig",UUID:[I;703,0,0,1],Pos:[1.0d,80.0d,2.0d],NoAI:1b,
+                    Passengers:[
+                        {id:"minecraft:cow",UUID:[I;703,0,0,1],Pos:[1.0d,81.0d,2.0d],NoAI:1b,
+                         Passengers:[{id:"minecraft:chicken",UUID:[I;703,0,0,2],Pos:[1.0d,82.0d,2.0d],NoAI:1b}]},
+                        {id:"minecraft:sheep",UUID:[I;703,0,0,2],Pos:[1.0d,81.0d,2.0d],NoAI:1b}
+                    ]
+                }"#).unwrap().0;
+                    let root = game.load_mob(tag, None).unwrap();
+                    let children = game.mob_passenger_ids(root);
+                    let (held, sibling) = (children[0], children[1]);
+                    let leaf = game.mob_passenger_ids(held)[0];
+                    let ids = [root, held, leaf, sibling];
+                    assert!(game.persist.off_level.contains_key(&held));
+                    assert!(game.persist.off_level.contains_key(&sibling));
+                    STATE.set(game, Holder::Entity(leaf), 77).unwrap();
+                    game.persist.forced_meta.insert(leaf, [5, 6, 7, 8]);
+                    game.portals.entities.entry(leaf).or_default().cooldown = 19;
+                    let source = game.dim;
+                    game.enter_level(Dim::Nether).unwrap();
+                    let owner = conflict.then(|| {
+                    let tag = horizon_core::nbt::parse_snbt(r#"{id:"minecraft:zombie",UUID:[I;703,0,0,1],Pos:[0.0d,70.0d,0.0d],NoAI:1b}"#).unwrap().0;
+                    game.load_mob(tag, None).unwrap()
+                });
+                    let before = calls.lock().unwrap().clone();
+                    // A player's direct mount may be nested below a retained object;
+                    // arrival must still carry the actual source root and every sibling.
+                    let destination = Vec3::new(32.0, 90.0, 48.0);
+                    game.arrive_vehicle(source, leaf, destination, 90.0);
+                    assert!(ids.iter().all(|id| game.mob_object(*id).is_some()));
+                    assert!(game.persist.off_level.contains_key(&root));
+                    assert!(game.persist.off_level.contains_key(&sibling));
+                    assert_eq!(game.persist.off_level.contains_key(&held), conflict);
+                    assert!(game.entity(root).is_none());
+                    assert!(game.entity(sibling).is_none());
+                    assert!(game.entity(leaf).is_some());
+                    assert_eq!(game.entity(held).is_some(), !conflict);
+                    if let Some(owner) = owner {
+                        assert!(game.entity(owner).is_some());
+                    }
+                    assert_eq!(game.mob_object(held).unwrap().extra.mount, Some(root));
+                    assert_eq!(game.mob_object(leaf).unwrap().extra.mount, Some(held));
+                    assert_eq!(game.mob_object(sibling).unwrap().extra.mount, Some(root));
+                    assert_eq!(game.mob_object(root).unwrap().position, destination);
+                    assert_eq!(
+                        game.mob_object(held).unwrap().position,
+                        Vec3::new(32.0, 91.0, 48.0)
+                    );
+                    assert_eq!(
+                        game.mob_object(leaf).unwrap().position,
+                        Vec3::new(32.0, 92.0, 48.0)
+                    );
+                    assert_eq!(
+                        game.mob_object(sibling).unwrap().position,
+                        Vec3::new(32.0, 91.0, 48.0)
+                    );
+                    assert_eq!(game.persist.forced_meta.get(&leaf), Some(&[5, 6, 7, 8]));
+                    assert_eq!(game.portals.entities[&leaf].cooldown, 19);
+                    assert_eq!(STATE.get(game, Holder::Entity(leaf)), Ok(77));
+                    if !conflict {
+                        assert_eq!(STATE.get(game, Holder::Entity(held)), Ok(41));
+                    }
+                    assert!(game.mobs_below_off_level().contains(&leaf));
+                    game.native_joins_flush(false, 0);
+                    assert_eq!(
+                        *calls.lock().unwrap(),
+                        before,
+                        "arrival must not construct again"
+                    );
+                    // Another player from the same stack arrives without duplicating it.
+                    game.arrive_vehicle(source, leaf, destination, 90.0);
+                    assert_eq!(
+                        game.mob_objects().filter(|m| ids.contains(&m.id)).count(),
+                        4
+                    );
+                    game.enter_level(source).unwrap();
+                    for id in ids {
+                        assert!(game.mob_object(id).is_none());
+                        assert!(!game.persist.uuids.contains_key(&id));
+                        assert!(!game.persist.raw.contains_key(&id));
+                        assert!(!game.persist.forced_meta.contains_key(&id));
+                    }
+                    game.enter_level(Dim::Nether).unwrap();
+                    assert_eq!(STATE.get(game, Holder::Entity(leaf)), Ok(77));
+                    game.native_joins_flush(false, 0);
+                    assert_eq!(*calls.lock().unwrap(), before);
+                })
+            });
+        }
+    }
+
+    /// `Entity.teleportCrossDimension` admits the passengers before the copied
+    /// vehicle, so a pig that shares its boat's or minecart's UUID takes it in
+    /// the destination and the vehicle is retained off-level below it.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn natural_carrier_retains_a_vehicle_root_refused_by_its_passenger() {
+        for (kind, uuid) in [("minecraft:oak_boat", 705), ("minecraft:minecart", 706)] {
+            super::super::native_entity_refs::tests::with_game(|game| {
+                game.options.dedicated = Some(Vec::new());
+                let tag = horizon_core::nbt::parse_snbt(&format!(
+                    r#"{{id:"{kind}",UUID:[I;{uuid},0,0,1],Pos:[1.0d,80.0d,2.0d],
+                    Passengers:[{{id:"minecraft:pig",UUID:[I;{uuid},0,0,1],Pos:[1.0d,80.0d,2.0d],NoAI:1b,
+                     Passengers:[{{id:"minecraft:chicken",UUID:[I;{uuid},0,0,2],Pos:[1.0d,80.0d,2.0d],NoAI:1b}}]}}]}}"#
+                ))
+                .unwrap()
+                .0;
+                let root = if kind.ends_with("boat") {
+                    game.load_boat_transferred(tag, Some([uuid, 0, 0, 1]), kind, None)
+                } else {
+                    game.load_cart_transferred(tag, Some([uuid, 0, 0, 1]), kind, None)
+                }
+                .unwrap();
+                let pig = game.mob_passenger_ids(root)[0];
+                let chicken = game.mob_passenger_ids(pig)[0];
+                assert!(game.persist.off_level.contains_key(&pig));
+                let source = game.dim;
+                game.enter_level(Dim::Nether).unwrap();
+                game.arrive_vehicle(source, chicken, Vec3::new(32.0, 90.0, 48.0), 0.0);
+                assert!(game.entity(pig).is_some());
+                assert!(game.entity(chicken).is_some());
+                assert!(game.entity(root).is_none());
+                assert!(game.boats.iter().all(|b| b.id != root));
+                assert!(game.carts.iter().all(|c| c.id != root));
+                assert!(game.boat_object(root).is_some() || game.cart_object(root).is_some());
+                assert_eq!(game.mob_object(pig).unwrap().extra.mount, Some(root));
+                assert_eq!(game.mob_object(chicken).unwrap().extra.mount, Some(pig));
+                assert!(game.mobs_below_off_level().contains(&pig));
+                assert!(game.mobs_below_off_level().contains(&chicken));
+                game.enter_level(source).unwrap();
+                for id in [root, pig, chicken] {
+                    assert!(!game.persist.off_level.contains_key(&id));
+                    assert!(game.mob_object(id).is_none());
+                }
+                assert!(game.boats.iter().all(|b| b.id != root));
+                assert!(game.carts.iter().all(|c| c.id != root));
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn natural_portal_schedules_a_player_on_a_retained_indirect_vehicle() {
+        super::super::native_entity_refs::tests::with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            super::super::native_player_death::tests::add_guest(game);
+            let source = game.dim;
+            let tag = horizon_core::nbt::parse_snbt(
+                r#"{
+                id:"minecraft:pig",UUID:[I;704,0,0,1],Pos:[1.0d,80.0d,2.0d],NoAI:1b,
+                Passengers:[{id:"minecraft:cow",UUID:[I;704,0,0,1],Pos:[1.0d,81.0d,2.0d],NoAI:1b}]
+            }"#,
+            )
+            .unwrap()
+            .0;
+            let root = game.load_mob(tag, None).unwrap();
+            let held = game.mob_passenger_ids(root)[0];
+            assert!(game.persist.off_level.contains_key(&held));
+            game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
+                guest.vehicle = Some(held);
+            });
+            super::super::native_entity_refs::tests::prepare_entity_ticking_neighborhood(
+                game,
+                horizon_core::position::ChunkPos::new(0, 0),
+            );
+            game.tickets.add_portal((0, 0));
+            game.update_chunk_tickets();
+            assert!(game.entity_ticking_area()(1, 2));
+            // Supply the block's real inside notification, then exercise the actual
+            // entity portal processor, carrier routing and server trip scheduler.
+            let delay = horizon_client::nether_portal::ENTITY_DELAY;
+            game.portals
+                .entities
+                .entry(root)
+                .or_default()
+                .set_inside(BlockPos::new(1, 80, 2), delay);
+            game.handle_entity_portals();
+            assert!(
+                game.mob_object(root).is_some(),
+                "route through the player carrier path"
+            );
+            game.carry_riders_through_portals();
+            assert_eq!(game.server_trips.len(), 1);
+            let trip = &game.server_trips[0];
+            assert_eq!(trip.source, source);
+            assert_eq!(trip.dim, Dim::Nether);
+            assert_eq!(
+                trip.vehicle,
+                Some(held),
+                "keep the direct mount in the ticket"
+            );
+            assert_eq!(game.dim, source);
+            game.enter_level(Dim::Nether).unwrap();
+            game.arrive_vehicle(source, held, Vec3::new(32.0, 90.0, 48.0), 0.0);
+            assert!(game.mob_object(root).is_some());
+            assert!(game.mob_object(held).is_some());
+            assert_eq!(game.mob_object(held).unwrap().extra.mount, Some(root));
+            assert_eq!(game.lan.as_ref().unwrap().hub.guests[0].vehicle, Some(held));
         });
     }
 
@@ -1553,7 +1952,7 @@ mod transfer_lifetime_tests {
                     let key = ("test".into(), "transfer".into());
                     let retained = source_index.lock().unwrap().snapshot(&key);
                     let mut stale_map = map.clone();
-                    game.entity_attachments.insert(uuid, map);
+                    game.entity_attachments.insert(id, map);
                     game.enter_level(Dim::Nether).unwrap();
                     let destination_ref =
                         mod_api::EntityRef::new(game.level(game.dim.id()).unwrap().epoch(), id);

@@ -6,8 +6,8 @@
 use super::api_values::TryIntoApi;
 use super::{Dim, Game, entity_culling::EntityCullDecision};
 use horizon_assets::item_model::{
-    Components, ComponentsView, DisplayContext, GlobalPos, ItemEnv, LevelState, OwnerState,
-    StackView,
+    Components, ComponentsView, DisplayContext, FluidAppearance, GlobalPos, ItemEnv, LevelState,
+    OwnerState, StackView,
 };
 use horizon_client::{
     block_entity_render::{diffuse_lights, vertex_light},
@@ -27,6 +27,43 @@ struct ItemEntityDraw<'a> {
     at: [f64; 3],
     partial: f32,
     entity: bool,
+}
+
+/// The game's painter for the HUD kit's icons (`hud_kit::icon`): items by their models, the
+/// player's face from `face`, their skin's texture.
+pub(super) struct IconPainter<'g, 'a> {
+    pub(super) game: &'g Game<'a>,
+    pub(super) face: Option<&'g str>,
+}
+
+impl horizon_client::hud_kit::icon::IconPainter for IconPainter<'_, '_> {
+    fn item(&self, batch: &mut HudBatch, id: &str, [x, y, size]: [f32; 3]) -> bool {
+        let start = batch.vertices.len();
+        self.game
+            .draw_item_model(batch, &ItemStack::new(id, 1), x, y);
+        let scale = size / horizon_client::hud_kit::icon::ITEM_SIZE;
+        batch.scale_since(start, x, y, scale, scale);
+        batch.vertices.len() > start
+    }
+    fn face(&self, batch: &mut HudBatch, [x, y, size]: [f32; 3]) -> bool {
+        let Some(skin) = self.face else {
+            return false;
+        };
+        let mut draws = Vec::new();
+        // `PlayerFaceExtractor`: the face, then its hat layer.
+        horizon_client::tab_list::face(
+            &mut draws,
+            skin,
+            x as i32,
+            y as i32,
+            size as i32,
+            true,
+            false,
+            u32::MAX,
+        );
+        horizon_client::hud_layout::paint(batch, &self.game.gui.atlas, &draws);
+        true
+    }
 }
 
 /// The game's answers to what the resolver cannot read from the stack.
@@ -104,6 +141,54 @@ impl ItemEnv for Env<'_, '_> {
         );
         color as i32
     }
+    fn item_model_update(
+        &self,
+        kind: &str,
+        config: &horizon_core::nbt::Tag,
+        stack: &StackView,
+        ctx: &horizon_assets::item_model::Context,
+        models: &mut Vec<String>,
+    ) {
+        if !mod_api::__private::listened(mod_api::HookId::ItemModelUpdate) {
+            return;
+        }
+        let Ok(snapshot) = stack.try_into_api() else {
+            return;
+        };
+        let Ok(display) = ctx.display.try_into_api();
+        let owner = ctx.owner.and_then(|owner| owner.try_into_api().ok());
+        let level = ctx.level.and_then(|level| level.try_into_api().ok());
+        self.game
+            .native_item_model_update(mod_api::__private::ItemModelUpdateCall {
+                kind,
+                config,
+                stack: &snapshot,
+                bundle_selected: stack.bundle_selected,
+                display,
+                owner: owner.as_ref(),
+                level: level.as_ref(),
+                seed: ctx.seed,
+                models,
+            });
+    }
+    fn stack_fluid(&self, stack: &StackView) -> Option<&str> {
+        // Vanilla's items keep vanilla's closed set; only a mod's own item asks its parts.
+        if stack.item.starts_with("minecraft:") {
+            return horizon_client::fluid_models::held_fluid(&stack.item);
+        }
+        if !mod_api::__private::item_listens(mod_api::HookId::ContainedFluid, &stack.item) {
+            return None;
+        }
+        let Ok(snapshot) = stack.try_into_api() else {
+            return None;
+        };
+        let mut fluid = None;
+        self.game.native_contained_fluid(&snapshot, &mut fluid);
+        drawn_contained_fluid(&stack.item, fluid?)
+    }
+    fn fluid_appearance(&self, fluid: &str) -> Option<FluidAppearance> {
+        horizon_client::fluid_models::item_appearance(fluid)
+    }
     fn enchantment_in_tag(&self, enchantment: &str, tag: &str) -> bool {
         self.game.stations().enchantments.in_tag(tag, enchantment)
     }
@@ -159,6 +244,29 @@ impl ItemEnv for Env<'_, '_> {
         let nanos = self.game.started.elapsed().subsec_nanos();
         (nanos % 1_000_000) as f32 / 1_000_000.0
     }
+}
+/// The fluid a mod's `contained_fluid` answer `key` draws in a stack of `item`: none (the stack
+/// draws as holding none) for a key no fluid is registered under, logged the first time an item
+/// answers so. A registered fluid with no look in an item is drawn, as the missing sprite.
+fn drawn_contained_fluid(item: &str, key: mod_api::FluidKey) -> Option<&'static str> {
+    let fluid = mod_api::__private::fluid_id(key);
+    if fluid.is_none() && first_unregistered_answer(item) {
+        log::warn!(
+            "contained_fluid for {item} answered a fluid key no fluid is registered under: drawn as holding none"
+        );
+    }
+    fluid
+}
+/// Whether `item` answers an unregistered fluid key for the first time: only that path reads the
+/// list, so a stack that draws pays nothing for it.
+fn first_unregistered_answer(item: &str) -> bool {
+    static REPORTED: std::sync::Mutex<Vec<Box<str>>> = std::sync::Mutex::new(Vec::new());
+    let mut reported = REPORTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if reported.iter().any(|seen| &**seen == item) {
+        return false;
+    }
+    reported.push(item.into());
+    true
 }
 /// The days since 1970-01-01 as a civil (year, month, day) date.
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -499,7 +607,7 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<Vertex>,
     ) {
-        let lights = diffuse_lights(self.dim == Dim::Nether);
+        let lights = diffuse_lights(self.nether_lighting());
         self.submit_item_lit(state, pose, light, lights, out);
     }
     /// [`Self::submit_item_world`] shaded by other diffuse lights (a
@@ -601,7 +709,7 @@ impl Game<'_> {
         light: u32,
         skinned: &mut super::creatures::Skinned,
     ) -> bool {
-        let lights = diffuse_lights(self.dim == Dim::Nether);
+        let lights = diffuse_lights(self.nether_lighting());
         let Some((mark, bounds)) = self.submit_item_skinned(state, &[pose], light, lights) else {
             return false;
         };
@@ -865,7 +973,7 @@ mod tests {
         let stack = StackView::new("minecraft:stick", 1);
 
         let mods: mod_api::Mods = vec![ModEntry::new("quiet", Box::new(Quiet))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 assert!(!mod_api::__private::listened(HookId::ItemModelProperty));
@@ -878,7 +986,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mods: mod_api::Mods =
             vec![ModEntry::new("charged", Box::new(Charged(calls.clone())))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 for _ in 0..3 {
@@ -916,7 +1024,7 @@ mod tests {
     fn a_mod_registers_its_range_select_item_model_property() {
         use mod_api::__private::game::*;
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("fill", Box::new(Fill))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             let mut properties = Vec::new();
             Game::native_register_range_select_item_model_property(
                 &mod_api::RegistrationContext::new(),
@@ -932,14 +1040,14 @@ mod tests {
     fn item_model_range_property_reads_the_mods_number() {
         let stack = StackView::new("minecraft:stick", 16);
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("fill", Box::new(Fill))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 assert_eq!(env.item_model_range_property("example:fill", &stack), 0.25);
                 assert_eq!(env.item_model_range_property("other:fill", &stack), 0.0);
             });
         });
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 assert_eq!(env.item_model_range_property("example:fill", &stack), 0.0);
@@ -980,7 +1088,7 @@ mod tests {
     fn a_mod_registers_its_select_item_model_property() {
         use mod_api::__private::game::*;
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("mode", Box::new(Mode))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             let mut properties = Vec::new();
             Game::native_register_select_item_model_property(
                 &mod_api::RegistrationContext::new(),
@@ -995,7 +1103,7 @@ mod tests {
     #[ignore = "needs prepared resources"]
     fn item_model_select_property_reads_the_mods_value() {
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("mode", Box::new(Mode))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 let one = StackView::new("minecraft:stick", 1);
@@ -1013,7 +1121,7 @@ mod tests {
                 assert_eq!(env.item_model_select_property("other:mode", &one), None);
             });
         });
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 let one = StackView::new("minecraft:stick", 1);
@@ -1081,12 +1189,125 @@ mod tests {
         }
     }
 
+    /// A mod's item model type: a cell that draws `gui` in a screen and `ground` elsewhere, `full`
+    /// or `empty` by the stack, and reports the seed, the owner's type and the level it was told,
+    /// as names the test reads back.
+    struct Cell;
+    #[mod_api::__subscriptions]
+    impl mod_api::Hooks for Cell {
+        fn register_item_models(
+            &self,
+            _: &mod_api::RegistrationContext,
+            event: &mut mod_api::RegisterItemModelsEvent<'_>,
+        ) {
+            event.models.push("cellmod:cell".into());
+        }
+        fn item_model_update(
+            &self,
+            _: &dyn ClientHost,
+            event: &mut mod_api::ItemModelUpdateEvent<'_>,
+        ) {
+            if event.kind != "cellmod:cell" {
+                return;
+            }
+            let place = match event.display {
+                mod_api::ItemDisplayContext::Gui => "gui",
+                _ => "ground",
+            };
+            let fill = if event.stack.count() > 1 {
+                "full"
+            } else {
+                "empty"
+            };
+            event.models.push(format!("{place}/{fill}"));
+            event.models.push(format!("seed {}", event.seed));
+            if let Some(owner) = event.owner {
+                event.models.push(format!("owner {}", owner.entity_type));
+            }
+            if let Some(level) = event.level {
+                event.models.push(format!("level {}", level.dimension));
+            }
+        }
+    }
+
+    /// A mod registers its item model type once at start, and the game's resolver gives it what
+    /// `ItemModel.update` reads: the stack, where the item is drawn, its owner and level when it
+    /// has them, and the seed. Another type, or no mod, draws nothing.
+    #[test]
+    #[ignore = "needs prepared resources"]
+    fn a_mods_item_model_type_answers_with_the_draws_context() {
+        use horizon_assets::item_model::{Context, DisplayContext, LevelState, OwnerState};
+        use mod_api::__private::game::*;
+        let config =
+            horizon_core::json_nbt::json_to_tag(&serde_json::json!({"type": "cellmod:cell"}))
+                .unwrap();
+        let owner = OwnerState {
+            entity_type: "minecraft:zombie".into(),
+            ..OwnerState::default()
+        };
+        let level = LevelState {
+            dimension: "minecraft:the_nether".into(),
+            ..LevelState::default()
+        };
+        let in_screen = Context {
+            display: DisplayContext::Gui,
+            owner: None,
+            level: None,
+            seed: 7,
+        };
+        let on_ground = Context {
+            display: DisplayContext::Ground,
+            owner: Some(&owner),
+            level: Some(&level),
+            seed: 42,
+        };
+        let drawn = |env: &Env<'_, '_>, kind: &str, count: i32, ctx: &Context<'_>| {
+            let mut models = Vec::new();
+            env.item_model_update(
+                kind,
+                &config,
+                &StackView::new("minecraft:stick", count),
+                ctx,
+                &mut models,
+            );
+            models
+        };
+        let mods: mod_api::Mods = vec![mod_api::ModEntry::new("cellmod", Box::new(Cell))].into();
+        mod_platform::testing::with_mods(mods, || {
+            let mut types = Vec::new();
+            Game::native_register_item_models(&mod_api::RegistrationContext::new(), &mut types);
+            assert_eq!(types, ["cellmod:cell"]);
+            super::super::native_entity_refs::tests::with_game(|game| {
+                let env = Env { game };
+                assert_eq!(
+                    drawn(&env, "cellmod:cell", 1, &in_screen),
+                    ["gui/empty", "seed 7"]
+                );
+                assert_eq!(
+                    drawn(&env, "cellmod:cell", 2, &on_ground),
+                    [
+                        "ground/full",
+                        "seed 42",
+                        "owner minecraft:zombie",
+                        "level minecraft:the_nether"
+                    ]
+                );
+                assert!(drawn(&env, "othermod:cell", 2, &on_ground).is_empty());
+            });
+        });
+        mod_platform::testing::with_mods(Vec::new().into(), || {
+            super::super::native_entity_refs::tests::with_game(|game| {
+                assert!(drawn(&Env { game }, "cellmod:cell", 2, &on_ground).is_empty());
+            });
+        });
+    }
+
     /// A mod registers its item tint source once at start.
     #[test]
     fn a_mod_registers_its_item_tint_source() {
         use mod_api::__private::game::*;
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("charge", Box::new(Charge))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             let mut sources = Vec::new();
             Game::native_register_item_tint_sources(
                 &mod_api::RegistrationContext::new(),
@@ -1107,7 +1328,7 @@ mod tests {
         let one = StackView::new("minecraft:stick", 1);
         let two = StackView::new("minecraft:stick", 2);
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new("charge", Box::new(Charge))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 let color = |source, stack| env.item_tint_source(source, &config, stack) as u32;
@@ -1116,7 +1337,7 @@ mod tests {
                 assert_eq!(color("other:charge", &one), 0xFFFF_FFFF);
             });
         });
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let env = Env { game };
                 assert_eq!(env.item_tint_source("example:charge", &config, &one), -1);

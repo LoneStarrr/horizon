@@ -4,6 +4,41 @@
 use super::{Game, commands::Target, native_hooks::mob_kind};
 
 impl Game<'_> {
+    pub(super) fn retire_vehicle_registration(&self, target: Target) {
+        match target {
+            Target::Boat(id) => {
+                if let Some(boat) = self.boats.iter().find(|boat| boat.id == id) {
+                    boat.attachment_lifetime.retire();
+                }
+            }
+            Target::Cart(id) => {
+                if let Some(cart) = self.carts.iter().find(|cart| cart.id == id) {
+                    cart.attachment_lifetime.retire();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `Entity.setRemoved` makes a vehicle invisible before notifying riders.
+    /// The owning list is kept stable while callbacks run.
+    pub(super) fn with_destroying_vehicle<R>(
+        &mut self,
+        target: Target,
+        action: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if !self.persist.destroying_vehicles.insert(target) {
+            return None;
+        }
+        self.retire_vehicle_registration(target);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        self.persist.destroying_vehicles.remove(&target);
+        match result {
+            Ok(value) => Some(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Whether this game is a server whose mounts the mods hear: the server thread or a
     /// dedicated server, never a client.
     fn native_hears_mounts(&self) -> bool {
@@ -24,13 +59,15 @@ impl Game<'_> {
 
     /// The type of the vehicle with entity id `id`.
     fn native_vehicle_kind(&self, id: u32) -> String {
-        if let Some(b) = self.boats.iter().find(|b| b.id == id) {
+        if let Some(b) = self.boat_object(id) {
             b.entity_type()
-        } else if let Some(c) = self.carts.iter().find(|c| c.id == id) {
+        } else if let Some(c) = self.cart_object(id) {
             c.kind.id().into()
+        } else if let Some(vehicle) = self.persist.removed_vehicles.get(&id) {
+            vehicle.kind()
         } else if self.cushions.iter().any(|c| c.id == id) {
             "minecraft:cushion".into()
-        } else if let Some(m) = self.mobs.iter().find(|m| m.id == id) {
+        } else if let Some(m) = self.mob_object(id) {
             mob_kind(m)
         } else if self.armor_stands.iter().any(|a| a.id == id) {
             self.target_type(Target::Stand(id))
@@ -44,18 +81,21 @@ impl Game<'_> {
     /// `native_entity_mount` for `rider` (the acting player when `None`) and `vehicle`: whether
     /// the mounting or dismounting goes ahead.
     fn native_mount_allowed(&mut self, rider: Option<u32>, vehicle: u32, mounting: bool) -> bool {
-        if !self.native_hears_mounts() {
+        if !self.native_hears_mounts()
+            || !mod_api::__private::listened(mod_api::HookId::EntityMount)
+        {
             return true;
         }
-        let (entity, kind) = match rider {
-            Some(id) => (
-                id,
-                self.mobs
-                    .iter()
-                    .find(|m| m.id == id)
-                    .map_or_else(String::new, mob_kind),
-            ),
-            None => (self.native_acting_entity(), "minecraft:player".into()),
+        let entity = rider.unwrap_or_else(|| self.native_acting_entity());
+        let notification = (entity, vehicle, mounting);
+        // A callback can discard the vehicle before this edge is unlinked.
+        // Its cleanup must not dispatch the identical in-flight request again.
+        if !self.persist.mount_notifications.insert(notification) {
+            return false;
+        }
+        let kind = match rider {
+            Some(id) => self.mob_object(id).map_or_else(String::new, mob_kind),
+            None => "minecraft:player".into(),
         };
         let vehicle_kind = self.native_vehicle_kind(vehicle);
         let mut canceled = false;
@@ -68,6 +108,7 @@ impl Game<'_> {
             mounting,
             canceled: &mut canceled,
         });
+        self.persist.mount_notifications.remove(&notification);
         !canceled
     }
 

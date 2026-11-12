@@ -1,6 +1,7 @@
 //! `Mob.convertTo` with `ConversionType.SINGLE`: one mob turns into another
 //! of a different type in its place, keeping what the old one had.
 use super::Mob;
+use horizon_core::random::RandomSource;
 
 /// `ConversionParams` of a `SINGLE` conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,18 @@ impl Params {
         keep_equipment: true,
         preserve_can_pick_up_loot: true,
     };
+}
+
+/// `Pig.thunderHit`'s completion after `single`: choose the converted pig's
+/// weapon from the source pig's RNG and prevent the result from despawning.
+pub fn pig_thunder_hit(from: &mut Mob, to: &mut Mob) {
+    let spear = from.random.next_int_bound(20).unwrap_or(1) == 0;
+    to.extra.set_main_hand(Some(if spear {
+        "minecraft:golden_spear".into()
+    } else {
+        "minecraft:golden_sword".into()
+    }));
+    to.persistent = true;
 }
 
 /// `ConversionType.SINGLE.convert` and `ConversionType.convertCommon`: `to`
@@ -74,8 +87,11 @@ pub fn common(from: &Mob, to: &mut Mob, preserve_can_pick_up_loot: bool) {
     to.absorption = from.absorption.clamp(0.0, maximum);
     // addEffect for each: Absorption's onEffectStarted raises it again.
     for effect in &from.extra.effects {
-        let (effect, ticks, amplifier) = (effect.id, effect.duration, effect.amplifier);
-        to.add_effect(effect, ticks, amplifier);
+        to.add_effect(effect.id, effect.duration, effect.amplifier);
+        // `new MobEffectInstance(effect)` copies its icon flag too.
+        if let Some(copy) = to.extra.effects.iter_mut().find(|e| e.id == effect.id) {
+            copy.show_icon = effect.show_icon;
+        }
     }
     to.extra.hidden_effects = from.extra.hidden_effects.clone();
     to.extra.effect_chains = from.extra.effect_chains.clone();
@@ -93,7 +109,7 @@ pub fn common(from: &Mob, to: &mut Mob, preserve_can_pick_up_loot: bool) {
     }
     // An ageable pair keeps the exact age, an adult's breeding cooldown too.
     if super::finalize::ageable(from.species()) && super::finalize::ageable(to.species()) {
-        super::finalize::set_age(to, from.extra.age);
+        super::finalize::set_age(to, from.extra.age, None);
         to.extra.forced_age = from.extra.forced_age;
         to.extra.forced_age_timer = from.extra.forced_age_timer;
     }
@@ -105,7 +121,8 @@ pub fn common(from: &Mob, to: &mut Mob, preserve_can_pick_up_loot: bool) {
     to.persistent |= from.persistent;
     to.name_visible = from.name_visible;
     to.invulnerable_flag = from.invulnerable_flag;
-    to.invulnerable = from.invulnerable;
+    // setInvulnerableTime(getInvulnerableTime()); the hurt cooldown is not copied.
+    to.invulnerable_time = from.invulnerable_time;
     to.no_gravity = from.no_gravity;
     to.silent = from.silent;
     // COMPONENTS_TO_COPY: the custom name.
@@ -229,6 +246,30 @@ mod tests {
                     && bare.extra.body_id().is_none()
             );
             assert_eq!(bare.custom_name.as_deref(), Some("Frosty"));
+        });
+    }
+    /// `ConversionType.convertCommon` copies absorption through the target's
+    /// setter, so it survives when the target's max absorption permits it.
+    #[test]
+    fn a_converting_mob_keeps_its_absorption() {
+        with_test_world(&[], |_, types| {
+            let mob = |id, kind: &str| {
+                Mob::new(
+                    id,
+                    Arc::new(types.types[kind].clone()),
+                    Vec3::new(3.5, 70.0, -2.5),
+                    0.0,
+                )
+            };
+            let mut z = mob(1, "minecraft:zombie");
+            z.absorption = 3.0;
+            let mut d = mob(2, "minecraft:drowned");
+            // LivingEntity.setAbsorptionAmount clamps to the new mob's maximum
+            // before effects are copied. An unmodified drowned has maximum 0.
+            Arc::make_mut(&mut Arc::make_mut(&mut d.kind).attributes)
+                .insert("minecraft:max_absorption".into(), 3.0);
+            single(&z, &mut d, Params::KEEP_ALL);
+            assert_eq!(d.absorption, 3.0, "the absorption crosses the conversion");
         });
     }
 }

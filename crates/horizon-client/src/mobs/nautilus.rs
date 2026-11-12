@@ -91,6 +91,11 @@ pub fn is_food(m: &Mob, item: &str, taming: &[String]) -> bool {
         m.kind.food.iter().any(|t| t == item)
     }
 }
+/// `TamableAnimal.feed`'s heal: twice the food's nutrition, or 1 for an item
+/// without a food component (a fish bucket).
+pub fn feed_heal(nutrition: Option<i32>) -> f32 {
+    nutrition.map_or(1.0, |n| 2.0 * n as f32)
+}
 /// The ambient, hurt and death sounds by age and whether it is under water.
 pub fn sounds(m: &Mob) -> [&'static str; 3] {
     let under = m.fluids.eye_in_water;
@@ -301,13 +306,16 @@ pub fn ai_step(
     if m.rider.is_some() {
         if m.extra.ints[1] == 0 || w.game_time % 40 == 0 {
             m.extra.ints[1] = 1;
-            events.push(MobEvent::EffectPlayer {
-                effect: "minecraft:breath_of_the_nautilus",
-                ticks: 60,
-                amplifier: 0,
-                // AbstractNautilus.applyEffects: ambient, visible, showIcon.
-                ambient: true,
-            });
+            events.push(w.route_rider_event(
+                m.id,
+                MobEvent::EffectPlayer {
+                    effect: "minecraft:breath_of_the_nautilus",
+                    ticks: 60,
+                    amplifier: 0,
+                    // AbstractNautilus.applyEffects: ambient, visible, showIcon.
+                    ambient: true,
+                },
+            ));
         }
     } else {
         m.extra.ints[1] = 0;
@@ -343,8 +351,13 @@ pub fn ai_step(
     if m.extra.anger > 0 {
         m.extra.anger -= 1;
     }
-    if m.ai.target.is_none() && m.alive() && !m.no_ai {
-        m.ai.target = find_target(m, w, level_random);
+    if m.ai.target.is_none()
+        && m.alive()
+        && !m.no_ai
+        && let Some(target) = find_target(m, w, level_random)
+        && let super::TargetChange::Set(next) = w.change_target(m, true, Some(target))
+    {
+        m.ai.target = next;
     }
 }
 /// `MemorySlot.tick`: expire before decrementing a finite saved lifetime.
@@ -533,9 +546,11 @@ impl Goal for Charge {
             sound(m, name, cx.events);
         }
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
         m.extra.counter2 = TIME_BETWEEN_ATTACKS;
-        m.ai.target = None;
+        if let super::TargetChange::Set(target) = cx.w.change_target(m, true, None) {
+            m.ai.target = target;
+        }
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
         let Some(who) = m.ai.target else { return };
@@ -551,7 +566,9 @@ impl Goal for Charge {
         let from = [m.position.x, m.position.y, m.position.z];
         let amount = m.attrs.attack_damage;
         cx.events.push(match who {
-            Who::Player => MobEvent::AttackPlayer(amount, from),
+            Who::Player => {
+                cx.w.route_player_event(MobEvent::AttackPlayer(amount, from))
+            }
             Who::Mob(id) => MobEvent::AttackMob {
                 target: id,
                 amount,
@@ -573,16 +590,24 @@ impl Goal for Charge {
             // from (sin(yaw), -cos(yaw)): its resistance, the halving of its own
             // motion, the lift on the ground and the knockback hook all apply.
             let yaw = f64::from(m.yaw * (std::f32::consts::PI / 180.0));
-            cx.events.push(MobEvent::Knockback {
+            let event = MobEvent::Knockback {
                 target: who,
                 power,
                 x: f64::from(horizon_core::geometry::trig::sin(yaw)),
                 z: -f64::from(horizon_core::geometry::trig::cos(yaw)),
                 source: super::Damage::mob(m.id, from),
+                apply_blocking: None,
+            };
+            cx.events.push(if who == Who::Player {
+                cx.w.route_player_event(event)
+            } else {
+                event
             });
             m.velocity = Vec3::new(m.velocity.x * 0.6, m.velocity.y, m.velocity.z * 0.6);
         }
-        m.ai.target = None;
+        if let super::TargetChange::Set(target) = cx.w.change_target(m, true, None) {
+            m.ai.target = target;
+        }
     }
 }
 /// The body texture: the baby's, the adult's, or the zombie's variant.
@@ -665,7 +690,7 @@ pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
     use horizon_core::nbt::Tag;
     m.extra.owner = crate::save::uuid_from_tag(tag.get("Owner"));
     m.extra.tame = m.extra.owner.is_some();
-    m.extra.sitting = crate::entity_nbt::flag(tag, "Sitting");
+    crate::mobs::tame::restore_sitting(m, crate::entity_nbt::flag(tag, "Sitting"));
     if let Some(Tag::String(v)) = tag.get("variant") {
         let v = v.to_string().unwrap_or_default();
         m.extra.variant = u8::from(v.trim_start_matches("minecraft:") == "warm");
@@ -1110,5 +1135,24 @@ mod cooldown_memory_tests {
             failures.is_empty(),
             "nautilus cooldown tick/save mismatches: {failures:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod feed_heal_tests {
+    use super::feed_heal;
+
+    #[test]
+    fn heals_twice_the_nutrition_of_vanilla_foods() {
+        // Foods.java: cod 2, pufferfish 1, cooked cod 5, cooked salmon 6.
+        assert_eq!(feed_heal(Some(2)), 4.0);
+        assert_eq!(feed_heal(Some(1)), 2.0);
+        assert_eq!(feed_heal(Some(5)), 10.0);
+        assert_eq!(feed_heal(Some(6)), 12.0);
+    }
+
+    #[test]
+    fn item_without_food_component_heals_one() {
+        assert_eq!(feed_heal(None), 1.0);
     }
 }

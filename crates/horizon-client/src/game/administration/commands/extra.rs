@@ -7,31 +7,17 @@ use super::{Arg, Context, Game, R, Target, err};
 use horizon_client::actions::Action;
 use horizon_client::{
     command::CommandError,
+    lan::waypoints::Icon,
     skins::{NameOrId, Resolve, ResolvedProfile},
     snbt,
     text::{self, ClickEvent, InlineObject, Style, Text},
 };
-use horizon_core::nbt::Tag;
+use horizon_core::nbt::{JavaString, Tag};
 use horizon_protocol::packets::{
     Empty,
     play::{self, Clientbound as C, DialogHolder},
 };
 use std::{collections::HashMap, time::Instant};
-
-/// Waypoint.Icon: the locator bar style and colour of a transmitter.
-#[derive(Clone, Debug, PartialEq)]
-pub(in crate::game) struct WaypointIcon {
-    pub style: String,
-    pub color: Option<i32>,
-}
-impl Default for WaypointIcon {
-    fn default() -> Self {
-        Self {
-            style: "minecraft:default".into(),
-            color: None,
-        }
-    }
-}
 
 /// A `/fetchprofile` lookup in flight: what it resolves, the message ids it
 /// answers with (`commands.fetchprofile.<kind>.success|failure`), the
@@ -134,7 +120,7 @@ pub(in crate::game) struct CommandExtras {
     /// The `/jfr start` recording: when it started and the tick count then.
     pub jfr: Option<(Instant, u64, String)>,
     /// Waypoint icons changed by `/waypoint modify`.
-    pub waypoint_icons: HashMap<Target, WaypointIcon>,
+    pub waypoint_icons: HashMap<Target, Icon>,
     /// `/datapack disable vanilla` took the built-in pack out of the selection.
     pub vanilla_disabled: bool,
     /// The waypoint manager's tracked transmitters (None until first used).
@@ -147,6 +133,11 @@ pub(in crate::game) struct CommandExtras {
     /// The `CommandResultCallback` results of the outermost source, when a
     /// harness records them.
     pub results: Option<Vec<(bool, i32)>>,
+    /// How many of `adv.announced` a command's own `broadcastChanges` had
+    /// made: the harness records those with the command, and leaves what
+    /// `run_command`'s check after it earns for the next tick, as vanilla
+    /// does for a command that calls no `broadcastChanges` (`/loot give`).
+    pub broadcast_announced: usize,
     /// The running `/pregen` task.
     pub pregen: Option<super::pregen::PregenTask>,
 }
@@ -391,11 +382,17 @@ impl Game<'_> {
             }
         }
     }
-    fn waypoint_icon(&self, t: Target) -> WaypointIcon {
+    pub(in crate::game) fn waypoint_icon(&self, t: Target) -> Icon {
         self.cmds
             .waypoint_icons
             .get(&self.waypoint_target(t))
             .cloned()
+            // The player's own icon comes back from their saved `locator_bar_icon`.
+            .or_else(|| {
+                (t == Target::Player)
+                    .then(|| Self::waypoint_icon_from_saved(self.level.player_extra.as_ref()))
+                    .flatten()
+            })
             .unwrap_or_default()
     }
     /// `WaypointArgument.getWaypoint`.
@@ -507,16 +504,22 @@ impl Game<'_> {
                 &[Text::colored(name, rgb)],
             )
         };
+        self.set_waypoint_icon(t, icon);
+        self.feedback(message);
+        Ok(0)
+    }
+    /// `WaypointCommand.mutateIcon`: untrack, change, track again.
+    pub(in crate::game) fn set_waypoint_icon(&mut self, t: Target, icon: Icon) {
+        if t == Target::Player {
+            Self::save_waypoint_icon(&icon, &mut self.level.player_extra);
+        }
         let t = self.waypoint_target(t);
         self.cmds.waypoint_icons.insert(t, icon);
-        // WaypointCommand.mutateIcon: untrack, change, track again.
         self.waypoint_transmitters();
         if let Some(tracked) = self.cmds.waypoints.as_mut() {
             tracked.retain(|x| *x != t);
             tracked.push(t);
         }
-        self.feedback(message);
-        Ok(0)
     }
 
     // ---- /dialog --------------------------------------------------------
@@ -897,12 +900,17 @@ impl Game<'_> {
         // `Component.object(new PlayerSprite(profile, true))`, encoded: `hat`
         // is left out at its default.
         let encoded_component = snbt::to_snbt(&Tag::compound([("player", profile_tag)]));
-        let mut head = Text::literal("\u{FFFC}");
-        head.spans[0].style.inline_object = Some(InlineObject::Player {
-            profile: json.into(),
-            hat: true,
-            fallback: format!("[{} head]", profile.name),
-        });
+        let head = Text::styled(
+            "\u{FFFC}",
+            Style {
+                inline_object: Some(InlineObject::Player {
+                    profile: json.into(),
+                    hat: true,
+                    fallback: format!("[{} head]", profile.name),
+                }),
+                ..Style::default()
+            },
+        );
         let item = |key: &str, args: &[Text], click: ClickEvent| {
             let inner = Text::translate(key, args)
                 .with_color(text::GREEN)
@@ -1302,4 +1310,121 @@ impl Game<'_> {
         }
     }
 }
-impl Game<'_> {}
+impl Game<'_> {
+    /// `LivingEntity.readAdditionalSaveData`'s `locator_bar_icon`
+    /// (`Waypoint.Icon.CODEC`: a required `style` and an optional int `color`).
+    /// None when the key is missing or does not decode, which is the default icon.
+    fn waypoint_icon_from_saved(entity: Option<&Tag>) -> Option<Icon> {
+        let icon = entity?.get("locator_bar_icon")?;
+        let Some(Tag::String(style)) = icon.get("style") else {
+            return None;
+        };
+        let color = match icon.get("color") {
+            Some(Tag::Int(rgb)) => Some(*rgb),
+            _ => None,
+        };
+        Some(Icon {
+            style: style.to_string_lossy(),
+            color,
+        })
+    }
+    /// `LivingEntity.addAdditionalSaveData`'s `locator_bar_icon`: written only
+    /// when the icon `hasData`, so any other icon takes the key out.
+    fn save_waypoint_icon(icon: &Icon, entity: &mut Option<Tag>) {
+        if icon.style == "minecraft:default" && icon.color.is_none() {
+            if let Some(Tag::Compound(map)) = entity {
+                map.remove(&JavaString::from("locator_bar_icon"));
+            }
+            return;
+        }
+        let mut fields = vec![("style", Tag::String(icon.style.as_str().into()))];
+        if let Some(rgb) = icon.color {
+            fields.push(("color", Tag::Int(rgb)));
+        }
+        if let Tag::Compound(map) = entity.get_or_insert_with(|| Tag::Compound(Default::default()))
+        {
+            map.insert("locator_bar_icon".into(), Tag::compound(fields));
+        }
+    }
+}
+
+#[cfg(test)]
+mod waypoint_icon_save_tests {
+    use super::*;
+    use crate::save::Level;
+
+    fn icon(style: &str, color: Option<i32>) -> Icon {
+        Icon {
+            style: style.into(),
+            color,
+        }
+    }
+
+    #[test]
+    fn an_icon_set_by_waypoint_modify_survives_a_save_and_a_load() {
+        let mut level = Level::default();
+        Game::save_waypoint_icon(
+            &icon("minecraft:bowtie", Some(0x00FF_0000)),
+            &mut level.player_extra,
+        );
+        // The player's file: `locator_bar_icon` is `{style, color}`.
+        let saved = level.player_tag();
+        assert_eq!(
+            saved.get("locator_bar_icon"),
+            Some(&Tag::compound([
+                ("style", Tag::String("minecraft:bowtie".into())),
+                ("color", Tag::Int(0x00FF_0000)),
+            ]))
+        );
+        // Loaded again: the same icon.
+        assert_eq!(
+            Game::waypoint_icon_from_saved(Some(&saved)),
+            Some(icon("minecraft:bowtie", Some(0x00FF_0000)))
+        );
+    }
+
+    #[test]
+    fn a_style_alone_or_a_colour_alone_is_data_and_is_saved() {
+        let mut only_style = None;
+        Game::save_waypoint_icon(&icon("minecraft:bowtie", None), &mut only_style);
+        let tag = only_style.unwrap();
+        assert_eq!(
+            tag.get("locator_bar_icon"),
+            Some(&Tag::compound([(
+                "style",
+                Tag::String("minecraft:bowtie".into())
+            )]))
+        );
+        let mut only_color = None;
+        Game::save_waypoint_icon(&icon("minecraft:default", Some(7)), &mut only_color);
+        assert_eq!(
+            Game::waypoint_icon_from_saved(only_color.as_ref()),
+            Some(icon("minecraft:default", Some(7)))
+        );
+    }
+
+    #[test]
+    fn a_player_with_no_icon_saves_no_key_and_a_reset_takes_it_out() {
+        let mut level = Level::default();
+        assert!(level.player_tag().get("locator_bar_icon").is_none());
+        // The default icon on a player with no file writes nothing, not even a file.
+        Game::save_waypoint_icon(&Icon::default(), &mut level.player_extra);
+        assert!(level.player_extra.is_none());
+        Game::save_waypoint_icon(&icon("minecraft:default", Some(1)), &mut level.player_extra);
+        assert!(level.player_tag().get("locator_bar_icon").is_some());
+        // `/waypoint modify ... reset` leaves the default icon: the key goes.
+        Game::save_waypoint_icon(&Icon::default(), &mut level.player_extra);
+        assert!(level.player_tag().get("locator_bar_icon").is_none());
+    }
+
+    #[test]
+    fn a_save_without_the_key_or_with_a_broken_one_loads_the_default_icon() {
+        assert_eq!(Game::waypoint_icon_from_saved(None), None);
+        let none = Tag::compound([("Health", Tag::Float(20f32.to_bits()))]);
+        assert_eq!(Game::waypoint_icon_from_saved(Some(&none)), None);
+        // `style` is required by the codec.
+        let no_style =
+            Tag::compound([("locator_bar_icon", Tag::compound([("color", Tag::Int(5))]))]);
+        assert_eq!(Game::waypoint_icon_from_saved(Some(&no_style)), None);
+    }
+}

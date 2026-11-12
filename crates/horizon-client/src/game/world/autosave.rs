@@ -3,6 +3,13 @@
 use super::*;
 
 impl Game<'_> {
+    pub(super) fn admit_entity_save() -> Result<()> {
+        if !horizon_client::join_seq::visibility::passes_settled() {
+            return Err("entity pass is lifted".into());
+        }
+        Ok(())
+    }
+
     pub(super) fn save_game(&mut self) -> Result<()> {
         self.save_game_with(true)
     }
@@ -70,8 +77,7 @@ impl Game<'_> {
         // their own file (`PlayerDataStorage.save`); the owner is also in the
         // file level.dat names, which is the one it loads from
         // (`playerdata::load_owner`).
-        if self.options.dedicated.is_some()
-            && !self.options.execution_role.is_client()
+        if self.options.execution_role == execution_role::ExecutionRole::DedicatedServer
             && let Some(host) = self.lan.as_mut()
         {
             // The vehicle tree goes into a player's file when they leave
@@ -93,6 +99,22 @@ impl Game<'_> {
                 }
             });
         }
+        if self.options.execution_role == execution_role::ExecutionRole::DedicatedServer
+            && let Some(host) = self.lan.as_ref()
+        {
+            self.save_connected_guest_statistics(host);
+            for guest in host.hub.guests.iter() {
+                if host
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.uuid == guest.uuid)
+                    || !host.play.contains_key(&guest.conn)
+                {
+                    continue;
+                }
+                self.save_guest_advancements(host, guest);
+            }
+        }
         self.save_world_state();
         self.message = Some(("Saved the game".into(), Instant::now()));
         Ok(())
@@ -105,9 +127,10 @@ impl Game<'_> {
         if self.remote.is_some() {
             return Ok(());
         }
+        self.admit_level_save()?;
         // `DedicatedServer.saveAllChunks` tells the management protocol's clients when a save starts and when
         // it ends without failing, for every save: the command, the autosave, the pause.
-        let dedicated = self.options.dedicated.is_some();
+        let dedicated = self.is_dedicated_server();
         if dedicated {
             dedicated::events::record_server("saving", serde_json::json!({}));
         }
@@ -119,6 +142,24 @@ impl Game<'_> {
         if dedicated {
             dedicated::events::record_server("saved", serde_json::json!({}));
         }
+        Ok(())
+    }
+}
+
+impl Game<'_> {
+    pub(super) fn admit_level_save(&self) -> Result<()> {
+        // A carrier transfer that broke after `prepared` stopped the
+        // session (`carrier_stop_session`): its recovery replays the
+        // affected regions from the disk state the transfer itself
+        // wrote, so no later save — the autosave a later tick would
+        // run, or any exit path's — may write over them.
+        if self.world.carrier_fences.is_broken() {
+            return Err(
+                "a carrier transfer did not finish; the world is left for recovery at reopen"
+                    .into(),
+            );
+        }
+        Self::admit_entity_save()?;
         Ok(())
     }
 }

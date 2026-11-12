@@ -1,6 +1,6 @@
 //! Text components from commands: `ComponentArgument` reads an SNBT (or JSON)
 //! value, `ComponentSerialization` turns it into styled text.
-use crate::text::{InlineObject, Style, Text, named_color};
+use crate::text::{InlineObject, Origin, Style, Text, named_color};
 use horizon_core::nbt::Tag;
 use serde_json::{Map, Value};
 
@@ -238,14 +238,21 @@ pub fn untrusted_http_url(url: &str) -> bool {
 pub fn parse_click_event(
     e: &serde_json::Map<String, Value>,
 ) -> Result<Option<crate::text::ClickEvent>, horizon_core::json_nbt::JsonNbtError> {
+    parse_click_event_origin(e, Origin::Remote)
+}
+fn parse_click_event_origin(
+    e: &serde_json::Map<String, Value>,
+    origin: Origin,
+) -> Result<Option<crate::text::ClickEvent>, horizon_core::json_nbt::JsonNbtError> {
     use crate::text::ClickEvent;
     use horizon_core::json_nbt::json_to_tag;
     let text = |k: &str| e.get(k).and_then(Value::as_str).map(str::to_owned);
     let legacy = || text("value");
     let event = match e.get("action").and_then(Value::as_str) {
+        Some("open_file") if origin == Origin::Local => text("path").map(ClickEvent::OpenFile),
         Some("open_url") => text("url")
             .or_else(legacy)
-            .filter(|u| untrusted_http_url(u))
+            .filter(|u| origin == Origin::Local || untrusted_http_url(u))
             .map(ClickEvent::OpenUrl),
         Some("change_page") => e
             .get("page")
@@ -257,7 +264,7 @@ pub fn parse_click_event(
                     .and_then(|s| s.parse().ok())
             })
             .and_then(|p| i32::try_from(p).ok())
-            .filter(|p| *p >= 1)
+            .filter(|p| origin == Origin::Local || *p >= 1)
             .map(ClickEvent::ChangePage),
         Some("suggest_command") => text("command")
             .or_else(legacy)
@@ -346,6 +353,7 @@ fn clone_json(root: Work<'_>) -> Value {
 fn object_style<'a>(
     o: &'a serde_json::Map<String, Value>,
     child: &mut dyn FnMut(&'a Value) -> Text,
+    origin: Origin,
 ) -> Style {
     let mut style = Style::default();
     if let Some(c) = o.get("color").and_then(Value::as_str) {
@@ -361,7 +369,7 @@ fn object_style<'a>(
     // ClickEvent.CODEC: the actions a chat line acts on here. A component
     // from a server never opens a file.
     if let Some(e) = style_event_object(o, "click_event", "clickEvent") {
-        style.click = parse_click_event(e).ok().flatten();
+        style.click = parse_click_event_origin(e, origin).ok().flatten();
     }
     // HoverEvent.ShowText, ShowItem and ShowEntity.
     if let Some(e) = style_event_object(o, "hover_event", "hoverEvent") {
@@ -431,28 +439,53 @@ pub fn to_text_with(
     resolve: &mut dyn FnMut(&str) -> Text,
     contents: &mut dyn FnMut(&serde_json::Map<String, Value>) -> Option<Text>,
 ) -> Text {
-    build(v, resolve, contents, Sourced(true))
+    build(v, resolve, contents, Sourced(true, Origin::Remote), &|_| {
+        Origin::Remote
+    })
 }
 
 /// The spans of `v` alone, as [`to_text`] decodes them, with `v` itself as the text's
 /// component: what a text received whole is (`From<Value> for Text`). It skips building a
 /// component for each part, which the whole one replaces.
 pub(crate) fn spans_of(v: Value) -> Text {
-    build(&v, &mut |s| Text::literal(s), &mut |_| None, Sourced(false)).with_component(v)
+    let mut text = render_source(&v, &|_| Origin::Remote);
+    text.retain_source(v);
+    text
+}
+
+pub(crate) fn render_source(v: &Value, origin: &dyn Fn(&Value) -> Origin) -> Text {
+    build(
+        v,
+        &mut |s| Text::literal(s),
+        &mut |_| None,
+        Sourced(false, Origin::Remote),
+        origin,
+    )
 }
 
 /// Whether [`build`] keeps each part's component, or only its spans.
 #[derive(Clone, Copy)]
-struct Sourced(bool);
+struct Sourced(bool, Origin);
 
 impl Sourced {
     fn literal(self, text: String) -> Text {
         match self.0 {
-            true => Text::literal(text),
+            true => {
+                let mut out = Text::literal(text);
+                for span in &mut out.rendered.spans {
+                    span.origin = self.1;
+                }
+                // Raw component builders never confer local origin.
+                if self.1 == Origin::Remote {
+                    out.clear_origins();
+                }
+                out
+            }
             false => {
                 let mut out = Text::empty();
                 if !text.is_empty() {
-                    out.spans.push(crate::text::Span {
+                    out.rendered.spans.push(crate::text::Span {
+                        origin: self.1,
                         text,
                         style: Style::default(),
                     });
@@ -467,28 +500,41 @@ impl Sourced {
             true => base.push(other),
             false => {
                 let mut other = other;
-                base.spans.append(&mut other.spans);
+                base.rendered.spans.append(&mut other.rendered.spans);
                 crate::text::discard_text(other);
             }
         }
     }
     fn styled(self, mut text: Text, style: &Style) -> Text {
         match self.0 {
-            true => text.with_style(style),
+            true => {
+                // The builder already resolved the node's own style before its parent's.
+                text.inherit_built_style(style);
+                text
+            }
             false => {
-                for span in &mut text.spans {
-                    span.style.inherit(style);
+                for span in &mut text.rendered.spans {
+                    span.inherit_style(style);
                 }
                 text
             }
         }
     }
     fn translate(self, key: &str, fallback: Option<&str>, args: &[Text]) -> Text {
-        match (self.0, fallback) {
+        let mut text = match (self.0, fallback) {
             (true, Some(fallback)) => Text::translate_with_fallback(key, fallback, args),
             (true, None) => Text::translate(key, args),
-            (false, fallback) => crate::text::format_translatable(key, fallback, args),
+            (false, fallback) => {
+                crate::text::format_translatable_origin(key, fallback, args, self.1)
+            }
+        };
+        if self.0 && self.1 == Origin::Remote {
+            text.clear_origins();
+            for span in &mut text.rendered.spans {
+                span.origin = Origin::Remote;
+            }
         }
+        text
     }
 }
 
@@ -499,6 +545,7 @@ fn build(
     resolve: &mut dyn FnMut(&str) -> Text,
     contents: &mut dyn FnMut(&serde_json::Map<String, Value>) -> Option<Text>,
     sourced: Sourced,
+    origin: &dyn Fn(&Value) -> Origin,
 ) -> Text {
     use std::collections::HashMap;
     enum Work<'a> {
@@ -534,11 +581,15 @@ fn build(
                 let Value::Object(o) = value else {
                     unreachable!()
                 };
-                let style = object_style(o, &mut |v| {
-                    done.remove(&(v as *const Value))
-                        .map(take_built_text)
-                        .unwrap_or_default()
-                });
+                let style = object_style(
+                    o,
+                    &mut |v| {
+                        done.remove(&(v as *const Value))
+                            .map(take_built_text)
+                            .unwrap_or_default()
+                    },
+                    origin(value),
+                );
                 let overridden = if hover { None } else { contents(o) };
                 let needs_content = overridden.is_none();
                 pending.push(Work::Content(value, hover, style, overridden));
@@ -558,7 +609,7 @@ fn build(
                 }
             }
             Work::Content(value, hover, mut style, overridden) => {
-                let mode = Sourced(sourced.0 || hover);
+                let mode = Sourced(sourced.0 || hover, origin(value));
                 if let Value::Array(a) = value
                     && let Some(first) = a.first()
                     && let Some((text, own_style)) = done.get(&(first as *const Value))
@@ -566,7 +617,8 @@ fn build(
                     style = if first.is_object() {
                         own_style.clone()
                     } else {
-                        text.spans
+                        text.rendered
+                            .spans
                             .first()
                             .map(|s| s.style.clone())
                             .unwrap_or_default()
@@ -593,7 +645,7 @@ fn build(
                 let Value::Object(o) = value else {
                     unreachable!()
                 };
-                let mode = Sourced(sourced.0 || hover);
+                let mode = Sourced(sourced.0 || hover, origin(value));
                 if let Some(Value::Array(a)) = o.get("extra") {
                     for v in a {
                         let extra = done
@@ -608,7 +660,7 @@ fn build(
                         || o.contains_key("player")
                         || o.contains_key("sprite"))
                 {
-                    text = text.with_component(clone_object(o));
+                    text.retain_annotated_source(value, origin);
                 }
                 done.insert(value as *const Value, (text, style));
             }
@@ -646,18 +698,18 @@ fn build_node<'a>(
             // its text is empty.
             for sibling in rest {
                 let sibling = child(sibling);
-                sourced.append(&mut base, sourced.styled(sibling, &style));
+                sourced.append(&mut base, sourced.styled(sibling, style));
             }
             base
         }
         Value::Object(o) => {
             let content = if let Some(t) = overridden {
-                t
+                Text::from(t.component())
             } else if let Some(object) =
                 inline_object_with_fallback(o, o.get("fallback").map(|v| plain_component(child(v))))
             {
-                let mut text = Text::literal("\u{fffc}");
-                text.spans[0].style.inline_object = Some(object);
+                let mut text = sourced.literal("\u{fffc}".into());
+                text.rendered.spans[0].style.inline_object = Some(object);
                 text
             } else if let Some(t) = o.get("text") {
                 match t {
@@ -668,7 +720,7 @@ fn build_node<'a>(
                 let args: Vec<Text> = o
                     .get("with")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().map(|x| child(x)).collect())
+                    .map(|a| a.iter().map(child).collect())
                     .unwrap_or_default();
                 let text = sourced.translate(key, o.get("fallback").and_then(Value::as_str), &args);
                 for arg in args {
@@ -676,9 +728,9 @@ fn build_node<'a>(
                 }
                 text
             } else if let Some(sel) = o.get("selector").and_then(Value::as_str) {
-                resolve(sel)
+                Text::from(resolve(sel).component())
             } else if let Some(key) = o.get("keybind").and_then(Value::as_str) {
-                crate::key_display::display_name(key)
+                Text::from(crate::key_display::display_name(key).component())
             } else {
                 Text::empty()
             };
@@ -777,7 +829,7 @@ fn inline_object_with_fallback(
 /// else is a component (`ComponentSerialization`).
 pub fn name_text(tag: &Tag) -> Text {
     match tag {
-        Tag::String(s) => Text::legacy(&s.to_string_lossy()),
+        Tag::String(s) => Text::untrusted_legacy(&s.to_string_lossy()),
         t => crate::scoreboard::comp_text(&crate::scoreboard::tag_to_json(t)),
     }
 }
@@ -865,11 +917,11 @@ mod tests {
                     let text = Text::from(tree);
                     assert_eq!(text.plain(), "[Test head]");
                     assert!(matches!(
-                        text.spans[0].style.inline_object,
+                        text.rendered.spans[0].style.inline_object,
                         Some(InlineObject::Player { .. })
                     ));
                     assert!(matches!(
-                        text.spans[0].style.click,
+                        text.rendered.spans[0].style.click,
                         Some(crate::text::ClickEvent::Custom { .. })
                     ));
                     crate::text::discard_text(text);
@@ -918,18 +970,26 @@ mod tests {
                 None
             },
         );
-        assert_eq!(text.spans[0].style.hover.as_ref().unwrap().plain(), "@p");
+        assert_eq!(
+            text.rendered.spans[0].style.hover.as_ref().unwrap().plain(),
+            "@p"
+        );
         let value = serde_json::json!({"text":"visible", "hover_event":{"action":"show_text", "value":{"translate":"test:hover"}}});
         let text = to_text(&value, &mut |_| panic!("hover resolver escaped"));
         assert_eq!(
-            text.spans[0].style.hover.as_ref().unwrap().component()["translate"],
+            text.rendered.spans[0]
+                .style
+                .hover
+                .as_ref()
+                .unwrap()
+                .component()["translate"],
             "test:hover"
         );
         let text = Text::from(serde_json::json!([[{"text":"", "color":"red"}], "tail"]));
         assert_eq!(text.plain(), "tail");
-        assert_eq!(text.spans[0].style.color, None);
+        assert_eq!(text.rendered.spans[0].style.color, None);
         let text = Text::from(serde_json::json!([{"text":"", "color":"red"}, "tail"]));
-        assert_eq!(text.spans[0].style.color, Some(crate::text::RED));
+        assert_eq!(text.rendered.spans[0].style.color, Some(crate::text::RED));
     }
 
     #[test]
@@ -953,8 +1013,40 @@ mod tests {
             let value = serde_json::json!({"translate":"test.missing", "fallback":"value: %s", "with":[{"text":"argument", "bold":true}]});
             let text = Text::from(value);
             assert_eq!(text.plain(), "value: argument");
-            assert_eq!(text.spans.last().unwrap().style.bold, Some(true));
+            assert_eq!(text.rendered.spans.last().unwrap().style.bold, Some(true));
         });
+    }
+
+    #[test]
+    fn nested_fallback_references_stay_bounded() {
+        // 300 references to the argument, nested three deep: 27 million copies of "A" from a
+        // 4 KB component, which ran a client out of memory.
+        let bomb = |depth: usize, text: &str| {
+            let pattern = "%1$s".repeat(300);
+            let mut v = serde_json::json!({ "text": text });
+            for _ in 0..depth {
+                v = serde_json::json!({"translate": "x.unknown", "fallback": pattern, "with": [v]});
+            }
+            v
+        };
+        let started = std::time::Instant::now();
+        let text = to_text(&bomb(3, "A"), &mut |s| Text::literal(s));
+        assert!(
+            text.rendered.spans.len() < 1 << 15,
+            "{} spans",
+            text.rendered.spans.len()
+        );
+        // One long argument referenced many times multiplies bytes, not spans.
+        let long = "B".repeat(64 << 10);
+        let text = to_text(&bomb(1, &long), &mut |s| Text::literal(s));
+        let bytes: usize = text.rendered.spans.iter().map(|s| s.text.len()).sum();
+        assert!(bytes <= 4 << 20, "{bytes} bytes");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A real fallback still formats.
+        let ok = serde_json::json!({
+            "translate": "x.unknown", "fallback": "%1$s and %1$s", "with": [{"text": "A"}]
+        });
+        assert_eq!(to_text(&ok, &mut |s| Text::literal(s)).plain(), "A and A");
     }
     use crate::lang::{self, Language, ResourceSource};
 
@@ -1012,6 +1104,9 @@ mod tests {
 
     #[test]
     fn a_text_received_whole_has_the_spans_its_parts_would() {
+        let _guard = crate::key_display::TEST_BINDINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use serde_json::json;
         for v in [
             json!(""),
@@ -1027,9 +1122,41 @@ mod tests {
         ] {
             let whole = spans_of(v.clone());
             let parts = to_text(&v, &mut |s| Text::literal(s));
-            assert_eq!(whole.spans, parts.spans, "{v}");
+            assert_eq!(whole.rendered.spans, parts.rendered.spans, "{v}");
             assert_eq!(whole.component(), v, "{v}");
         }
+    }
+
+    #[test]
+    fn keybind_components_decode_assigned_key_and_reflect_rebinding() {
+        let _guard = crate::key_display::TEST_BINDINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::key_display::replace_action_bindings([("key.jump", "key.keyboard.space")]);
+        let ((), _) = crate::lang::scoped(
+            crate::lang::Language::of(
+                "en_us",
+                [
+                    ("key.jump".into(), "Jump".into()),
+                    ("key.keyboard.space".into(), "Space".into()),
+                    ("key.keyboard.up".into(), "Up Arrow".into()),
+                    ("key.keyboard.unknown".into(), "None".into()),
+                ],
+            ),
+            || {
+                let v = serde_json::json!({"keybind": "key.jump"});
+                assert_eq!(to_text(&v, &mut |_| Text::empty()).plain(), "Space");
+
+                crate::key_display::set_action_binding("key.jump", "key.keyboard.up");
+                assert_eq!(to_text(&v, &mut |_| Text::empty()).plain(), "Up Arrow");
+
+                crate::key_display::set_action_binding("key.jump", "key.keyboard.unknown");
+                assert_eq!(to_text(&v, &mut |_| Text::empty()).plain(), "None");
+
+                crate::key_display::reset_action_bindings();
+                assert_eq!(to_text(&v, &mut |_| Text::empty()).plain(), "Jump");
+            },
+        );
     }
 
     #[test]
@@ -1056,24 +1183,24 @@ mod tests {
         }
         let out = serde_json::json!({"text": "A", "color": "#1000000"});
         let text = to_text(&out, &mut |_| Text::empty());
-        assert_eq!(text.spans[0].style.color, None);
+        assert_eq!(text.rendered.spans[0].style.color, None);
     }
 
     #[test]
     fn shadow_color_accepts_packed_and_rgba_styles() {
         let packed = serde_json::json!({"text": "A", "shadow_color": -16711936});
         let text = to_text(&packed, &mut |_| Text::empty());
-        assert_eq!(text.spans[0].style.shadow_color, Some(0xff00ff00));
+        assert_eq!(text.rendered.spans[0].style.shadow_color, Some(0xff00ff00));
         assert_eq!(text.component()["shadow_color"], -16711936);
         let rgba = serde_json::json!({"text": "A", "shadow_color": [1, 0, 0.5, 1]});
         let text = to_text(&rgba, &mut |_| Text::empty());
-        assert_eq!(text.spans[0].style.shadow_color, Some(0xffff007f));
+        assert_eq!(text.rendered.spans[0].style.shadow_color, Some(0xffff007f));
         let translucent = serde_json::json!({"text": "A", "shadow_color": [1, 0, 0.5, 0.5]});
         let text = to_text(&translucent, &mut |_| Text::empty());
-        assert_eq!(text.spans[0].style.shadow_color, Some(0x7fff007f));
+        assert_eq!(text.rendered.spans[0].style.shadow_color, Some(0x7fff007f));
         let no_shadow = serde_json::json!({"text": "A", "shadow_color": 0});
         let text = to_text(&no_shadow, &mut |_| Text::empty());
-        assert_eq!(text.spans[0].style.shadow_color, Some(0));
+        assert_eq!(text.rendered.spans[0].style.shadow_color, Some(0));
     }
 
     #[test]
@@ -1089,15 +1216,15 @@ mod tests {
         let text = to_text(&component, &mut |_| Text::empty());
         assert_eq!(text.plain(), "<[head] >");
         assert!(matches!(
-            &text.spans[1].style.inline_object,
+            &text.rendered.spans[1].style.inline_object,
             Some(InlineObject::Player { hat: false, .. })
         ));
-        assert!(text.spans[2].style.inline_object.is_none());
+        assert!(text.rendered.spans[2].style.inline_object.is_none());
         assert_eq!(text.component(), component);
         let sprite = serde_json::json!({"object": "atlas", "sprite": "minecraft:item/porkchop"});
         let text = to_text(&sprite, &mut |_| Text::empty());
         assert!(matches!(
-            &text.spans[0].style.inline_object,
+            &text.rendered.spans[0].style.inline_object,
             Some(InlineObject::Atlas { sprite, .. }) if sprite == "minecraft:item/porkchop"
         ));
         // ObjectContents.visit without a fallback: the sprite's defaultFallback.
@@ -1121,9 +1248,9 @@ mod tests {
         assert_eq!(&input[n..], " rest");
         let t = to_text(&v, &mut |_| Text::empty());
         assert_eq!(t.plain(), "Hi there");
-        assert_eq!(t.spans[1].style.color, named_color("red"));
+        assert_eq!(t.rendered.spans[1].style.color, named_color("red"));
         // SNBT `1b` is a number in JSON; style flags still take it as true.
-        assert_eq!(t.spans[1].style.bold, Some(true));
+        assert_eq!(t.rendered.spans[1].style.bold, Some(true));
         let (v, _) = parse_snbt("[\"a\",{\"text\":\"b\"}]").unwrap();
         assert_eq!(to_text(&v, &mut |_| Text::empty()).plain(), "ab");
     }
@@ -1144,19 +1271,19 @@ mod tests {
         for component in [modern, legacy] {
             let text = to_text(&component, &mut |_| Text::empty());
             assert_eq!(
-                text.spans[0].style.click,
+                text.rendered.spans[0].style.click,
                 Some(ClickEvent::OpenUrl("https://example.com".into()))
             );
-            assert_eq!(text.spans[0].style.underlined, Some(true));
+            assert_eq!(text.rendered.spans[0].style.underlined, Some(true));
         }
         let snbt = r#"{text:"site",underlined:1b,clickEvent:{action:open_url,value:"https://example.com"}}"#;
         let (v, _) = parse_snbt(snbt).unwrap();
         let text = to_text(&v, &mut |_| Text::empty());
         assert_eq!(
-            text.spans[0].style.click,
+            text.rendered.spans[0].style.click,
             Some(ClickEvent::OpenUrl("https://example.com".into()))
         );
-        assert_eq!(text.spans[0].style.underlined, Some(true));
+        assert_eq!(text.rendered.spans[0].style.underlined, Some(true));
     }
 
     #[test]
@@ -1212,7 +1339,7 @@ mod tests {
                 }),
                 &mut |_| Text::empty(),
             );
-            assert_eq!(text.spans[0].style.click, None);
+            assert_eq!(text.rendered.spans[0].style.click, None);
         }
     }
 
@@ -1235,7 +1362,7 @@ mod tests {
         // Not an identifier: no font.
         let (v, _) = parse_snbt(r#"{text:"a",font:"Bad Font"}"#).unwrap();
         let t = to_text(&v, &mut |_| Text::empty());
-        assert_eq!(t.spans[0].style.font, None);
+        assert_eq!(t.rendered.spans[0].style.font, None);
     }
 
     #[test]

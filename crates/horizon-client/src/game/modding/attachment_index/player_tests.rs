@@ -22,7 +22,7 @@ const VALUE: AttachmentType<i32> = AttachmentType {
 fn snapshot(
     game: &Game<'_>,
     dim: Dim,
-) -> Arc<Vec<horizon_mod_runtime::attachments::index::AttachmentRow<AttachmentHolder>>> {
+) -> Arc<horizon_mod_runtime::attachments::index::AttachmentSnapshot<AttachmentHolder>> {
     game.attachment_indexes[&dim]
         .lock()
         .unwrap()
@@ -113,7 +113,8 @@ fn first_stores_bind_once_and_guest_turns_preserve_the_registration() {
             let host: &mut dyn ServerHost = game;
             VALUE.set(host, Holder::Player(12), 8).unwrap();
             assert!(
-                game.player_attachments
+                game.player_state
+                    .attachments
                     .registration()
                     .unwrap()
                     .same_registration(&first)

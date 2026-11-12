@@ -37,7 +37,7 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     )
     .unwrap();
     game.native_lifecycle
-        .begin_open(mod_api::NativeAuthority::IntegratedServer);
+        .begin_open(mod_api::Authority::IntegratedServer);
     game.world = World::new(game.res.facts().air, 1);
     game.world
         .chunks
@@ -78,12 +78,14 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     let keys = [(0, 0)].into();
     let mut saved = HashMap::new();
     game.save_every_entity(&keys, &mut saved);
-    assert_eq!(saved.values().map(Vec::len).sum::<usize>(), 1);
+    // A dying but not removed entity still saves until its death animation
+    // completes. Both roots are savable before the explicit discard.
+    assert_eq!(saved.values().map(Vec::len).sum::<usize>(), 2);
     let before_save = saved.values().any(|tags| !tags.is_empty());
     let health = game.mobs[0].health;
     let world_time = game.world.game_time;
     assert!(!game.entity_discard(mod_api::EntityRef::new(
-        mod_api::NativeWorldEpoch::new(u64::MAX),
+        mod_api::WorldEpoch::new(u64::MAX),
         42
     )));
     assert!(game.entity_discard(mod_api::EntityRef::new(
@@ -125,13 +127,21 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     );
     saved.clear();
     game.save_every_entity(&keys, &mut saved);
-    assert!(saved.values().all(Vec::is_empty));
+    assert_eq!(
+        saved
+            .values()
+            .flatten()
+            .map(|(id, _, _)| *id)
+            .collect::<Vec<_>>(),
+        [43],
+        "discard removes only its target; the dying survivor still saves"
+    );
     let report = serde_json::json!({
         "before_id": before_id, "before_uuid": before_uuid, "before_save": before_save,
         "after_id": game.level_entity(42).is_some(),
         "after_uuid": game.target_with_uuid(removed_uuid).is_some(),
         "after_enumeration": after_enumeration,
-        "after_save": saved.values().any(|tags| !tags.is_empty()),
+        "after_save": saved.values().flatten().any(|(id, _, _)| *id == 42),
         "removed": game.mobs[0].removed,
     });
     if let Some(path) = std::env::var_os("HORIZON_DISCARD_REPORT") {
@@ -162,7 +172,7 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     game.mobs[3].extra.mount = Some(44);
     saved.clear();
     game.save_every_entity(&keys, &mut saved);
-    let root = &saved[&(0, 0)][0];
+    let root = &saved[&(0, 0)][0].2;
     assert!(matches!(root.get("Passengers"), Some(Tag::List(list)) if list.len() == 1));
     assert!(game.entity_discard(mod_api::EntityRef::new(
         game.native_lifecycle.epoch().unwrap(),
@@ -171,5 +181,5 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     saved.clear();
     game.save_every_entity(&keys, &mut saved);
     assert_eq!(saved[&(0, 0)].len(), 1);
-    assert!(saved[&(0, 0)][0].get("Passengers").is_none());
+    assert!(saved[&(0, 0)][0].2.get("Passengers").is_none());
 }

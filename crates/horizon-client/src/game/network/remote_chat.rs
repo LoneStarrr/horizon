@@ -32,6 +32,34 @@ enum CommandCheck {
     PermissionsRequired,
 }
 
+impl Game<'_> {
+    /// `ChatListener.showMessageToPlayer`'s line and narration of a player
+    /// message: none when its sender is hidden in the Social Interactions
+    /// screen (`Minecraft.isBlocked`) or the server filtered all of it; a
+    /// partial filter mask shows and narrates `applyWithFormatting(signedContent)`
+    /// instead of the decorated `line` and `narration`.
+    pub(super) fn shown_player_chat(
+        &mut self,
+        p: &play::PlayerChat,
+        line: Text,
+        narration: String,
+    ) -> Option<(Text, String)> {
+        use super::remote::Decoration;
+        let filtered = horizon_client::chat::filtered_message(&p.content, &p.filter)?;
+        if self.social_hides(p.sender) {
+            return None;
+        }
+        if p.filter.0 != 2 {
+            return Some((line, narration));
+        }
+        Some((
+            self.decorate_chat(&p.chat_type, &filtered, Decoration::Chat),
+            self.decorate_chat(&p.chat_type, &filtered, Decoration::Narration)
+                .plain(),
+        ))
+    }
+}
+
 /// ClientPacketListener.verifyCommand over the tree the server sent.
 fn verify_command(tree: &Dispatcher, registries: &Registries, command: &str) -> CommandCheck {
     let parse = tree.parse(command, registries);
@@ -375,7 +403,7 @@ impl Game<'_> {
     /// The confirmation's title, the command in yellow in its message, and
     /// its two buttons.
     fn command_prompt_layout(&self, prompt: &CommandPrompt, size: (f32, f32)) -> Choice {
-        let command = Text::literal(&prompt.command).with_color(0xFF_FF55);
+        let command = Text::untrusted(&prompt.command).with_color(0xFF_FF55);
         let mut choice = Choice::new(
             &self.gui.atlas.font,
             size,

@@ -49,6 +49,8 @@ struct RainView<'a> {
     random: LegacyRandom,
 }
 
+impl horizon_world::level::BlockEntityNeighbors for RainView<'_> {}
+
 impl LevelAccess for RainView<'_> {
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         self.world.block(pos.x, pos.y, pos.z)
@@ -148,11 +150,11 @@ impl Game<'_> {
 
     /// The level's dimension type with its gameplay attributes, from the facts the game uses.
     pub(super) fn level_dimension_type(&self, level: LevelRef) -> Option<LevelDimensionType> {
-        use horizon_world::dimension_type::{CardinalLight, DimensionFacts, Skybox};
+        use horizon_world::dimension_type::{CardinalLight, Skybox};
         use horizon_world::worldgen::value_provider::IntProvider;
         self.native_level_read_world(level)?;
         let key = horizon_core::LevelKey::parse(level.dimension_id()).ok()?;
-        let facts = DimensionFacts::of_level(key);
+        let facts = self.dimension_facts_for(key);
         Some(LevelDimensionType {
             id: facts.id.clone(),
             min_y: facts.height.min_y,
@@ -217,6 +219,17 @@ impl Game<'_> {
     pub(super) fn level_difficulty(&self, level: LevelRef) -> Option<&'static str> {
         self.native_level_world(level)?;
         DIFFICULTIES.get(usize::from(self.ui.difficulty)).copied()
+    }
+    /// `ServerLevel.getCurrentDifficultyAt(pos)` in the level the handle names, in place or
+    /// parked.
+    pub(super) fn level_local_difficulty(
+        &self,
+        level: LevelRef,
+        pos: [i32; 3],
+    ) -> Option<mod_api::Difficulty> {
+        let world = self.native_level_world(level)?;
+        let at = pos.map(f64::from);
+        Some(super::creatures::local_difficulty_in(world, at).into())
     }
     /// Read a registered boolean game rule.
     pub(super) fn level_game_rule_bool(
@@ -322,10 +335,10 @@ mod tests {
     use super::super::native_entity_refs::tests::with_game;
     use horizon_client::chunk::Chunk;
     use horizon_client::gamerules;
-    use mod_api::testing::with_mods;
     use mod_api::{
         FeatureFlags, GameRuleChangedEvent, GameRuleValue, Hooks, LevelHost, ModEntry, ServerHost,
     };
+    use mod_platform::testing::with_mods;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -333,7 +346,7 @@ mod tests {
     fn dimension_shape_reads_current_parked_and_stale_levels() {
         use super::super::Dim;
         use horizon_client::chunk::LevelShape;
-        use mod_api::{Host, LevelDimensionShape, NativeAuthority};
+        use mod_api::{Authority, Host, LevelDimensionShape};
 
         with_game(|game| {
             game.world.shape = LevelShape::new(-32, 320, 256, true, false).unwrap();
@@ -351,7 +364,7 @@ mod tests {
                 Some(LevelDimensionShape::new(0, 256, 128, false, true))
             );
             game.native_lifecycle
-                .begin_open(NativeAuthority::IntegratedServer);
+                .begin_open(Authority::IntegratedServer);
             let host: &dyn Host = game;
             assert_eq!(overworld.dimension_shape(host), None);
             assert_eq!(nether.dimension_shape(host), None);
@@ -558,7 +571,7 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn rule_reads_distinguish_unknown_stale_and_unavailable_and_snapshot_values() {
         use super::super::execution_role::ExecutionRole;
-        use mod_api::{LevelReadError, NativeWorldEpoch};
+        use mod_api::{LevelReadError, WorldEpoch};
         with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
             assert!(
@@ -582,10 +595,8 @@ mod tests {
             );
             let rules = level.game_rules(game).unwrap();
             assert!(rules.contains(&("minecraft:random_tick_speed".into(), GameRuleValue::Int(7))));
-            let stale = mod_api::LevelRef::new(
-                NativeWorldEpoch::new(level.epoch().get() + 1),
-                level.dimension(),
-            );
+            let stale =
+                mod_api::LevelRef::new(WorldEpoch::new(level.epoch().get() + 1), level.dimension());
             let gone = mod_api::LevelRef::new(
                 level.epoch(),
                 mod_api::__private::dimension_key("missing:level"),
@@ -621,17 +632,14 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn weather_read_resolves_levels_and_refuses_stale_or_unavailable_handles() {
         use super::super::execution_role::ExecutionRole;
-        use mod_api::{LevelRef, NativeWorldEpoch};
+        use mod_api::{LevelRef, WorldEpoch};
 
         with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
             game.world.weather.rain_level = (0.0, 0.5);
             game.world.weather.thunder_level = (0.0, 0.75);
             assert_eq!(level.weather(game), Some((0.5, 0.375)));
-            let stale = LevelRef::new(
-                NativeWorldEpoch::new(level.epoch().get() + 1),
-                level.dimension(),
-            );
+            let stale = LevelRef::new(WorldEpoch::new(level.epoch().get() + 1), level.dimension());
             assert_eq!(stale.weather(game), None);
             let absent = LevelRef::new(
                 level.epoch(),

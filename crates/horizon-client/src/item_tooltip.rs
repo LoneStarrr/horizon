@@ -1,14 +1,15 @@
 //! Item tooltip formatting: equipment modifiers with a player's base values,
-//! and lines without player context for the recipe book's search tree.
+//! and lines without player context for the recipe book and creative search trees.
 use crate::text::{GRAY, Text};
 use crate::{
     bundle::TooltipLayout,
+    enchant::Enchantments,
     hud::rgba,
     items::{ItemInfo, ItemStack, Items},
 };
 use horizon_core::nbt::Tag;
 use mod_api::TooltipPlacement;
-pub use mod_api::item_tooltip::TooltipDisplay;
+pub use mod_api::item::item_tooltip::TooltipDisplay;
 /// Borrow the engine's modelled visibility without allocating an API stack.
 pub fn tooltip_display(stack: &ItemStack) -> TooltipDisplay<'_> {
     TooltipDisplay::from_component(
@@ -72,9 +73,18 @@ fn modifier_line(
 
 /// `Attribute.getStyle`: the colour of a line for an attribute whose value
 /// rises or falls. Gravity, scale and the waypoint ranges are neutral, burning
-/// time and fall damage are negative, every other attribute is positive.
-fn attribute_color(attribute: &str, rises: bool) -> u32 {
-    let (blue, red) = (rgba(85, 85, 255, 255), rgba(255, 85, 85, 255));
+/// time and fall damage are negative, every other attribute is positive; a
+/// mod's declared attribute answers its own sentiment, positive by default.
+fn attribute_color(
+    attribute: &str,
+    rises: bool,
+    sentiment: Option<horizon_world::attributes::Sentiment>,
+) -> u32 {
+    let (blue, red, grey) = (
+        rgba(85, 85, 255, 255),
+        rgba(255, 85, 85, 255),
+        rgba(170, 170, 170, 255),
+    );
     match attribute {
         "burning_time" | "fall_damage_multiplier" => {
             if rises {
@@ -83,16 +93,24 @@ fn attribute_color(attribute: &str, rises: bool) -> u32 {
                 blue
             }
         }
-        "gravity" | "scale" | "waypoint_transmit_range" | "waypoint_receive_range" => {
-            rgba(170, 170, 170, 255)
-        }
-        _ => {
-            if rises {
-                blue
-            } else {
-                red
+        "gravity" | "scale" | "waypoint_transmit_range" | "waypoint_receive_range" => grey,
+        _ => match sentiment.unwrap_or_default() {
+            horizon_world::attributes::Sentiment::Positive => {
+                if rises {
+                    blue
+                } else {
+                    red
+                }
             }
-        }
+            horizon_world::attributes::Sentiment::Neutral => grey,
+            horizon_world::attributes::Sentiment::Negative => {
+                if rises {
+                    red
+                } else {
+                    blue
+                }
+            }
+        },
     }
 }
 
@@ -172,10 +190,11 @@ pub fn attribute_tooltip(
     shown: bool,
     listener: &dyn AttributeTooltipListener,
     translate: &dyn Fn(&str) -> Option<String>,
+    sentiment: &dyn Fn(&str) -> Option<horizon_world::attributes::Sentiment>,
 ) -> (Vec<(String, u32)>, Vec<(Text, u32)>) {
     let lines = if shown {
         let filter = listener.skipped(stack, ctx);
-        attribute_lines_filtered(modifiers, ctx.player_base, &filter, translate)
+        attribute_lines_filtered(modifiers, ctx.player_base, &filter, translate, sentiment)
     } else {
         Vec::new()
     };
@@ -194,6 +213,7 @@ pub fn attribute_lines(
         player_base,
         &AttributeFilter::default(),
         translate,
+        &|_| None,
     )
 }
 
@@ -204,6 +224,7 @@ pub fn attribute_lines_filtered(
     player_base: Option<[f64; 2]>,
     filter: &AttributeFilter,
     translate: &dyn Fn(&str) -> Option<String>,
+    sentiment: &dyn Fn(&str) -> Option<horizon_world::attributes::Sentiment>,
 ) -> Vec<(String, u32)> {
     let mut lines = Vec::new();
     for group in SLOT_GROUPS {
@@ -248,7 +269,10 @@ pub fn attribute_lines_filtered(
                 let (line, color) = if base.is_some() {
                     (format!(" {line}"), rgba(0, 170, 0, 255))
                 } else {
-                    (line, attribute_color(path, *amount > 0.0))
+                    (
+                        line,
+                        attribute_color(path, *amount > 0.0, sentiment(attribute)),
+                    )
                 };
                 lines.push((line, color));
             }
@@ -393,10 +417,11 @@ pub fn bundle_tooltip(
     x: f32,
     y: f32,
     box_width: f32,
+    description_lines: usize,
 ) -> Option<TooltipLayout> {
     tooltip_display(stack)
         .shows("minecraft:bundle_contents")
-        .then(|| crate::bundle::tooltip_layout(items, stack, x, y, box_width))
+        .then(|| crate::bundle::tooltip_layout(items, stack, x, y, box_width, description_lines))
         .flatten()
 }
 
@@ -1102,12 +1127,29 @@ pub fn disc_fragment_line(
     Some(translate(key).unwrap_or_else(|| key.to_owned()))
 }
 
+/// The enchantment components in `ItemStack.addDetailsToTooltip` order.
+pub fn enchantment_lines(
+    stack: &ItemStack,
+    display: &TooltipDisplay,
+    enchantments: &Enchantments,
+) -> Vec<(String, bool)> {
+    let mut lines = Vec::new();
+    if display.shows("minecraft:stored_enchantments") {
+        lines.extend(enchantments.tooltip(stack.stored_enchantments()));
+    }
+    if display.shows("minecraft:enchantments") {
+        lines.extend(enchantments.tooltip(stack.enchantments()));
+    }
+    lines
+}
+
 /// The lines of `stack` below its name that its components give, in
 /// `ItemStack.addDetailsToTooltip` order.
 pub fn detail_lines(
     stack: &ItemStack,
     info: Option<&ItemInfo>,
     attributes: &dyn AttributeTooltipListener,
+    enchantments: &Enchantments,
     translate: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let text = |key: &str| translate(key).unwrap_or_else(|| key.to_owned());
@@ -1170,6 +1212,11 @@ pub fn detail_lines(
             text(&format!("trim_material.minecraft.{}", short(material)))
         ));
     }
+    lines.extend(
+        enchantment_lines(stack, &display, enchantments)
+            .into_iter()
+            .map(|(text, _)| text),
+    );
     lines.extend(dyed_line(stack, &display, false, translate).map(|l| l.0));
     let modifiers =
         crate::item_attributes::attribute_modifiers_or(stack, info.map_or(&[], |i| &i.modifiers));
@@ -1180,9 +1227,16 @@ pub fn detail_lines(
         creative: false,
     };
     let (modifier_lines, added) = attribute_tooltip(
-        stack, &modifiers, &ctx,
+        stack,
+        &modifiers,
+        &ctx,
         // The search text lists attribute lines whatever the stack's display says, as before.
-        true, attributes, translate,
+        true,
+        attributes,
+        translate,
+        // The search text builds without a catalog: vanilla colors, positive
+        // for a mod attribute.
+        &|_| None,
     );
     lines.extend(modifier_lines.into_iter().map(|(line, _)| line));
     lines.extend(added.into_iter().map(|(text, _)| text.plain()));
@@ -1319,13 +1373,20 @@ pub fn lines(
     stack: &ItemStack,
     info: Option<&ItemInfo>,
     attributes: &dyn AttributeTooltipListener,
+    enchantments: &Enchantments,
     translate: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut lines = vec![name_line(stack, translate)];
     if tooltip_display(stack).shows("minecraft:lore") {
         lines.extend(lore_texts(stack).into_iter().map(|t| t.plain()));
     }
-    lines.extend(detail_lines(stack, info, attributes, translate));
+    lines.extend(detail_lines(
+        stack,
+        info,
+        attributes,
+        enchantments,
+        translate,
+    ));
     lines
 }
 
@@ -1352,12 +1413,7 @@ pub fn lore_texts(stack: &ItemStack) -> Vec<crate::text::Text> {
     };
     lines
         .into_iter()
-        .map(|mut text| {
-            for span in &mut text.spans {
-                span.style.inherit(&base);
-            }
-            text
-        })
+        .map(|text| text.with_style(&base))
         .collect()
 }
 
@@ -1376,7 +1432,7 @@ pub fn styled_name(stack: &ItemStack, fallback: impl FnOnce() -> String) -> crat
     {
         return crate::entity_nbt::name_text(component);
     }
-    crate::text::Text::legacy(&fallback())
+    crate::text::Text::untrusted_legacy(&fallback())
 }
 
 #[cfg(test)]
@@ -1387,6 +1443,7 @@ mod tests {
 
     #[test]
     fn disc_fragment_shows_music_disc_line_first() {
+        let enchantments = Enchantments::default();
         let translate = |k: &str| {
             (k == "item.minecraft.disc_fragment_5.desc").then(|| "Music Disc - 5".to_owned())
         };
@@ -1395,14 +1452,26 @@ mod tests {
             disc_fragment_line(&stack, &translate).as_deref(),
             Some("Music Disc - 5")
         );
-        let lines = detail_lines(&stack, None, &NoAttributeListener, &translate);
+        let lines = detail_lines(
+            &stack,
+            None,
+            &NoAttributeListener,
+            &enchantments,
+            &translate,
+        );
         assert_eq!(lines.first().map(String::as_str), Some("Music Disc - 5"));
         let other = ItemStack::new("minecraft:stick", 1);
         assert_eq!(disc_fragment_line(&other, &translate), None);
         assert!(
-            !detail_lines(&other, None, &NoAttributeListener, &translate)
-                .iter()
-                .any(|l| l == "Music Disc - 5")
+            !detail_lines(
+                &other,
+                None,
+                &NoAttributeListener,
+                &enchantments,
+                &translate
+            )
+            .iter()
+            .any(|l| l == "Music Disc - 5")
         );
     }
 
@@ -1433,6 +1502,33 @@ mod tests {
         assert_eq!(text.spans[1].style.color, Some(0x0000ff));
         assert!(!text.spans[0].style.is_italic());
         assert!(text.spans[1].style.is_italic());
+    }
+
+    #[test]
+    fn lore_retains_translation_component() {
+        let mut stack = ItemStack::new("minecraft:stick", 1);
+        stack.data_mut().set_other(
+            "minecraft:lore",
+            Some(Tag::List(vec![Tag::compound([
+                ("translate", Tag::String("example.lore".into())),
+                ("with", Tag::List(vec![Tag::String("argument".into())])),
+            ])])),
+        );
+        let lines = lore_texts(&stack);
+        // Decoding canonicalizes string arguments to literal text components.
+        assert_eq!(
+            lines[0].component(),
+            serde_json::json!({
+                "translate": "example.lore",
+                "with": [{"text": "argument"}],
+                "color": "dark_purple",
+                "italic": true
+            })
+        );
+        assert_eq!(
+            lines[0].spans.last().unwrap().style.color,
+            Some(crate::text::DARK_PURPLE)
+        );
     }
 
     #[test]
@@ -1509,10 +1605,10 @@ mod tests {
         let items = Items::for_tests(Default::default());
         let mut bundle = ItemStack::new("minecraft:bundle", 1);
         bundle.data_mut().bundle_contents = vec![ItemStack::new("minecraft:stone", 3)];
-        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_some());
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0, 2).is_some());
         // A stack that is not a bundle has no grid.
         let stone = ItemStack::new("minecraft:stone", 1);
-        assert!(bundle_tooltip(&items, &stone, 0.0, 0.0, 96.0).is_none());
+        assert!(bundle_tooltip(&items, &stone, 0.0, 0.0, 96.0, 2).is_none());
         // A display that hides the contents component hides the grid.
         bundle.data_mut().set_other(
             "minecraft:tooltip_display",
@@ -1521,13 +1617,13 @@ mod tests {
                 Tag::List(vec![Tag::String("minecraft:bundle_contents".into())]),
             )])),
         );
-        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_none());
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0, 2).is_none());
         // So does one that hides the whole tooltip.
         bundle.data_mut().set_other(
             "minecraft:tooltip_display",
             Some(Tag::compound([("hide_tooltip", Tag::Byte(1))])),
         );
-        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_none());
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0, 2).is_none());
         // A component the display does not name leaves the grid alone.
         bundle.data_mut().set_other(
             "minecraft:tooltip_display",
@@ -1536,7 +1632,7 @@ mod tests {
                 Tag::List(vec![Tag::String("minecraft:lore".into())]),
             )])),
         );
-        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_some());
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0, 2).is_some());
     }
 
     #[test]
@@ -1589,6 +1685,7 @@ mod tests {
 
     #[test]
     fn ominous_bottle_lists_bad_omen_at_its_amplifier_for_100_minutes() {
+        let enchantments = Enchantments::default();
         let lang = |key: &str| {
             Some(
                 match key {
@@ -1616,10 +1713,10 @@ mod tests {
             Some((format!("Bad Omen IV ({duration})"), blue))
         );
         assert!(
-            lines(&bottle, None, &NoAttributeListener, &lang)
+            lines(&bottle, None, &NoAttributeListener, &enchantments, &lang)
                 .contains(&format!("Bad Omen IV ({duration})")),
             "{:?}",
-            lines(&bottle, None, &NoAttributeListener, &lang)
+            lines(&bottle, None, &NoAttributeListener, &enchantments, &lang)
         );
         // A numbered template, as some languages write it.
         let numbered = |key: &str| match key {
@@ -2020,7 +2117,7 @@ mod tests {
         let rows = sword_rows();
         let lang = |key: &str| Some(key.to_owned());
         let text = |filter: &AttributeFilter| -> Vec<String> {
-            attribute_lines_filtered(&rows, None, filter, &lang)
+            attribute_lines_filtered(&rows, None, filter, &lang, &|_| None)
                 .into_iter()
                 .map(|(line, _)| line)
                 .collect()
@@ -2110,6 +2207,7 @@ mod tests {
                 vec![("Rune: fire", 7)],
             ),
             &lang,
+            &|_| None,
         );
         assert_eq!(lines.len(), 3, "only the head modifier is left");
         assert_eq!(added.len(), 1);
@@ -2122,6 +2220,7 @@ mod tests {
             false,
             &Hide(AttributeFilter::default(), vec![("note", u32::MAX)]),
             &lang,
+            &|_| None,
         );
         assert!(lines.is_empty());
         assert_eq!(added.len(), 1);
@@ -2189,6 +2288,38 @@ mod tests {
         assert_eq!(modifier_line(&lang, "movement_speed", 0.0, 2, false), None);
     }
 
+    #[test]
+    fn test_russian_wooden_sword_modifiers() {
+        let lang = |k: &str| {
+            Some(
+                match k {
+                    "attribute.modifier.equals.0" => "%2$s: %1$s",
+                    "attribute.modifier.plus.0" => "%2$s: +%1$s",
+                    "attribute.modifier.take.0" => "%2$s: -%1$s",
+                    "attribute.modifier.equals.2" => "%2$s: %1$s%%",
+                    "attribute.modifier.plus.2" => "%2$s: +%1$s%%",
+                    "attribute.modifier.take.2" => "%2$s: -%1$s%%",
+                    "attribute.name.attack_damage" => "Урон при атаке",
+                    "attribute.name.attack_speed" => "Скорость атаки",
+                    "attribute.name.movement_speed" => "Скорость",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        };
+        assert_eq!(
+            modifier_line(&lang, "attack_damage", 4.0, 0, true).as_deref(),
+            Some("Урон при атаке: 4")
+        );
+        assert_eq!(
+            modifier_line(&lang, "attack_speed", 1.6, 0, true).as_deref(),
+            Some("Скорость атаки: 1.6")
+        );
+        assert_eq!(
+            modifier_line(&lang, "movement_speed", -0.6, 2, false).as_deref(),
+            Some("Скорость: -60%")
+        );
+    }
     #[test]
     fn modifier_lines_support_positional_format() {
         let lang = |k: &str| {
@@ -2436,5 +2567,47 @@ mod tests {
         );
         let texts: Vec<String> = lines.iter().map(|(text, _)| text.plain()).collect();
         assert_eq!(texts, ["scale"]);
+    }
+}
+
+#[cfg(test)]
+mod stack_modifier_tests {
+    use horizon_client::items::ItemStack;
+
+    #[test]
+    fn tooltip_attributes_come_from_the_stack() {
+        let mut sword = ItemStack::new("minecraft:diamond_sword", 1);
+        let attack = horizon_core::nbt::Tag::compound([
+            (
+                "type",
+                horizon_core::nbt::Tag::String("minecraft:attack_damage".into()),
+            ),
+            (
+                "id",
+                horizon_core::nbt::Tag::String("minecraft:test".into()),
+            ),
+            ("amount", horizon_core::nbt::Tag::Double(5.0f64.to_bits())),
+            (
+                "operation",
+                horizon_core::nbt::Tag::String("add_value".into()),
+            ),
+            ("slot", horizon_core::nbt::Tag::String("mainhand".into())),
+        ]);
+        sword.data_mut().set_other(
+            "minecraft:attribute_modifiers",
+            Some(horizon_core::nbt::Tag::List(vec![attack])),
+        );
+        let modifiers = sword.default_attribute_modifiers_or(&[]);
+        assert_eq!(modifiers.len(), 1);
+        assert_eq!(modifiers[0].attribute, "minecraft:attack_damage");
+        assert_eq!(modifiers[0].amount, 5.0);
+        sword.data_mut().set_other(
+            "!minecraft:attribute_modifiers",
+            Some(horizon_core::nbt::Tag::compound(Vec::<(
+                &str,
+                horizon_core::nbt::Tag,
+            )>::new())),
+        );
+        assert!(sword.default_attribute_modifiers_or(&[]).is_empty());
     }
 }

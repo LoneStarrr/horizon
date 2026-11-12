@@ -3,6 +3,82 @@
 
 #### A menu's slots
 
+##### Mod-created recipe input sets
+
+`Hooks::recipe_property_sets` runs once after recipes resolve for each load and again after
+`/reload`. Add `RecipePropertyAddition::new("mymod:cooking_pot_input", items)` to its
+`event.additions`: a key in the listener's manifest-owned namespaces creates a set. Ownership
+uses the package ID plus the manifest's `namespaces`, so a package named
+`ported_farmersdelight` with `namespaces = ["farmersdelight"]` can create
+`farmersdelight:cooking_pot_input`. A later listener may extend an existing set but cannot
+create a new foreign key. Invalid keys, unknown vanilla keys and air are skipped with a
+warning; unregistered items do not participate in acceptance or network sync.
+
+Attach a `MenuPart` to the registered menu type and filter its input slot with the same set:
+
+```rust,ignore
+struct PotInput;
+#[mod_api::horizon_part]
+impl mod_api::MenuPart for PotInput {
+    fn menu_slot_rules(
+        &self,
+        context: &dyn mod_api::LoopContext,
+        event: &mut mod_api::MenuSlotRulesEvent<'_>,
+    ) {
+        if event.slot == 0 {
+            event.may_place &= context.mod_recipe_property_contains(
+                "farmersdelight:cooking_pot_input", event.stack.item(),
+            );
+        }
+    }
+}
+// In Hooks::register:
+// registrar.menu_part("farmersdelight:cooking_pot", PotInput);
+```
+
+The Host exposes the same `mod_recipe_property_contains(set, ItemKey)` query outside
+restricted menu callbacks. This query covers mod-created sets only: unknown sets, unknown
+items and vanilla set keys return false. Existing vanilla station acceptance is unchanged.
+The server reads its owning load; the client reads local preload sets before its first
+`UpdateRecipes`, then the authoritative server generation. A packet replaces the entire
+generation, including an empty one. Closing a screen or changing dimension retains it;
+disconnecting discards it. Reads allocate nothing and do not rescan recipes or registries.
+There is no second hook and no per-slot load callback.
+
+##### Keeping a block menu open
+
+The server closes a player's block menu when `AbstractContainerMenu.stillValid` says no: by default when the
+block entity is gone or the player's eyes are farther than their block interaction range plus 4 from it. A
+large machine whose menu belongs to a core block deep inside it answers `menu_still_valid` on its menu type
+instead, as a Java menu overrides `stillValid`:
+
+```rust,ignore
+struct ShellReach;
+#[mod_api::horizon_part]
+impl mod_api::MenuPart for ShellReach {
+    fn menu_still_valid(
+        &self,
+        _: &dyn mod_api::LoopContext,
+        event: &mut mod_api::MenuStillValidEvent<'_>,
+    ) {
+        // `event.valid` arrives as the game's answer; keep the menu open while
+        // the player stands within 12 blocks of the core.
+        let d: f64 = (0..3)
+            .map(|k| (event.eye[k] - (f64::from(event.pos[k]) + 0.5)).powi(2))
+            .sum();
+        event.valid = d < 12.0 * 12.0;
+    }
+}
+// In Hooks::register:
+// registrar.menu_part("mymod:torus", ShellReach);
+```
+
+It is asked each tick the menu is open and before each click on it, on the server only, and only for a mod
+menu type: vanilla menu types keep their own check. A part that leaves `valid` alone keeps the game's answer,
+and a menu whose block entity is gone closes without asking. [Hook notes](../../reference/hook-notes.md#keeping-a-block-menu-open)
+has the details.
+
+
 Client hooks can read the local player's menu with `host.local_player()?.container_menu(host)`,
 including the inventory when no container is open. `MenuRef::slot_count`, `slot` and `carried`
 read on either side; `slot` and `carried` return an outer `None` when the handle or slot is

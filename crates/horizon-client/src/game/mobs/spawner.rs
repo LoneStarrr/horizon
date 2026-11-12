@@ -19,7 +19,7 @@ use horizon_client::{
 use horizon_core::nbt::Tag;
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{LegacyRandom, LevelRandom, RandomSource},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -142,14 +142,14 @@ impl Game<'_> {
         let pos = [key.0, key.1, key.2];
         let mut random = std::mem::replace(
             &mut self.world.random,
-            horizon_core::random::LegacyRandom::new(0),
+            LevelRandom::for_level(LegacyRandom::new(0)),
         );
         let mut events = Vec::new();
         let mut planned: Vec<Planned> = Vec::new();
         // A minecart spawner has no block.
         let source = cart
             .is_none()
-            .then(|| mod_api::NativeSpawner::Block(mod_api::BlockPos::new(key.0, key.1, key.2)));
+            .then(|| mod_api::SpawnSource::Block(mod_api::BlockPos::new(key.0, key.1, key.2)));
         let extras = {
             let mut level = self.natural_level();
             // A minecart spawner has no block to tell the spawn checks of.
@@ -158,7 +158,7 @@ impl Game<'_> {
             });
             let mut spawn = |l: &super::natural_spawning::GameLevel,
                              r: &SpawnerSpawn,
-                             rng: &mut LegacyRandom| {
+                             rng: &mut LevelRandom| {
                 l.game.plan_spawner_mob(l, r, source, &mut planned, rng)
             };
             spawner.server_tick(&level, &mut random, pos, &mut spawn, &mut events);
@@ -181,6 +181,7 @@ impl Game<'_> {
         mut created: Vec<Mob>,
         rides: Vec<(u32, u32)>,
     ) -> HashMap<u32, u32> {
+        let _save_lease = horizon_client::join_seq::visibility::PassLease::enter();
         let mut finalized: Vec<Mob> = Vec::new();
         let mut gears: Vec<Option<Tag>> = Vec::new();
         let mut loads: Vec<(Tag, Option<Tag>, u32)> = Vec::new();
@@ -229,7 +230,7 @@ impl Game<'_> {
         &self,
         l: &super::natural_spawning::GameLevel,
         r: &SpawnerSpawn,
-        source: Option<mod_api::NativeSpawner>,
+        source: Option<mod_api::SpawnSource>,
         planned: &mut Vec<Planned>,
         random: &mut horizon_core::random::LegacyRandom,
     ) -> Option<SpawnerAdded> {
@@ -533,7 +534,7 @@ impl Game<'_> {
             let mut events = Vec::new();
             let mut random = std::mem::replace(
                 &mut self.world.random,
-                horizon_core::random::LegacyRandom::new(0),
+                LevelRandom::for_level(LegacyRandom::new(0)),
             );
             if let Some(BlockEntity::Spawner(s)) = self.world.block_entities.get_mut(&key) {
                 match data {
@@ -585,7 +586,7 @@ impl Game<'_> {
         &self,
         camera: glam::DVec3,
         alpha: f64,
-        out: &mut Vec<mod_render::render::Vertex>,
+        out: &mut Vec<horizon_client_render::render_geometry::Vertex>,
     ) {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);

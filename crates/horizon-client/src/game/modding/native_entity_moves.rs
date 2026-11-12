@@ -13,14 +13,14 @@ use mod_api::EntityRef;
 
 /// `Level.isInSpawnableBounds` and `/tp`'s limits: 30,000,000 blocks out,
 /// 20,000,000 up or down.
-fn in_bounds([x, y, z]: [f64; 3]) -> bool {
+pub(super) fn in_bounds([x, y, z]: [f64; 3]) -> bool {
     (-30_000_000.0..30_000_000.0).contains(&x)
         && (-30_000_000.0..30_000_000.0).contains(&z)
         && (-20_000_000.0..20_000_000.0).contains(&y)
 }
 
 /// `Direction.fromYRot`: the horizontal direction a yaw faces.
-fn facing(yaw: f32) -> &'static str {
+pub(super) fn facing(yaw: f32) -> &'static str {
     const BY_2D: [&str; 4] = ["south", "west", "north", "east"];
     BY_2D[((f64::from(yaw) / 90.0 + 0.5).floor() as i32 & 3) as usize]
 }
@@ -41,6 +41,7 @@ impl Game<'_> {
             return false;
         };
         self.teleport_to(t, pos, rotation, true);
+        self.teleport_stops(t);
         true
     }
     /// Sends the entity to `pos` in the level `dimension`
@@ -319,7 +320,9 @@ mod tests {
             let stand = game.entity(13).unwrap();
             assert!(!stand.set_rotation(game, 30.0, 10.0));
             game.others.push(super::super::commands::OtherEntity {
+                attachment_lifetime: Default::default(),
                 knot_check: None,
+                eye: None,
                 join: Default::default(),
                 item_transformation: None,
                 interaction: None,

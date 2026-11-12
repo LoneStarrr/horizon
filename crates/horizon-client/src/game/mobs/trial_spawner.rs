@@ -18,7 +18,7 @@ use horizon_client::{
 use horizon_core::nbt::Tag;
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{LegacyRandom, LevelRandom, RandomSource},
 };
 use std::collections::HashMap;
 
@@ -120,6 +120,33 @@ impl Game<'_> {
             .put(lease, BlockEntity::TrialSpawner(spawner));
         result
     }
+    /// What the LAN encoder builds update tags from beyond the block entity:
+    /// the mods' hook (`api_block_entity_update_tag`), and the block
+    /// states with `trial_spawner_state=active`, the only ones whose tag
+    /// holds `next_mob_spawns_at` (`TrialSpawnerStateData.getUpdateTag`).
+    pub(super) fn lan_update_tag_sources(
+        &self,
+        encoder: &mut horizon_client::lan::chunks::ChunkEncoder,
+    ) {
+        encoder.mod_update_tag = Some(|pos, entity| {
+            let mut tag = None;
+            Game::api_block_entity_update_tag(pos, entity, &mut tag);
+            tag
+        });
+        let registry = self.pack.assets.registry;
+        encoder.trial_active = (0..registry.len() as u32)
+            .filter(|&i| {
+                registry
+                    .state(horizon_world::registry::BlockStateId(i))
+                    .is_some_and(|b| {
+                        b.name == "minecraft:trial_spawner"
+                            && b.properties
+                                .get("trial_spawner_state")
+                                .is_some_and(|s| s == TrialState::Active.name())
+                    })
+            })
+            .collect();
+    }
     /// The trial spawner block at `key`: its state and ominous flag.
     pub(super) fn trial_spawner_block(&self, key: Pos) -> Option<(TrialState, bool)> {
         let block = self
@@ -150,11 +177,14 @@ impl Game<'_> {
         ominous: bool,
     ) -> Result<()> {
         let pos = [key.0, key.1, key.2];
-        let mut random = std::mem::replace(&mut self.world.random, LegacyRandom::new(0));
+        let mut random = std::mem::replace(
+            &mut self.world.random,
+            LevelRandom::for_level(LegacyRandom::new(0)),
+        );
         let mut sequences = std::mem::take(&mut self.rand_sequences);
         let mut events = Vec::new();
         let mut planned: Vec<Planned> = Vec::new();
-        let source = Some(mod_api::NativeSpawner::Block(mod_api::BlockPos::new(
+        let source = Some(mod_api::SpawnSource::Block(mod_api::BlockPos::new(
             key.0, key.1, key.2,
         )));
         let mut uuids: Vec<(u32, Uuid)> = Vec::new();
@@ -167,7 +197,7 @@ impl Game<'_> {
             });
             let loot = self.server_loot.get();
             let seed = self.level.seed;
-            let mut spawn = |l: &GameLevel, r: &SpawnerSpawn, rng: &mut LegacyRandom| {
+            let mut spawn = |l: &GameLevel, r: &SpawnerSpawn, rng: &mut LevelRandom| {
                 let added = l.game.plan_spawner_mob(l, r, source, &mut planned, rng)?;
                 let uuid = match planned.last_mut() {
                     Some(Planned::Loaded(Tag::Compound(tag), _, _)) => {
@@ -186,7 +216,7 @@ impl Game<'_> {
             };
             // TrialSpawner.ejectReward: the table's items, each thrown up out
             // of the spawner (DefaultDispenseItemBehavior.spawnItem, accuracy 2).
-            let mut eject = |table: &str, random: &mut LegacyRandom| {
+            let mut eject = |table: &str, random: &mut LevelRandom| {
                 let Some(loot) = &loot else {
                     return false;
                 };
@@ -241,7 +271,7 @@ impl Game<'_> {
         // Vec3.atBottomCenterOf(pos).relative(UP, 1.2), lowered by spawnItem.
         let above = [center[0], center[1] + 0.7 - 0.125, center[2]];
         for (stack, v) in ejected {
-            self.spawn_item(stack, above, v, 0);
+            self.spawn_item_thrown(stack, above, v);
         }
         if next != current || ominous != spawner.is_ominous {
             self.set_trial_spawner_state(key, next, spawner.is_ominous)?;
@@ -262,11 +292,23 @@ impl Game<'_> {
                 }
                 TrialEvent::TrialOmen(uuid) => self.bad_omen_to_trial_omen(uuid),
                 TrialEvent::Discard(uuid) => {
-                    let id = self.persist.uuids.iter().find(|(_, u)| **u == uuid);
-                    if let Some((id, _)) = id
-                        && let Some(m) = self.mobs.iter_mut().find(|m| m.id == *id)
-                    {
-                        m.removed = true;
+                    let (at, dropped) = {
+                        let id = self.persist.uuids.iter().find(|(_, u)| **u == uuid);
+                        if let Some((id, _)) = id
+                            && let Some(m) = self.mobs.iter_mut().find(|m| m.id == *id)
+                        {
+                            let at = m.position;
+                            let dropped = horizon_client::mobs::drops::drop_preserved_equipment(m);
+                            m.removed = true;
+                            (Some(at), dropped)
+                        } else {
+                            (None, Vec::new())
+                        }
+                    };
+                    if let Some(at) = at {
+                        for stack in dropped {
+                            self.spawn_at_location(at, 0.0, stack);
+                        }
                     }
                 }
                 TrialEvent::SoundAt(name, at, pitch) => self.audio.play(

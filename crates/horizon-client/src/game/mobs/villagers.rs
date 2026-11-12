@@ -104,9 +104,11 @@ impl Game<'_> {
     /// `BehaviorUtils.throwItem`: toss a stack from a villager's hand toward
     /// a point.
     fn villager_throw(&mut self, from: Vec3, eye: f64, to: Vec3, stack: ItemStack) {
-        let at = [from.x, eye - 0.3, from.z];
+        // The hand drop and the velocity are the float 0.3F, widened.
+        let k = f64::from(0.3_f32);
+        let at = [from.x, eye - k, from.z];
         let d = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z).normalize();
-        self.spawn_item(stack, at, [d.x * 0.3, d.y * 0.3, d.z * 0.3], 10);
+        self.spawn_item(stack, at, [d.x * k, d.y * k, d.z * k], 10);
     }
 
     /// `TradeWithVillager.tick` for one pair: gossip (at most once in 1200
@@ -117,9 +119,15 @@ impl Game<'_> {
         };
         let now = self.world.game_time;
         let items = world_items!(self);
-        let meeting = villager::meet(&mut self.mobs, ia, ib, now, |item| {
-            items.get(item).map_or(64, |i| i.max_stack)
-        });
+        let professions = self.stations().professions.clone();
+        let meeting = villager::meet(
+            &mut self.mobs,
+            ia,
+            ib,
+            now,
+            |item| items.get(item).map_or(64, |i| i.max_stack),
+            &professions,
+        );
         for stack in meeting.thrown {
             self.villager_throw(meeting.from, meeting.eye, meeting.to, stack);
         }
@@ -321,15 +329,32 @@ impl Game<'_> {
         if due.is_empty() {
             return;
         }
+        // Reuse the existing item-cell index only for large, spread-out item
+        // sets with many due sensors. Small and clustered scenes retain the
+        // original full scan without building an index.
+        let mut nearby = super::item_areas::ItemAreas::worthwhile(&self.dropped, due.len())
+            .then(super::item_areas::ItemAreas::default);
         let w = self.mob_world_base(&[]);
         let mut found = Vec::new();
         for i in due {
             let m = &self.mobs[i];
             let area = m.bounds().inflate(Vec3::new(32.0, 16.0, 32.0));
-            let requested = villager::requested_items(m);
+            let professions = self.stations().professions.clone();
+            let requested = villager::requested_items(m, &professions);
             let eye = Vec3::new(m.position.x, m.eye_y(), m.position.z);
             let mut best: Option<(f64, Vec3)> = None;
-            for e in &self.dropped {
+            let mut scan = nearby
+                .as_mut()
+                .map(|index| index.scan(&self.dropped, self.next_entity, area));
+            let mut j = 0;
+            loop {
+                if let Some(indexed) = &mut scan {
+                    j = indexed.next_from(j, self.dropped.len());
+                }
+                let Some(e) = self.dropped.get(j) else {
+                    break;
+                };
+                j += 1;
                 let d = e.position.distance_squared(m.position);
                 if best.is_some_and(|(b, _)| d >= b)
                     || !e.bounds().intersects(area)
@@ -340,7 +365,7 @@ impl Game<'_> {
                 let item = &e.stack.item;
                 let wants = villager::food_points(item) > 0
                     || picks_up.as_ref().is_some_and(|t| t.contains(&**item))
-                    || requested.contains(&&**item);
+                    || requested.iter().any(|key| key == &**item);
                 let fits =
                     villager::ext(m).is_none_or(|x| x.can_add(&e.stack, self.item_max_stack(item)));
                 // ItemEntity's eye height is 0.2125.
@@ -395,7 +420,8 @@ impl Game<'_> {
             if scan.is_empty() {
                 continue;
             }
-            let requested = villager::requested_items(m);
+            let professions = self.stations().professions.clone();
+            let requested = villager::requested_items(m, &professions);
             let mut j = 0;
             loop {
                 j = scan.next_from(j, self.dropped.len());
@@ -413,7 +439,7 @@ impl Game<'_> {
                 let item = e.stack.item.clone();
                 let wants = villager::food_points(&item) > 0
                     || picks_up.as_ref().is_some_and(|t| t.contains(&*item))
-                    || requested.contains(&&*item);
+                    || requested.iter().any(|key| key == &*item);
                 if !wants {
                     j += 1;
                     continue;
@@ -506,26 +532,14 @@ impl Game<'_> {
         let Some(uuid) = self.player_uuid_of(killer) else {
             return;
         };
-        let eye = Vec3::new(victim.position.x, victim.eye_y(), victim.position.z);
-        let witnesses: Vec<usize> = {
-            let w = self.mob_world_base(&[]);
-            self.mobs
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| {
-                    m.id != victim.id
-                        && m.species() == Species::Villager
-                        && m.alive()
-                        && (m.position.x - victim.position.x).abs() <= 16.0
-                        && (m.position.y - victim.position.y).abs() <= 16.0
-                        && (m.position.z - victim.position.z).abs() <= 16.0
-                        && w.line_of_sight(eye, Vec3::new(m.position.x, m.eye_y(), m.position.z))
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
-        for i in witnesses {
-            villager::ext_mut(&mut self.mobs[i]).gossips.add(
+        let snapshot: Vec<_> = self.mobs.iter().map(|m| m.seen(None)).collect();
+        let witnesses =
+            villager_brain::murder_witnesses(&mut victim.clone(), &self.mob_world_base(&snapshot));
+        for id in witnesses {
+            let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) else {
+                continue;
+            };
+            villager::ext_mut(m).gossips.add(
                 uuid,
                 GossipType::MajorNegative,
                 gossip::REPUTATION_CHANGE_PER_EVENT,
@@ -695,3 +709,52 @@ mod nested_spawn_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod off_level_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn retained_ancestor_does_not_consume_a_due_villager_sensor() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            let kind = game
+                .res
+                .mob_types()
+                .get("minecraft:villager")
+                .unwrap()
+                .clone();
+            let mut m = Mob::new(73, kind.clone(), Vec3::new(1.0, 80.0, 0.5), 0.0);
+            villager_brain::init(&mut m, 0, 0, 0);
+            let mut health = horizon_client::health::TestLevel::new(0);
+            for _ in 0..40 {
+                villager_brain::tick(
+                    &mut m,
+                    &game.mob_world_base(&[]),
+                    &mut health.level(),
+                    &mut Vec::new(),
+                );
+            }
+            m.extra.mount = Some(72);
+            game.mobs.push(m);
+            let ghost = Mob::new(72, kind, Vec3::ZERO, 0.0);
+            game.persist
+                .off_level
+                .insert(72, crate::game::persist::OffLevel::Mob(ghost));
+            game.tick_creature_entities().unwrap();
+            assert!(
+                villager_brain::take_item_scan(game.mob_object_mut(73).unwrap()),
+                "a frozen resident's due sensor was consumed by independent item sensing"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/villager_witness_tests.rs"]
+mod witness_tests;

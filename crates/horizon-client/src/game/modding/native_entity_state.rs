@@ -13,7 +13,7 @@ use horizon_client::pose::Pose;
 use mod_api::EntityRef;
 
 /// `Pose`'s serialized names by id (`Pose.STANDING` is 0).
-const POSES: [&str; 18] = [
+pub(super) const POSES: [&str; 18] = [
     "standing",
     "fall_flying",
     "sleeping",
@@ -35,7 +35,7 @@ const POSES: [&str; 18] = [
 ];
 
 /// `Entity.getMaxAirSupply`: a dolphin's 4800, an axolotl's 6000, else 300.
-fn max_air(species: Option<Species>) -> i32 {
+pub(super) fn max_air(species: Option<Species>) -> i32 {
     match species {
         Some(Species::Dolphin) => 4800,
         Some(Species::Axolotl) => horizon_client::mobs::axolotl::MAX_AIR,
@@ -501,8 +501,7 @@ mod tests {
         with_game(|game| {
             game.options.dedicated = Some(Vec::new());
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let player = game.entity(20).unwrap();
             test(game, player);
         });
@@ -514,7 +513,7 @@ mod tests {
         use horizon_client::entities::ArmorStand;
         use horizon_client::items::ItemStack;
         use horizon_core::geometry::Vec3;
-        use mod_api::NativeWorldEpoch;
+        use mod_api::WorldEpoch;
 
         with_player(|game, player| {
             game.player.as_mut().unwrap().fire_ticks = 0;
@@ -561,7 +560,7 @@ mod tests {
             ));
             let boat = game.entity(44).unwrap();
             assert_eq!(boat.fire_ticks(game), None);
-            let stale = EntityRef::new(NativeWorldEpoch::new(mob.epoch().get() + 1), mob.id());
+            let stale = EntityRef::new(WorldEpoch::new(mob.epoch().get() + 1), mob.id());
             assert_eq!(stale.fire_ticks(game), None);
         });
     }
@@ -573,7 +572,7 @@ mod tests {
         use horizon_client::entities::ExperienceOrb;
         use horizon_client::items::ItemStack;
         use horizon_core::geometry::Vec3;
-        use mod_api::NativeWorldEpoch;
+        use mod_api::WorldEpoch;
 
         with_player(|game, player| {
             assert_eq!(player.tick_count(game), None);
@@ -608,6 +607,7 @@ mod tests {
 
             game.orbs.push(ExperienceOrb {
                 attachment_lifetime: Default::default(),
+                fall_distance: 0.0,
                 rotation: [0.0, 0.0],
                 join: Default::default(),
                 id: 43,
@@ -620,6 +620,7 @@ mod tests {
                 count: 1,
                 ticks: 21,
                 health: 5,
+                air: 300,
                 no_gravity: true,
                 following: None,
             });
@@ -640,7 +641,7 @@ mod tests {
             ));
             let boat = game.entity(45).unwrap();
             assert_eq!(boat.tick_count(game), None);
-            let stale = EntityRef::new(NativeWorldEpoch::new(mob.epoch().get() + 1), mob.id());
+            let stale = EntityRef::new(WorldEpoch::new(mob.epoch().get() + 1), mob.id());
             assert_eq!(stale.tick_count(game), None);
         });
     }
@@ -657,7 +658,7 @@ mod tests {
         use horizon_client::items::ItemStack;
         use horizon_client::projectiles::{Projectile, ProjectileKind};
         use horizon_core::{geometry::Vec3, position::BlockPos};
-        use mod_api::NativeWorldEpoch;
+        use mod_api::WorldEpoch;
 
         with_guests(|game| {
             // Players keep their own state: in place during their turn, beside the hub otherwise.
@@ -700,6 +701,7 @@ mod tests {
             let item = game.dropped[0].id;
             game.orbs.push(ExperienceOrb {
                 attachment_lifetime: Default::default(),
+                fall_distance: 0.0,
                 rotation: [0.0, 0.0],
                 join: Default::default(),
                 no_gravity: false,
@@ -713,6 +715,7 @@ mod tests {
                 count: 1,
                 ticks: 0,
                 health: 5,
+                air: 300,
                 following: None,
             });
             game.boats
@@ -738,11 +741,23 @@ mod tests {
                 .push(Rocket::remote(44, Vec3::ZERO, Vec3::ZERO));
             game.tridents
                 .push(ThrownTrident::remote(45, Vec3::ZERO, 0.0, 0.0));
-            for id in [item, 41, 42, 43, tnt, arrow, snowball, 44, 45] {
+            // Entity defaults to 300; VehicleEntity overrides it to 10 and
+            // Projectile to 2 (`getDimensionChangingDelay` in vanilla 26.3).
+            for (id, delay) in [
+                (item, 300),
+                (41, 300),
+                (42, 10),
+                (43, 10),
+                (tnt, 300),
+                (arrow, 2),
+                (snowball, 2),
+                (44, 2),
+                (45, 2),
+            ] {
                 let entity = game.entity(id).unwrap();
                 assert_eq!(entity.portal_cooldown(game), Some(0), "entity {id}");
                 game.set_portal_cooldown(id);
-                assert_eq!(entity.portal_cooldown(game), Some(300), "entity {id}");
+                assert_eq!(entity.portal_cooldown(game), Some(delay), "entity {id}");
             }
 
             // A falling block keeps its own, as its save does.
@@ -755,6 +770,7 @@ mod tests {
             game.next_entity += 1;
             let falling = game.next_entity;
             game.falling.push(FallingBlock {
+                on_ground: false,
                 attachment_lifetime: Default::default(),
                 rotation: [0.0, 0.0],
                 join: Default::default(),
@@ -790,7 +806,7 @@ mod tests {
             ));
             let charge = game.entity(game.creatures.projectiles[2].id).unwrap();
             assert_eq!(charge.portal_cooldown(game), None);
-            let stale = EntityRef::new(NativeWorldEpoch::new(mob.epoch().get() + 1), mob.id());
+            let stale = EntityRef::new(WorldEpoch::new(mob.epoch().get() + 1), mob.id());
             assert_eq!(stale.portal_cooldown(game), None);
             game.enter_level(Dim::Nether).unwrap();
             assert_eq!(mob.portal_cooldown(game), None);
@@ -859,7 +875,7 @@ mod tests {
                 Some(false),
                 "live secondary use, not last tick's body flag"
             );
-            let stale = EntityRef::new(mod_api::NativeWorldEpoch::new(0), 7);
+            let stale = EntityRef::new(mod_api::WorldEpoch::new(0), 7);
             assert_eq!(stale.is_shift_key_down(game), None);
             game.remote.as_mut().unwrap().logged_in = false;
             assert!(game.local_player().is_none());

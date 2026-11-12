@@ -122,7 +122,7 @@ impl Launcher {
 
     pub(super) fn select_instance(&mut self, instance: &Instance) {
         // A native build's warning names the mods of the instance it was opened for.
-        self.native_confirm = None;
+        self.pending_consent = None;
         self.settings.instance =
             (instance.kind != InstanceKind::Default).then(|| instance.id.clone());
         self.save_settings();
@@ -217,6 +217,12 @@ impl Launcher {
                             trf("{version} is not installed", &[("version", own)])
                         }
                         (None, None, None) => tr("No version installed").into(),
+                        (None, Some(tag), _)
+                            if horizon_launcher::developer_install::uses_developer(tag) =>
+                        {
+                            horizon_launcher::developer_install::instance_status(tag, prepared)
+                                .unwrap_or_default()
+                        }
                         (None, Some(_), _) if !prepared => tr("Needs preparing").into(),
                         (None, Some(tag), _) if self.native_build_of(tag).is_some() => {
                             let build = self.native_build_of(tag).unwrap_or_default();

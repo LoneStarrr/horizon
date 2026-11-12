@@ -344,11 +344,10 @@ impl Game<'_> {
             self.post_attack(index);
             return;
         };
-        let weapon = self
-            .res
-            .items()
-            .get(&stack.item)
-            .and_then(|i| i.weapon_damage.map(|d| (d, i.max_damage)));
+        let items = self.res.items();
+        let weapon = items
+            .weapon_damage(&stack)
+            .map(|damage| (damage, items.get(&stack.item).map_or(0, |i| i.max_damage)));
         self.native_hurt_enemy_event(&stack, index);
         let smash = self.smash_attack();
         if smash {
@@ -367,11 +366,10 @@ impl Game<'_> {
     /// `ItemStack.postHurtEnemy`: `hurtAndBreak(weapon.itemDamagePerAttack)` of
     /// the weapon in the acting hand.
     pub(super) fn weapon_wear(&mut self, stack: &ItemStack) {
-        let weapon = self
-            .res
-            .items()
-            .get(&stack.item)
-            .and_then(|i| i.weapon_damage.map(|d| (d, i.max_damage)));
+        let items = self.res.items();
+        let weapon = items
+            .weapon_damage(stack)
+            .map(|damage| (damage, items.get(&stack.item).map_or(0, |i| i.max_damage)));
         if let Some((per_attack, max)) = weapon
             && max > 0
             && !self.creative
@@ -420,6 +418,28 @@ impl Game<'_> {
         self.audio.play(sound, Some(feet), 1.0, 1.0);
         Some(fall)
     }
+    /// What a server's guest does after their hit landed on another player:
+    /// the weapon's side, the exhaustion and the sprint a knockback stops.
+    /// Returns the attacker's motion when a smash set it, which
+    /// `MaceItem.hurtEnemy` sends at once (`ClientboundSetEntityMotionPacket`),
+    /// not at the end of the tick after gravity (#8246). The mark from before
+    /// the hit stays.
+    pub(in crate::game) fn pvp_hit_after(
+        &mut self,
+        victim_on_ground: bool,
+        stops_sprint: bool,
+    ) -> Option<Vec3> {
+        let p = self.player.as_mut()?;
+        let marked = std::mem::take(&mut p.health.sync_velocity);
+        self.weapon_hit_player(victim_on_ground);
+        let p = self.player.as_mut()?;
+        let sent = std::mem::replace(&mut p.health.sync_velocity, marked).then_some(p.velocity);
+        self.pvp_exhaustion();
+        if stops_sprint {
+            self.stop_sprint_after_extra_knockback();
+        }
+        sent
+    }
     /// `Player.itemAttackInteraction` after the player's hit hurt another
     /// player: the weapon's side of it, as `weapon_hit` does for a mob. A
     /// smash stops the fall and its Wind Burst (a `post_attack` explosion on
@@ -432,12 +452,7 @@ impl Game<'_> {
         if smash {
             self.mace_smash_self(victim_on_ground);
         }
-        if self
-            .res
-            .items()
-            .get(&stack.item)
-            .is_some_and(|i| i.weapon_damage.is_some())
-        {
+        if self.res.items().weapon_damage(&stack).is_some() {
             self.award_stat("used", &stack.item, 1);
         }
         self.post_attack_bursts(&stack, "minecraft:player");
@@ -461,12 +476,7 @@ impl Game<'_> {
         {
             self.smash_knockback(center, Spared::Stand(id), fall);
         }
-        if self
-            .res
-            .items()
-            .get(&stack.item)
-            .is_some_and(|i| i.weapon_damage.is_some())
-        {
+        if self.res.items().weapon_damage(&stack).is_some() {
             self.award_stat("used", &stack.item, 1);
         }
         self.post_attack_bursts(&stack, "minecraft:armor_stand");
@@ -641,17 +651,17 @@ impl Game<'_> {
                 let Some(i) = self.armor_stands.iter().position(|s| s.id == id) else {
                     continue;
                 };
-                // knockback(0.4, ..) follows a hurtServer that landed, on a
+                // knockback(0.4F, ..) follows a hurtServer that landed, on a
                 // stand that is still there (LivingEntity.knockback).
                 if !self.punch_armor_stand(i) {
                     continue;
                 }
                 let mut knock = horizon_client::health::Knock {
-                    strength: 0.4,
+                    strength: f64::from(0.4_f32),
                     x: xd,
                     z: zd,
                 };
-                let source = mod_api::health::HurtSource {
+                let source = mod_api::entity::health::HurtSource {
                     damage_type: "minecraft:player_attack",
                     causing: attack.attacker,
                     direct: attack.attacker,
@@ -687,7 +697,7 @@ impl Game<'_> {
             };
             let kind = self.mobs[i].kind.id.clone();
             let kind = format!("minecraft:{}", kind.trim_start_matches("minecraft:"));
-            let amount = self.enchanted_damage(&kind, base) * scale;
+            let amount = self.enchanted_damage(&kind, base, Some(id)) * scale;
             let source = self.attack_source(from);
             // hurtServer first; the knockback and post-attack effects follow
             // only when it landed.
@@ -697,7 +707,7 @@ impl Game<'_> {
                     self.native_kill_event(i);
                 }
                 let level = crate::game::entity::damage_level_of!(self, &attack);
-                self.mobs[i].knockback(level, 0.4, xd, zd, &source);
+                self.mobs[i].knockback(level, 0.4, xd, zd, &source, amount);
                 self.remember_mob_player_credit(self.mobs[i].id);
                 self.post_attack(i);
             }
@@ -769,5 +779,34 @@ mod tests {
         // baseDamageScaleFactor at 0.95 strength.
         let scaled = sweep_base_damage(0.5, 8.0, 0.95);
         assert!((scaled - (1.0 + 0.5 * 8.0 * (0.2 + 0.95 * 0.95 * 0.8))).abs() < 1e-6);
+    }
+
+    /// A hit takes the mace one point (`Weapon.itemDamagePerAttack`): a part of the mace that
+    /// multiplies the wear by 5 makes it 5, one that halves it leaves 0 (the item stays whole), one
+    /// that cancels it none; an iron sword without a part wears as vanilla.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; process-wide parts, run this test alone"]
+    fn a_damage_item_part_changes_the_wear_of_a_weapon_hit() {
+        use crate::game::damage_item_tests::{Rule, with_wear_part};
+        with_wear_part("minecraft:mace", Rule::Times(5), |game, wear| {
+            let hit = |game: &mut Game<'_>, item: &str| {
+                game.creative = false;
+                game.selected = 0;
+                let weapon = ItemStack::new(item, 1);
+                game.inventory[0] = Some(weapon.clone());
+                game.weapon_wear(&weapon);
+                game.inventory[0].as_ref().unwrap().damage
+            };
+            assert_eq!(hit(game, "minecraft:mace"), 5);
+            assert_eq!(wear.take_asked(), [1]);
+            wear.set(Rule::Halve);
+            assert_eq!(hit(game, "minecraft:mace"), 0);
+            assert_eq!(wear.take_asked(), [1]);
+            wear.set(Rule::Cancel);
+            assert_eq!(hit(game, "minecraft:mace"), 0);
+            assert_eq!(wear.take_asked(), [1]);
+            assert_eq!(hit(game, "minecraft:iron_sword"), 1);
+            assert!(wear.take_asked().is_empty());
+        });
     }
 }

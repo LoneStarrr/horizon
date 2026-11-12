@@ -118,7 +118,7 @@ impl Game<'_> {
         if g.spectator()
             || g.dead
             || menu.drag.is_some()
-            || !menu.slots.still_valid(&self.world, g, menu.pos)
+            || !menu.still_valid(&host.hub.loop_context, &self.world, g)
         {
             return false;
         }
@@ -160,7 +160,7 @@ impl Game<'_> {
                 .as_ref()
                 .is_some_and(|(w, _)| *w == window)
         {
-            play.crafting.machine = None;
+            *play.crafting.machine = None;
         }
         // sendAllDataToRemote: the client predicted the game's routing. A mod
         // that removed its own block leaves no menu to send: it closes, and

@@ -25,6 +25,35 @@ pub(super) const NARROW: f32 = 960.;
 /// Under this window width Home's tabs are as tight as they go.
 pub(super) const NARROWEST: f32 = 750.;
 
+/// Height above the Version menu's rows that the window gives to the page's head: the top bar,
+/// the tabs, the title and the button the menu hangs from (taken a little high, so the menu
+/// never runs past the window's foot).
+const PICKER_ABOVE: f32 = 360.;
+/// What the menu takes besides its rows: its padding, the Manage versions row (55 high) and a
+/// margin under it.
+const PICKER_CHROME: f32 = 12. + 55. + 16.;
+/// The fewest and the most height the Version menu's rows get (two and a half rows; eight).
+const PICKER_ROWS_MIN: f32 = 130.;
+const PICKER_ROWS_MAX: f32 = 440.;
+
+/// How tall the Version menu's rows may be in a window `window_height` high: what is left under
+/// the button, within [`PICKER_ROWS_MIN`] and [`PICKER_ROWS_MAX`]. More rows scroll.
+fn picker_rows_max_height(window_height: f32) -> f32 {
+    (window_height - PICKER_ABOVE - PICKER_CHROME).clamp(PICKER_ROWS_MIN, PICKER_ROWS_MAX)
+}
+
+/// The Version menu's state (Home's picker).
+#[derive(Default)]
+pub(super) struct PickerState {
+    /// The menu is open.
+    pub(super) open: bool,
+    /// Its rows scroll.
+    pub(super) scroll: Scrollbar,
+    /// The window's height when the menu opened: its rows are as tall as the room under the
+    /// button.
+    pub(super) window_height: f32,
+}
+
 /// Which of Home's menus is open.
 #[derive(Clone, Copy, PartialEq, Default)]
 pub(super) enum HomeMenu {
@@ -99,7 +128,7 @@ impl Launcher {
             .pt(px(64. - crate::glass::CONTENT_INSET))
             .child(self.edition_tabs(java.is_some(), cx))
             .child(self.home_title(cx))
-            .child(self.played_text())
+            .child(self.played_text(cx))
             .child(actions)
     }
 
@@ -209,8 +238,9 @@ impl Launcher {
             )
     }
 
-    /// "You've played for 41 h 06 min! Last played today.", or how long it has run now.
-    fn played_text(&self) -> Div {
+    /// "You've played for 41 h 06 min! Last played today.", or how long it has run now; then
+    /// the players counts the launcher knows (not in the mockup).
+    fn played_text(&self, cx: &mut Context<Self>) -> Div {
         let line = match (self.client_since, self.selected_instance()) {
             (Some(since), _) => trf(
                 "Playing for {time} now. Have fun!",
@@ -228,12 +258,49 @@ impl Launcher {
             },
             (None, None) => String::new(),
         };
+        let link = |id: &'static str, label: String| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .hover(|s| s.text_color(white(ink::FULL)))
+                .child(label)
+        };
+        let playing = self.playing.map(|count| {
+            let label = format!(
+                "· {}",
+                trf("{count} playing now", &[("count", &thousands(count))])
+            );
+            let url = telemetry::stats_url(&self.links.website);
+            link("playing-now", label).on_click(move |_: &ClickEvent, _, cx| {
+                if let Some(url) = &url {
+                    cx.open_url(url);
+                }
+            })
+        });
+        let official = self.official_players.map(|count| {
+            link(
+                "official-players",
+                format!(
+                    "· {}",
+                    trf(
+                        "{count} on the official SMP",
+                        &[("count", &thousands(count))]
+                    )
+                ),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.go(Page::Servers);
+                cx.notify();
+            }))
+        });
         ui::text(15., FontWeight::NORMAL, ink::STRONG)
             .mt(px(16.))
             .flex()
             .flex_wrap()
             .gap(px(4.))
             .child(line)
+            .children(playing)
+            .children(official)
     }
 
     /// Play and its ⋯ menu (`PlayGroup`): Stop while the game runs, Update when the launcher's
@@ -379,7 +446,15 @@ impl Launcher {
                     Some(_) => (tr("Update"), "download-04"),
                     None => (tr("Play"), "play"),
                 };
-                let press = play_press(ready, self.owner, false);
+                let press = play_press(
+                    ready,
+                    if horizon_launcher::developer_offline::selected() {
+                        Some(true)
+                    } else {
+                        self.owner
+                    },
+                    false,
+                );
                 let main = body(label.into(), icon).id("play").cursor_pointer();
                 let main = match (&update, press) {
                     (Some(_), _) => main.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -388,14 +463,14 @@ impl Launcher {
                     })),
                     (None, PlayPress::Play) => {
                         main.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.picker_open = false;
+                            this.picker.open = false;
                             this.play();
                             cx.notify();
                         }))
                     }
                     (None, PlayPress::PrepareThenPlay) => {
                         main.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.picker_open = false;
+                            this.picker.open = false;
                             this.play_when_prepared = this.selected().cloned();
                             this.prepare(backend::MinecraftFrom::Install);
                             cx.notify();
@@ -441,8 +516,7 @@ impl Launcher {
                         "Stay on {version}",
                         &[(
                             "version",
-                            &horizon_launcher::nightly::label(tag)
-                                .unwrap_or_else(|| horizon_launcher::nightly::short_commit(tag)),
+                            &horizon_launcher::nightly::label(tag).unwrap_or(tag.to_string()),
                         )],
                     ),
                     locked || !ready,
@@ -528,10 +602,10 @@ impl Launcher {
             |tag| {
                 horizon_launcher::nightly::label(tag)
                     .or_else(|| build_import::label(tag))
-                    .unwrap_or_else(|| horizon_launcher::nightly::short_commit(tag))
+                    .unwrap_or_else(|| tag.clone())
             },
         );
-        let open = self.picker_open;
+        let open = self.picker.open;
         let chevron = ui::icon("arrow-down-01", 18., white(ink::NOTE)).when(open, |s| {
             s.with_transformation(gpui::Transformation::rotate(gpui::radians(
                 std::f32::consts::PI,
@@ -572,9 +646,15 @@ impl Launcher {
                         ),
                 )
                 .child(chevron)
-                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     if !this.closed_by_this_press(event) {
-                        this.picker_open = !this.picker_open;
+                        this.picker.open = !this.picker.open;
+                        this.picker.window_height = f32::from(window.viewport_size().height);
+                        // Opens at the top of the list, not where it was left.
+                        this.picker
+                            .scroll
+                            .handle
+                            .set_offset(gpui::point(px(0.), px(0.)));
                     }
                     cx.notify();
                 })),
@@ -583,39 +663,55 @@ impl Launcher {
         let mut wrap = div().relative().child(button);
         if open {
             let follows = self.launcher_version().cloned();
+            // A solid backing under the glass, as the language menu's: the plate's backdrop
+            // doesn't paint under a popover whose rows scroll, and the rows must stay legible.
+            let backing = if ui::light() {
+                gpui::white().opacity(0.94)
+            } else {
+                ui::color(0x16112b).opacity(0.94)
+            };
             let mut menu = ui::popover(300.)
+                .bg(backing)
                 .id("picker-menu")
                 .occlude()
                 .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.picker_open = false;
+                    this.picker.open = false;
                     this.menu_closed_at = Some(event.position);
                     cx.notify();
                 }));
+            // The versions scroll in the room under the button; Manage versions stays under them.
+            let mut rows = div()
+                .id("picker-list")
+                .flex()
+                .flex_col()
+                .max_h(px(picker_rows_max_height(self.picker.window_height)))
+                .overflow_y_scroll();
             for tag in &self.installed {
                 let chosen = self.selected() == Some(tag);
                 let latest = follows.as_ref() == Some(tag);
                 let name = horizon_launcher::nightly::label(tag)
                     .or_else(|| build_import::label(tag))
-                    .unwrap_or_else(|| horizon_launcher::nightly::short_commit(tag));
+                    .unwrap_or_else(|| tag.clone());
                 let note = if latest {
                     tr("Newest · follows updates").to_string()
                 } else {
                     tag.clone()
                 };
                 let pick = tag.clone();
-                menu = menu.child(
+                rows = rows.child(
                     ui::menu_item(format!("pick-{tag}"), name.into(), note, false, &t)
                         .when(chosen, |d| {
                             d.child(ui::icon("tick-02", 17., ui::color(soft)).relative())
                         })
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.pin_version((!latest).then(|| pick.clone()));
-                            this.picker_open = false;
+                            this.picker.open = false;
                             cx.notify();
                         })),
                 );
             }
-            menu = menu.child(
+            // The wheel moves the list while it can, and goes on to the page at its ends.
+            menu = menu.child(self.picker.scroll.wrap(rows, &t)).child(
                 ui::menu_item(
                     "manage",
                     tr("Manage versions").into(),
@@ -625,7 +721,7 @@ impl Launcher {
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.go(Page::Versions);
-                    this.picker_open = false;
+                    this.picker.open = false;
                     cx.notify();
                 })),
             );
@@ -941,6 +1037,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_version_menus_rows_fit_the_room_under_the_button() {
+        // 760 high (the window's default): 760 - 360 above - 83 for the menu's padding and
+        // Manage versions = 317. The 600 px minimum window leaves 157; a short one keeps
+        // two and a half rows; a tall one stops at eight.
+        assert_eq!(picker_rows_max_height(760.), 317.);
+        assert_eq!(picker_rows_max_height(600.), 157.);
+        assert_eq!(picker_rows_max_height(400.), 130.);
+        assert_eq!(picker_rows_max_height(1400.), 440.);
+    }
+
+    #[test]
     fn an_edition_tab_goes_to_that_editions_instance_played_last() {
         use horizon_launcher::instances::{Instance, JavaGame, Kind};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -954,11 +1061,11 @@ mod tests {
             icon: None,
             group: None,
             version: None,
-            native_profile: native_mods::Profile::Balanced,
             played: Duration::ZERO,
             last_played: last,
             launch: Default::default(),
             java: java.then(JavaGame::default),
+            native_profile: Default::default(),
         };
         let list = [
             one("horizon", Kind::Default, false, at(50)),

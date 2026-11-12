@@ -174,24 +174,19 @@ impl FoodWorld for TickWorld<'_> {
             .expect("validated health field"))
     }
     fn hurt_starvation(&mut self, _: (), food: &mut FoodData, amount: f32) -> Result<()> {
-        // FoodData still ticks after a mode switch with an empty food bar, but
-        // Player.hurtServer rejects starvation for invulnerable abilities.
-        if self.invulnerable {
-            return Ok(());
-        }
         let id = self
             .resources
             .damage
             .id("minecraft:starve")
             .expect("validated starvation source");
-        self.events
-            .push(MotionEvent::Health(HealthEvent::StarvationDamage(amount)));
         let mut environment = Environment {
             level: self.level.reborrow(),
+            invulnerability_checked: None,
+            can_harm_player: true,
             entity: self.entity,
             victim: self.victim,
             causing: 0,
-            invulnerable: false,
+            invulnerable: self.invulnerable,
             permanently_invulnerable: false,
             invulnerable_time: false,
             creative_source: false,
@@ -212,6 +207,7 @@ impl FoodWorld for TickWorld<'_> {
             blocking: None,
             blocked: 0.0,
             shield_damage: 0,
+            blocking_item_used: false,
             fully_blocked: false,
             block_sound: false,
             knocked: false,
@@ -224,6 +220,9 @@ impl FoodWorld for TickWorld<'_> {
         if ServerPlayerCombat::new(self.attributes, self.data, food, self.ids, &mut environment)?
             .hurt(self.hurt, amount)?
         {
+            environment
+                .events
+                .push(MotionEvent::Health(HealthEvent::StarvationDamage(amount)));
             *self.hurt_animation_time = self.hurt.hurt_time;
         }
         Ok(())

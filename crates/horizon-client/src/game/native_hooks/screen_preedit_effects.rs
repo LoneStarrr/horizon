@@ -11,10 +11,12 @@ impl Game<'_> {
     /// under 120) and `horizontal_offset` shifts the stack right (negative
     /// left). Set `canceled` and the panels are not drawn: draw your own with
     /// `native_screen_render_post`. Once a frame while the screen draws them,
-    /// on the window only. The exclusion areas follow this choice a frame late.
+    /// on the window only; if the effects space changes within a frame (the
+    /// recipe book opening between two layout builds), it is asked again for
+    /// the new space. The exclusion areas follow this choice in the same frame.
     pub(in crate::game) fn native_screen_render_inventory_mob_effects(
         &self,
-        screen: &NativeScreenView<'_>,
+        screen: &ScreenView<'_>,
         available_space: i32,
         compact: &mut bool,
         horizontal_offset: &mut i32,
@@ -37,7 +39,7 @@ impl Game<'_> {
     /// screen is open, even when no text field is focused.
     pub(in crate::game) fn native_screen_preedit_pre(
         &self,
-        screen: &NativeScreenView<'_>,
+        screen: &ScreenView<'_>,
         full_text: &str,
         caret_position: usize,
         blocks: &[String],
@@ -59,7 +61,7 @@ impl Game<'_> {
     /// wanted) and `native_screen_preedit_pre` did not cancel. Same arguments.
     pub(in crate::game) fn native_screen_preedit_post(
         &self,
-        screen: &NativeScreenView<'_>,
+        screen: &ScreenView<'_>,
         full_text: &str,
         caret_position: usize,
         blocks: &[String],

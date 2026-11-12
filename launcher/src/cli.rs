@@ -3,23 +3,19 @@
 use clap::{Parser, Subcommand};
 use horizon_launcher::account::{self, Accounts};
 use horizon_launcher::backend::{self, Release};
-use horizon_launcher::build_import;
 use horizon_launcher::github_mods;
 use horizon_launcher::i18n::{tr, trf};
 use horizon_launcher::instances;
 use horizon_launcher::loaders;
 use horizon_launcher::native_mods;
-use horizon_launcher::native_status;
 use horizon_launcher::other_launchers;
 use horizon_launcher::server_list;
 use horizon_launcher::storage::{Category, Storage};
-
 #[derive(Clone, Debug)]
 enum ClearStorage {
     All,
     Row(Category),
 }
-
 fn parse_storage_row(value: &str) -> Result<ClearStorage, String> {
     use clap::ValueEnum;
     if value == "all" {
@@ -35,10 +31,9 @@ fn parse_storage_row(value: &str) -> Result<ClearStorage, String> {
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
 #[derive(Parser)]
 #[command(
-    name = "horizon-launcher",
+    name = crate::identity::EXECUTABLE,
     version = backend::VERSION,
     about = "Installs, prepares and starts Horizon. Without a subcommand, opens the window."
 )]
@@ -49,7 +44,6 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
 }
-
 #[derive(Subcommand)]
 enum JavaCmd {
     /// The Java runtimes Horizon downloaded from Mojang and the ones installed on this computer
@@ -58,7 +52,6 @@ enum JavaCmd {
     /// version's JSON (java-runtime-delta)
     Install { java: String },
 }
-
 #[derive(Subcommand)]
 enum RustCmd {
     /// Whether it is installed, its version and whether this computer can link with it
@@ -68,7 +61,6 @@ enum RustCmd {
     /// Delete the toolchain and the native builds' Cargo home
     Remove,
 }
-
 #[derive(Subcommand)]
 enum ServersCmd {
     /// The servers, their folder and whether they run
@@ -123,7 +115,6 @@ enum ServersCmd {
     /// Take a server off the list (its folder stays)
     Forget { server: String },
 }
-
 #[derive(Subcommand)]
 enum AccountCmd {
     /// The signed-in accounts and which one plays
@@ -146,32 +137,45 @@ enum AccountCmd {
         /// Its name or UUID
         who: String,
     },
-    /// Play as this account, or as one of your offline names
+    /// Play as this account
     Select { who: String },
-    /// Play offline (LAN, offline-mode servers) beside a signed-in account that owns the game:
-    /// as NAME (kept to switch back to; 3 to 16 letters, digits or _), or as the name the game
-    /// made up
-    Offline { name: Option<String> },
-    /// Forget one of your offline names; its skin and cape go with it
-    ForgetOffline { name: String },
-    /// Show or set an offline name's skin and cape: a 64x64 (or 64x32) skin PNG, a 64x32 cape
-    /// PNG, the model. Kept by the launcher and given to the game when that name plays
-    Skin {
-        name: String,
-        /// The skin's PNG
-        file: Option<PathBuf>,
-        /// classic or slim arms
+}
+
+#[derive(Subcommand)]
+enum DataCmd {
+    /// What is allowed, the install ID and how many items wait (the default)
+    Status,
+    /// Turn kinds on: performance, crashes, bugs, benchmarks, or all
+    Allow {
+        #[arg(required = true)]
+        kinds: Vec<String>,
+    },
+    /// Turn kinds off: performance, crashes, bugs, benchmarks, or all
+    Deny {
+        #[arg(required = true)]
+        kinds: Vec<String>,
+    },
+    /// Print exactly what would be sent
+    Show,
+    /// Delete everything sent from here, and what waits, and take a new install ID
+    Delete,
+    /// Send what is waiting now
+    Send,
+    /// Send a bug report you write; it is printed first, as it would leave
+    Bug {
+        text: String,
+        /// Add the end of the game's log (scrubbed, without chat)
         #[arg(long)]
-        model: Option<String>,
-        /// The cape's PNG
+        log: bool,
+        /// Send without asking
         #[arg(long)]
-        cape: Option<PathBuf>,
-        /// Back to the default skin
+        yes: bool,
+    },
+    /// Upload a benchmark report (docs/benchmark-report.md); it is printed first
+    Benchmark {
+        file: PathBuf,
         #[arg(long)]
-        no_skin: bool,
-        /// Take the cape off
-        #[arg(long)]
-        no_cape: bool,
+        yes: bool,
     },
 }
 
@@ -698,10 +702,14 @@ enum Cmd {
     },
     /// Download and install a release (a tag such as v2026.10.13, or "latest")
     Install { tag: String },
+    /// Install a local unsigned developer build from a trusted checkout
+    #[command(about = tr("Install a local unsigned developer build from a trusted checkout"), after_help = tr("Example: horizon-launcher developer-install CHECKOUT --program CHECKOUT/target/debug/horizon-client --trust-unsigned\nThis executes the checkout's build code and an unsigned game with your rights. Trust both before continuing."), long_about = tr("Install a local unsigned developer build. This runs the checkout's build code through cargo run -p xtask -- package. Commit tracked changes and rebuild first. Build horizon-ctl, horizon-prepare and horizon-server beside the game, and compile exporters into the checkout's exporters folder. Native builds use the saved local source commit, including unpublished commits. Select this base explicitly; automatic updates never replace it."))]
+    DeveloperInstall(developer_builds::DeveloperInstall),
     /// Remove an installed version
     Remove { tag: String },
     /// Install a game program you have, such as a horizon-client built on your fork's Actions,
-    /// as its own version on an installed release or Nightly's game files, and select it.
+    /// as its own version on an installed base's game files, and select it. A local unsigned
+    /// developer base is allowed only when explicitly selected or named with --version.
     /// Nothing signed it: it runs with your rights, and updates never replace it
     #[command(
         after_help = "The program must match this computer's executable format and carry the exact `horizon-game-executable;`\nidentity signature embedded by ordinary and launcher-generated games. It carries no mod API level or build id,\nand is not a signature of authenticity. Unmarked programs are refused."
@@ -709,8 +717,8 @@ enum Cmd {
     ImportBuild {
         /// The program (horizon-client, horizon-client.exe on Windows), or a zip holding it
         path: PathBuf,
-        /// The installed release or Nightly whose game files it plays with (default: the
-        /// selected one, else the newest)
+        /// The installed base whose game files it plays with (default: the selected usable
+        /// base, else the newest release or Nightly; developer bases need explicit selection)
         #[arg(long)]
         version: Option<String>,
         /// You picked this build yourself and trust it with full access to this computer
@@ -736,7 +744,7 @@ enum Cmd {
         /// Allow missing original Java asset/data jars to be downloaded from Modrinth
         #[arg(long)]
         allow_jar_downloads: bool,
-        #[arg(long)]
+        #[arg(long, help = "Installed version to play (default: instance version)")]
         version: Option<String>,
         /// The instance to play (its name or id; default: the selected one). A Java instance
         /// starts its Minecraft: Java Edition, downloaded with its Java the first time
@@ -778,10 +786,24 @@ enum Cmd {
         accept_eula: bool,
     },
     /// Show disposable storage by category as JSON. Builds must be idle
+    ///
+    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches, installed-version
+    /// removal and automatic runtime eviction retain files while any launch path lacks enforceable
+    /// lifetime exclusion; an empty process scan is not authorization. Read-only reports stay available.
+    /// Private launch records and raw captures are collected together only after all participating owners
+    /// exit, under the exclusive permanent namespace gate. Published unit keys persist until exclusive
+    /// unit removal. Registry entry counts are logged; lock entries are not age-collected.
     Storage {
-        /// Clear build-files, prebuilt-games, spare-game-builds, rust-compiler, other-caches or all implemented rows
+        /// Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
         #[arg(long, value_parser = parse_storage_row)]
         clear: Option<ClearStorage>,
+    },
+    /// Generate the registry-only Cargo.lock for one native mod, without executing mod code
+    NativeLock {
+        folder: PathBuf,
+        /// Explicitly replace an existing lock with newly resolved registry pins
+        #[arg(long)]
+        update_lock: bool,
     },
     /// Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the instance's exact
     /// Horizon source revision with the launcher's own Rust, as the version the instance then
@@ -791,6 +813,11 @@ enum Cmd {
         /// as JSON for cargo horizon-mod internals sync; never installs or selects a game
         #[arg(long, conflicts_with_all = ["server_output", "instance", "version", "update", "profile"], requires = "folder")]
         sync_internals: bool,
+        #[arg(long, requires = "folder", conflicts_with_all = ["sync_internals", "server_output", "instance", "version", "update", "profile"])]
+        catalog: bool,
+        /// Copy discovery catalogs into this caller-owned empty directory
+        #[arg(long, requires = "catalog")]
+        catalog_output: Option<PathBuf>,
         /// A mod folder (horizon-mod.toml with [native], Cargo.toml and src/), or a folder of them
         /// (default: the native mods installed and turned on in the instance). Server exports
         /// also read wasm internals declarations from .hmod packages directly in this folder
@@ -819,17 +846,20 @@ enum Cmd {
         #[arg(long)]
         version: Option<String>,
         /// Move to the newest installed release or Nightly instead of the Horizon the instance
-        /// plays (a full rebuild)
+        /// plays (rebuilds the mods for that pinned SDK)
         #[arg(long, conflicts_with = "version")]
         update: bool,
         /// Allow native code for this install (remembered; revoke in Settings, Storage)
         #[arg(long)]
         trust_native_code: bool,
-        /// This instance's build mode: optimized, balanced or developer. Remembers an explicit
-        /// choice for this instance; otherwise uses its saved choice, starting at Balanced.
-        /// Without a picker reason or explicit choice, installed mods use the prebuilt route.
+        /// Native mods use the pinned SDK's optimized compilation settings.
+        /// The game is never rebuilt by a mod build.
         #[arg(long, value_enum)]
         profile: Option<native_mods::Profile>,
+        /// Build the horizon-mixins tool from its pinned source instead of downloading the
+        /// prebuilt one: for CI, which keeps that path proven
+        #[arg(long, hide = true)]
+        mixins_from_source: bool,
     },
     /// Show a release's patch notes (default: the newest)
     Notes { tag: Option<String> },
@@ -850,8 +880,8 @@ enum Cmd {
     /// system|en|fr|ru|de|zh|es|uk|pl (the window's language; system follows the computer's), accent
     /// violet|blue|teal|green|amber|red|pink|#rrggbb|DEGREES (a named accent, any colour, or any
     /// hue), background PATH (a picture behind Home; "default"
-    /// shows Horizon's landscape), native-cache-gib N (combined native compilation cache limit
-    /// in GiB, default 30; 0 disables automatic cleanup)
+    /// shows Horizon's landscape), cache-limit-gib N (managed cache limit
+    /// in GiB: 10, 25 (default), 50, 100; 0 disables automatic cleanup)
     Settings {
         #[arg(value_parser = SETTING_KEYS)]
         key: Option<String>,
@@ -906,6 +936,12 @@ enum Cmd {
         /// Add the end of the game's log (names and worlds hidden, without chat)
         #[arg(long)]
         log: bool,
+    },
+    /// Opt-in data collection (docs/telemetry.md): what is allowed, what would be sent, and
+    /// deleting it; all off until you allow a kind
+    Data {
+        #[command(subcommand)]
+        action: Option<DataCmd>,
     },
     /// Instances: separate game folders, each with its own worlds, options and packs
     Instance {
@@ -1015,7 +1051,7 @@ const SETTING_KEYS: [&str; 14] = [
     "language",
     "accent",
     "background",
-    "native-cache-gib",
+    "cache-limit-gib",
 ];
 
 fn on_off(value: &str) -> Result<bool, String> {
@@ -1090,13 +1126,13 @@ fn set_setting(s: &mut backend::Settings, key: &str, value: &str) -> Result<(), 
                 })?),
             }
         }
-        "native-cache-gib" => {
-            s.native_cache_gib = match value {
+        "cache-limit-gib" => {
+            s.cache_limit_gib = match value {
                 "default" => None,
                 n => Some(
                     n.parse::<u64>()
                         .ok()
-                        .filter(|n| n.checked_mul(1 << 30).is_some())
+                        .filter(|n| matches!(n, 0 | 10 | 25 | 50 | 100))
                         .ok_or_else(|| {
                             tr("Enter a cache limit in GiB; 0 disables automatic cleanup.")
                                 .to_string()
@@ -1118,29 +1154,6 @@ fn set_setting(s: &mut backend::Settings, key: &str, value: &str) -> Result<(), 
     Ok(())
 }
 
-/// Every launcher setting, as `settings` shows them.
-fn settings_json(s: &backend::Settings) -> serde_json::Value {
-    serde_json::json!({
-        "selected_version": backend::resolve_version(None).ok(),
-        "game_architecture": s.game_architecture.name(),
-        "minecraft_dir": s.minecraft_dir,
-        "server_dir": backend::server_dir(None),
-        "install_new_versions": s.install_new_versions.unwrap_or(true),
-        "prune_old_versions": s.auto_prune(),
-        "keep_versions": s.keep_newest(),
-        "opening_animation": !s.skip_opening,
-        "game_args": s.game_args,
-        "proxy": s.proxy,
-        "desktop_entry": s.desktop_entry.unwrap_or(true),
-        "while_playing": s.while_playing.name(),
-        "language": s.language.map_or("system", |l| l.code()),
-        "accent": s.accent.name(),
-        "background": horizon_launcher::themes::background(&backend::data_dir(), s.background.as_deref()),
-        "native_cache_gib": s.native_cache_gib.unwrap_or(native_mods::DEFAULT_CACHE_GIB),
-        "no_ai": backend::no_ai(),
-    })
-}
-
 /// Runs a subcommand and returns the exit code, or None when the window should open.
 pub fn run() -> Option<i32> {
     use clap::FromArgMatches;
@@ -1155,8 +1168,8 @@ pub fn run() -> Option<i32> {
     let cli = Cli::from_arg_matches(&definition.get_matches()).unwrap_or_else(|e| e.exit());
     let command = cli.command?;
     let result = match command {
-        Cmd::Mcp | Cmd::AgentConfig { .. } if no_ai => Err(horizon_core::no_ai::REFUSAL.into()),
-        Cmd::Mcp => crate::mcp::serve(),
+        Cmd::Mcp | Cmd::AgentConfig { .. } if no_ai => Err(horizon_platform::no_ai::REFUSAL.into()),
+        Cmd::Mcp => crate::mcp::serve().map(|()| 0),
         command => {
             let result = execute(command, cli.json);
             // A game it started has ended (attached) or none did (an error): a session file it
@@ -1166,7 +1179,7 @@ pub fn run() -> Option<i32> {
         }
     };
     Some(match result {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
             1
@@ -1196,15 +1209,18 @@ fn json(value: serde_json::Value) {
 }
 
 /// Runs a game process in this terminal and reports how it ended.
-fn attached(cmd: Command) -> Result<(), String> {
+fn attached(cmd: Command) -> Result<i32, String> {
     let (mut cmd, _runtime) = backend::prepare_command(cmd)?;
-    let status = cmd
-        .status()
+    let status = backend::spawn_attached(&mut cmd)
+        .and_then(|mut child| child.wait())
         .map_err(|e| format!("Could not start {:?}: {e}", cmd.get_program()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Exited with {status}"))
+    #[cfg(unix)]
+    {
+        horizon_launcher::process::supervisor::exit_code(status).map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().ok_or_else(|| format!("Exited with {status}"))
     }
 }
 
@@ -1215,7 +1231,7 @@ fn release_json(r: &Release) -> serde_json::Value {
     })
 }
 
-fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
+fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
     if matches!(command, Cmd::Versions { .. } | Cmd::Update { .. }) {
         for (tag, from) in backend::reuse_prepared_everywhere() {
             if !as_json {
@@ -1253,14 +1269,16 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 } else {
                     "prepared, no sounds (prepare again)"
                 };
-                println!("{mark} {tag}  {state}");
+                let label =
+                    horizon_launcher::developer_install::label(tag).unwrap_or_else(|| tag.clone());
+                println!("{mark} {label}  {state}");
             }
         }
         Cmd::Versions { installed: false } => {
             let releases = backend::releases()?;
             if as_json {
                 json(releases.iter().map(release_json).collect());
-                return Ok(());
+                return Ok(0);
             }
             let installed = backend::installed();
             for r in &releases {
@@ -1298,9 +1316,20 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             };
             let report = storage.report(row, all).map_err(native_mods::cache_error)?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            if row.is_some() || all {
+                if let Some(kept) = report.rows.iter().flat_map(|row| &row.kept).next() {
+                    return Err(kept.reason.clone());
+                }
+            }
         }
+        Cmd::NativeLock {
+            folder,
+            update_lock,
+        } => native_mods::registry_lock(&folder, update_lock)?,
         Cmd::NativeBuild {
             sync_internals,
+            catalog,
+            catalog_output,
             folder,
             server_output,
             allow_jar_downloads,
@@ -1309,15 +1338,25 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             update,
             trust_native_code,
             profile,
+            mixins_from_source,
         } => {
             native_permission(trust_native_code)?;
+            native_mods::mixins_from_source(mixins_from_source);
+            if catalog {
+                let discovered =
+                    native_mods::pinned_catalog_with_modules(&folder.expect("required by clap"))?;
+                let destination = catalog_output.ok_or("--catalog requires --catalog-output")?;
+                let destination = discovered.snapshot(&destination)?;
+                println!("{}", destination.display());
+                return Ok(0);
+            }
             if sync_internals {
                 let entries = native_mods::sync_internals(&folder.expect("required by clap"))?;
                 println!(
                     "{}",
                     serde_json::to_string(&entries).map_err(|error| error.to_string())?
                 );
-                return Ok(());
+                return Ok(0);
             }
             let steps = |step: native_mods::Step| eprintln!("{}", step.label());
             if let Some(output) = server_output {
@@ -1335,9 +1374,10 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                     &base,
                     &folder,
                     &output,
-                    profile.unwrap_or_default(),
+                    profile,
                     allow_jar_downloads,
                     steps,
+                    registry_consent,
                 )?;
                 let built = std::path::absolute(&built).unwrap_or(built);
                 let path = built.display().to_string();
@@ -1352,7 +1392,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                         server.toml (docs/hosting.md); the launcher writes nothing itself."
                     )
                 );
-                return Ok(());
+                return Ok(0);
             }
             let target = match &instance {
                 Some(name) => instances::find(name)?,
@@ -1379,7 +1419,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             };
             let profile = explicit.then_some(target.native_profile);
             let built =
-                native_mods::build(&base, &folder, &target, profile, steps).map_err(|error| {
+                native_mods::build(&base, &folder, &target, profile, steps, registry_consent).map_err(|error| {
                     let error = String::from(error);
                     if error.starts_with(native_mods::MISMATCH) {
                         trf("{error} Run `cargo horizon-mod update --horizon {commit}` in each mod's folder to pin it to this game, then build again.", &[("error", &error), ("commit", &base)])
@@ -1393,6 +1433,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 )
             );
         }
+        Cmd::DeveloperInstall(args) => developer_builds::install(args, as_json)?,
         Cmd::Remove { tag } => {
             backend::remove_version(&tag)?;
             println!("Removed {tag}.");
@@ -1401,24 +1442,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             path,
             version,
             trust_unsigned,
-        } => {
-            if !trust_unsigned {
-                return Err("An imported build is unsigned: Horizon can't check where it came from. If you trust it, pass --trust-unsigned.".into());
-            }
-            let tag = build_import::import(&path, version.as_deref())?;
-            let prepared = backend::check_prepared(&tag);
-            if as_json {
-                json(serde_json::json!({ "imported": tag, "prepared": prepared }));
-            } else if prepared {
-                println!(
-                    "Imported {tag} and selected it. It is prepared already, from another installed version."
-                );
-            } else {
-                println!(
-                    "Imported {tag} and selected it. Prepare it next: horizon-launcher prepare --version {tag}"
-                );
-            }
-        }
+        } => developer_builds::import(&path, version.as_deref(), trust_unsigned, as_json)?,
         Cmd::Prepare {
             minecraft,
             download,
@@ -1435,7 +1459,12 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 backend::preparer(&tag, &minecraft, from, &|line| eprintln!("{line}"))?;
             backend::sounds(&tag, &minecraft, &|line| println!("{line}"));
             match preparer {
-                backend::Preparer::Process(cmd) => attached(cmd)?,
+                backend::Preparer::Process(cmd) => {
+                    let code = attached(cmd)?;
+                    if code != 0 {
+                        return Ok(code);
+                    }
+                }
                 backend::Preparer::InProcess(options) => {
                     backend::prepare_in_process(&options, &|line| println!("{line}"))?
                 }
@@ -1490,26 +1519,23 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 after_exit(&instance, &vars);
                 return played;
             }
-            // Who plays this launch; the accounts below choose it in memory only, for its
-            // `--name` and look.
-            let mut accounts = Accounts::load();
+            // Who plays this launch only.
             let who = match account {
-                Some(who) => Some(account::Player::Microsoft(
-                    accounts
+                Some(who) => Some(
+                    Accounts::load()
                         .find(&who)
                         .ok_or_else(|| {
                             format!("No signed-in account {who}. See `horizon-launcher account`.")
                         })?
                         .uuid
                         .clone(),
-                )),
+                ),
                 None => None,
             };
-            if let Some(who) = &who {
-                accounts.play_as(account::store(), who.clone())?;
-            }
-            let mut cmd =
-                backend::client_as(&instance.resolve_version(version.as_deref())?, who.as_ref())?;
+            let mut cmd = backend::client_as(
+                &instance.resolve_version(version.as_deref())?,
+                who.as_deref(),
+            )?;
             instances::apply(&mut cmd, &instance)?;
             if let Some(code) = join {
                 backend::join_friend(&mut cmd, &code)?;
@@ -1527,10 +1553,6 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             }
             cmd.args(arg);
             let started = std::time::Instant::now();
-            if let Some(name) = accounts.name_arg() {
-                cmd.arg("--name").arg(name);
-            }
-            cmd.envs(accounts.look_env());
             let vars = instance.vars(cmd.get_program());
             cmd.envs(vars.iter().map(|(k, v)| (k, v)));
             horizon_launcher::jars::prepare_launch(
@@ -1544,7 +1566,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 eprintln!("Play time not saved: {e}");
             }
             after_exit(&instance, &vars);
-            played?
+            return played;
         }
         Cmd::Server {
             dir,
@@ -1562,7 +1584,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 horizon_launcher::jars::Permission::headless(allow_jar_downloads),
             )
             .map_err(|error| error.to_string())?;
-            attached(cmd)?
+            return attached(cmd);
         }
         Cmd::Notes { tag } => {
             let r = backend::release_notes(tag.as_deref())?;
@@ -1581,6 +1603,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             }
         }
         Cmd::Account { action } => account_command(action.unwrap_or(AccountCmd::List), as_json)?,
+        Cmd::Data { action } => data(action.unwrap_or(DataCmd::Status), as_json)?,
         Cmd::Benchmark { repeats } => {
             let path = crate::perf::benchmark(repeats.max(1))?;
             if as_json {
@@ -1597,7 +1620,9 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 for (name, url) in [
                     ("Website", &links.website),
                     ("Roadmap", &links.roadmap),
-                    ("Docs", &links.docs),
+                    ("Documentation", &links.docs),
+                    ("Discord", &links.discord),
+                    ("Sponsor", &links.sponsor),
                 ] {
                     println!("{name:<8} {}", if url.is_empty() { "(none)" } else { url });
                 }
@@ -1639,7 +1664,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                         .collect();
                 }
                 json(all);
-                return Ok(());
+                return Ok(0);
             }
             for c in agents::clients(exe)
                 .iter()
@@ -1779,16 +1804,15 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             as_json,
         )?,
         Cmd::Instance { action } => instance(action.unwrap_or(InstanceCmd::List), as_json)?,
-        Cmd::Modpack { action } => modpack(action.unwrap_or(ModpackCmd::List), as_json)?,
+        Cmd::Modpack { action } => return modpack(action.unwrap_or(ModpackCmd::List), as_json),
         Cmd::Mods { action } => mods(action.unwrap_or(ModsCmd::List { instance: None }), as_json)?,
         Cmd::Servers { action } => servers(action.unwrap_or(ServersCmd::List), as_json)?,
         Cmd::Rust { action } => rust(action.unwrap_or(RustCmd::Status), as_json)?,
         Cmd::Java { action } => java(action.unwrap_or(JavaCmd::List), as_json)?,
         Cmd::Mcp => unreachable!(),
     }
-    Ok(())
+    Ok(0)
 }
-
 fn java(action: JavaCmd, as_json: bool) -> Result<(), String> {
     use horizon_launcher::java;
     match action {
@@ -1825,7 +1849,6 @@ fn java(action: JavaCmd, as_json: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
 fn rust(action: RustCmd, as_json: bool) -> Result<(), String> {
     use horizon_launcher::rust_toolchain as rust;
     match action {
@@ -1873,7 +1896,6 @@ fn rust(action: RustCmd, as_json: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
 fn update(check: bool, as_json: bool) -> Result<(), String> {
     let updates = backend::check_updates()?;
     if as_json && check {
@@ -1912,7 +1934,6 @@ fn update(check: bool, as_json: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
 /// `account …`: names and UUIDs only; tokens are never printed.
 fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
     let mut accounts = Accounts::load();
@@ -1931,14 +1952,10 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                         "selected": accounts.selected.as_ref() == Some(&a.uuid),
                         "authentication": account::session::status(account::store(), &a.uuid),
                     })).collect::<Vec<_>>(),
-                    "offline": accounts.offline.iter().map(|n| serde_json::json!({
-                        "name": n,
-                        "selected": accounts.player() == account::Player::Offline(n.clone()),
-                    })).collect::<Vec<_>>(),
                     "sign_in_configured": account::client_id().is_some(),
                     "owner": accounts.has_owner(account::store()),
                 }));
-            } else if accounts.accounts.is_empty() && accounts.offline.is_empty() {
+            } else if accounts.accounts.is_empty() {
                 println!(
                     "No Microsoft account signed in. Play needs one that owns Minecraft: Java \
                      Edition: horizon-launcher account sign-in"
@@ -1957,15 +1974,6 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                         _ => String::new(),
                     };
                     println!("{mark} {}  {}  {}{why}", a.name, a.uuid, status.label());
-                }
-                for n in &accounts.offline {
-                    let on = accounts.player() == account::Player::Offline(n.clone());
-                    println!("{} {n}  offline", if on { "*" } else { " " });
-                }
-                if accounts.player() == account::Player::GameName {
-                    println!(
-                        "Playing offline as the game's own name (`account select NAME` to switch)."
-                    );
                 }
                 if !accounts.has_owner(account::store()) {
                     println!(
@@ -2050,99 +2058,88 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
             println!("Signed out {}.", a.name);
         }
         AccountCmd::Select { who } => {
-            let offline = accounts
-                .offline
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(&who))
-                .cloned();
-            let (player, name) = match (accounts.find(&who).cloned(), offline) {
-                (Some(a), _) => (account::Player::Microsoft(a.uuid), a.name),
-                (None, Some(n)) => (
-                    account::Player::Offline(n.clone()),
-                    format!("{n} (offline)"),
-                ),
-                (None, None) => return Err(find(&accounts, &who).unwrap_err()),
-            };
-            accounts.play_as(account::store(), player)?;
+            let a = find(&accounts, &who)?;
+            accounts.play_as(&a.uuid)?;
             accounts.save()?;
-            println!("The game plays as {name}.");
-        }
-        AccountCmd::Offline { name } => {
-            let player = match name {
-                Some(n) => account::Player::Offline(n),
-                None => account::Player::GameName,
-            };
-            accounts.play_as(account::store(), player)?;
-            accounts.save()?;
-            match accounts.name_arg() {
-                Some(n) => println!("The game plays offline as {n}."),
-                None => println!("The game plays offline, as the name it made up."),
-            }
-        }
-        AccountCmd::Skin {
-            name,
-            file,
-            model,
-            cape,
-            no_skin,
-            no_cape,
-        } => {
-            use horizon_launcher::skins::{self, Model};
-            let name = accounts
-                .offline
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(&name))
-                .cloned()
-                .ok_or_else(|| {
-                    format!("No offline name {name}: add it with `account offline {name}`.")
-                })?;
-            let model = match model.as_deref() {
-                None => None,
-                Some("classic") => Some(Model::Classic),
-                Some("slim") => Some(Model::Slim),
-                Some(m) => return Err(format!("{m}: say classic or slim")),
-            };
-            let mut look = accounts.look(&name);
-            if let Some(file) = &file {
-                skins::keep(&skins::dir(), &name, file, false)?;
-                look.skin = true;
-            }
-            if let Some(file) = &cape {
-                skins::keep(&skins::dir(), &name, file, true)?;
-                look.cape = true;
-            }
-            if let Some(m) = model {
-                look.model = m;
-            }
-            look.skin &= !no_skin;
-            look.cape &= !no_cape;
-            accounts
-                .looks
-                .insert(name.to_ascii_lowercase(), look.clone());
-            accounts.save()?;
-            if as_json {
-                json(serde_json::json!({
-                    "name": name, "skin": look.skin, "cape": look.cape, "model": look.model.name(),
-                }));
-            } else {
-                let say = |on: bool, what: &str| if on { what.to_string() } else { "none".into() };
-                println!(
-                    "{name}: skin {} ({} arms), cape {}",
-                    say(look.skin, "kept"),
-                    look.model.name(),
-                    say(look.cape, "kept")
-                );
-            }
-        }
-        AccountCmd::ForgetOffline { name } => {
-            accounts.remove_offline(&name, &horizon_launcher::skins::dir())?;
-            accounts.save()?;
-            println!("Forgot the offline name {name}.");
+            println!("The game plays as {}.", a.name);
         }
     }
     Ok(())
 }
-
+/// `data`: the same consent as Settings → Data collection.
+fn data(action: DataCmd, as_json: bool) -> Result<(), String> {
+    use horizon_launcher::telemetry;
+    let review = |item: &horizon_telemetry::Item, yes: bool| -> Result<bool, String> {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(item).map_err(|e| e.to_string())?
+        );
+        if yes {
+            return Ok(true);
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err("Add --yes to send it without asking.".into());
+        }
+        eprint!("Send this? [y/N] ");
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        Ok(line.trim().eq_ignore_ascii_case("y"))
+    };
+    match action {
+        DataCmd::Status => {
+            let status = telemetry::status_json();
+            if as_json {
+                json(status);
+                return Ok(());
+            }
+            let consent = telemetry::consent();
+            if consent.needs_asking() {
+                println!("Not answered yet: nothing is collected.");
+            }
+            for (kind, name, _) in telemetry::SWITCHES {
+                let on = consent.allows(kind);
+                println!("{name}: {}", if on { "on" } else { "off" });
+            }
+            println!("Waiting to be sent: {}", status["waiting"]);
+            match horizon_telemetry::endpoint() {
+                Some(url) => println!("Server: {url}"),
+                None => println!("Server: turned off (HORIZON_TELEMETRY_URL=off), nothing is sent"),
+            }
+        }
+        DataCmd::Allow { kinds } => {
+            telemetry::set(&telemetry::parse_kinds(&kinds)?, true)?;
+            return data(DataCmd::Status, as_json);
+        }
+        DataCmd::Deny { kinds } => {
+            telemetry::set(&telemetry::parse_kinds(&kinds)?, false)?;
+            return data(DataCmd::Status, as_json);
+        }
+        DataCmd::Show => {
+            let (what, text) = telemetry::preview();
+            eprintln!("{what}");
+            println!("{text}");
+        }
+        DataCmd::Delete => println!("{}", telemetry::delete_my_data()?),
+        DataCmd::Send => println!("{:?}", telemetry::send()),
+        DataCmd::Bug { text, log, yes } => {
+            telemetry::ensure_allowed(horizon_telemetry::Kind::Bug)?;
+            let item = telemetry::bug_report(&text, log)?;
+            if review(&item, yes)? {
+                println!("{}", telemetry::submit(&item)?);
+            }
+        }
+        DataCmd::Benchmark { file, yes } => {
+            telemetry::ensure_allowed(horizon_telemetry::Kind::Benchmark)?;
+            let item = telemetry::benchmark_report(&file)?;
+            if review(&item, yes)? {
+                println!("{}", telemetry::submit(&item)?);
+            }
+        }
+    }
+    Ok(())
+}
 fn servers(action: ServersCmd, as_json: bool) -> Result<(), String> {
     use horizon_launcher::servers::{self, NewServer, World};
     let find = |which: &str| {
@@ -2248,69 +2245,10 @@ fn servers(action: ServersCmd, as_json: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
 /// Installs the native mods of `found` (a GitHub link, resolved) into the game folder `home`: the
 /// warning and the exact source link first, and nothing downloaded without `trust`.
-fn native_permission(trust: bool) -> Result<(), String> {
-    if trust {
-        backend::Settings::load().allow_native_mods()?;
-    }
-    native_mods::require_consent().map_err(String::from)
-}
-
-fn github_native(
-    home: &Path,
-    java: bool,
-    found: &github_mods::Resolved,
-    only: Option<&str>,
-    all: bool,
-    trust: bool,
-) -> Result<(), String> {
-    if java {
-        return Err("Native mods from GitHub are for Horizon instances.".into());
-    }
-    println!("{}", found.label());
-    println!("Source, to read: {}", found.source_url());
-    eprintln!("{}", github_mods::WARNING);
-    native_permission(trust)?;
-    let mods = github_mods::fetch(found)?;
-    let chosen = github_mods::choose(&mods, only, all);
-    let done = chosen.and_then(|chosen| {
-        chosen
-            .into_iter()
-            .map(|p| github_mods::install(home, found, p))
-            .collect::<Result<Vec<_>, _>>()
-    });
-    github_mods::discard(found);
-    let done = done?;
-    // The window's trust notice, once. Nothing is turned on: native mods are always on.
-    let mut settings = backend::Settings::load();
-    if !settings.native_mods_noticed {
-        eprintln!("{}", native_status::NOTICE);
-        settings.native_mods_noticed = true;
-        settings.save()?;
-    }
-    for o in done {
-        println!(
-            "Installed {} {} from GitHub ({}), sha256 {}.",
-            o.id,
-            o.version,
-            o.label(),
-            o.sha256
-        );
-    }
-    println!("Build it next: horizon-launcher native-build --trust-native-code");
-    println!(
-        "{}",
-        tr(
-            "Developing a mod? Use native-build --profile developer. The choice is remembered for this instance."
-        )
-    );
-    Ok(())
-}
-
 fn mods(action: ModsCmd, as_json: bool) -> Result<(), String> {
-    use horizon_launcher::browser::{Kind, Query, SourceId, horizon, installed, java_instance};
+    use horizon_launcher::browser::{horizon, installed, java_instance, Kind, Query, SourceId};
     use horizon_launcher::modpacks;
     // What the browser installs goes into an instance's game folder; Java mods' checks are kept
     // in the default one, shared by all.
@@ -2588,14 +2526,6 @@ fn mods(action: ModsCmd, as_json: bool) -> Result<(), String> {
                 Some(target) => java_instance::install(&*source, target, &p, &home, &line)?,
                 None => installed::install(&*source, &p, everything, &home, &line)?,
             };
-            // The first native mod: the window's trust notice, once.
-            let mut settings = backend::Settings::load();
-            let native = done.iter().any(|e| native_status::is_native_file(&e.file));
-            if native && !settings.native_mods_noticed {
-                eprintln!("{}", native_status::NOTICE);
-                settings.native_mods_noticed = true;
-                settings.save()?;
-            }
             if as_json {
                 json(done.iter().map(entry_json).collect());
             }
@@ -2750,7 +2680,6 @@ fn mods(action: ModsCmd, as_json: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
 /// The other launchers' instances in `folder`, else in their default folders.
 fn other_instances(folder: Option<&Path>) -> Result<Vec<other_launchers::Found>, String> {
     use horizon_launcher::sources::{Folders, Os};
@@ -2763,7 +2692,6 @@ fn other_instances(folder: Option<&Path>) -> Result<Vec<other_launchers::Found>,
         }
     })
 }
-
 /// Where `instance others` looked when it found nothing, and what it looks for.
 fn no_other_instances(folder: Option<&Path>) -> String {
     use horizon_launcher::sources::{Folders, Os};
@@ -2789,7 +2717,6 @@ fn no_other_instances(folder: Option<&Path>) -> String {
         }
     }
 }
-
 fn other_plays(f: &other_launchers::Found) -> String {
     match (&f.minecraft, &f.loader) {
         (None, _) => "Minecraft version not recorded: copy-from --minecraft <version>".into(),
@@ -2797,7 +2724,6 @@ fn other_plays(f: &other_launchers::Found) -> String {
         (Some(v), None) => format!("Minecraft {v}"),
     }
 }
-
 fn other_json(f: &other_launchers::Found) -> serde_json::Value {
     serde_json::json!({
         "launcher": f.launcher, "name": f.name, "minecraft": f.minecraft,
@@ -2806,7 +2732,6 @@ fn other_json(f: &other_launchers::Found) -> serde_json::Value {
         "game": f.game, "shared": f.shared,
     })
 }
-
 /// Runs the instance's post-exit command in this terminal, if it has one, and waits for it.
 fn after_exit(instance: &instances::Instance, vars: &[(&'static str, std::ffi::OsString)]) {
     let Some(mut cmd) =
@@ -2845,7 +2770,7 @@ fn instance(action: InstanceCmd, as_json: bool) -> Result<(), String> {
         serde_json::json!({
             "id": i.id, "name": i.name, "kind": format!("{:?}", i.kind).to_lowercase(),
             "home": i.home, "icon": i.icon, "group": i.group, "selected": selected,
-            "version": i.version, "java": i.java, "played_secs": i.played.as_secs(),
+            "version": i.version, "version_label": i.version.as_deref().and_then(horizon_launcher::developer_install::label), "java": i.java, "played_secs": i.played.as_secs(),
             "last_played_ms": i.last_played.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64),
         })
     };
@@ -2866,7 +2791,10 @@ fn instance(action: InstanceCmd, as_json: bool) -> Result<(), String> {
                 ),
                 None => format!("  Minecraft {} (Java Edition)", java.minecraft),
             },
-            (None, Some(v)) => format!("  {v}"),
+            (None, Some(v)) => format!(
+                "  {}",
+                horizon_launcher::developer_install::label(v).unwrap_or_else(|| v.clone())
+            ),
             (None, None) => String::new(),
         };
         let played = match i.last_played {
@@ -3601,7 +3529,7 @@ fn worlds(action: WorldsCmd, as_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn modpack(action: ModpackCmd, as_json: bool) -> Result<(), String> {
+fn modpack(action: ModpackCmd, as_json: bool) -> Result<i32, String> {
     use horizon_launcher::browser::horizon;
     use horizon_launcher::modpacks::{self, Imported};
     use horizon_port_pack::report::Status;
@@ -3700,17 +3628,110 @@ fn modpack(action: ModpackCmd, as_json: bool) -> Result<(), String> {
                 horizon_launcher::jars::Permission::headless(allow_jar_downloads),
             )
             .map_err(|error| error.to_string())?;
-            attached(cmd)?
+            return attached(cmd);
         }
         ModpackCmd::Remove { pack } => modpacks::remove(&work(&pack)?)?,
     }
-    Ok(())
+    Ok(0)
 }
 
+#[cfg(test)]
+mod storage_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn attached_preserves_real_process_codes_and_unix_signals() {
+        let mut codes = vec![0, 37];
+        #[cfg(unix)]
+        codes.push(143);
+        #[cfg(windows)]
+        codes.push(0xFEDC_BA98u32 as i32);
+        for code in codes {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cli::tests::attached_status_actor",
+                    "--nocapture",
+                ])
+                .env("HORIZON_CLI_STATUS_ROLE", "wrapper")
+                .env("HORIZON_CLI_STATUS_CODE", code.to_string())
+                .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("HORIZON_NO_AUDIO", "1")
+                .current_dir(root.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit());
+            for (key, folder) in [
+                ("HORIZON_HOME", "logs"),
+                ("HORIZON_LAUNCHER_HOME", "launcher"),
+                ("XDG_DATA_HOME", "xdg-data"),
+                ("XDG_CONFIG_HOME", "xdg-config"),
+                ("HORIZON_LAUNCHER_TRASH", "trash"),
+                ("HORIZON_LAUNCHER_CLIPBOARD", "clipboard"),
+                ("HORIZON_LAUNCHER_DESKTOP", "desktop"),
+            ] {
+                command.env(key, root.path().join(folder));
+            }
+            assert_eq!(command.status().unwrap().code(), Some(code));
+        }
+    }
+
+    #[test]
+    fn attached_status_actor() {
+        let Ok(role) = std::env::var("HORIZON_CLI_STATUS_ROLE") else {
+            return;
+        };
+        let code: i32 = std::env::var("HORIZON_CLI_STATUS_CODE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        if role == "child" {
+            assert!(std::env::var_os(horizon_mod_package::holder::ENV).is_none());
+            assert!(std::env::var_os(horizon_mod_package::holder::ENTRY).is_none());
+            use std::io::IsTerminal;
+            let shape = format!(
+                "{}:{}:{}",
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                std::io::stderr().is_terminal()
+            );
+            assert_eq!(shape, std::env::var("HORIZON_CLI_STDIO_SHAPE").unwrap());
+            #[cfg(unix)]
+            if code == 143 {
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                    libc::raise(libc::SIGTERM);
+                }
+                panic!("SIGTERM did not terminate the actor");
+            }
+            std::process::exit(code);
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "cli::tests::attached_status_actor",
+                "--nocapture",
+            ])
+            .env("HORIZON_CLI_STATUS_ROLE", "child");
+        use std::io::IsTerminal;
+        command.env(
+            "HORIZON_CLI_STDIO_SHAPE",
+            format!(
+                "{}:{}:{}",
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                std::io::stderr().is_terminal()
+            ),
+        );
+        assert_eq!(attached(command).unwrap(), code);
+        std::process::exit(code);
+    }
 
     #[test]
     fn completions_cover_each_shell_and_nested_commands() {
@@ -3985,17 +4006,15 @@ mod tests {
             _ => panic!("expected native-build"),
         }
         // A version refuses --update, as in the game mode.
-        assert!(
-            parse(&[
-                "mods",
-                "--server-output",
-                "engine-out",
-                "--version",
-                "v2026.10.13",
-                "--update"
-            ])
-            .is_err()
-        );
+        assert!(parse(&[
+            "mods",
+            "--server-output",
+            "engine-out",
+            "--version",
+            "v2026.10.13",
+            "--update"
+        ])
+        .is_err());
         assert!(parse(&["mods", "--allow-version-mismatch"]).is_err());
         // The game mode is unchanged: an instance build without --server-output.
         assert!(matches!(
@@ -4021,38 +4040,17 @@ mod tests {
         }
         assert_eq!(native_mods::base_for(None, &[], false), None);
     }
-
-    #[test]
-    fn native_cache_command_and_persisted_limit() {
-        assert!(matches!(
-            Cli::try_parse_from(["horizon-launcher", "storage"])
-                .unwrap()
-                .command,
-            Some(Cmd::Storage { clear: None })
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "all"])
-                .unwrap()
-                .command,
-            Some(Cmd::Storage {
-                clear: Some(ClearStorage::All)
-            })
-        ));
-        assert!(Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "worlds"]).is_err());
-        assert!(Cli::try_parse_from(["horizon-launcher", "native-cache"]).is_err());
-        assert!(
-            Cli::try_parse_from(["horizon-launcher", "storage", "--clear", "other-caches"]).is_ok()
-        );
-        let mut settings = backend::Settings::default();
-        set_setting(&mut settings, "native-cache-gib", "12").unwrap();
-        let saved = serde_json::to_string(&settings).unwrap();
-        let loaded: backend::Settings = serde_json::from_str(&saved).unwrap();
-        assert_eq!(loaded.native_cache_gib, Some(12));
-        assert!(set_setting(&mut settings, "native-cache-gib", "18446744073709551615").is_err());
-        assert!(set_setting(&mut settings, "native-cache-gib", "-1").is_err());
-        set_setting(&mut settings, "native-cache-gib", "0").unwrap();
-        assert_eq!(settings.native_cache_gib, Some(0));
-        set_setting(&mut settings, "native-cache-gib", "default").unwrap();
-        assert_eq!(settings.native_cache_gib, None);
-    }
 }
+
+#[cfg(test)]
+#[path = "cli_catalog_tests.rs"]
+mod catalog_tests;
+
+#[path = "cli_native_permission.rs"]
+mod native_permission_impl;
+use native_permission_impl::{github_native, native_permission, registry_consent};
+
+mod developer_builds;
+
+mod settings_output;
+use settings_output::settings_json;

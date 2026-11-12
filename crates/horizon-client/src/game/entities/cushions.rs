@@ -385,6 +385,18 @@ impl Game<'_> {
     /// `Cushion.dropItem`: the break sound and particles, then the coloured
     /// item unless drops are off or the breaker has infinite materials.
     pub(super) fn break_cushion(&mut self, index: usize, by_player: bool) {
+        self.break_cushion_by(
+            index,
+            by_player,
+            by_player.then_some(super::commands::Target::Player),
+        )
+    }
+    pub(super) fn break_cushion_by(
+        &mut self,
+        index: usize,
+        by_player: bool,
+        source: Option<super::commands::Target>,
+    ) {
         let c = self.cushions.remove(index);
         let p = c.position;
         self.world.modified.insert((c.pos[0] >> 4, c.pos[2] >> 4));
@@ -392,7 +404,7 @@ impl Game<'_> {
             self.dismount_removed_vehicle(p.y);
         }
         // BlockAttachedEntity.kill, before dropItem.
-        self.entity_killed_event([p.x, p.y, p.z], by_player);
+        self.entity_killed_event_by([p.x, p.y, p.z], source);
         self.audio.play(
             "minecraft:entity.cushion.break",
             Some([p.x, p.y, p.z]),
@@ -468,13 +480,44 @@ impl Game<'_> {
                 continue;
             }
             self.cushions[i].check_interval = 0;
-            let c = self.cushions[i].clone();
-            if self.cushion_in_fire(&c) || !self.cushion_survives(&c) {
-                self.break_cushion(i, false);
-                continue;
+            if !self.check_cushion(i) {
+                i += 1;
             }
-            i += 1;
         }
+    }
+
+    /// `Cushion.tickAtCheckInterval` plus the survive check; true when the cushion broke.
+    fn check_cushion(&mut self, i: usize) -> bool {
+        let c = self.cushions[i].clone();
+        let p = c.position;
+        let (x, y, z) = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+        // collidedWithFluid: the fluid box of the cushion's own block against its box.
+        if let Some((height, _)) =
+            self.fluid_height_of(x, y, z, Some(horizon_client::blocks::Fluid::Lava))
+        {
+            let fluid = Aabb::new(
+                Vec3::new(f64::from(x), f64::from(y), f64::from(z)),
+                Vec3::new(
+                    f64::from(x) + 1.0,
+                    f64::from(y) + f64::from(height),
+                    f64::from(z) + 1.0,
+                ),
+            );
+            if aabb(c.bounds())
+                .deflate(Vec3::new(1.0e-7, 1.0e-7, 1.0e-7))
+                .intersects(fluid)
+            {
+                // LAVA_IGNITE's lavaHurt deals 4 damage, which breaks the cushion.
+                self.break_cushion(i, false);
+                self.lava_hurt_sound([p.x, p.y, p.z]);
+                return true;
+            }
+        }
+        if self.cushion_in_fire(&c) || !self.cushion_survives(&c) {
+            self.break_cushion(i, false);
+            return true;
+        }
+        false
     }
 
     /// `LivingEntity.stopRiding` off a cushion: `dismountVehicle` beside it,
@@ -507,8 +550,6 @@ impl Game<'_> {
     /// `Cushion.removePassenger` plays none once the cushion is removed.
     pub(super) fn dismount_removed_vehicle(&mut self, vehicle_y: f64) {
         self.riding = None;
-        let border = self.border_bounds();
-        let b = self.res.behaviours();
         let Some(p) = self.player.as_ref() else {
             return;
         };
@@ -516,7 +557,26 @@ impl Game<'_> {
             f64::from(p.dimensions.width),
             f64::from(p.dimensions.height),
         );
-        let mut at = Vec3::new(p.position.x, p.position.y.max(vehicle_y), p.position.z);
+        let at = self.removed_vehicle_dismount_point(p.position, w, h, vehicle_y);
+        if let Some(p) = self.player.as_mut() {
+            self.previous_position = p.position;
+            p.position = at;
+            p.velocity = Vec3::ZERO;
+            p.fall_distance = 0.0;
+        }
+    }
+
+    /// Free-position branch shared by removed vehicles and portal dismounts.
+    pub(super) fn removed_vehicle_dismount_point(
+        &self,
+        position: Vec3,
+        w: f64,
+        h: f64,
+        vehicle_y: f64,
+    ) -> Vec3 {
+        let border = self.border_bounds();
+        let b = self.res.behaviours();
+        let mut at = Vec3::new(position.x, position.y.max(vehicle_y), position.z);
         // `getBbWidth() <= 4 && getBbHeight() <= 4`.
         if w <= 4.0 && h <= 4.0 {
             let center = at.add_vector(Vec3::new(0.0, h / 2.0, 0.0));
@@ -535,12 +595,7 @@ impl Game<'_> {
                 at = free.add_vector(Vec3::new(0.0, -h / 2.0, 0.0));
             }
         }
-        if let Some(p) = self.player.as_mut() {
-            self.previous_position = p.position;
-            p.position = at;
-            p.velocity = Vec3::ZERO;
-            p.fall_distance = 0.0;
-        }
+        at
     }
 
     /// `LivingEntity.dismountVehicle` from a live vehicle at `vehicle` whose
@@ -614,7 +669,7 @@ impl Game<'_> {
     pub(super) fn cushion_geometry(
         &self,
         camera: glam::DVec3,
-        out: &mut Vec<mod_render::render::Vertex>,
+        out: &mut Vec<horizon_client_render::render_geometry::Vertex>,
     ) {
         let Some(model) = self.cushion_model.as_ref() else {
             return;
@@ -673,6 +728,28 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use horizon_core::nbt::Tag;
+
+    /// `Entity.saveWithoutId` writes `OnGround` and `fall_distance`; a
+    /// cushion never moves, so a save keeps what it was loaded with.
+    #[test]
+    fn a_cushion_save_keeps_its_loaded_ground_state() {
+        use crate::entity_nbt::{cushion_from_nbt, cushion_to_nbt};
+        let d = |v: f64| Tag::Double(v.to_bits());
+        let pos = Tag::List(vec![d(0.5), d(64.0), d(0.5)]);
+        let raw = Tag::compound([
+            ("Pos", pos),
+            ("block_pos", Tag::IntArray(vec![0, 64, 0])),
+            ("OnGround", Tag::Byte(1)),
+            ("fall_distance", d(20.0)),
+        ]);
+        let c = cushion_from_nbt(&raw, 1).unwrap();
+        let saved = cushion_to_nbt(&c, [1, 2, 3, 4], Some(&raw));
+        assert_eq!(saved.get("OnGround"), Some(&Tag::Byte(1)));
+        assert_eq!(saved.get("fall_distance"), Some(&d(20.0)));
+        let fresh = cushion_to_nbt(&c, [1, 2, 3, 4], None);
+        assert_eq!(fresh.get("OnGround"), Some(&Tag::Byte(0)));
+        assert_eq!(fresh.get("fall_distance"), Some(&d(0.0)));
+    }
 
     /// `Cushion.getCushionItemStackWithData`: a named cushion drops named.
     #[test]

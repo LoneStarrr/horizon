@@ -3,7 +3,7 @@
 //! in-flight guards. Repeated start is a no-op; repeated stop preserves the last report.
 #[path = "profiler/firefox.rs"]
 mod firefox;
-use crate::crash::NativeModCall;
+use crate::content::crash::ModCall;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering::SeqCst};
@@ -12,8 +12,12 @@ use std::time::Instant;
 
 const THREADS: usize = 64;
 const CALLS: usize = 4096;
-static ENABLED: AtomicBool = AtomicBool::new(false);
+// This cannot index any real record, even after capacity exhaustion.
+const OVERFLOW: usize = usize::MAX;
+pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicUsize = AtomicUsize::new(0);
+// Unlike the admission epoch, this remains valid while stop drains existing guards.
+static POOL_EPOCH: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static POOL: AtomicPtr<Pool> = AtomicPtr::new(std::ptr::null_mut());
 static CONTROL: Mutex<()> = Mutex::new(());
@@ -55,6 +59,13 @@ pub(crate) struct Report {
     pub dropped: usize,
 }
 impl Report {
+    fn completed(&mut self, stored: StoredRecord) {
+        if stored.completed {
+            self.record(stored.record);
+        } else {
+            self.dropped += 1;
+        }
+    }
     fn record(&mut self, record: Record) {
         let a = self
             .calls
@@ -107,12 +118,21 @@ impl Report {
         text
     }
 }
+#[derive(Clone, Copy)]
+struct StoredRecord {
+    record: Record,
+    completed: bool,
+}
 struct Buffer {
     next: AtomicUsize,
-    records: Vec<UnsafeCell<Option<Record>>>,
+    records: Vec<UnsafeCell<Option<StoredRecord>>>,
 }
 // Each index is reserved once with fetch_add. Only its reserving guard writes it; stop
 // reads only after all guards have left. Buffers are never reused within an epoch.
+#[allow(
+    unsafe_code,
+    reason = "Thread-owned buffers are read only after profiling drains."
+)]
 unsafe impl Sync for Buffer {}
 struct Pool {
     next_thread: AtomicUsize,
@@ -156,7 +176,7 @@ fn start_with_clock(clock: fn() -> u64) -> bool {
             .collect(),
     });
     POOL.store(Box::into_raw(pool), SeqCst);
-    EPOCH.fetch_add(1, SeqCst);
+    POOL_EPOCH.store(EPOCH.fetch_add(1, SeqCst) + 1, SeqCst);
     ENABLED.store(true, SeqCst);
     true
 }
@@ -199,6 +219,10 @@ pub(crate) fn stop_report() -> Report {
         std::thread::yield_now();
     }
     // No validated entrant can access the old pool after disable/epoch change and drain.
+    #[allow(
+        unsafe_code,
+        reason = "The disabled and drained pool has one owning allocation."
+    )]
     let pool = unsafe { Box::from_raw(POOL.swap(std::ptr::null_mut(), SeqCst)) };
     let mut report = Report {
         dropped: pool.dropped.load(SeqCst),
@@ -211,20 +235,28 @@ pub(crate) fn stop_report() -> Report {
             .take(buffer.next.load(SeqCst).min(CALLS))
         {
             // All writers have finished, including guards unwound by panics.
+            #[allow(
+                unsafe_code,
+                reason = "Profiling has drained all writers before reading records."
+            )]
             if let Some(record) = unsafe { *record.get() } {
-                report.record(record);
+                report.completed(record);
             }
         }
     }
     report
 }
 pub(crate) struct Guard {
-    pool: *const Pool,
-    slot: usize,
-    call: NativeModCall,
-    began: u64,
+    timing: Option<mod_vocab::dispatch_scope::Timing>,
 }
-pub(crate) fn enter(call: NativeModCall) -> Option<Guard> {
+impl Guard {
+    pub(crate) fn into_timing(mut self) -> mod_vocab::dispatch_scope::Timing {
+        self.timing
+            .take()
+            .expect("live profiler guard owns its timing")
+    }
+}
+pub(crate) fn enter(call: ModCall) -> Option<Guard> {
     if !is_enabled() {
         return None;
     }
@@ -241,6 +273,10 @@ pub(crate) fn enter(call: NativeModCall) -> Option<Guard> {
         return None;
     }
     // ACTIVE pins this pool until the returned guard drops.
+    #[allow(
+        unsafe_code,
+        reason = "ACTIVE pins the pool until the guard is dropped."
+    )]
     let pool = unsafe { &*POOL.load(SeqCst) };
     let slot = SLOT.with(|s| {
         let (old_epoch, old_slot) = s.get();
@@ -252,44 +288,98 @@ pub(crate) fn enter(call: NativeModCall) -> Option<Guard> {
             slot
         }
     });
+    // Each entry reserves one unique record before user code runs. The clock
+    // field temporarily holds the start timestamp, and leave completes it.
+    // Exhaustion is explicit: the sentinel still owns one ACTIVE reference.
+    let record = match pool.buffers.get(slot) {
+        Some(buffer) => {
+            let record = buffer.next.fetch_add(1, SeqCst);
+            if record < CALLS {
+                #[allow(
+                    unsafe_code,
+                    reason = "Entry uniquely owns this reserved record; stop waits for ACTIVE."
+                )]
+                unsafe {
+                    *buffer.records[record].get() = Some(StoredRecord {
+                        record: Record {
+                            mod_id: call.id,
+                            hook: call.hook,
+                            part: call.part,
+                            nanoseconds: (pool.clock)(),
+                        },
+                        completed: false,
+                    });
+                }
+                record
+            } else {
+                pool.dropped.fetch_add(1, SeqCst);
+                OVERFLOW
+            }
+        }
+        None => {
+            pool.dropped.fetch_add(1, SeqCst);
+            OVERFLOW
+        }
+    };
     Some(Guard {
-        pool,
-        slot,
-        call,
-        began: (pool.clock)(),
+        timing: Some(mod_vocab::dispatch_scope::Timing {
+            generation: epoch,
+            slot,
+            record,
+        }),
     })
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        // This guard holds one ACTIVE reference, so stop cannot free the pool yet.
-        let pool = unsafe { &*self.pool };
-        let ns = (pool.clock)().saturating_sub(self.began);
-        let index = pool
-            .buffers
-            .get(self.slot)
-            .map(|b| (b, b.next.fetch_add(1, SeqCst)));
-        if let Some((buffer, index)) = index.filter(|(_, i)| *i < CALLS) {
-            // Unique reserved index, and stop waits for our ACTIVE decrement before reading.
-            unsafe {
-                *buffer.records[index].get() = Some(Record {
-                    mod_id: self.call.id,
-                    hook: self.call.hook,
-                    part: self.call.part,
-                    nanoseconds: ns,
-                });
-            }
-        } else {
-            pool.dropped.fetch_add(1, SeqCst);
+        if let Some(timing) = self.timing.take() {
+            leave(timing);
         }
-        ACTIVE.fetch_sub(1, SeqCst);
     }
+}
+pub(crate) fn leave(timing: mod_vocab::dispatch_scope::Timing) {
+    // The factory capability ensures only an authentic entry reaches this private
+    // callback. Its ACTIVE reference pins the pool epoch until completion.
+    if POOL_EPOCH.load(SeqCst) != timing.generation {
+        return;
+    }
+    if timing.record == OVERFLOW {
+        ACTIVE.fetch_sub(1, SeqCst);
+        return;
+    }
+    if timing.slot >= THREADS || timing.record >= CALLS {
+        return;
+    }
+    let pointer = POOL.load(SeqCst);
+    if pointer.is_null() {
+        return;
+    }
+    #[allow(
+        unsafe_code,
+        reason = "The authentic timing token owns an ACTIVE reference to this epoch."
+    )]
+    let pool = unsafe { &*pointer };
+    if let Some(record) = pool
+        .buffers
+        .get(timing.slot)
+        .and_then(|buffer| buffer.records.get(timing.record))
+    {
+        #[allow(
+            unsafe_code,
+            reason = "Only this token writes its reserved record; stop waits for ACTIVE."
+        )]
+        if let Some(record) = unsafe { &mut *record.get() } {
+            record.record.nanoseconds = (pool.clock)().saturating_sub(record.record.nanoseconds);
+            record.completed = true;
+        }
+    }
+    ACTIVE.fetch_sub(1, SeqCst);
 }
 
 #[cfg(test)]
 mod tests {
     use super::stop_report as stop;
     use super::*;
-    use crate::crash::enter_native_mod;
+    use crate::content::crash::enter_native_mod;
     static SERIAL: Mutex<()> = Mutex::new(());
     type Pause = Box<dyn FnOnce()>;
     thread_local! {
@@ -304,11 +394,65 @@ mod tests {
             now
         })
     }
-    fn call(id: &'static str, hook: &'static str, part: Option<&'static str>) -> NativeModCall {
-        NativeModCall { id, hook, part }
+    fn call(id: &'static str, hook: &'static str, part: Option<&'static str>) -> ModCall {
+        ModCall { id, hook, part }
     }
     #[test]
+    fn incomplete_records_are_skipped_and_counted() {
+        let mut report = Report::default();
+        report.completed(StoredRecord {
+            record: Record {
+                mod_id: "unfinished",
+                hook: "reserved",
+                part: None,
+                nanoseconds: u64::MAX,
+            },
+            completed: false,
+        });
+        assert!(report.calls.is_empty());
+        assert_eq!(report.dropped, 1);
+    }
+
+    #[test]
+    fn overflow_tokens_do_not_alias_records_or_lose_crash_owners() {
+        if !isolated("overflow_tokens_do_not_alias_records_or_lose_crash_owners") {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap();
+        stop();
+        TIME.with(|time| time.set(0));
+        assert!(start_with_clock(tick));
+        let mut guards: Vec<_> = (0..CALLS)
+            .map(|_| enter_native_mod(call("nested", "frame", None)))
+            .collect();
+        let overflowing = enter_native_mod(call("overflow", "frame", None));
+        assert_eq!(
+            crate::content::crash::current_native_mod(),
+            Some("overflow")
+        );
+        drop(overflowing);
+        assert_eq!(crate::content::crash::current_native_mod(), Some("nested"));
+        while let Some(guard) = guards.pop() {
+            drop(guard);
+        }
+        assert_eq!(crate::content::crash::current_native_mod(), None);
+        assert_eq!(ACTIVE.load(SeqCst), 0);
+        let report = stop_report();
+        assert_eq!(report.dropped, 1);
+        let nested = &report.calls[&("nested", "frame", None)];
+        assert_eq!(nested.count, CALLS as u64);
+        // The deterministic clock yields odd inclusive durations 1 .. 8191.
+        // A sentinel aliasing any real record breaks these bounds.
+        assert_eq!(nested.min, 1);
+        assert_eq!(nested.max, (2 * CALLS - 1) as u64);
+        assert!(!report.calls.contains_key(&("overflow", "frame", None)));
+    }
+
+    #[test]
     fn profiler_guards_and_threads() {
+        if !isolated("profiler_guards_and_threads") {
+            return;
+        }
         let _serial = SERIAL.lock().unwrap();
         stop();
         *REPORT.lock().unwrap() = None;
@@ -375,6 +519,9 @@ mod tests {
     }
     #[test]
     fn profiler_drains_in_flight_and_reports_overflow() {
+        if !isolated("profiler_drains_in_flight_and_reports_overflow") {
+            return;
+        }
         let _serial = SERIAL.lock().unwrap();
         assert!(start_with_clock(tick));
         let (entered, ready) = std::sync::mpsc::channel();
@@ -409,6 +556,9 @@ mod tests {
     }
     #[test]
     fn profiler_stale_epoch_is_rejected() {
+        if !isolated("profiler_stale_epoch_is_rejected") {
+            return;
+        }
         let _serial = SERIAL.lock().unwrap();
         assert!(start_with_clock(tick));
         let (entered, ready) = std::sync::mpsc::channel();

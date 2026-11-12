@@ -791,7 +791,7 @@ impl Goal for PandaHurtBy {
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         let s = st(m);
         if s.got_bamboo || s.did_bite {
-            m.ai.target = None;
+            m.set_ai_target(cx.w, None);
             false
         } else {
             self.0.can_continue(m, cx)
@@ -937,8 +937,7 @@ impl PandaLook {
     fn target(m: &Mob, cx: &Cx) -> Option<(Vec3, f64)> {
         match get(m)?.look_at? {
             Who::Player => {
-                cx.w.player
-                    .as_ref()
+                cx.w.selected_player()
                     .filter(|p| p.alive)
                     .map(|p| (p.position, p.eye[1]))
             }

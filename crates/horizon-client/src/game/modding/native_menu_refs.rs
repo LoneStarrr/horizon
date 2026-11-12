@@ -375,6 +375,11 @@ impl Game<'_> {
         };
         let mut rules = Box::new(Menu::new(kind));
         rules.set_registry_id(menu_id);
+        if let Some(open) = guest.menu.as_ref() {
+            let world = self.native_level_world(self.level(&guest.dimension)?)?;
+            let limits = open.slots.stack_limits(world, open.size);
+            rules.set_container_limits(limits);
+        }
         (slot < rules.slot_count()).then_some(())?;
         load_player(&mut rules, guest);
         for (k, off) in disabled.iter().flatten().enumerate() {
@@ -859,7 +864,7 @@ mod tests {
             assert_eq!(newer.slot_count(game), None);
             let inventory = game.player_container_menu(player).unwrap();
             let host = game.lan.as_mut().unwrap();
-            host.play.entry(1).or_default().crafting.table = Some((
+            *host.play.entry(1).or_default().crafting.table = Some((
                 7,
                 0,
                 Box::new(horizon_client::menu::Menu::new(

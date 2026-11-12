@@ -4,7 +4,7 @@
 //! returns what it printed. A few commands keep a process or a sign-in going for the session;
 //! mcp.rs runs those itself under the same names (`play`, `server`, `account_sign_in`...).
 use clap::{ArgAction, Command};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 /// CLI commands that are not generated tools: the MCP server itself; No AI, the player's switch
 /// and never an agent's; trusting native mods' code, the player's decision too; the ones
@@ -17,6 +17,7 @@ const NOT_TOOLS: &[&str] = &[
     "native-build",
     // It installs a program nothing signed: the player's decision.
     "import-build",
+    "developer-install",
     // They install native code nobody reviewed, and say it first: the player's decision.
     "mods add-github",
     "mods update-github",
@@ -34,6 +35,7 @@ pub const DESTRUCTIVE: &[&str] = &[
     "mods remove",
     "servers forget",
     "account sign-out",
+    "data delete",
     "worlds delete",
     "multiplayer remove",
     "screenshots delete",
@@ -45,7 +47,14 @@ pub const DESTRUCTIVE: &[&str] = &[
 ];
 
 /// Commands that send something or reach other people: only when the player asks.
-pub const OPEN_WORLD: &[&str] = &["servers create", "share-log"];
+pub const OPEN_WORLD: &[&str] = &[
+    "data allow",
+    "data send",
+    "data bug",
+    "data benchmark",
+    "servers create",
+    "share-log",
+];
 
 /// A generated tool: its name, the CLI words it runs and the clap command behind them.
 pub struct Tool {
@@ -269,6 +278,7 @@ arguments are the command's, in snake_case. A tool runs the command with `--json
 The tools that change the player's things for good need `confirm: true`. \
 The tools that send something or reach other people say \"only when the player asks\". \
 The game's own tools, `game_*`, are in [horizon-ctl-commands.md](horizon-ctl-commands.md). \
+For unsigned developer installations only, `HORIZON_LAUNCHER_DEVELOPER_OFFLINE=1` enables account-free Play. Only the exact value `1` enables it. The installed base must have persisted developer provenance, and the selected game must advertise `--developer-single-player` through `--launch-api`; older games must be rebuilt and reinstalled. Signed releases, Nightlies and their native descendants keep the account check. This mode supplies no session, blocks normal external connections and LAN hosting, and preserves managed launch leases, instance settings and unsigned labels. It is not a sandbox for native mods. If direct execution reports unregistered cache directories, use Horizon Launcher Play from the same launcher data directory with the intended instance and installed version (`horizon-launcher play --instance <instance> --version <tag>`).\n\n\
 With No AI on, `mcp` and `agent-config` are hidden and refuse; every other command stays. See [agent-control.md](agent-control.md#no-ai).\n\n",
     );
     let mut rows = Vec::new();
@@ -353,7 +363,10 @@ fn collect(cmd: &Command, path: &mut Vec<String>, out: &mut Vec<(String, Command
 
 /// Whether an argument is part of a tool (not --help, --version or the global --json).
 fn shown(arg: &clap::Arg) -> bool {
-    !arg.is_hide_set() && !matches!(arg.get_id().as_str(), "help" | "version" | "json")
+    // Only clap's built-in `--version` flag is left out: a command's own `--version <tag>` argument is shown.
+    !arg.is_hide_set()
+        && !matches!(arg.get_id().as_str(), "help" | "json")
+        && !matches!(arg.get_action(), clap::ArgAction::Version)
 }
 
 /// Whether an argument takes several values (a list).
@@ -388,7 +401,8 @@ mod tests {
             "modpack_import",
             "servers_create",
             "servers_run",
-            "bug_report",
+            "data_status",
+            "data_bug",
             "account_select",
             "benchmark",
         ] {
@@ -429,11 +443,10 @@ mod tests {
                 .unwrap(),
             ["servers", "run", "My server", "--", "status"]
         );
-        assert!(
-            run.argv(&json!({ "server": "x" }))
-                .unwrap_err()
-                .contains("args is required")
-        );
+        assert!(run
+            .argv(&json!({ "server": "x" }))
+            .unwrap_err()
+            .contains("args is required"));
         let logs = tool("logs").describe();
         assert_eq!(
             logs["inputSchema"]["properties"]["lines"]["type"],
@@ -481,12 +494,10 @@ mod tests {
     fn destructive_tools_need_confirm() {
         let remove = tool("remove");
         assert_eq!(remove.describe()["annotations"]["destructiveHint"], true);
-        assert!(
-            remove
-                .argv(&json!({ "tag": "v1" }))
-                .unwrap_err()
-                .contains("confirm")
-        );
+        assert!(remove
+            .argv(&json!({ "tag": "v1" }))
+            .unwrap_err()
+            .contains("confirm"));
         assert_eq!(
             remove
                 .argv(&json!({ "tag": "v1", "confirm": true }))

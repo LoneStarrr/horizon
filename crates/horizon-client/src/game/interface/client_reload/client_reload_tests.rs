@@ -185,9 +185,9 @@ fn a_converted_file_outside_the_pack_is_absent_not_empty() {
 #[ignore = "needs prepared resources"]
 fn initial_load_stages_and_applies_client_reload_listeners() {
     use crate::game::{Progress, load_resources, native_entity_refs::tests::with_game};
-    use mod_api::testing::with_mods;
     use mod_api::{self, ModEntry};
     use mod_api::{AddClientReloadListenersEvent, ClientHost, Hooks};
+    use mod_platform::testing::with_mods;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Counts the real root's own `post_effect` assets, like a mod reading
@@ -295,9 +295,9 @@ fn initial_load_stages_and_applies_client_reload_listeners() {
 #[ignore = "needs prepared resources"]
 fn client_reload_reads_real_assets_with_pack_overrides() {
     use crate::game::native_entity_refs::tests::with_game;
-    use mod_api::testing::with_mods;
     use mod_api::{self, ModEntry};
     use mod_api::{AddClientReloadListenersEvent, ClientHost, Hooks};
+    use mod_platform::testing::with_mods;
     use std::{
         collections::BTreeSet,
         sync::Mutex,
@@ -514,8 +514,8 @@ fn client_reload_reads_real_assets_with_pack_overrides() {
 #[ignore = "needs prepared resources"]
 fn client_setup_reaches_each_listener_once_per_firing() {
     use crate::game::native_entity_refs::tests::with_game;
-    use mod_api::testing::with_mods;
     use mod_api::{ClientHost, Hooks, ModEntry};
+    use mod_platform::testing::with_mods;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Setup(Arc<AtomicUsize>);
@@ -571,8 +571,8 @@ fn only_the_first_local_client_is_the_client_start() {
 #[ignore = "needs prepared resources"]
 fn the_lifecycle_moments_fire_once_each_in_order() {
     use crate::game::native_entity_refs::tests::with_game;
-    use mod_api::testing::with_mods;
     use mod_api::{ClientHost, Hooks, ModEntry, ServerHost};
+    use mod_platform::testing::with_mods;
     use std::sync::Mutex;
 
     struct Log(Arc<Mutex<Vec<String>>>);
@@ -702,8 +702,8 @@ fn the_lifecycle_moments_fire_once_each_in_order() {
 #[ignore = "needs prepared resources"]
 fn an_arm_pose_answer_replaces_the_pose_the_item_gives() {
     use crate::game::native_entity_refs::tests::with_game;
-    use mod_api::testing::with_mods;
     use mod_api::{ArmPose, ClientHost, GetArmPoseEvent, Hand, Hooks, ModEntry};
+    use mod_platform::testing::with_mods;
 
     struct Horn;
     #[mod_api::__subscriptions]
@@ -734,7 +734,10 @@ fn an_arm_pose_answer_replaces_the_pose_the_item_gives() {
         assert_eq!(game.held_arm_poses(1, &m), [None, None]);
         let mods = vec![ModEntry::new("horn", Box::new(Horn))].into();
         with_mods(mods, || {
-            assert_eq!(game.held_arm_poses(1, &m), [Some(ArmPose::TootHorn), None]);
+            assert_eq!(
+                game.held_arm_poses(1, &m),
+                [Some(horizon_core::arm_pose::ArmPose::TootHorn), None]
+            );
         });
     });
 }
@@ -796,6 +799,7 @@ fn refused_client_context_keeps_pack_and_listeners() {
             &[],
             &game.mods,
             game.register_client_reload_listeners(),
+            &[],
             &[],
             &game.pack.assets,
             &game.res,
@@ -876,7 +880,7 @@ fn client_completion_reads_published_resources_without_world_access() {
         Box::new(Probe(seen.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_client_game(|game| {
             let version = game.block_sprites_version();
             for entering in [ModPhase::Setup, ModPhase::World] {
@@ -903,8 +907,7 @@ fn client_startup_finishes_configs_before_the_first_runtime_callback() {
             use mod_api::__private::{ModPhase, PhaseOwner};
             use mod_api::{
                 ClientHost, ClientSetupEvent, ClientTickPreEvent, ConfigLoadingEvent, Hooks,
-                HostSide, ModEntry, NativeConfig, NativeConfigKind, RegisterConfigsEvent,
-                ScreenOpening, ScreenOpeningEvent,
+                HostSide, ModEntry, RegisterConfigsEvent, ScreenOpening, ScreenOpeningEvent,
             };
             use std::{sync::Mutex, time::Instant};
 
@@ -912,14 +915,14 @@ fn client_startup_finishes_configs_before_the_first_runtime_callback() {
             #[mod_api::__subscriptions]
             impl Hooks for Probe {
                 fn register_configs(&self, _: HostSide<'_>, event: &mut RegisterConfigsEvent<'_>) {
-                    event.configs.push(NativeConfig::new(
+                    event.configs.push(mod_api::Config::new(
                         "startup_phase",
-                        NativeConfigKind::Client,
+                        mod_api::ConfigKind::Client,
                         "enabled = true\n",
                     ));
-                    event.configs.push(NativeConfig::new(
+                    event.configs.push(mod_api::Config::new(
                         "startup_phase",
-                        NativeConfigKind::Common,
+                        mod_api::ConfigKind::Common,
                         "enabled = true\n",
                     ));
                 }
@@ -957,7 +960,7 @@ fn client_startup_finishes_configs_before_the_first_runtime_callback() {
                 Box::new(Probe(seen.clone())),
             )]
             .into();
-            mod_api::testing::with_mods(mods, || {
+            mod_platform::testing::with_mods(mods, || {
                 for pack_error in [None, Some("selected resource pack failed")] {
                     seen.lock().unwrap().clear();
                     with_client_game(|game| {
@@ -1029,9 +1032,8 @@ fn humanoid_arm_pose_mod_reads_mob_state_and_changes_the_model() {
     };
     use horizon_core::{geometry::Vec3, use_animation::UseAnimation};
     use horizon_items::equipment::{MAINHAND, OFFHAND};
-    use mod_api::{
-        ArmPose, ClientHost, GetArmPoseEvent, Hand, Hooks, ModEntry, testing::with_mods,
-    };
+    use mod_api::{ArmPose, ClientHost, GetArmPoseEvent, Hand, Hooks, ModEntry};
+    use mod_platform::testing::with_mods;
     use std::{
         collections::HashMap,
         sync::{
@@ -1104,7 +1106,7 @@ fn humanoid_arm_pose_mod_reads_mob_state_and_changes_the_model() {
         game.tick_player_model();
         let own_before =
             anim::humanoid_arm_poses(game.player_model.as_ref().unwrap(), [None; 2], 0.0);
-        assert_eq!(own_before, [ArmPose::Item, ArmPose::Item]);
+        assert_eq!(own_before, [horizon_core::arm_pose::ArmPose::Item; 2]);
         for (id, kind) in [
             (60, "minecraft:zombie"),
             (61, "minecraft:skeleton"),
@@ -1144,7 +1146,7 @@ fn humanoid_arm_pose_mod_reads_mob_state_and_changes_the_model() {
                 game.tick_remote_arm_poses();
                 assert_eq!(
                     game.mobs[0].extra.held_arm_pose,
-                    [Some(ArmPose::ThrowTrident), None]
+                    [Some(horizon_core::arm_pose::ArmPose::ThrowTrident), None]
                 );
                 let posed = arms(&game.mobs[0]);
                 assert!((posed[1][3] + std::f32::consts::PI).abs() < 1e-6);
@@ -1168,3 +1170,6 @@ fn humanoid_arm_pose_mod_reads_mob_state_and_changes_the_model() {
         assert_eq!(game.mobs.iter().map(arms).collect::<Vec<_>>(), baseline);
     });
 }
+
+#[path = "custom_arm_pose_tests.rs"]
+mod custom_arm_pose_tests;

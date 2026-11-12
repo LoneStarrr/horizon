@@ -1,9 +1,9 @@
 //! The locator bar of the players on a served world (lan/waypoints.rs): what
 //! each player looks like to their level's waypoint manager this tick.
-use super::Game;
+use super::{Game, commands::Target};
 use horizon_client::{
     items::ItemStack,
-    lan::waypoints::{self, HIDING_HEADS, Icon, PLAYER_RANGE},
+    lan::waypoints::{self, HIDING_HEADS, PLAYER_RANGE},
 };
 
 /// `waypoint_transmit_range`: hidden by crouching, invisibility or a head worn.
@@ -62,7 +62,13 @@ impl Game<'_> {
                             team.color.as_deref().and_then(waypoints::team_rgb),
                         )
                     }),
-                    icon: Icon::default(),
+                    // `/waypoint modify` and a mod's writes, kept by connection.
+                    icon: self
+                        .cmds
+                        .waypoint_icons
+                        .get(&Target::Guest(g.conn))
+                        .cloned()
+                        .unwrap_or_default(),
                 },
             ));
         }

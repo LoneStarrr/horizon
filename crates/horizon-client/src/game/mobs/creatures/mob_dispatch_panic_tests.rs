@@ -43,15 +43,15 @@ impl mod_api::Hooks for PanicOnDespawn {
     fn mob_despawn(&self, _: &dyn mod_api::Host, event: &mut mod_api::MobDespawnEvent<'_>) {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if self.force_allow {
-            *event.result = mod_api::NativeDespawn::Allow;
+            *event.result = mod_api::Despawn::Allow;
         }
         if self.at == Some(call) {
             // An unwound answer must not become the next attempt's answer.
-            *event.result = mod_api::NativeDespawn::Allow;
+            *event.result = mod_api::Despawn::Allow;
             panic!("actual mob despawn listener panicked");
         }
         if self.at.is_some_and(|at| call < at) {
-            *event.result = mod_api::NativeDespawn::Deny;
+            *event.result = mod_api::Despawn::Deny;
         }
     }
 }
@@ -116,7 +116,7 @@ fn mob_despawn_listener_panic_preserves_owned_rows_and_lent_random() {
                 std::process::id(),
                 std::thread::current().id()
             ));
-            mod_api::testing::with_mods(mods, || {
+            mod_platform::testing::with_mods(mods, || {
                 crate::game::native_entity_refs::tests::with_game(|game| {
                     game.world_root = root.clone();
                     game.enter_level(dimension).unwrap();
@@ -184,7 +184,8 @@ fn mob_despawn_listener_panic_preserves_owned_rows_and_lent_random() {
                         .unwrap();
                     game.world.set(4, 80, 4, stone).unwrap();
                     let expected_writes = game.world.path_writes.clone();
-                    game.world.random = LegacyRandom::new(0x5eed);
+                    game.world.random =
+                        horizon_core::random::LevelRandom::for_level(LegacyRandom::new(0x5eed));
                     let expected_draw = game.world.random.clone().next_long();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         game.tick_creature_entities()

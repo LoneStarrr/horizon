@@ -5,7 +5,7 @@ use horizon_client::{
     items::ItemStack,
     scoreboard_cmd::{Holder, Tracker},
     text::Text,
-    worldborder::MAX_SIZE,
+    worldborder::{MAX_CENTER, MAX_SIZE},
 };
 use horizon_core::{position::ChunkPos, random::RandomSource};
 
@@ -486,7 +486,7 @@ impl Game<'_> {
                 if self.border.center() == [x, z] {
                     return Err(err("commands.worldborder.center.failed", &[]));
                 }
-                if x.abs() > 2.999_998_4e7 || z.abs() > 2.999_998_4e7 {
+                if x.abs() > MAX_CENTER || z.abs() > MAX_CENTER {
                     return Err(err(
                         "commands.worldborder.set.failed.far",
                         &[&"2.9999984E7"],
@@ -733,7 +733,13 @@ impl Game<'_> {
                 let mut pending = crate::game::spill::Pending::default();
                 let key = (p[0], p[1], p[2]);
                 let has_block_entity = if let Some(entity) = self.world.block_entities.get(&key) {
-                    pending.record(p, entity, &name, self.world.block_names.get(&key).cloned());
+                    pending.record(
+                        p,
+                        entity,
+                        &name,
+                        self.world.block_names.get(&key).cloned(),
+                        self.world.block_lock(key),
+                    );
                     true
                 } else if let Some(saved) = self.block_entity_nbt(p) {
                     pending.record_saved(p, &saved);
@@ -915,7 +921,9 @@ impl Game<'_> {
                     };
                     let Some(slot) = slot else { continue };
                     let item = drops.get(i).filter(|drop| drop.count > 0).cloned();
-                    if self.slot_set_by_command(&slot, item.clone()) {
+                    if self.slot_accepts(&slot, item.as_ref())
+                        && self.slot_set_by_command(&slot, item.clone())
+                    {
                         used.push(item.unwrap_or(ItemStack {
                             item: "minecraft:air".into(),
                             count: 0,
@@ -1750,3 +1758,7 @@ mod loot_location_shape_tests {
         assert_eq!(chunks.len(), count, "no chunk is loaded as a side effect");
     }
 }
+
+#[cfg(test)]
+#[path = "loot_slot_tests.rs"]
+mod loot_slot_tests;

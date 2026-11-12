@@ -82,7 +82,7 @@ impl PreparedFunctionCall {
 /// enabled ids from `datapacks.json` (`PackRepository.reload`).
 pub(super) struct PackStack {
     pub builtin: Option<DataPack>,
-    content: DataPack,
+    pub(super) content: DataPack,
     pub packs: Vec<Arc<DataPack>>,
     pub enabled: Vec<String>,
 }
@@ -161,20 +161,27 @@ pub(super) fn overlay_files(
 }
 
 impl FnState {
+    /// The enabled world packs in resource priority order, highest first: a
+    /// later selected pack overrides an earlier one (`PackRepository` order).
+    pub(in crate::game) fn pack_sources(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &horizon_assets::resource_source::ResourceSource> {
+        self.enabled
+            .iter()
+            .rev()
+            .filter_map(|id| self.packs.iter().find(|pack| &pack.id == id))
+            .map(|pack| pack.source())
+    }
+
     /// The highest enabled world pack providing this data resource.
     pub(super) fn data_resource(
         &self,
         name: &str,
     ) -> Option<horizon_assets::resource_source::Resource> {
-        self.enabled
-            .iter()
-            .rev()
-            .filter_map(|id| self.packs.iter().find(|pack| &pack.id == id))
-            .find_map(|pack| {
-                let source = pack.source();
-                source.contains(name).then(|| {
-                    horizon_assets::resource_source::Resource::file(source.clone(), name.to_owned())
-                })
+        self.pack_sources()
+            .find(|source| source.contains(name))
+            .map(|source| {
+                horizon_assets::resource_source::Resource::file(source.clone(), name.to_owned())
             })
     }
 
@@ -205,6 +212,16 @@ impl Game<'_> {
         }
         let _ = self.reload_datapacks(false, &self.level.enabled_features.clone());
     }
+    pub(super) fn open_world_datapacks(
+        &mut self,
+        enabled_features: &[String],
+    ) -> Result<PackStack, ReloadStageError> {
+        // Function admission parses commands immediately, including block arguments.
+        // Populate static registries on first open; admission synchronizes pack IDs.
+        self.build_registries();
+        self.reload_datapacks(false, enabled_features)
+    }
+
     pub(super) fn reload_datapacks(
         &mut self,
         run_load: bool,
@@ -220,7 +237,7 @@ impl Game<'_> {
             )
         })?;
         let next_root = self
-            .stage_enabled_inventory()
+            .stage_condition_inventory()
             .map_err(|error| ReloadStageError::DataSource(error.to_string()))?;
         let resources = next_root
             .as_ref()
@@ -242,7 +259,7 @@ impl Game<'_> {
             enabled_features,
             &additional,
         );
-        let prepared = self.prepare_server_reload(&stack, &resources)?;
+        let prepared = self.begin_condition_reload(&stack, &resources)?;
         let context = self
             .prepare_loop_context(&resources)
             .map_err(|error| ReloadStageError::DataSource(error.to_string()))?;
@@ -306,6 +323,17 @@ impl Game<'_> {
         registries.function_tags = store.function_tags.keys().cloned().collect();
         registries.predicates = store.predicates.keys().cloned().collect();
         registries.item_modifiers = store.item_modifiers.keys().cloned().collect();
+        let sources = registries
+            .by_registry
+            .entry("minecraft:slot_source".into())
+            .or_default();
+        sources.ids = store.slot_sources.keys().cloned().collect();
+        sources.tags = store
+            .slot_source_tags
+            .keys()
+            .filter(|id| store.slot_source_tag(id).is_ok())
+            .cloned()
+            .collect();
         for (id, ids) in [
             ("minecraft:predicate", &registries.predicates),
             ("minecraft:item_modifier", &registries.item_modifiers),
@@ -361,6 +389,21 @@ impl Game<'_> {
         reg.function_tags = self.fns.store.function_tags.keys().cloned().collect();
         reg.predicates = self.fns.store.predicates.keys().cloned().collect();
         reg.item_modifiers = self.fns.store.item_modifiers.keys().cloned().collect();
+        let sources = reg
+            .by_registry
+            .entry("minecraft:slot_source".into())
+            .or_default();
+        sources.ids = self.fns.store.slot_sources.keys().cloned().collect();
+        sources.tags = self
+            .fns
+            .store
+            .slot_source_tags
+            .keys()
+            .filter(|id| self.fns.store.slot_source_tag(id).is_ok())
+            .cloned()
+            .collect();
+        reg.schedules = self.fns.schedule.iter().map(|s| s.id.clone()).collect();
+
         reg.datapacks_enabled = std::iter::once("vanilla".to_owned())
             .chain(self.fns.enabled.iter().cloned())
             .collect();
@@ -1278,7 +1321,7 @@ impl Game<'_> {
         );
         stack.enabled =
             datapack::selected_ids(stack.packs.iter().map(Arc::as_ref), &self.fns.enabled);
-        let prepared = match self.prepare_server_reload(&stack, &self.options.resources) {
+        let prepared = match self.prepare_pack_condition_reload(&stack) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fns.enabled = previous_enabled;
@@ -1372,6 +1415,61 @@ mod tests {
 
     #[test]
     #[ignore = "needs prepared resources and scratch homes/cwd"]
+    fn first_world_open_admits_block_function() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            let folder = "first-open-block-function";
+            let world = std::env::current_dir().unwrap().join("saves").join(folder);
+            let pack = world.join("datapacks/first_open");
+            let functions = pack.join("data/first_open/function");
+            std::fs::create_dir_all(&functions).unwrap();
+            let f = horizon_core::version::DATA_PACK_FORMAT;
+            std::fs::write(
+                pack.join("pack.mcmeta"),
+                serde_json::json!({"pack":{
+                    "description":"First open regression", "pack_format":f.0,
+                    "min_format":[f.0,f.1], "max_format":[f.0,f.1]
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                functions.join("block.mcfunction"),
+                "execute if block 0 64 0 minecraft:repeater[delay=2] run return 1\n",
+            )
+            .unwrap();
+            std::fs::write(
+                functions.join("invalid.mcfunction"),
+                "setblock 0 64 0 first_open:missing_block\n",
+            )
+            .unwrap();
+            let request = crate::game::world_loading::WorldRequest::new(
+                folder,
+                None,
+                Some(3042),
+                true,
+                None,
+                game.level.rule_registry.clone(),
+            )
+            .unwrap();
+            game.load_world(request).unwrap();
+            assert!(
+                game.fns.store.functions.contains_key("first_open:block"),
+                "first-open admission errors: {:?}",
+                game.fns.store.errors
+            );
+            assert!(!game.fns.store.functions.contains_key("first_open:invalid"));
+            assert!(
+                game.fns
+                    .store
+                    .errors
+                    .iter()
+                    .any(|(id, _)| id == "first_open:invalid")
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources and scratch homes/cwd"]
     fn prepared_function_calls_keep_causality_and_fallback_boundaries() {
         use crate::game::native_entity_refs::tests::with_game;
         use horizon_client::motion::PlayerMotion;
@@ -1380,6 +1478,11 @@ mod tests {
             game.options.dedicated = None;
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 202.0, 4.5)).unwrap());
             game.creative = true;
+            // Supply the synthetic chunk before forceload's synchronous load barrier.
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
             game.world_root = std::env::current_dir().unwrap().join("h155-causal-world");
             let pack = game.world_root.join("datapacks/h155_causal");
             let dir = pack.join("data/h155c/function");
@@ -1679,6 +1782,11 @@ mod tests {
             game.options.dedicated = None;
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 202.0, 4.5)).unwrap());
             game.creative = true;
+            // Supply the synthetic chunk before forceload's synchronous load barrier.
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
             game.world_root = std::env::current_dir().unwrap().join("h155-world");
             let pack = game.world_root.join("datapacks/h155_unit");
             let dir = pack.join("data/h155/function");
@@ -1900,14 +2008,29 @@ mod tests {
             .unwrap();
             game.world_root = root.clone();
             game.set_allow_commands(true);
+            // Establish the live pack generation before injecting a refused candidate.
+            // Mod declarations are load-bound; replacing them cannot be used to test
+            // a subsequent successful reload of the same live worker registry.
+            game.reload_datapacks(true, &[]).unwrap();
+            assert!(game.items().block_tags["reload_test:candidate"].contains("minecraft:stone"));
+            assert!(game.run_command("datapack disable \"file/candidate\""));
+            assert!(game.run_command("datapack enable \"file/candidate\""));
+            let live_stone = mod_platform::__private::part_tests::block_key("minecraft:stone");
+            assert_eq!(
+                super::super::native_world_read::block_in_tag(live_stone, "reload_test:candidate"),
+                Some(true)
+            );
             crate::game::api_values::install_parts(&[ModEntry::new(
                 "reload_test",
                 Box::new(MissingItem),
             )])
             .unwrap();
-            let stone = mod_api::__private::part_tests::block_key("minecraft:stone");
-            let registry = game.pack.assets.registry;
-            crate::game::api_values::resolve_block_definitions(registry).unwrap();
+            // Resolve candidate metadata without rebinding the live worker registry.
+            let (registry, _) =
+                horizon_world::level::data::load_registry_with_flags(&game.options.resources)
+                    .unwrap();
+            crate::game::api_values::resolve_block_definitions(&registry).unwrap();
+            let stone = mod_platform::__private::part_tests::block_key("minecraft:stone");
             let old_tag =
                 super::super::native_world_read::block_in_tag(stone, "reload_test:candidate");
             let old_context = game.loop_context.clone();
@@ -1931,38 +2054,11 @@ mod tests {
                 super::super::native_world_read::block_in_tag(stone, "reload_test:candidate"),
                 old_tag
             );
-            struct Valid;
-            #[mod_api::__subscriptions]
-            impl Hooks for Valid {
-                fn register(&self, registrar: &mut dyn Registrar, _: &RegistrationContext) {
-                    registrar.block_key("minecraft:stone");
-                }
-            }
-            crate::game::api_values::install_parts(&[ModEntry::new(
-                "reload_test",
-                Box::new(Valid),
-            )])
-            .unwrap();
-            game.reload_datapacks(true, &[]).unwrap();
-            assert!(game.items().block_tags["reload_test:candidate"].contains("minecraft:stone"));
-            assert_eq!(
-                super::super::native_world_read::block_in_tag(stone, "reload_test:candidate"),
-                Some(true)
-            );
-            // The command path also prepares the replacement before publishing
-            // its canonical selection or persisting the player's pack settings.
-            assert!(game.run_command("datapack disable \"file/candidate\""));
-            assert!(game.run_command("datapack enable \"file/candidate\""));
             game.save_datapack_settings();
             let settings = std::fs::read(root.join("datapacks.json")).unwrap();
             let enabled = game.fns.enabled.clone();
             let context = game.loop_context.clone();
             let generation = game.damage_tag_generation;
-            crate::game::api_values::install_parts(&[ModEntry::new(
-                "reload_test",
-                Box::new(MissingItem),
-            )])
-            .unwrap();
             assert!(!game.run_command("datapack disable \"file/candidate\""));
             assert_eq!(game.fns.enabled, enabled);
             assert_eq!(
@@ -2070,7 +2166,11 @@ mod tests {
         ] {
             std::fs::create_dir_all(pack.join(path)).unwrap();
         }
-        std::fs::write(pack.join("pack.mcmeta"), "{}").unwrap();
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            r#"{"pack":{"description":"Function fixture"}}"#,
+        )
+        .unwrap();
         let function = pack.join("data/test/function/start.mcfunction");
         std::fs::write(
             &function,
@@ -2152,7 +2252,7 @@ mod tests {
             game.level.enabled_features = Default::default();
             std::fs::write(
                 pack.join("pack.mcmeta"),
-                r#"{"features":{"enabled":["test:feature"]}}"#,
+                r#"{"pack":{"description":"Feature fixture"},"features":{"enabled":["test:feature"]}}"#,
             )
             .unwrap();
             let stack = game
@@ -3283,3 +3383,6 @@ mod required_tag_tests {
         });
     }
 }
+
+#[cfg(test)]
+include!("functions/typed_state_range_tests.rs");

@@ -596,7 +596,7 @@ def compare_worlds(vanilla, horizon):
     chunks = {(k[1], k[2]) for k in load_regions(va / 'region')}
     compare_entities(load_regions(va / 'entities'), load_regions(ha / 'entities'), report, chunks)
     for rel in ['level.dat'] + sorted(
-            str(p.relative_to(vanilla)) for pattern in ('data/**/*.dat', 'players/**/*.dat')
+            p.relative_to(vanilla).as_posix() for pattern in ('data/**/*.dat', 'players/**/*.dat')
             for p in vanilla.glob(pattern)):
         a, b = vanilla / rel, horizon / rel
         if not b.exists():
@@ -665,7 +665,7 @@ def main():
     else:
         bin_dir = Path(args.bin_dir).resolve() if args.bin_dir else None
         if bin_dir is None:
-            subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib', '--bins'], cwd=ROOT, check=True)
+            subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib', '--bins'], cwd=ROOT, check=True)
             bin_dir = ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / 'fast'
         h = horizon_resave(v0, RUN / 'h', bin_dir)
     print('comparing', v0, 'with', h)

@@ -12,18 +12,40 @@ Call `host.query(&TYPE)` on `&dyn Host`, then borrow its rows with `batch.iter()
 Reads require `T: Send + Sync + 'static`, not `Clone`. Each successful row has a
 Copy `holder` and a borrowed `value: &T`. Match `AttachmentHolder` to work with the
 existing `EntityRef`, `PlayerRef`, `BlockEntityRef`, `ChunkRef` or `LevelRef`.
-Copying that identity does not keep its holder loaded.
+Copying that identity does not keep its holder loaded. Attachment ownership follows
+an entity object, not its saved UUID. A rejected passenger can own attachments
+without being in the level; it is absent from queries until admitted. Equal-UUID
+objects never share attachment contents.
 
-This compiled fixture defines a serialized counter and sums its captured values:
+This example defines a serialized counter and sums its captured values:
 
-```rust
-{{#include ../../../../crates/horizon-mod-wasm/tests/attachments/mod/src/lib.rs:2}}
-{{#include ../../../../crates/horizon-mod-wasm/tests/attachments/mod/src/lib.rs:4:17}}
+```rust,ignore
+use mod_api::*;
+static VALUE: AttachmentType<u32> = AttachmentType {
+    namespace: "query_fixture",
+    name: "value",
+    default: || panic!("no defaults"),
+    codec: Some(AttachmentCodec {
+        encode: |value| Ok([("n".into(), Tag::Int(*value as i32))].into()),
+        decode: |saved| match saved.get(&"n".into()) {
+            Some(Tag::Int(n)) => Ok(*n as u32),
+            _ => Err(AttachmentError::Decode),
+        },
+    }),
+    copy_on_death: false,
+    sync: false,
+};
 
-{{#include ../../../../crates/horizon-mod-wasm/tests/attachments/mod/src/lib.rs:21:27}}
+fn total(host: &dyn Host) -> u32 {
+    host.query(&VALUE)
+        .unwrap()
+        .iter()
+        .map(|row| *row.unwrap().value)
+        .sum()
+}
 ```
 
-The fixture deliberately panics if a default is inserted: queries never call the
+The example deliberately panics if a default is inserted: queries never call the
 key's default, dirty the holder, or queue synchronization. It uses `unwrap` to
 check test assumptions; real mods should handle key and row errors according to
 their own policy. A saved entry decodes lazily when visited. A malformed saved
@@ -42,11 +64,18 @@ Use `host.query_mut(&TYPE)` on `&mut dyn ServerHost` (`T: Clone + Send + Sync +
 'static`). This does not return `&mut T`. A mutable query row exposes `holder()`,
 `value()`, `set(host, replacement)` and `remove(host)`.
 
-The same compiled fixture starts with 41, replaces it with 42, checks that a fresh
+The same example starts with 41, replaces it with 42, checks that a fresh
 query sees 42 while the original row still reads 41, then removes the live value:
 
-```rust
-{{#include ../../../../crates/horizon-mod-wasm/tests/attachments/mod/src/lib.rs:37:44}}
+```rust,ignore
+                let batch = host.query_mut(&VALUE).unwrap();
+                let row = batch.iter().next().unwrap().unwrap();
+                assert_eq!(*row.value(), 41);
+                row.set(host, 42).unwrap();
+                assert_eq!(total(host), 42);
+                assert_eq!(*row.value(), 41);
+                assert_eq!(row.remove(host).unwrap(), Some(42));
+                assert_eq!(total(host), 0);
 ```
 
 Every set/remove validates the captured residency against the supplied host's
@@ -94,10 +123,50 @@ clone each typed value. Repeated snapshots interleaved with writes can therefore
 cost more, and keeping many batches retains their old values. There is no idle
 index sweep when no attachment or residency change occurs.
 
-At the generated component boundary the whole owned batch transfers once, not
-one host call per row. Borrowed traversal still uses that owned batch. An erased
+An erased
 decoded value can only be read where its Rust type identity matches. A different
-native type or another component group's type produces `TypeMismatch`; a failed
+native or wasm type produces `TypeMismatch`; a failed
 decoded downcast does not fall back to saved decoding. Share attachment type
 identity through the normal dependency model rather than redeclaring a different
 type with the same key.
+
+## First-store errors
+
+First stores on resident mobs, paintings and dragon parts bind their lifetime
+registration. Each actual dragon part owns its own registration: stores never
+alias its parent or siblings. Removing or replacing the dragon, or unloading its
+physical storage, retires all eight parts even while attachment maps or query
+snapshots remain retained. Parking a level preserves its resident parts.
+Constructor-listener stores are indexed even when the triggering access was only
+an inspection. Physical removal also releases the part's canonical attachment
+map and construction state during entity cleanup; immediate network-ID reuse
+clears the old part state before admitting its replacement.
+Inspection and removal do not create a registration. First-store indexing for
+other families is unchanged. A store can return
+`AttachmentError::HolderBusy` while the
+engine has lifted or extracted its physical storage: retry after the current
+pass. The refused store writes no value and creates no registration.
+
+`AttachmentError::UnsupportedHolder(family)` means the physical family cannot
+own attachments; retrying cannot help. The name is bounded static text, not an
+engine type. Wire decoding accepts at most 256 UTF-8 bytes for that text and
+rejects longer names on both native and wasm guest paths. Family names are stable lowercase identifiers: `mob`, `item`,
+`orb`, `projectile`, `armorstand`, `itemframe`, `painting`, `boat`,
+`minecart`, `other`, `fangs`, `crystal`, `dragon`, `tnt`, `falling`,
+`rocket`, `trident`, `spawner`, `cloud`, `cushion`, `knot`, `player`, `hook`,
+and `dragonpart`.
+Retained row writes report the matching `AttachmentRowError::HolderBusy` or
+`AttachmentRowError::UnsupportedHolder`; a missing holder is instead
+`StaleHolder`.
+
+For an immutable keyed read (including render hooks), capture a snapshot with
+`host.query(&TYPE)?`, then call `query.get(holder)?` with an `AttachmentHolder`.
+The result is an owned value: `Some(value)` on a hit and `None` before sync or
+when absent. `None` does not mean the holder is alive: absent and not-live
+(stale or displaced) holders alike return `Ok(None)` when absent from the
+snapshot. This read performs no host liveness check; only scoped residency
+probes report `StaleHolder`. The expected O(1) holder probe runs before decoding, never scans
+rows and never initializes defaults. Values require `Clone`; decode/type errors
+use `AttachmentRowError::Value`. Fresh queries see replacements and removals;
+retained queries keep their captured values. Scoped residency tokens still
+reject rebound holders with `StaleHolder`.

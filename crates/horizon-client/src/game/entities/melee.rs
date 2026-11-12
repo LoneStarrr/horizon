@@ -5,12 +5,22 @@ use super::*;
 impl Game<'_> {
     /// `Player.getAttackStrengthScale(0.5)`.
     pub(super) fn attack_strength_scale(&self) -> f32 {
+        self.attack_strength_scale_at(0.5)
+            .expect("finite partial tick")
+    }
+
+    /// `Player.getAttackStrengthScale(partial)` for the player in place.
+    /// Returns `None` for a non-finite partial tick; finite partials are not restricted.
+    pub(super) fn attack_strength_scale_at(&self, partial: f32) -> Option<f32> {
+        if !partial.is_finite() {
+            return None;
+        }
         // 1.8.9 had no attack cooldown.
         if self.legacy_rules() {
-            return 1.0;
+            return Some(1.0);
         }
         let delay = horizon_client::attack_strength::delay(self.main_hand_attack_speed());
-        ((self.attack_ticks as f32 + 0.5) / delay).clamp(0.0, 1.0)
+        Some(((self.attack_ticks as f32 + partial) / delay).clamp(0.0, 1.0))
     }
 
     /// `Player.isSweepAttack`: a charged, grounded sword hit below the movement
@@ -195,3 +205,5 @@ impl Game<'_> {
         true
     }
 }
+
+impl Game<'_> {}

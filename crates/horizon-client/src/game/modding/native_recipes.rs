@@ -30,17 +30,36 @@ const MAX_SYNCED_RECIPES: usize = 1_000_000;
 #[derive(Default)]
 pub(super) struct RecipeTables {
     tables: Option<Arc<Recipes>>,
-    pub(super) categories: Option<HashMap<String, mod_api::recipe_book::RecipeBookCategory>>,
+    pub(super) books: Option<
+        Result<
+            horizon_client::recipe_book::ModBookIndex,
+            horizon_client::recipe_book::DisplayLoadError,
+        >,
+    >,
     known: (Option<u64>, Arc<[i32]>),
     /// The server's recipes of the types its native mods sent (`horizon:
     /// recipe_content`) over the window's own: what `Game::recipes` reads on
     /// a client once they came.
     synced: Option<horizon_client::crafting::Recipes>,
+    /// The display numbers of those recipes: the server numbers its book's
+    /// displays over its own recipe set, a world's data pack recipes
+    /// included, so the book numbers them the same (`Game::display_index`).
+    pub(super) synced_index: Option<horizon_client::recipe_book::RecipeIndex>,
     /// The recipe content's parts so far, until its last.
     incoming: Vec<(String, serde_json::Value)>,
     /// The types that came before the player did: the mods hear of them
     /// once the helpers can answer (`recipes_received_now`).
     received: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+impl RecipeTables {
+    pub(in crate::game) fn install_test_recipes(
+        &mut self,
+        recipes: horizon_client::crafting::Recipes,
+    ) {
+        self.synced = Some(recipes);
+    }
 }
 
 /// Item id -> its index in [`Recipes::items`].
@@ -144,7 +163,10 @@ impl Game<'_> {
                 let at = |i: usize| (i / w) * size + i % w;
                 let mut grid: [Option<ItemStack>; 9] = Default::default();
                 for (i, stack) in slots.iter().enumerate() {
-                    grid[at(i)] = stack.as_ref().map(&read_stack).transpose()?;
+                    #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
+                    {
+                        grid[at(i)] = stack.as_ref().map(&read_stack).transpose()?;
+                    }
                 }
                 let grid = &grid[..size * size];
                 let scale = |id: i32| self.maps.data.get(&id).map(|m| m.scale);
@@ -155,7 +177,8 @@ impl Game<'_> {
                 else {
                     return Ok(None);
                 };
-                let mut placed = recipes.remainders(id, grid, size);
+                let mut placed =
+                    recipes.remainders(id, grid, size, &|s| self.crafting_remainder(s));
                 let remainders = (0..w * h)
                     .map(|i| placed[at(i)].take().try_into_api().map_err(|_| InvalidItem))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -209,8 +232,11 @@ impl Game<'_> {
                 else {
                     return Err(InvalidInput);
                 };
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
                 let template = template.as_ref().map(&read_stack).transpose()?;
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
                 let base = base.as_ref().map(&read_stack).transpose()?;
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
                 let addition = addition.as_ref().map(&read_stack).transpose()?;
                 let stations = self.stations();
                 let Some((id, output)) = stations.recipes.smithing_recipe(
@@ -230,17 +256,16 @@ impl Game<'_> {
     pub(super) fn registered_recipe_book_category(
         &mut self,
         kind: &str,
-    ) -> Option<mod_api::recipe_book::RecipeBookCategory> {
-        if self.recipe_tables.categories.is_none() {
-            let mut declarations = Vec::new();
-            self.native_recipe_book_categories(&mut declarations);
-            self.recipe_tables.categories = Some(horizon_client::recipe_book::mod_categories(
-                declarations,
-                self.recipes(),
-                self.items(),
-            ));
-        }
-        self.recipe_tables.categories.as_ref()?.get(kind).cloned()
+    ) -> Option<mod_api::item::recipe_book::RecipeBookCategory> {
+        self.ensure_mod_book_displays();
+        self.recipe_tables
+            .books
+            .as_ref()?
+            .as_ref()
+            .ok()?
+            .categories()
+            .find(|category| category.recipe_type == kind)
+            .cloned()
     }
     /// `give`: `count` of `item`, refused outside a world, unless
     /// creative and for an item the game doesn't have.
@@ -489,9 +514,18 @@ impl Game<'_> {
     pub(super) fn synced_recipes(&self) -> Option<&horizon_client::crafting::Recipes> {
         self.recipe_tables.synced.as_ref()
     }
+    /// The display numbers the recipe book reads: the server's recipes',
+    /// once a server sent them, else the world's own.
+    pub(super) fn display_index(&self) -> &horizon_client::recipe_book::RecipeIndex {
+        match &self.recipe_tables.synced_index {
+            Some(index) => index,
+            None => &self.stations().recipe_index,
+        }
+    }
     /// A new play session (`Login`): what the last server sent is gone.
     pub(super) fn forget_synced_recipes(&mut self) {
         self.recipe_tables.synced = None;
+        self.recipe_tables.synced_index = None;
         self.recipe_tables.incoming.clear();
         self.recipe_tables.received = None;
         self.recipe_tables.tables = None;
@@ -505,38 +539,14 @@ impl Game<'_> {
             && let Some(types) = self.recipe_tables.received.take()
         {
             self.native_recipes_received(&types);
+            self.build_screen();
         }
-    }
-    /// `OnDatapackSyncEvent.sendRecipes`: the recipe types the native mods
-    /// want their clients to have, from this load's tables, become what the
-    /// server sends its Horizon clients at a join and after `/reload`. Called
-    /// once a load's tables are built, before any player hears of them.
-    pub(super) fn sync_recipe_content(&mut self) {
-        use horizon_client::lan::recipes;
-        let mut types = Vec::new();
-        self.native_datapack_sync(&mut types);
-        types.sort();
-        types.dedup();
-        let sources = if types.is_empty() {
-            Vec::new()
-        } else {
-            horizon_items::recipe_sources::sources(&self.options.resources, &self.pack_files())
-                .unwrap_or_else(|e| {
-                    log::warn!("Horizon: the recipes for the clients were not read: {e}");
-                    Vec::new()
-                })
-        };
-        recipes::set_content(recipes::encode_content(
-            &types,
-            &sources,
-            recipes::sent_before(),
-        ));
     }
     /// A `horizon:recipe_content` part the server sent the window. On the
     /// last, the window's tables take the server's recipes of those types in
     /// place of its own, and the mods hear of it (`RecipesReceivedEvent`).
     pub(super) fn remote_recipe_content(&mut self, data: &[u8]) {
-        let part: horizon_client::lan::recipes::ContentPart = match serde_json::from_slice(data) {
+        let part = match horizon_client::lan::recipes::ContentPart::decode(data) {
             Ok(part) => part,
             Err(e) => {
                 log::warn!("Horizon: bad recipe content from the server: {e}");
@@ -557,6 +567,7 @@ impl Game<'_> {
         let received = std::mem::take(&mut self.recipe_tables.incoming);
         // No type any more: back on the window's own recipes.
         if types.is_empty() {
+            self.recipe_tables.synced_index = None;
             if self.recipe_tables.synced.take().is_some() {
                 self.recipe_tables.tables = None;
                 self.forget_book();
@@ -571,6 +582,7 @@ impl Game<'_> {
             let of = |v: &serde_json::Value| types.iter().any(|t| v["type"].as_str() == Some(t));
             let mut all: Vec<_> = own.into_iter().filter(|(_, v)| !of(v)).collect();
             all.extend(received);
+            let index = horizon_client::recipe_book::RecipeIndex::load_from_sources(&all);
             horizon_client::crafting::Recipes::from_sources(
                 root,
                 self.items(),
@@ -578,10 +590,12 @@ impl Game<'_> {
                 all,
                 self.res.core.item_data.context(),
             )
+            .map(|recipes| (recipes, index))
         });
         match built {
-            Ok(recipes) => {
+            Ok((recipes, index)) => {
                 self.recipe_tables.synced = Some(recipes);
+                self.recipe_tables.synced_index = Some(index);
                 // What was made of the window's own recipes is made again.
                 self.recipe_tables.tables = None;
                 self.forget_book();
@@ -687,7 +701,7 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn recipe_for_dispatches_cooking_and_stonecutting_and_pack_recipes() {
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {
                 let level = game.level(game.dim.id()).unwrap();
                 let kind = |name| mod_api::Identifier::parse(name).unwrap();
@@ -789,7 +803,7 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn recipe_for_preserves_smithing_order_and_damage() {
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {
                 let level = game.level(game.dim.id()).unwrap();
                 let kind = |name| mod_api::Identifier::parse(name).unwrap();
@@ -841,7 +855,7 @@ mod tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn recipe_for_refuses_mod_owned_types_instead_of_empty_matches() {
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {
                 let level = game.level(game.dim.id()).unwrap();
                 let kind = mod_api::Identifier::parse("test:crusher").unwrap();

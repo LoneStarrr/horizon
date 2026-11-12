@@ -10,6 +10,8 @@ use std::{
 };
 
 pub const FILE: &str = "horizon-mods.txt";
+/// The `horizon-mods.txt` key of [`ModList::wasm_memory_cap_mib`].
+const WASM_MEMORY_CAP: &str = "wasm.memory_cap_mib";
 /// The folder holding `.hmod` files, beside `options.txt`.
 pub const DIR: &str = "horizon-mods";
 /// Where the launcher installs native mods (`<id>.hmod`), beside [`DIR`]. They run only in a
@@ -28,6 +30,10 @@ pub struct ModList {
     /// The keys the player chose for mods' keys, mod id → key name → key
     /// (`key.<id>.<name>:key.keyboard.x` lines).
     pub keys: BTreeMap<String, BTreeMap<String, String>>,
+    /// The player's cap on each wasm dependency group's memory, in MiB
+    /// (`wasm.memory_cap_mib:<1 to 4096>`); unset, wasm32's whole 4 GiB. A group whose mods
+    /// declare more (`wasm_memory_mib`) is refused at load, naming both numbers.
+    pub wasm_memory_cap_mib: Option<u32>,
     /// What the Mods page shows, filled by the game from the mods it found.
     pub installed: Vec<Installed>,
     /// What the Mods screen's panel shows of each installed mod, by id.
@@ -81,13 +87,92 @@ pub struct Installed {
     pub native: Option<NativePage>,
 }
 
-/// A native mod's settings page: its keys as Key Binds rows, then its
-/// buttons. The keys the player chooses are kept in `ModList::keys`.
+/// A native mod's settings page: its keys as Key Binds rows, then the settings it registered
+/// (`Registrar::register_setting`). The keys the player chooses are kept in `ModList::keys`, the
+/// settings in the mod's data folder.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NativePage {
     /// The keys the mod registers on Options > Controls, under its title.
     pub mappings: Vec<KeyMapping>,
-    pub buttons: Vec<String>,
+    /// Its settings, in registration order, with the values the page shows.
+    pub settings: Vec<NativeSetting>,
+}
+
+/// A setting on a native mod's page: its key within the mod, the translation keys of its label
+/// and tooltip, and its value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSetting {
+    pub key: String,
+    pub label: String,
+    pub tooltip: Option<String>,
+    pub value: NativeSettingValue,
+}
+
+/// A setting's value as its row shows and changes it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeSettingValue {
+    /// On or off: a click flips it.
+    Toggle(bool),
+    /// Option `index` of `options` (translation keys): a click moves to the next.
+    Choice { options: Vec<String>, index: usize },
+    /// A number from `min` to `max` in steps of `step`, on a slider.
+    Range {
+        min: f64,
+        max: f64,
+        step: f64,
+        value: f64,
+    },
+    /// A colour, `0xRRGGBB`: a click moves to the next of the sixteen dye colours.
+    Color(u32),
+}
+
+/// The sixteen dye colours (`DyeColor.getTextureDiffuseColor`, white to black), a colour
+/// setting's button steps through.
+pub const DYE_COLORS: [u32; 16] = [
+    0xF9FFFE, 0xF9801D, 0xC74EBD, 0x3AB3DA, 0xFED83D, 0x80C71F, 0xF38BAA, 0x474F52, 0x9D9D97,
+    0x169C9C, 0x8932B8, 0x3C44AA, 0x835432, 0x5E7C16, 0xB02E26, 0x1D1D21,
+];
+
+impl NativeSettingValue {
+    /// A click on its button: a toggle flips, a choice and a colour move to the next (a colour
+    /// that isn't a dye colour to the first one), a range doesn't change (it is a slider).
+    pub fn click(&mut self) {
+        match self {
+            Self::Toggle(on) => *on = !*on,
+            Self::Choice { options, index } => *index = (*index + 1) % options.len().max(1),
+            Self::Color(rgb) => {
+                let next = DYE_COLORS
+                    .iter()
+                    .position(|c| c == rgb)
+                    .map_or(0, |i| i + 1);
+                *rgb = DYE_COLORS[next % DYE_COLORS.len()];
+            }
+            Self::Range { .. } => {}
+        }
+    }
+    /// A range's value as the slider's handle place, 0 to 1; 0 for the other kinds.
+    pub fn fraction(&self) -> f32 {
+        match self {
+            Self::Range {
+                min, max, value, ..
+            } => ((value - min) / (max - min)).clamp(0.0, 1.0) as f32,
+            _ => 0.0,
+        }
+    }
+    /// A range moved to slider place `fraction` (0 to 1): the nearest step, kept in range.
+    pub fn slide(&mut self, fraction: f32) {
+        if let Self::Range {
+            min,
+            max,
+            step,
+            value,
+        } = self
+        {
+            let raw = *min + f64::from(fraction.clamp(0.0, 1.0)) * (*max - *min);
+            let steps = ((raw - *min) / *step).round();
+            *value = (*min + steps * *step).clamp(*min, *max);
+        }
+    }
 }
 
 /// A key a native mod registers on Options > Controls, under the mod's title.
@@ -222,10 +307,17 @@ impl ModList {
                 entry.insert(name.to_owned(), v.trim().to_owned());
             }
         }
+        let wasm_memory_cap_mib = text
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(k, _)| k.trim() == WASM_MEMORY_CAP)
+            .filter_map(|(_, v)| v.trim().parse().ok())
+            .rfind(|mib| (1..=crate::manifest::MAX_WASM_MEMORY_MIB).contains(mib));
         Self {
             enabled,
             disabled,
             keys,
+            wasm_memory_cap_mib,
             installed: Vec::new(),
             info: BTreeMap::new(),
         }
@@ -237,7 +329,15 @@ impl ModList {
             keys.iter()
                 .map(move |(name, key)| format!("key.{id}.{name}:{key}\n"))
         });
-        on.chain(off).chain(keys).collect()
+        let cap = self
+            .wasm_memory_cap_mib
+            .map(|mib| format!("{WASM_MEMORY_CAP}:{mib}\n"));
+        on.chain(off).chain(keys).chain(cap).collect()
+    }
+    /// The cap on each wasm group's memory this instance allows, in MiB.
+    pub fn wasm_memory_cap(&self) -> u32 {
+        self.wasm_memory_cap_mib
+            .unwrap_or(crate::manifest::MAX_WASM_MEMORY_MIB)
     }
     /// Mod `id`'s chosen keys, for `Mods::set_bindings`.
     pub fn keys_of(&self, id: &str) -> Vec<(&str, &str)> {
@@ -328,6 +428,22 @@ mod tests {
         assert_eq!(list.enabled.iter().collect::<Vec<_>>(), ["coords_hud"]);
         assert_eq!(ModList::parse(&list.serialize()), list);
         assert_eq!(ModList::default().serialize(), "");
+    }
+
+    #[test]
+    fn the_player_may_lower_the_wasm_memory_cap() {
+        assert_eq!(ModList::parse("").wasm_memory_cap(), 4096);
+        let list = ModList::parse("mod.a:true\nwasm.memory_cap_mib:512\n");
+        assert_eq!(list.wasm_memory_cap(), 512);
+        assert_eq!(ModList::parse(&list.serialize()), list);
+        // Outside 1 to 4096 MiB (wasm32's whole space) the line is ignored.
+        for text in [
+            "wasm.memory_cap_mib:0\n",
+            "wasm.memory_cap_mib:8192\n",
+            "wasm.memory_cap_mib:lots\n",
+        ] {
+            assert_eq!(ModList::parse(text).wasm_memory_cap(), 4096, "{text}");
+        }
     }
 
     #[test]
@@ -434,5 +550,56 @@ mod tests {
         list.toggle(2);
         assert!(list.is_on(2));
         assert_eq!(list.serialize(), "mod.c:true\n");
+    }
+}
+
+#[cfg(test)]
+mod native_setting_tests {
+    use super::*;
+
+    #[test]
+    fn a_setting_button_steps_its_value_and_a_slider_snaps_to_its_step() {
+        let mut toggle = NativeSettingValue::Toggle(false);
+        toggle.click();
+        assert_eq!(toggle, NativeSettingValue::Toggle(true));
+        let mut choice = NativeSettingValue::Choice {
+            options: vec!["a".into(), "b".into()],
+            index: 1,
+        };
+        choice.click();
+        assert_eq!(
+            choice,
+            NativeSettingValue::Choice {
+                options: vec!["a".into(), "b".into()],
+                index: 0
+            }
+        );
+        let mut color = NativeSettingValue::Color(0x12_3456);
+        color.click();
+        assert_eq!(color, NativeSettingValue::Color(DYE_COLORS[0]));
+        let mut color = NativeSettingValue::Color(DYE_COLORS[15]);
+        color.click();
+        assert_eq!(color, NativeSettingValue::Color(DYE_COLORS[0]));
+        let mut range = NativeSettingValue::Range {
+            min: 1.0,
+            max: 3.0,
+            step: 0.5,
+            value: 2.0,
+        };
+        assert_eq!(range.fraction(), 0.5);
+        range.slide(0.6);
+        assert_eq!(
+            range,
+            NativeSettingValue::Range {
+                min: 1.0,
+                max: 3.0,
+                step: 0.5,
+                value: 2.0
+            }
+        );
+        range.slide(0.9);
+        assert_eq!(range.fraction(), 1.0, "2.8 snaps to 3.0");
+        range.slide(-4.0);
+        assert_eq!(range.fraction(), 0.0);
     }
 }

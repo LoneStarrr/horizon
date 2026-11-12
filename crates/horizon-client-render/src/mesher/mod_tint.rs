@@ -3,12 +3,13 @@
 //! mod's own source meshes as vanilla's blocks do, and one with it asks the mod once per block and
 //! tint index, as `ModelBlockRenderer.computeTintColor` caches it.
 use super::{MeshTables, Resolver, Tint, Tints, lighting};
-use crate::chunk::Chunk;
+use crate::{biome::BiomeInfo, chunk::Chunk};
 use horizon_assets::model::Direction as D;
 use horizon_core::geometry::Direction;
 use horizon_world::{fluid::FluidState, registry::BlockRegistry};
 use mod_api::{
-    BlockAndTintGetter, BlockTintSource, ColorResolver, LightLayer, TintLayer, VanillaTint,
+    BiomeColorResolver, BiomeColors, BlockAndTintGetter, BlockTintSource, ColorResolver,
+    LightLayer, ResolverBiome, TintLayer, VanillaTint,
 };
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc, sync::OnceLock};
 
@@ -19,6 +20,70 @@ static REGISTERED: OnceLock<BTreeMap<String, Arc<[TintLayer]>>> = OnceLock::new(
 /// [`MeshTables::new`] applies them. False when already set.
 pub fn register_block_tint_sources(layers: BTreeMap<String, Arc<[TintLayer]>>) -> bool {
     REGISTERED.set(layers).is_ok()
+}
+
+/// The mods' colour resolvers, by registration index: set once at start, read by every mesh.
+struct RegisteredResolver {
+    callback: Arc<dyn BiomeColorResolver>,
+    warned: std::sync::atomic::AtomicBool,
+}
+static RESOLVERS: OnceLock<Box<[RegisteredResolver]>> = OnceLock::new();
+
+/// Sets the native mods' colour resolvers (`register_color_resolvers`), once, before the block
+/// tint sources that read them. False when already set.
+pub fn register_color_resolvers(resolvers: Arc<[Arc<dyn BiomeColorResolver>]>) -> bool {
+    RESOLVERS
+        .set(
+            resolvers
+                .iter()
+                .map(|callback| RegisteredResolver {
+                    callback: callback.clone(),
+                    warned: std::sync::atomic::AtomicBool::new(false),
+                })
+                .collect(),
+        )
+        .is_ok()
+}
+
+pub(super) fn resolver_exists(index: u32) -> bool {
+    RESOLVERS.get().is_some_and(|r| (index as usize) < r.len())
+}
+
+/// Mod resolver `index`'s colour of `biome` at block column `(x, z)`, 0xRRGGBB: vanilla's
+/// `ColorResolver.getColor`. White for an index no resolver has.
+pub(super) fn resolve(index: u32, biome: &BiomeInfo, x: f64, z: f64) -> u32 {
+    let Some(resolver) = RESOLVERS.get().and_then(|r| r.get(index as usize)) else {
+        return 0xFF_FFFF;
+    };
+    // A failed resolver stays disabled, avoiding repeated panic-hook output as
+    // subsequent columns and sections are meshed.
+    if resolver.warned.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0xFF_FFFF;
+    }
+    let info = ResolverBiome {
+        temperature: biome.temperature,
+        downfall: biome.downfall,
+        colors: BiomeColors {
+            grass: biome.grass,
+            foliage: biome.foliage,
+            dry_foliage: biome.dry_foliage,
+            water: biome.water,
+        },
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resolver.callback.color(&biome.name, &info, x, z)
+    })) {
+        Ok(color) => color & 0xFF_FFFF,
+        Err(_) => {
+            if !resolver
+                .warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                log::warn!("Horizon: colour resolver {index} panicked; using white");
+            }
+            0xFF_FFFF
+        }
+    }
 }
 
 /// What [`register_block_tint_sources`] set; none before.
@@ -114,11 +179,15 @@ impl MeshTables {
         values: Option<ModTintValues>,
     ) -> crate::Result<()> {
         let sources = has_custom_sources(by_block);
-        let values = if sources {
-            Some(values.ok_or("a block tint source needs game-prepared metadata")?)
-        } else {
-            None
-        };
+        // Section geometry reads the same values through its `level`.
+        let values =
+            if sources || !self.section_geometry.is_empty() {
+                Some(values.ok_or(
+                    "a block tint source or section geometry needs game-prepared metadata",
+                )?)
+            } else {
+                None
+            };
         let mut mod_tints = ModTints {
             values,
             ..Default::default()
@@ -283,6 +352,9 @@ impl BlockAndTintGetter for Region<'_, '_, '_> {
             ColorResolver::Foliage => Resolver::Foliage,
             ColorResolver::DryFoliage => Resolver::Dry,
             ColorResolver::Water => Resolver::Water,
+            ColorResolver::Mod(resolver) => {
+                Resolver::Mod(mod_api::__private::mod_color_resolver_index(resolver))
+            }
         };
         let mut tints = self.tints.borrow_mut();
         let [cx, cz, base_y] = tints.origin;

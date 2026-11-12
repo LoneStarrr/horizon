@@ -18,6 +18,18 @@ mod glass_server_dialog;
 mod glass_servers;
 use glass_servers::glass_setting_row;
 
+/// One consent boundary for every launcher-managed start/restart route.
+fn run_managed_server(
+    tx: &std::sync::mpsc::Sender<backend::Msg>,
+    dir: &Path,
+    args: &[&str],
+    log: &dyn Fn(String),
+) -> Result<(), Problem> {
+    crate::jar_launch::with_consent(tx, |permission| {
+        servers::run_managed(dir, args, log, permission)
+    })
+}
+
 /// The servers this launcher started in this session, stopped when it closes unless they run as a
 /// service (`stop_on_quit`).
 static STARTED_HERE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -59,11 +71,11 @@ pub(super) enum Field {
     PostExit,
     /// Home's memory row (`launch_page.rs`).
     MemoryLimit,
-    /// Settings' new offline name (`switch_page.rs`).
-    OfflineName,
     DeleteServer,
     /// Settings' accent as hex (`themes_page.rs`).
     AccentHex,
+    /// The Shop's gift recipient (`wardrobe_page/shop/basket.rs`).
+    ShopGift,
 }
 
 impl Field {
@@ -89,9 +101,9 @@ impl Field {
         Field::LaunchEnv,
         Field::PostExit,
         Field::MemoryLimit,
-        Field::OfflineName,
         Field::DeleteServer,
         Field::AccentHex,
+        Field::ShopGift,
     ];
 }
 
@@ -399,13 +411,9 @@ pub(super) fn keep_running_through_update() {
     STARTED_HERE.lock().unwrap().clear();
 }
 
-/// The player's own name, to let them in on a friends-only server: the Microsoft account that plays,
-/// else the name the game made up for them (`horizon-player.txt`).
+/// The player's own name, to let them in on a friends-only server: the Microsoft account that plays.
 fn own_name(accounts: &Accounts) -> Option<String> {
-    accounts
-        .selected()
-        .map(|a| a.name.clone())
-        .or_else(crate::offline_name)
+    accounts.selected().map(|a| a.name.clone())
 }
 
 fn bytes(n: u64) -> String {
@@ -472,7 +480,17 @@ impl Launcher {
             let log = move |l: String| {
                 let _ = lines.send(Event::Line(l));
             };
-            let _ = tx.send(Event::Done(job(&log)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&log)))
+                .unwrap_or_else(|panic| {
+                    let error = (panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    Err(Problem::plain(trf(
+                        "Could not run {program}: {error}",
+                        &[("program", "horizon-server"), ("error", &error)],
+                    )))
+                });
+            let _ = tx.send(Event::Done(result));
         });
     }
 
@@ -489,9 +507,7 @@ impl Launcher {
                     if args[0] == "start" {
                         log(tr("A new world takes a minute the first time").into());
                     }
-                    crate::jar_launch::with_consent(&tx, |permission| {
-                        servers::run_managed(&dir, &args, log, permission)
-                    })
+                    run_managed_server(&tx, &dir, &args, log)
                 }
                 _ => servers::run_streamed(&dir, &args, log),
             };
@@ -553,8 +569,7 @@ impl Launcher {
             && (self.servers.tab == Tab::Overview || self.theme.glass);
         let mut changed = self.internet_tick(overview);
         while let Ok(event) = self.servers.rx.try_recv() {
-            changed = true;
-            self.servers_event(event);
+            changed |= self.servers_event(event);
         }
         if self.page != Page::Servers || self.servers.polling || !self.servers.loaded {
             return changed;
@@ -608,21 +623,24 @@ impl Launcher {
         changed
     }
 
-    fn servers_event(&mut self, event: Event) {
+    fn servers_event(&mut self, event: Event) -> bool {
         let s = &mut self.servers;
         match event {
             Event::Polled { dir, status, logs } => {
                 s.polling = false;
+                let mut changed = false;
                 let was = s.statuses.get(&dir).map(|st| st.phase.clone());
                 if was.as_deref() != Some("running") && status.phase == "running" {
                     // A fresh start took every saved setting.
                     s.restart_needed.clear();
                     s.pvp = None;
+                    changed = true;
                 }
                 if let Some((next, lines)) = logs {
                     if s.log_dir.as_ref() != Some(&dir) {
                         s.log.clear();
                         s.log_dir = Some(dir.clone());
+                        changed = true;
                     }
                     if !lines.is_empty() {
                         s.log.extend(lines);
@@ -630,24 +648,38 @@ impl Launcher {
                             s.log.pop_front();
                         }
                         s.console_scroll.handle.scroll_to_bottom();
+                        changed = true;
                     }
                     s.log_next = next;
                 }
                 let read_pvp = status.phase == "running" && s.pvp.is_none();
-                s.statuses.insert(dir, *status);
+                if s.statuses.get(&dir) != Some(&status) {
+                    s.statuses.insert(dir, *status);
+                    changed = true;
+                }
                 if read_pvp {
                     self.read_pvp();
+                    changed = true;
                 }
+                changed
             }
             Event::Statuses(all) => {
                 s.polling = false;
-                s.statuses.extend(all);
+                let mut changed = false;
+                for (dir, status) in all {
+                    if s.statuses.get(&dir) != Some(&status) {
+                        s.statuses.insert(dir, status);
+                        changed = true;
+                    }
+                }
+                changed
             }
             Event::Line(line) => {
                 s.job_log.push_back(line);
                 while s.job_log.len() > 6 {
                     s.job_log.pop_front();
                 }
+                true
             }
             Event::Done(result) => {
                 s.busy = None;
@@ -658,6 +690,7 @@ impl Launcher {
                     Err(p) => s.problem = Some(p),
                 }
                 self.load_details();
+                true
             }
             Event::Created(result) => {
                 s.creating = false;
@@ -675,6 +708,7 @@ impl Launcher {
                     }
                     Err(p) => s.problem = Some(p),
                 }
+                true
             }
             Event::Details {
                 dir,
@@ -686,6 +720,9 @@ impl Launcher {
                     s.config = config;
                     s.backups = backups;
                     s.service = Some(service);
+                    true
+                } else {
+                    false
                 }
             }
             Event::Deleted { dir, result } => {
@@ -706,6 +743,7 @@ impl Launcher {
                     Ok(()) => s.note = Some("Server moved to the trash.".into()),
                     Err(e) => s.problem = Some(Problem::plain(e)),
                 }
+                true
             }
             Event::Applied(result) => {
                 s.applying = false;
@@ -719,16 +757,24 @@ impl Launcher {
                 } else {
                     self.apply_settings();
                 }
+                true
             }
-            Event::Pvp(on) => s.pvp = on,
+            Event::Pvp(on) => {
+                s.pvp = on;
+                true
+            }
             Event::UpdateCheck(result) => {
                 s.checking = false;
                 match result {
                     Ok(v) => s.update = Some(v),
                     Err(p) => s.problem = Some(p),
                 }
+                true
             }
-            Event::Failed(e) => s.problem = Some(Problem::plain(e)),
+            Event::Failed(e) => {
+                s.problem = Some(Problem::plain(e));
+                true
+            }
         }
     }
 
@@ -820,7 +866,53 @@ impl Launcher {
         };
         STARTED_HERE.lock().unwrap().push(dir.clone());
         self.servers.restart_needed.clear();
-        self.server_command("Starting", vec!["start".into()]);
+        let tx = self.tx.clone();
+        self.server_job("Starting", move |log| {
+            if let Some(api) = servers::Api::open(&dir) {
+                if let Ok(status) = api.call("GET", "/api/v1/status", None) {
+                    if status["phase"] == "stopped"
+                        && api.call("POST", "/api/v1/start", None).is_ok()
+                    {
+                        return Ok(String::new());
+                    }
+                }
+            }
+            log("A new world takes a minute the first time".into());
+            run_managed_server(&tx, &dir, &["start"], log).map(|_| String::new())
+        });
+    }
+
+    fn stop_server(&mut self) {
+        let Some(dir) = self.servers.open.clone() else {
+            return;
+        };
+        self.server_job("Stopping", move |log| {
+            // The running server's API first; when it can't be reached or refuses, the CLI,
+            // whose error is the job's.
+            let via_api = servers::Api::open(&dir)
+                .is_some_and(|api| api.call("POST", "/api/v1/stop", None).is_ok());
+            if via_api {
+                return Ok(String::new());
+            }
+            servers::run_streamed(&dir, &["stop"], log).map(|_| String::new())
+        });
+    }
+
+    fn restart_server(&mut self) {
+        let Some(dir) = self.servers.open.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        self.server_job("Restarting", move |log| {
+            // The running server's API first; when it can't be reached or refuses, the CLI,
+            // whose error is the job's.
+            let via_api = servers::Api::open(&dir)
+                .is_some_and(|api| api.call("POST", "/api/v1/restart", None).is_ok());
+            if via_api {
+                return Ok(String::new());
+            }
+            run_managed_server(&tx, &dir, &["restart"], log).map(|_| String::new())
+        });
     }
 
     fn fix(&mut self, fix: Fix, cx: &mut Context<Self>) {
@@ -1056,7 +1148,7 @@ impl Launcher {
                         .font_weight(FontWeight::MEDIUM)
                 })
                 // The friend field sits in its chip, on the chip's fill.
-                .when(matches!(f, Field::Players | Field::OfflineName), |d| {
+                .when(matches!(f, Field::Players), |d| {
                     d.h_full().px(px(14.)).bg(gpui::transparent_black())
                 })
                 // The server's command line: the field is the line's middle, on its fill, in mono.
@@ -1071,9 +1163,7 @@ impl Launcher {
                 // The mockup's focus ring (`:focus-visible`, 2 px of the accent's soft shade) on a
                 // field of its own, drawn inside its edge: GPUI has no outline.
                 .when(
-                    focused
-                        && !invalid
-                        && !matches!(f, Field::Players | Field::OfflineName | Field::Command),
+                    focused && !invalid && !matches!(f, Field::Players | Field::Command),
                     |d| {
                         let small = matches!(
                             f,
@@ -1218,7 +1308,7 @@ impl Launcher {
                 self.save_launch()
             }
             Field::MemoryLimit => self.memory_enter(),
-            Field::OfflineName => self.offline_name_enter(),
+            Field::ShopGift => self.shop.find_soon = true,
             Field::ServerName | Field::ServerAddress => self.add_server(),
         }
     }
@@ -1374,12 +1464,34 @@ impl Launcher {
         {
             page = page.child(self.problem_notice(p, cx));
         }
+        // The banner, with a "Hide" once it has been on screen a while: hiding it hides the
+        // sidebar's card too, for good. Nothing at all once hidden.
+        let partner = (!self.settings.partner_hidden).then(|| {
+            let mut slot = div().relative().w(px(600.)).child(super::partner::banner(
+                "partner-servers",
+                600.,
+                &t,
+            ));
+            if self.settings.partner_seen_secs >= super::partner::SEEN_BEFORE_HIDE {
+                slot = slot.child(
+                    super::partner::hide_button("partner-servers-hide", &t).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.settings.partner_hidden = true;
+                            this.save_settings();
+                            cx.notify();
+                        },
+                    )),
+                );
+            }
+            slot
+        });
         if self.servers.list.is_empty() {
             return page
                 .child(centered(
                     tr("No server yet. Create one: it takes a few seconds, and with the defaults (tick the EULA, press Create) you get a friends-only survival world."),
                     &t,
-                ));
+                ))
+                .children(partner);
         }
         let mut list = div().flex().flex_col().border_t_1().border_color(t.rule);
         for (i, e) in self.servers.list.clone().into_iter().enumerate() {
@@ -1425,7 +1537,7 @@ impl Launcher {
                 &t,
             ));
         }
-        page.child(list)
+        page.child(list).children(partner)
     }
 
     fn add_server_folder(&mut self, cx: &mut Context<Self>) {
@@ -1595,7 +1707,7 @@ impl Launcher {
             disabled(start)
         } else if running {
             start.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.server_command("Stopping", vec!["stop".into()]);
+                this.stop_server();
                 cx.notify();
             }))
         } else {
@@ -1608,7 +1720,7 @@ impl Launcher {
         let restart = if idle && running {
             restart.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.servers.restart_needed.clear();
-                this.server_command("Restarting", vec!["restart".into()]);
+                this.restart_server();
                 cx.notify();
             }))
         } else {
@@ -1714,7 +1826,7 @@ impl Launcher {
                         if idle {
                             b.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.servers.restart_needed.clear();
-                                this.server_command("Restarting", vec!["restart".into()]);
+                                this.restart_server();
                                 cx.notify();
                             }))
                         } else {
@@ -3337,6 +3449,64 @@ fn setting_name(key: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_start_and_restart_require_consent_before_running_the_supervisor() {
+        const CHILD: &str = "HORIZON_MANAGED_CONSENT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "servers_page::tests::managed_start_and_restart_require_consent_before_running_the_supervisor", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HORIZON_LAUNCHER_HOME", root.path().join("launcher"))
+                .env("HORIZON_HOME", root.path().join("cache"))
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bin = servers::runtime_root().join("current");
+        std::fs::create_dir_all(&bin).unwrap();
+        let supervisor = bin.join("horizon-server");
+        std::fs::write(&supervisor, "#!/bin/sh\nprintf ran > \"$2/ran\"\n").unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(bin.join("horizon-engine"), "never executed").unwrap();
+        std::fs::write(root.path().join("horizon-resources.json"), "{}").unwrap();
+        let config = format!(
+            "[engine]\nresources = {:?}\n",
+            root.path().to_str().unwrap()
+        );
+        std::fs::write(root.path().join("server.toml"), config).unwrap();
+        let package = root
+            .path()
+            .join(horizon_mod_package::mod_list::DIR)
+            .join("needs_jar");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("horizon-mod.toml"), format!(
+            "id='needs_jar'\nname='Needs jar'\nversion='1'\napi='0.2'\ncapabilities=['registries']\n[[jar]]\nid='fixture'\nversion='1'\nsha512='{}'\n", "a".repeat(128)
+        )).unwrap();
+        std::fs::write(
+            root.path().join(horizon_mod_package::mod_list::FILE),
+            "mod.needs_jar:true\n",
+        )
+        .unwrap();
+        for action in ["start", "restart"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = root.path().to_path_buf();
+            let job = std::thread::spawn(move || run_managed_server(&tx, &dir, &[action], &|_| {}));
+            let message = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let backend::Msg::JarConsent { jars, reply } = message else {
+                panic!("expected jar consent")
+            };
+            assert_eq!(jars.len(), 1);
+            assert_eq!(jars[0].id(), "fixture");
+            reply.send(false).unwrap();
+            assert!(job.join().unwrap().is_err());
+            assert!(!root.path().join("ran").exists());
+        }
+    }
 
     #[test]
     fn backups_read_for_people() {

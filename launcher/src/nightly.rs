@@ -49,6 +49,9 @@ pub fn short_commit(version: &str) -> String {
 /// A Nightly's version as a player reads it: `Nightly · 4baa571` for `nightly-2026-10-29-4baa571`,
 /// or None for anything that is not one. The date is already on the row beside it.
 pub fn label(version: &str) -> Option<String> {
+    if let Some(label) = crate::developer_install::label(version) {
+        return Some(label);
+    }
     date_of(version)?;
     let commit = version.strip_prefix("nightly-")?.get(11..);
     Some(match commit {
@@ -90,7 +93,10 @@ pub fn after_update(version: &str) {
         &pinned,
         backend::auto_installed,
     ) {
-        let _ = backend::remove(&old);
+        // A removal stops at the first running program, with half the version already gone.
+        if !backend::in_use(&old) {
+            let _ = backend::remove(&old);
+        }
     }
 }
 

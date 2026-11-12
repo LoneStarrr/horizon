@@ -28,6 +28,66 @@ use std::{
 
 use horizon_core::nbt::{Compound, JavaString, Tag};
 
+// A borrowed comparison view preserves Java's UTF-16 ordering without building keys.
+trait AttachmentKeyView {
+    fn namespace(&self) -> Utf16Units<'_>;
+    fn name(&self) -> Utf16Units<'_>;
+}
+enum Utf16Units<'a> {
+    Owned(std::iter::Copied<std::slice::Iter<'a, u16>>),
+    Borrowed(std::str::EncodeUtf16<'a>),
+}
+impl Iterator for Utf16Units<'_> {
+    type Item = u16;
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            Self::Owned(units) => units.next(),
+            Self::Borrowed(units) => units.next(),
+        }
+    }
+}
+impl AttachmentKeyView for (JavaString, JavaString) {
+    fn namespace(&self) -> Utf16Units<'_> {
+        Utf16Units::Owned(self.0.0.iter().copied())
+    }
+    fn name(&self) -> Utf16Units<'_> {
+        Utf16Units::Owned(self.1.0.iter().copied())
+    }
+}
+impl AttachmentKeyView for (&str, &str) {
+    fn namespace(&self) -> Utf16Units<'_> {
+        Utf16Units::Borrowed(self.0.encode_utf16())
+    }
+    fn name(&self) -> Utf16Units<'_> {
+        Utf16Units::Borrowed(self.1.encode_utf16())
+    }
+}
+impl PartialEq for dyn AttachmentKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for dyn AttachmentKeyView + '_ {}
+impl PartialOrd for dyn AttachmentKeyView + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for dyn AttachmentKeyView + '_ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.namespace()
+            .cmp(other.namespace())
+            .then_with(|| self.name().cmp(other.name()))
+    }
+}
+impl<'a> std::borrow::Borrow<dyn AttachmentKeyView + 'a> for (JavaString, JavaString) {
+    fn borrow(&self) -> &(dyn AttachmentKeyView + 'a) {
+        self
+    }
+}
+
+// no wire: owned by the lower runtime crate, which cannot depend on mod_api's derive;
+// mod_api supplies the explicit tagged Wire implementation, including bounded static text.
 /// An attachment operation could not be completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -46,6 +106,15 @@ pub enum AttachmentError {
     InvalidCopyPolicy,
     /// Syncing to clients requires a serializer.
     InvalidSyncPolicy,
+    /// The holder's physical storage is temporarily extracted or lifted.
+    /// Retry after the current pass; the refused store writes no value.
+    HolderBusy,
+    /// This physical holder family has no attachment lifetime storage; retrying cannot help.
+    /// Stable lowercase family names: mob, item, orb, projectile, armorstand,
+    /// itemframe, painting, boat, minecart, other, fangs, crystal, dragon, tnt,
+    /// falling, rocket, trident, spawner, cloud, cushion, knot, player, hook,
+    /// dragonpart.
+    UnsupportedHolder(&'static str),
 }
 
 /// NBT key reserved for server-owned attachment maps.
@@ -63,18 +132,22 @@ pub fn attachment_compound(tag: Option<&Tag>) -> Result<Option<&Compound>, Attac
 /// A server holder in the host's current dimension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+// no wire: runtime-owned selector; mod_api supplies its explicit tagged Wire codec.
 pub enum Holder {
     Entity(u32),
     Player(u128),
     BlockEntity([i32; 3]),
     Chunk([i32; 2]),
     Level,
+    /// A detached player's map, available only during its clone hook.
+    OriginalPlayer(u64),
 }
 
 /// Whether borrowing a map may create publication authority for a new value.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+// no wire: host-local storage access intent, never a cross-target payload.
 pub enum AttachmentAccess {
     /// Inspection, removal or sync: never create a registration.
     Existing,
@@ -93,10 +166,12 @@ pub trait AttachmentHost {
 
 /// A value of a mod's own type, as the holder keeps it: shared, so a copy of the holder's map
 /// copies no value.
+// no wire: host-local erased Arc value; attachment values cross through their registered codec.
 pub type AttachmentValue = Arc<dyn Any + Send + Sync>;
 
 /// How a policy-checked type declared its value: what saving, respawning and syncing do with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// no wire: runtime-owned policy; mod_api supplies its explicit field-wise Wire codec.
 pub struct AttachmentPolicy {
     pub copy_on_death: bool,
     pub sync: bool,
@@ -105,6 +180,7 @@ pub struct AttachmentPolicy {
 /// What comes with a stored value: its saved form (`None` for a type with no codec), its type's
 /// policy, and why it is stored.
 #[derive(Clone, Debug, PartialEq)]
+// no wire: runtime-owned saved form; mod_api supplies its explicit NBT-aware Wire codec.
 pub struct AttachmentForm {
     pub encoded: Option<Compound>,
     pub policy: AttachmentPolicy,
@@ -114,6 +190,7 @@ pub struct AttachmentForm {
 /// Why a value is stored, which decides what else changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+// no wire: runtime-owned write intent; mod_api supplies its explicit tagged Wire codec.
 pub enum AttachmentWrite {
     /// A saved value just decoded: nothing else changes.
     Decoded,
@@ -224,6 +301,9 @@ impl<H: AttachmentHost + ?Sized> AttachmentStore for H {
             policy,
             write,
         } = form;
+        if matches!(holder, Holder::OriginalPlayer(_)) {
+            return Err(AttachmentError::MissingHolder);
+        }
         Attachments::store(
             self.attachments(holder, AttachmentAccess::Store)?,
             namespace,
@@ -244,6 +324,9 @@ impl<H: AttachmentHost + ?Sized> AttachmentStore for H {
         name: &str,
         sync: bool,
     ) -> Result<(), AttachmentError> {
+        if matches!(holder, Holder::OriginalPlayer(_)) {
+            return Err(AttachmentError::MissingHolder);
+        }
         Attachments::discard(
             self.attachments(holder, AttachmentAccess::Existing)?,
             namespace,
@@ -268,12 +351,14 @@ impl<H: AttachmentHost + ?Sized> AttachmentStore for H {
 }
 
 /// The optional on-disk representation of an attachment.
+// no wire: host-local encoder/decoder function pointers, not cross-target values.
 pub struct AttachmentCodec<T> {
     pub encode: fn(&T) -> Result<Compound, AttachmentError>,
     pub decode: fn(&Compound) -> Result<T, AttachmentError>,
 }
 
 /// A mod-defined attachment key and its value's behavior.
+// no wire: host-local key with callback pointers; attachment calls cross by namespace/name and codec.
 pub struct AttachmentType<T: 'static> {
     pub namespace: &'static str,
     pub name: &'static str,
@@ -314,7 +399,8 @@ pub struct AttachmentSync {
 }
 
 impl<T: Clone + Send + Sync + 'static> AttachmentType<T> {
-    /// Read a value, inserting its default if absent; see `get_existing`.
+    /// Read a value, inserting its default if absent except on an original-player snapshot;
+    /// see `get_existing`.
     pub fn get<S: AttachmentStore + ?Sized>(
         &self,
         store: &mut S,
@@ -324,7 +410,9 @@ impl<T: Clone + Send + Sync + 'static> AttachmentType<T> {
             return Ok(value);
         }
         let value = (self.default)();
-        self.keep(store, holder, value.clone(), AttachmentWrite::Default)?;
+        if !matches!(holder, Holder::OriginalPlayer(_)) {
+            self.keep(store, holder, value.clone(), AttachmentWrite::Default)?;
+        }
         Ok(value)
     }
     /// Whether a holder carries a value, like NeoForge's `hasData`; never inserts the default.
@@ -353,7 +441,9 @@ impl<T: Clone + Send + Sync + 'static> AttachmentType<T> {
             return Ok(None);
         };
         let value = self.decode(&saved)?;
-        self.keep(store, holder, value.clone(), AttachmentWrite::Decoded)?;
+        if !matches!(holder, Holder::OriginalPlayer(_)) {
+            self.keep(store, holder, value.clone(), AttachmentWrite::Decoded)?;
+        }
         Ok(Some(value))
     }
     /// Replace a value on an existing holder. A key already decoded as a different type is
@@ -458,6 +548,7 @@ enum Entry {
 /// Query reads may cache decoded values, but never change the canonical raw/decoded state.
 #[doc(hidden)]
 #[non_exhaustive]
+// no wire: host-local retained binding with erased decoded state, not a wire payload.
 pub struct AttachmentEntry {
     state: Entry,
 }
@@ -618,6 +709,7 @@ impl AttachmentRegistration {
 
 /// The data held by one entity, block entity, chunk or level.
 #[derive(Default)]
+// no wire: host-local canonical map and publication authority; only saved values cross the boundary.
 pub struct Attachments {
     entries: BTreeMap<index::AttachmentKey, Arc<AttachmentEntry>>,
     // Keep malformed or otherwise unrecognized NBT exactly as it was read.
@@ -848,17 +940,31 @@ impl Attachments {
         name: &str,
     ) -> Result<Option<&Arc<AttachmentEntry>>, AttachmentError> {
         self.check_namespace(namespace)?;
-        Ok(self.entries.get(&(namespace.into(), name.into())))
+        Ok(self
+            .entries
+            .get(&(namespace, name) as &dyn AttachmentKeyView))
     }
     /// Whether a value is stored, saved or set, without decoding or inserting it.
     fn holds(&self, namespace: &str, name: &str) -> bool {
-        self.entries.contains_key(&(namespace.into(), name.into()))
+        self.entries
+            .contains_key(&(namespace, name) as &dyn AttachmentKeyView)
     }
     /// Refuse a namespace whose saved form isn't a compound: nothing under it can be read or
     /// written without losing it.
     fn check_namespace(&self, namespace: &str) -> Result<(), AttachmentError> {
-        match self.raw.as_ref().and_then(|raw| raw.get(&namespace.into())) {
-            Some(tag) if !matches!(tag, Tag::Compound(_)) => Err(AttachmentError::InvalidNamespace),
+        thread_local! {
+            static NAMESPACE: std::cell::RefCell<JavaString> = Default::default();
+        }
+        let invalid = self.raw.as_ref().is_some_and(|raw| {
+            NAMESPACE.with_borrow_mut(|key| {
+                key.0.clear();
+                key.0.extend(namespace.encode_utf16());
+                raw.get(key)
+                    .is_some_and(|tag| !matches!(tag, Tag::Compound(_)))
+            })
+        });
+        match invalid {
+            true => Err(AttachmentError::InvalidNamespace),
             _ => Ok(()),
         }
     }
@@ -1008,7 +1114,7 @@ mod tests {
     fn rows(
         index: &Arc<Mutex<index::AttachmentIndex<u32>>>,
         key: &AttachmentType<i32>,
-    ) -> Arc<Vec<index::AttachmentRow<u32>>> {
+    ) -> Arc<index::AttachmentSnapshot<u32>> {
         index
             .lock()
             .unwrap()
@@ -1687,6 +1793,49 @@ mod tests {
         assert_eq!(SYNCED.get(&mut map, Holder::Level), Ok(7));
     }
     #[test]
+    fn original_player_reads_never_store_defaults_or_decoded_values() {
+        struct One(Attachments);
+        impl AttachmentHost for One {
+            fn attachments(
+                &mut self,
+                _: Holder,
+                _: AttachmentAccess,
+            ) -> Result<&mut Attachments, AttachmentError> {
+                Ok(&mut self.0)
+            }
+        }
+        let mut host = One(Attachments::default());
+        let holder = Holder::OriginalPlayer(1);
+        assert_eq!(COUNTER.get(&mut host, holder), Ok(0));
+        assert_eq!(COUNTER.has(&mut host, holder), Ok(false));
+        assert_eq!(COUNTER.get_existing(&mut host, holder), Ok(None));
+        for write in [
+            AttachmentWrite::Set,
+            AttachmentWrite::Default,
+            AttachmentWrite::Decoded,
+        ] {
+            assert_eq!(
+                AttachmentStore::store(
+                    &mut host,
+                    holder,
+                    "test",
+                    "counter",
+                    Arc::new(9i32),
+                    AttachmentForm {
+                        encoded: None,
+                        policy: COUNTER.policy(),
+                        write,
+                    }
+                ),
+                Err(AttachmentError::MissingHolder),
+            );
+        }
+        host.0.apply_sync(change("counter", Some(42)));
+        assert_eq!(COUNTER.get_existing(&mut host, holder), Ok(Some(42)));
+        assert_eq!(COUNTER.get_existing(&mut host, holder), Ok(Some(42)));
+    }
+
+    #[test]
     fn sync_data_reports_the_current_value() {
         struct One(Attachments);
         impl AttachmentHost for One {
@@ -1703,5 +1852,43 @@ mod tests {
         host.0.take_sync_changes();
         SYNCED.sync_data(&mut host, Holder::Level).unwrap();
         assert_eq!(host.0.take_sync_changes(), [change("synced", Some(4))]);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_key_tests {
+    use super::*;
+    #[test]
+    fn borrowed_order_matches_java_units() {
+        let samples = [
+            "", "a", "aa", "z", "é", "\u{d7ff}", "\u{e000}", "\u{ffff}", "😀", "𐀀", "a😀",
+        ];
+        for a in samples {
+            for b in samples {
+                for c in samples {
+                    for d in samples {
+                        let owned: (JavaString, JavaString) = (a.into(), b.into());
+                        let other: (JavaString, JavaString) = (c.into(), d.into());
+                        let borrowed = (a, b);
+                        let right = (c, d);
+                        assert_eq!(
+                            (&borrowed as &dyn AttachmentKeyView).cmp(&right),
+                            owned.cmp(&other)
+                        );
+                        assert_eq!(
+                            (&owned as &dyn AttachmentKeyView).cmp(&right),
+                            owned.cmp(&other)
+                        );
+                    }
+                }
+            }
+        }
+        // Saved Java names can contain unpaired surrogates as well.
+        let malformed = (JavaString(vec![0xd800]), JavaString(vec![0xdc00]));
+        let valid = ("𐀀", "");
+        assert_eq!(
+            (&malformed as &dyn AttachmentKeyView).cmp(&valid),
+            malformed.cmp(&(valid.0.into(), valid.1.into()))
+        );
     }
 }

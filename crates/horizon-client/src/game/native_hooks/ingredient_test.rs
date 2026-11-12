@@ -10,14 +10,16 @@ impl Game<'_> {
         ingredient: &Ingredient,
     ) -> Result<std::sync::Arc<[mod_api::ItemKey]>, mod_api::IngredientKeysError> {
         use mod_api::IngredientKeysError::*;
-        let mut pending = vec![ingredient];
+        let mut pending = Vec::from([ingredient]);
         let mut candidates = std::collections::HashSet::new();
         while let Some(node) = pending.pop() {
             if node.custom.is_some() {
                 return Err(NotEnumerable);
             }
             if let Some((shape, children)) = &node.children {
-                if matches!(shape, mod_api::crafting::Shape::Intersection) && children.is_empty() {
+                if let mod_api::item::crafting::Shape::Intersection = shape
+                    && children.is_empty()
+                {
                     // The existing matcher defines all([]) as true. Such a programmatically
                     // constructed shape needs the full candidate universe, not an empty list.
                     candidates.extend(self.items().items.keys().map(|name| &**name));
@@ -54,7 +56,7 @@ mod enumeration_tests {
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn ingredient_keys_are_exact_for_tags_shapes_and_refuse_component_predicates() {
-        mod_api::testing::with_mods(Vec::new().into(), || {
+        mod_platform::testing::with_mods(Vec::new().into(), || {
             crate::game::native_entity_refs::tests::with_game(|game| {
                 let host: &dyn mod_api::Host = game;
                 let parse = |json| host.recipe_ingredient(json).unwrap().unwrap();
@@ -88,7 +90,7 @@ mod enumeration_tests {
                 // Parent display lists need not be trusted: use the actual engine shape rule.
                 let mut difference = mod_api::Ingredient::of(Vec::new());
                 difference.children = Some((
-                    mod_api::crafting::Shape::Difference,
+                    mod_api::item::crafting::Shape::Difference,
                     vec![planks.clone(), parse(r#""minecraft:birch_planks""#)],
                 ));
                 let keys = assert_exact(&difference);
@@ -101,7 +103,8 @@ mod enumeration_tests {
                 );
 
                 let mut universal = mod_api::Ingredient::of(Vec::new());
-                universal.children = Some((mod_api::crafting::Shape::Intersection, Vec::new()));
+                universal.children =
+                    Some((mod_api::item::crafting::Shape::Intersection, Vec::new()));
                 assert_eq!(
                     assert_exact(&universal).len(),
                     game.items().registry_order.len()
@@ -114,7 +117,10 @@ mod enumeration_tests {
                     Err(mod_api::IngredientKeysError::NotEnumerable)
                 );
                 let mut mixed = mod_api::Ingredient::of(Vec::new());
-                mixed.children = Some((mod_api::crafting::Shape::Compound, vec![plain, component]));
+                mixed.children = Some((
+                    mod_api::item::crafting::Shape::Compound,
+                    vec![plain, component],
+                ));
                 assert_eq!(
                     mixed.item_keys(host),
                     Err(mod_api::IngredientKeysError::NotEnumerable)

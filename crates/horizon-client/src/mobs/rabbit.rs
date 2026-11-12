@@ -49,6 +49,9 @@ pub fn register(m: &mut Mob) {
     g.add(6, Stroll::avoiding_water(0.6));
     g.add(11, LookAtPlayer::new(10.0));
     m.ai.mov.kind = super::control::MoveKind::Custom;
+    // Rabbit's constructor ends with setSpeedModifier(0.0), which leaves the move control in
+    // MOVE_TO towards the default wanted position (0, 0, 0).
+    m.ai.mov.set_wanted(0.0, 0.0, 0.0, 0.0);
     m.ai.nav.can_float = true;
     m.extra.ints[IDLE_TIMEOUT] = m.random.next_int_bound(40).unwrap_or(0) + 180;
 }
@@ -502,9 +505,10 @@ mod tests {
             brain: Brain::Passive,
             anim: Anim::Rabbit,
             sounds: [""; 3],
-            step_sound: None,
+            sound_overrides: Default::default(),
             food: Arc::default(),
             tempt: Arc::default(),
+            passenger_attachments: Vec::new(),
         });
         Mob::new(1, kind, Vec3::ZERO, 0.0)
     }

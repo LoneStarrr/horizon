@@ -324,6 +324,51 @@ fn a_review_protects_published_files() {
 }
 
 #[test]
+fn a_version_taken_down_by_hash_may_leave_its_entry() {
+    // A lost signing key: the next version comes under a new key, and the old one is dropped.
+    let base: Entry = toml::from_str(&hud_entry()).unwrap();
+    let old = base.versions[0].clone();
+    let mut rotated = base.clone();
+    rotated.versions[0].version = "0.2.0".into();
+    rotated.versions[0].sha256 = HPACK.into();
+    let down = |id: &str, sha256: &str| Revoked {
+        id: id.into(),
+        sha256: Some(sha256.into()),
+        reason: "signed with a lost key".into(),
+        date: "2026-11-09".into(),
+    };
+    let one = std::slice::from_ref(&base);
+    let next = std::slice::from_ref(&rotated);
+
+    let r = review_with_revoked(one, next, &[down("coords_hud", &old.sha256)], "ludovic111");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "coords_hud 0.1.0: leaves the entry, taken down in revoked.toml"),
+        "{r:?}"
+    );
+    // Not taken down, another project's take-down, or a take-down of every version
+    // without a hash: still refused.
+    for revoked in [
+        vec![],
+        vec![down("other_mod", &old.sha256)],
+        vec![Revoked {
+            sha256: None,
+            ..down("coords_hud", "")
+        }],
+    ] {
+        let r = review_with_revoked(one, next, &revoked, "ludovic111");
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("coords_hud 0.1.0: removed")),
+            "{revoked:?}: {r:?}"
+        );
+    }
+}
+
+#[test]
 fn a_review_refuses_following_a_repository() {
     let pinned: Entry = toml::from_str(COZY).unwrap();
     let follows: Entry = toml::from_str(COZY_REPO).unwrap();
@@ -381,6 +426,31 @@ fn native_project_rejects_a_content_only_version() {
         errors.iter().any(|e| e.contains("coords_hud 0.1.0:")),
         "{errors:?}"
     );
+}
+
+#[test]
+fn a_new_icon_is_a_new_address() {
+    let s = Scratch::new("icon-address");
+    let icon = |s: &Scratch| {
+        s.build()
+            .unwrap()
+            .project("coords_hud")
+            .unwrap()
+            .icon
+            .clone()
+            .unwrap()
+    };
+    let before = icon(&s);
+    let (path, version) = before.split_once("?v=").unwrap();
+    assert_eq!(
+        path,
+        "https://horizon-rust.github.io/horizon-mods/icons/coords_hud.png"
+    );
+    assert_eq!(version.len(), 12, "{before}");
+    assert_eq!(icon(&s), before, "the same icon keeps its address");
+    s.write_bytes("icons/coords_hud.png", &png(256, 256));
+    let after = icon(&s);
+    assert!(after.starts_with(path) && after != before, "{after}");
 }
 
 #[test]
@@ -544,4 +614,120 @@ fn a_project_listed_by_its_repository_takes_its_versions_from_releases() {
             .iter()
             .any(|e| e.contains("owner/name"))
     );
+}
+
+#[test]
+fn native_binaries_round_trip_and_exact_lookup() {
+    let scratch = Scratch::new("native-binaries");
+    let mut entry: Entry = toml::from_str(&hud_entry()).unwrap();
+    let v = &mut entry.versions[0];
+    let file = sample().project("coords_hud").unwrap().versions[0]
+        .file
+        .clone();
+    for (build, target) in [
+        ("build-a", "x86_64-unknown-linux-gnu"),
+        ("build-a", "aarch64-apple-darwin"),
+        ("build-b", "x86_64-unknown-linux-gnu"),
+        ("build-b", "aarch64-apple-darwin"),
+    ] {
+        v.native_binaries.push(super::super::NativeBinary {
+            build: build.into(),
+            target: target.into(),
+            file: file.clone(),
+        });
+    }
+    scratch.write("mods/coords_hud.toml", &entry.to_toml().unwrap());
+    let index = scratch.build().unwrap();
+    assert_eq!(
+        index.project("coords_hud").unwrap().versions[0].native_binaries,
+        entry.versions[0].native_binaries
+    );
+    let text = serde_json::to_string(&index).unwrap();
+    let decoded = Index::parse(&text).unwrap();
+    let v = &decoded.project("coords_hud").unwrap().versions[0];
+    assert_eq!(v.native_binaries, entry.versions[0].native_binaries);
+    let mut repeated = entry.clone();
+    repeated.versions[0]
+        .native_binaries
+        .push(entry.versions[0].native_binaries[0].clone());
+    scratch.write("mods/coords_hud.toml", &repeated.to_toml().unwrap());
+    assert!(
+        scratch
+            .build()
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("duplicate native"))
+    );
+    assert_eq!(
+        v.native_binary("build-b", "aarch64-apple-darwin")
+            .unwrap()
+            .build,
+        "build-b"
+    );
+    assert_eq!(
+        v.native_binary("build-c", "aarch64-apple-darwin"),
+        Err(super::super::NativeBinaryAbsent)
+    );
+    assert_eq!(
+        v.native_binary("build-a", "x86_64-pc-windows-msvc"),
+        Err(super::super::NativeBinaryAbsent)
+    );
+    let mut duplicate = decoded.clone();
+    let v = &mut duplicate
+        .projects
+        .iter_mut()
+        .find(|p| p.id == "coords_hud")
+        .unwrap()
+        .versions[0];
+    v.native_binaries.push(v.native_binaries[0].clone());
+    assert!(duplicate.check().unwrap_err().contains("duplicate native"));
+    for field in ["hash", "signature", "file", "target"] {
+        let mut bad = decoded.clone();
+        let b = &mut bad
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "coords_hud")
+            .unwrap()
+            .versions[0]
+            .native_binaries[0];
+        match field {
+            "hash" => b.file.sha256 = "bad".into(),
+            "signature" => b.file.signature = Some("bad".into()),
+            "file" => b.file.name = "../bad".into(),
+            _ => b.target = "Linux".into(),
+        }
+        assert!(bad.check().is_err(), "{field}");
+    }
+}
+
+#[test]
+fn native_binary_build_limits() {
+    let mut index = sample();
+    let version = &mut index
+        .projects
+        .iter_mut()
+        .find(|p| p.id == "coords_hud")
+        .unwrap()
+        .versions[0];
+    version.native_binaries.push(super::super::NativeBinary {
+        build: "a".repeat(128),
+        target: "x86_64-unknown-linux-gnu".into(),
+        file: version.file.clone(),
+    });
+    assert!(index.check().is_ok());
+    for build in ["a".repeat(129), "build\nid".into()] {
+        let mut bad = index.clone();
+        bad.projects
+            .iter_mut()
+            .find(|p| p.id == "coords_hud")
+            .unwrap()
+            .versions[0]
+            .native_binaries[0]
+            .build = build;
+        assert!(
+            bad.check()
+                .unwrap_err()
+                .contains("invalid native build or canonical target triple")
+        );
+    }
 }

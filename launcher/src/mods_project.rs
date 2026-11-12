@@ -13,9 +13,9 @@ use super::mods_page::{Checking, Event};
 use super::*;
 use gpui::img;
 use horizon_launcher::browser::{
-    self, Kind as PackKind, Project, SourceId, Support, Version,
+    self,
     details::{self, Details, Environment, Filters, Image, Sort, Tags},
-    images, java,
+    images, java, Kind as PackKind, Project, SourceId, Support, Version,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -261,21 +261,19 @@ impl Launcher {
                 let home = backend::data_dir();
                 for _ in 0..IMAGE_WORKERS {
                     let (receive, tx, home) = (receive.clone(), tx.clone(), home.clone());
-                    std::thread::spawn(move || {
-                        loop {
-                            let Ok(next) = receive.lock().map(|r| r.recv()) else {
-                                break;
-                            };
-                            let Ok((url, size)) = next else {
-                                break;
-                            };
-                            let path = images::fetch(&home, &url, size).ok();
-                            if tx
-                                .send(Event::Loaded(Loaded::Image((url, size), path)))
-                                .is_err()
-                            {
-                                break;
-                            }
+                    std::thread::spawn(move || loop {
+                        let Ok(next) = receive.lock().map(|r| r.recv()) else {
+                            break;
+                        };
+                        let Ok((url, size)) = next else {
+                            break;
+                        };
+                        let path = images::fetch(&home, &url, size).ok();
+                        if tx
+                            .send(Event::Loaded(Loaded::Image((url, size), path)))
+                            .is_err()
+                        {
+                            break;
                         }
                     });
                 }
@@ -676,12 +674,16 @@ impl Launcher {
             Support::Partial(_) => t.warn,
             Support::No(_) => t.muted,
         };
-        let back = button("mods-back", "Back to results", Kind::Ghost, &t).on_click(cx.listener(
-            |this, _: &ClickEvent, _, cx| {
-                this.mods.browse.open = None;
-                cx.notify();
-            },
-        ));
+        let back = button(
+            "mods-back",
+            format!("← {}", tr("Back to results")),
+            Kind::Secondary,
+            &t,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            this.mods.browse.open = None;
+            cx.notify();
+        }));
         let details = o.details.clone();
         let versions = o.versions.clone();
         let version_list = o.version_list.clone();
@@ -690,17 +692,13 @@ impl Launcher {
             &[("count", &thousands(p.downloads))],
         )];
         if let Some(Ok(d)) = &details {
-            // A registry project has no followers: its source repository's stars stand there.
-            match &d.github {
-                Some(g) => meta.push(trf(
-                    "{count} stars on GitHub",
-                    &[("count", &thousands(g.stars))],
-                )),
-                None if p.source != SourceId::Horizon => meta.push(trf(
+            // A registry project has no followers: its source repository's stars stand beside its
+            // rating instead, as a star and a number (`mods_page::stars`).
+            if p.source != SourceId::Horizon {
+                meta.push(trf(
                     "{count} followers",
                     &[("count", &thousands(d.followers))],
-                )),
-                None => {}
+                ));
             }
             if let Some(day) = d.updated.get(..10) {
                 meta.push(trf("updated {date}", &[("date", day)]));

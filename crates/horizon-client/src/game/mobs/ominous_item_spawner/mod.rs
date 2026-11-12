@@ -21,6 +21,8 @@ const TICKS_SCALING: f32 = 50.0;
 const ROTATION_SPEED: f32 = 40.0;
 
 pub(super) struct OminousItemSpawner {
+    /// Entity-owned registration metadata; content clones are detached.
+    pub(super) attachment_lifetime: horizon_mod_runtime::attachments::AttachmentLifetime,
     pub(in crate::game) join: horizon_client::join_seq::JoinSeq,
     /// Its entity id: from the entity counter on the server, the server's on
     /// a client.
@@ -37,6 +39,7 @@ pub(super) struct OminousItemSpawner {
 }
 
 horizon_client::impl_joined!(OminousItemSpawner);
+horizon_mod_runtime::impl_attachment_lifetime!(OminousItemSpawner);
 
 /// `ProjectileItem.DispenseConfig` of the items fired down: power,
 /// uncertainty and `overrideDispenseEvent`; None for items that just fall.
@@ -73,6 +76,7 @@ impl Game<'_> {
     ) {
         self.next_entity += 1;
         self.ominous_spawners.push(OminousItemSpawner {
+            attachment_lifetime: Default::default(),
             join: Default::default(),
             id: self.next_entity,
             item,
@@ -85,7 +89,7 @@ impl Game<'_> {
     }
     /// A saved spawner, as `readAdditionalSaveData` leaves it: its tick
     /// count starts again from 0.
-    pub(super) fn load_ominous_item_spawner(&mut self, tag: horizon_core::nbt::Tag) {
+    pub(super) fn load_ominous_item_spawner(&mut self, mut tag: horizon_core::nbt::Tag) {
         let Some((item, at, spawn_item_after)) =
             horizon_client::entity_nbt::ominous_item_spawner_from_nbt(&tag)
         else {
@@ -96,8 +100,20 @@ impl Game<'_> {
         let saved = horizon_client::entity_nbt::uuid(&tag);
         // Its saved UUID and the attachments saved under it (#7398).
         self.remember_uuid(id, saved, &tag);
+        // Entity.load's `setXRot` keeps the pitch in -90..90 and its `setRot`
+        // takes both `% 360`; the save writes the rotation back from this tag.
+        let [yaw, pitch] = horizon_client::entity_nbt::rotation(&tag);
+        let (yaw, pitch) = (yaw % 360.0, (pitch % 360.0).clamp(-90.0, 90.0));
+        let floats = [yaw, pitch].map(|v| horizon_core::nbt::Tag::Float(v.to_bits()));
+        if let horizon_core::nbt::Tag::Compound(map) = &mut tag {
+            map.insert(
+                "Rotation".into(),
+                horizon_core::nbt::Tag::List(floats.into()),
+            );
+        }
         let uuid = self.uuid_for(id);
         self.ominous_spawners.push(OminousItemSpawner {
+            attachment_lifetime: Default::default(),
             join: Default::default(),
             id,
             item,
@@ -146,6 +162,7 @@ impl Game<'_> {
     /// entity data (`ItemStack.EMPTY` until then, which draws nothing).
     pub(super) fn add_remote_ominous_item_spawner(&mut self, id: u32, position: [f64; 3]) {
         self.ominous_spawners.push(OminousItemSpawner {
+            attachment_lifetime: Default::default(),
             join: Default::default(),
             id,
             item: ItemStack::new("minecraft:air", 1),

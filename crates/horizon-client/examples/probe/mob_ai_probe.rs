@@ -207,6 +207,7 @@ fn goal_name(m: &Mob, name: &str) -> String {
         "GhastLook" => "GhastLookGoal",
         "Peek" => "ShulkerPeekGoal",
         "GhastShoot" => "GhastShootFireballGoal",
+        "BlazeAttack" => "BlazeAttackGoal",
         "Stroll" => "WaterAvoidingRandomStrollGoal",
         "ParrotWander" => "ParrotWanderGoal",
         "RandomStroll" => "RandomStrollGoal",
@@ -286,7 +287,7 @@ fn villager_flag(m: &mut Mob, flag: &str) {
     match k {
         "profession" => {
             let p = villager::profession_index(v).expect("profession");
-            villager::set_profession(m, p);
+            villager::set_profession(m, villager::profession_table(), usize::from(p));
         }
         "level" => m.extra.villager_level = v.parse().unwrap(),
         "xp" => {
@@ -361,7 +362,7 @@ fn summon_golem(
     let Some(mut golem) = golem else {
         return;
     };
-    golem.random = LegacyRandom::new(spawn_seed(index));
+    golem.random.set_seed(spawn_seed(index));
     born.push(golem);
     for j in near {
         villager_brain::golem_detected(&mut mobs[j], w.game_time);
@@ -392,9 +393,14 @@ fn villager_events(
             MobEvent::VillagerMeet { mob, other } => {
                 events.remove(i);
                 if let (Some(a), Some(b)) = (index(mobs, mob), index(mobs, other)) {
-                    let meeting = villager::meet(mobs, a, b, w.game_time, |item| {
-                        items.get(item).map_or(64, |i| i.max_stack)
-                    });
+                    let meeting = villager::meet(
+                        mobs,
+                        a,
+                        b,
+                        w.game_time,
+                        |item| items.get(item).map_or(64, |i| i.max_stack),
+                        w.professions,
+                    );
                     assert!(
                         meeting.thrown.is_empty(),
                         "villagers toss items: not modelled here"
@@ -435,7 +441,7 @@ fn villager_events(
                 child.extra.age = -24000;
                 child.extra.bed = Some(bed);
                 let seed = spawn_seed(index);
-                child.random = LegacyRandom::new(seed);
+                child.random.set_seed(seed);
                 horizon_client::mobs::villager_brain::init(&mut child, w.game_time, day_time, seed);
                 born.push(child);
             }
@@ -491,7 +497,7 @@ impl HeartHost for Host<'_> {
         let seed = 1000 + *self.created;
         *self.created += 1;
         let mut m = Mob::new(200_000 + seed as u32, kind, at, 0.0);
-        m.random = LegacyRandom::new(seed);
+        m.random.set_seed(seed);
         horizon_client::mobs::monster_brain::init(&mut m, seed);
         m
     }
@@ -538,7 +544,7 @@ impl HiveHost for ProbeHive<'_, '_> {
         if m.species() != Species::Bee {
             return None;
         }
-        m.random = LegacyRandom::new(spawn_seed(index));
+        m.random.set_seed(spawn_seed(index));
         horizon_client::mobs::bee::draw_cooldowns(&mut m);
         Some(m)
     }
@@ -549,6 +555,7 @@ impl HiveHost for ProbeHive<'_, '_> {
     fn sound(&mut self, name: &'static str, at: [f64; 3]) {
         self.events.push(MobEvent::Sound(name, at, 1.0, 1.0));
     }
+    fn set_changed(&mut self, _at: [i32; 3]) {}
 }
 /// The hive's honey level and front from its block state.
 fn hive_state(registry: &BlockRegistry, world: &World, at: [i32; 3]) -> (Option<i32>, [i32; 2]) {
@@ -1088,7 +1095,7 @@ pub fn main() -> horizon_client::Result<()> {
                     other => villager_flag(&mut m, other),
                 }
             }
-            m.random = LegacyRandom::new(spec.seed);
+            m.random.set_seed(spec.seed);
             if matches!(
                 m.species(),
                 Species::Cod | Species::Salmon | Species::TropicalFish
@@ -1198,6 +1205,7 @@ pub fn main() -> horizon_client::Result<()> {
                 MobWorld {
                     goal_host: None,
                     teams: Default::default(),
+                    professions: horizon_client::mobs::villager::profession_table(),
                     loop_context: crate::test_resources::server_loop_context(),
                     world: &world,
                     registry,
@@ -1211,14 +1219,18 @@ pub fn main() -> horizon_client::Result<()> {
                     player: player.clone(),
                     // The probe lends no goal view: no identity to capture.
                     player_identity: None,
+                    player_selection: None,
                     controlling_player_movement: None,
                     nearest_player: player.as_ref().filter(|p| !p.spectator).map(|p| p.position),
                     others: $snapshot,
+                    live_mobs: None,
                     dragon: None,
                     leash_boats: &[],
                     who_lookup: None,
+                    foreign: None,
                     others_grid: $grid,
                     others_index: None,
+                    passenger_objects: &[],
                     others_villagers: None,
                     others_solid: None,
                     daylight: (world.day_time.rem_euclid(24000)) < 12000,

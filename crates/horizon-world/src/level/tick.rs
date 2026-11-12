@@ -124,8 +124,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     // the `open` property, the barrel's own sound and the
                     // container game events are its whole report.
                     if let Some((previous, count)) = self.level.recheck_container_openers(pos) {
-                        if previous != count {
-                            let open = count > 0;
+                        // ContainerOpenersCounter.recheckOpeners calls onOpen
+                        // or onClose only when the count crosses zero;
+                        // openerCountChanged (empty for a barrel) is what
+                        // hears any other change.
+                        let was_open = previous > 0;
+                        let open = count > 0;
+                        if was_open != open {
                             let sound: Arc<str> = if open {
                                 "minecraft:block.barrel.open".into()
                             } else {
@@ -279,6 +284,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// `BlockState.randomTick` followed by the fluid's random tick.
     pub fn random_tick_at(&mut self, pos: BlockPos) {
         let state = self.state(pos);
+        horizon_threads::work::set_block(self.b.block(state).0);
         if self.b.is_randomly_ticking(state) {
             let (mut current, mut handled) = (state, false);
             self.level
@@ -314,8 +320,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 }
                 Class::BambooStalk => {
                     if b.table.int(state, p.stage) == 0 {
-                        // Vanilla's roll comes first; NeoForge asks the crop
-                        // hook only after the other checks.
+                        // Vanilla's roll comes first, in vanilla's order, before
+                        // the crop hook is asked.
                         let roll = self.rand_int(3) == 0;
                         if self.is_empty_block(above(pos))
                             && self.raw_brightness(above(pos), 0) >= 9
@@ -373,7 +379,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                         {
                             let next = self.growing_plant_grow_into_state(state);
                             self.set_block_and_update(growth, next);
-                            // NeoForge passes the new head as the original state.
+                            // The hook gets the new head as the original state.
                             let grown = self.state(growth);
                             self.level.crop_grow_post(growth, grown);
                         }
@@ -476,7 +482,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 Class::SweetBerryBush => {
                     let age = b.table.int(state, p.age);
                     if age < 3 {
-                        // Vanilla rolls before the light check; NeoForge after.
+                        // Vanilla rolls before the light check.
                         let roll = self.rand_int(5) == 0;
                         if self.raw_brightness(above(pos), 0) >= 9
                             && self.level.crop_grow_pre(pos, state, roll)
@@ -648,7 +654,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             "#minecraft:infiniburn_end" => &b.tags.infiniburn_end,
             _ => &b.tags.infiniburn_overworld,
         };
-        let infini = b.in_set(below_state, infiniburn);
+        let mut infini = None;
+        self.level
+            .before_is_fire_source(below_state, below(pos), &mut infini);
+        let infini = infini.unwrap_or_else(|| b.in_set(below_state, infiniburn));
         let age = b.table.int(state, p.age);
         let raining = self.level.is_raining();
         if !infini
@@ -672,7 +681,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 }
                 return;
             }
-            if age == 15 && self.rand_int(4) == 0 && !self.can_burn(self.below_state(pos)) {
+            if age == 15
+                && self.rand_int(4) == 0
+                && !self.can_burn(self.below_state(pos), below(pos), Direction::Up)
+            {
                 self.remove_block(pos, false);
                 return;
             }
@@ -688,7 +700,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             (Direction::North, 300),
             (Direction::South, 300),
         ] {
-            self.fire_check_burn_out(pos, rel(pos, direction), chance + extra, age);
+            self.fire_check_burn_out(pos, direction, chance + extra, age);
         }
         for xx in -1..=1 {
             for zz in -1..=1 {
@@ -703,7 +715,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     let test = pos.offset(xx, yy, zz);
                     let ignite = self.fire_ignite_odds_at(test);
                     if ignite > 0 {
-                        let mut odds = (ignite + 40 + self.level.difficulty() * 7) / (age + 30);
+                        let mut odds = (ignite
+                            .saturating_add(40)
+                            .saturating_add(self.level.difficulty() * 7))
+                            / (age + 30);
                         if burnout {
                             odds /= 2;
                         }
@@ -731,7 +746,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         Direction::ALL
             .into_iter()
-            .map(|d| self.ignite_odds(self.rel_state(pos, d)))
+            .map(|d| {
+                let at = rel(pos, d);
+                self.ignite_odds(self.state(at), at, d.opposite())
+            })
             .max()
             .unwrap_or(0)
     }
@@ -742,12 +760,14 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             || self.level.is_raining_at(rel(pos, Direction::North))
             || self.level.is_raining_at(rel(pos, Direction::South))
     }
-    /// `FireBlock.checkBurnOut` of the block at `pos` by the fire at `fire`.
-    fn fire_check_burn_out(&mut self, fire: BlockPos, pos: BlockPos, chance: i32, age: i32) {
+    /// `FireBlock.checkBurnOut` of the block beside the fire at `fire` in
+    /// `direction`: notify after the cancel gates, before replacing the block.
+    fn fire_check_burn_out(&mut self, fire: BlockPos, direction: Direction, chance: i32, age: i32) {
         let b = self.b;
-        let odds = self.burn_odds(self.state(pos));
+        let (pos, face) = (rel(fire, direction), direction.opposite());
+        let old = self.state(pos);
+        let odds = self.burn_odds(old, pos, face);
         if self.rand_int(chance) < odds {
-            let old = self.state(pos);
             let allowed = self.level.allow_spread(Spread::Fire, fire, pos);
             let mut burned = false;
             if self.rand_int(age + 10) < 5 && !self.level.is_raining_at(pos) {
@@ -757,10 +777,12 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     && self.level.allow_block_ignite(pos, "spread")
                 {
                     let next = self.fire_state_with_age(pos, new_age);
+                    self.level.on_caught_fire(self.ticks, old, pos, face);
                     self.set_block_and_update(pos, next);
                     burned = true;
                 }
             } else if allowed && self.level.allow_block_burn(pos) {
+                self.level.on_caught_fire(self.ticks, old, pos, face);
                 self.remove_block(pos, false);
                 burned = true;
             }
@@ -1786,6 +1808,8 @@ impl Behaviours {
         while let Ok(Some(tick)) = ticks.blocks.next_tick() {
             let mut sim = self.sim(level, ticks);
             let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
             if u32::from(self.block(state).0) == tick.kind.0 {
                 sim.tick_due_block(state, tick.pos);
             }
@@ -1806,7 +1830,10 @@ impl Behaviours {
         }
         while let Ok(Some(tick)) = ticks.fluids.next_tick() {
             let mut sim = self.sim(level, ticks);
-            let fluid = self.fluid(sim.state(tick.pos)).kind();
+            let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
+            let fluid = self.fluid(state).kind();
             if TickTypeId(fluid.tick_id()) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
@@ -1855,7 +1882,10 @@ impl Behaviours {
                 return false;
             };
             let mut sim = self.sim(level, ticks);
-            let fluid = self.fluid(sim.state(tick.pos)).kind();
+            let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
+            let fluid = self.fluid(state).kind();
             if TickTypeId(fluid.tick_id()) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
@@ -1865,6 +1895,8 @@ impl Behaviours {
             };
             let mut sim = self.sim(level, ticks);
             let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
             if u32::from(self.block(state).0) == tick.kind.0 {
                 sim.tick_due_block(state, tick.pos);
             }
@@ -1915,6 +1947,7 @@ impl Behaviours {
             return;
         }
         let (min_x, min_z) = (chunk.x * 16, chunk.z * 16);
+        horizon_threads::work::set_chunk(chunk.x, chunk.z);
         for _ in 0..speed {
             if level.random().next_int_bound(48).unwrap_or(1) == 0 {
                 let pos = ticks.block_random_pos(min_x, 0, min_z, 15);
@@ -2031,3 +2064,7 @@ impl RandomTickMask {
         self.0[i >> 6] >> (i & 63) & 1 != 0
     }
 }
+
+#[cfg(test)]
+#[path = "fire_tick_tests.rs"]
+mod fire_tick_tests;

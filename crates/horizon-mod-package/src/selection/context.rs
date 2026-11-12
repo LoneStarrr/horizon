@@ -25,7 +25,7 @@ pub fn data_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBu
     std::env::temp_dir()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ModSelectionContext {
     pub game_dir: PathBuf,
     pub home: PathBuf,
@@ -33,14 +33,14 @@ pub struct ModSelectionContext {
 }
 
 /// Arguments the game owns after the selection options have been consumed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Argument {
     Switch(String),
     Value(String, String),
     Dedicated(Vec<String>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LaunchArguments {
     pub context: ModSelectionContext,
     pub rest: Vec<Argument>,
@@ -126,9 +126,20 @@ impl LaunchArguments {
                     rest.push(Argument::Switch(arg));
                     break;
                 }
-                "--fullscreen" | "--session-stdin" | "--creative" | "--test-terrain"
-                | "--no-pause" | "--offscreen" | "--headless" | "--control" | "--server-thread"
-                | "--in-frame" | "--no-server-thread" | "--pregen" => {
+                "--developer-single-player"
+                | "--fullscreen"
+                | "--profile"
+                | "--session-stdin"
+                | "--creative"
+                | "--test-terrain"
+                | "--no-pause"
+                | "--offscreen"
+                | "--headless"
+                | "--control"
+                | "--server-thread"
+                | "--in-frame"
+                | "--no-server-thread"
+                | "--pregen" => {
                     rest.push(Argument::Switch(arg));
                 }
                 _ => {

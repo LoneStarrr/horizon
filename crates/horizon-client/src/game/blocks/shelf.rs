@@ -8,6 +8,10 @@ use horizon_core::{
 };
 use horizon_world::level::hit_slot;
 
+fn accepts(limit: Option<u32>, stack: Option<&horizon_client::items::ItemStack>) -> bool {
+    limit.is_none_or(|limit| stack.is_none_or(|stack| stack.count <= limit))
+}
+
 impl Game<'_> {
     /// Slot and facing for a click on a shelf's front face.
     pub(super) fn shelf_hit(&self, hit: &Hit) -> Option<(usize, Direction, bool)> {
@@ -99,7 +103,7 @@ impl Game<'_> {
 
     /// `ShelfBlock.useItemOn`: a single swap, or a connected hotbar swap while powered.
     pub(super) fn use_shelf(&mut self, hit: &Hit) -> Option<bool> {
-        use mod_api::first_person::Hand;
+        use mod_api::client::first_person::Hand;
         if self.hand != Hand::Main {
             return None;
         }
@@ -112,6 +116,7 @@ impl Game<'_> {
             let count = chain.len();
             for (i, p) in chain.into_iter().enumerate() {
                 let key = (p[0], p[1], p[2]);
+                let limit = self.world.container_stack_limit(key);
                 let Some(BlockEntity::Shelf(shelf)) = self.world.block_entities.get_mut(&key)
                 else {
                     continue;
@@ -122,6 +127,9 @@ impl Game<'_> {
                         continue;
                     }
                     let index = index as usize;
+                    if !accepts(limit, self.inventory[index].as_ref()) {
+                        continue;
+                    }
                     swapped |= self.inventory[index].is_some() || shelf.items[n].is_some();
                     std::mem::swap(&mut self.inventory[index], &mut shelf.items[n]);
                 }
@@ -142,6 +150,9 @@ impl Game<'_> {
         } else {
             let held = self.inventory[self.selected].clone();
             let key = (pos[0], pos[1], pos[2]);
+            if !accepts(self.world.container_stack_limit(key), held.as_ref()) {
+                return Some(false);
+            }
             let Some(BlockEntity::Shelf(shelf)) = self.world.block_entities.get_mut(&key) else {
                 return None;
             };
@@ -256,5 +267,18 @@ impl Game<'_> {
                 self.submit_item_world(&item, pose, light, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_limit_tests {
+    #[test]
+    fn shelf_swap_refuses_an_oversized_offer_without_capping_unmodified_shelves() {
+        let stack = horizon_client::items::ItemStack::new("minecraft:stick", 99);
+        assert!(super::accepts(None, Some(&stack)));
+        assert!(!super::accepts(Some(10), Some(&stack)));
+        assert!(super::accepts(Some(10), None));
+        let stack = horizon_client::items::ItemStack::new("minecraft:stick", 10);
+        assert!(super::accepts(Some(10), Some(&stack)));
     }
 }

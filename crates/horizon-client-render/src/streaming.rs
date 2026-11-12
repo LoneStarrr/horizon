@@ -9,7 +9,7 @@ use crate::{
     chunk::Chunk,
     chunk_map::ChunkMembershipDelta,
     graphics::LeafCullingMode,
-    light::{LightChanges, LightTables, apply_lighting, apply_relighting, light_chunk},
+    light::{LightChanges, LightTables, light_chunk},
     mesher::{MeshScratch, MeshTables, Mesher, Region, SectionMesh, borrow},
     world::World,
 };
@@ -29,37 +29,7 @@ pub const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Worker CPU time and job counts by kind, for benchmarks
 /// (`examples/gen_light_bench.rs`). Off unless enabled: a relaxed load per
 /// job then.
-pub mod job_stats {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    pub const KINDS: [&str; 7] = [
-        "load", "generate", "decorate", "finish", "light", "mesh", "other",
-    ];
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-    static COUNT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-    pub fn enable(on: bool) {
-        ENABLED.store(on, Ordering::Relaxed);
-    }
-    pub(super) fn enabled() -> bool {
-        ENABLED.load(Ordering::Relaxed)
-    }
-    pub(super) fn add(kind: usize, nanos: u64) {
-        NANOS[kind].fetch_add(nanos, Ordering::Relaxed);
-        COUNT[kind].fetch_add(1, Ordering::Relaxed);
-    }
-    /// (kind, nanoseconds, count) since the last call; resets them.
-    pub fn take() -> Vec<(&'static str, u64, u64)> {
-        (0..KINDS.len())
-            .map(|i| {
-                (
-                    KINDS[i],
-                    NANOS[i].swap(0, Ordering::Relaxed),
-                    COUNT[i].swap(0, Ordering::Relaxed),
-                )
-            })
-            .collect()
-    }
-}
+pub mod job_stats;
 /// A chunk under generation, opaque to the streamer.
 pub type Proto = Box<dyn std::any::Any + Send>;
 
@@ -328,7 +298,7 @@ enum Job {
     Decorate(i32, i32, Box<[Proto; 9]>, Vec<(usize, Chunk)>),
     Finish(Proto),
     Light(i32, i32, Box<Region>, u64, bool),
-    Mesh(i32, i32, i32, Box<Region>, u64, MeshSettings),
+    Mesh(i32, i32, i32, Arc<Region>, u64, MeshSettings),
     /// Proto chunks checked out to be saved (`ChunkGenerator::save_protos`),
     /// off the main thread like vanilla's IOWorker.
     Save(Vec<ProtoSave>),
@@ -600,8 +570,8 @@ pub struct Streaming {
     decoration_order: DecorationOrder,
     order_area: Option<((i32, i32), i32)>,
     /// What the queued jobs' priorities were computed from (`requeue`): the
-    /// centre, the band, and the extra areas.
-    queue_basis: (((i32, i32), Option<Band>), Vec<((i32, i32), i32)>),
+    /// centre, the band, the extra areas, and the forced chunks.
+    queue_basis: forced_ring::Basis,
     finishing: FxHashSet<(i32, i32)>,
     decorates: bool,
     /// `ChunkGenerator::decorates_beside_final`.
@@ -624,6 +594,12 @@ pub struct Streaming {
     saves: Arc<dyn Saves>,
     /// Results received while `save` waited, for the next `update`.
     deferred: Vec<Done>,
+    /// Per-update collection scratch, retained to avoid allocator churn while
+    /// the view is moving or many columns are dirty.
+    light_scratch: Vec<(i64, i32, i32)>,
+    gone_scratch: Vec<(i32, i32)>,
+    mesh_candidates_scratch: Vec<(i64, i32, i32, SectionMask)>,
+    mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
     sequence: u64,
     pub center: (i32, i32),
     /// The view distance around `center`; below 0, no area there (a dedicated
@@ -638,6 +614,9 @@ pub struct Streaming {
     mod_tickets: ModTickets,
     /// No work is scheduled while paused (title screen).
     pub paused: bool,
+    /// Finished meshes the renderer has not taken yet (the game's pending
+    /// uploads): they count against the meshing room as the jobs do.
+    pub upload_backlog: usize,
     /// Dimension flags: sky light, Nether face shading.
     pub sky_light: bool,
     pub nether_shading: bool,
@@ -691,6 +670,9 @@ pub struct Streaming {
     /// Set while `update` runs, after it refreshed `cover`: nothing else can
     /// change `extra` meanwhile, so `cover` answers without comparing them.
     cover_current: bool,
+    /// The combined `forced` set as each column's distance to the nearest one, made again when
+    /// they change; read like `cover`, while `cover_current`.
+    forced_cover: Option<ForcedCover>,
     /// Mesh the sections for drawing (false on a server thread).
     pub mesh: bool,
     /// The pregeneration band (`set_band`).
@@ -888,6 +870,7 @@ impl GenerationScan {
                 extra: input.ranges.extra,
                 forced: input.ranges.forced,
                 cover: input.ranges.cover,
+                forced_cover: None,
                 band: input.ranges.band,
             };
             self.remember(ranges, input.world);
@@ -1158,6 +1141,16 @@ pub struct WorkerContext {
     /// for none.
     pub hidden_states: Arc<[bool]>,
 }
+mod bounded;
+mod dynamic_emission;
+mod queue_census;
+pub use queue_census::QueueCensus;
+mod forced_cover;
+mod forced_ring;
+mod relight_now;
+use bounded::nearest_first;
+use dynamic_emission::light_region_ready;
+use forced_cover::ForcedCover;
 impl Streaming {
     pub fn new<G: ChunkGenerator>(
         generator: Arc<G>,
@@ -1232,6 +1225,10 @@ impl Streaming {
             written: Default::default(),
             saves,
             deferred: Vec::new(),
+            light_scratch: Vec::new(),
+            gone_scratch: Vec::new(),
+            mesh_candidates_scratch: Vec::new(),
+            mesh_columns_scratch: Vec::new(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -1239,6 +1236,7 @@ impl Streaming {
             commanded: HashSet::new(),
             mod_tickets: ModTickets::default(),
             paused: false,
+            upload_backlog: 0,
             sky_light: true,
             nether_shading: false,
             shader_pack_lighting: false,
@@ -1262,6 +1260,7 @@ impl Streaming {
             extra: Vec::new(),
             cover: None,
             cover_current: false,
+            forced_cover: None,
             mesh: true,
             band: None,
             band_ranked: None,
@@ -1288,13 +1287,12 @@ impl Streaming {
     /// The resident sections `LevelExtractor.allChanged` queues again. An
     /// unlit column will queue itself when its light job completes.
     fn mark_loaded_sections_dirty(world: &mut World, lit: &FxHashSet<(i32, i32)>) {
+        let mask = SectionMask::below(world.layout().sections());
         for &(x, z) in world.chunks.keys() {
             if !lit.contains(&(x, z)) {
                 continue;
             }
-            for sy in 0..world.layout().sections() as i32 {
-                world.dirty_sections.insert((x, sy, z));
-            }
+            world.dirty_sections.insert_column_mask((x, z), mask);
         }
     }
     /// A column received from a server, with the light it sent
@@ -1307,10 +1305,12 @@ impl Streaming {
         world.chunks.insert(key, Arc::new(chunk));
         self.lit.insert(key);
         self.generated_total += 1;
+        let mask = SectionMask::below(world.layout().sections());
         for dz in -1..=1 {
             for dx in -1..=1 {
-                for sy in 0..world.layout().sections() as i32 {
-                    world.dirty_sections.insert((key.0 + dx, sy, key.1 + dz));
+                let n = (key.0 + dx, key.1 + dz);
+                if n == key || world.chunks.contains_key(&n) {
+                    world.dirty_sections.insert_column_mask(n, mask);
                 }
             }
         }
@@ -1431,11 +1431,9 @@ impl Streaming {
     /// render distance 32 nothing was decorated until every proto chunk had
     /// been generated.
     fn requeue(&mut self) {
-        let basis = (self.center, self.band);
-        if self.queue_basis.0 == basis && self.queue_basis.1 == self.extra {
+        if !forced_ring::basis_changed(self) {
             return;
         }
-        self.queue_basis = (basis, self.extra.clone());
         let mut queue = self.shared.queue.lock().unwrap();
         rank_again(&mut queue, |x, z| self.distance(x, z));
     }
@@ -1549,6 +1547,7 @@ impl Streaming {
         let loaded = chunk.light_loaded;
         let new = self.dropped_new.remove(&key) || chunk.generated;
         world.loaded_chunks.push((key.0, key.1, new));
+        chunk.dynamic_pending = self.light_tables.holds_dynamic(&chunk);
         world.chunks.insert(key, Arc::new(chunk));
         if loaded {
             self.lit.insert(key);
@@ -1629,7 +1628,7 @@ impl Streaming {
             z,
         )
     }
-    fn region(world: &World, x: i32, z: i32) -> Option<Box<Region>> {
+    fn region(world: &World, x: i32, z: i32) -> Option<Arc<Region>> {
         let mut region: Region = Default::default();
         for dz in 0..3 {
             for dx in 0..3 {
@@ -1641,7 +1640,7 @@ impl Streaming {
                 );
             }
         }
-        Some(Box::new(region))
+        Some(Arc::new(region))
     }
     pub fn is_lit(&self, x: i32, z: i32) -> bool {
         self.lit.contains(&(x, z))
@@ -1783,6 +1782,7 @@ impl Streaming {
 
     /// Start planning, yielding before any late-generated column is saved.
     pub fn begin_plan_update(&mut self, world: &mut World) -> PlanStep {
+        let mut hz_laps = crate::spans::laps();
         if self.paused {
             return PlanStep::Ready(StreamingUpdate {
                 uploads: Vec::new(),
@@ -1792,6 +1792,7 @@ impl Streaming {
             });
         }
         ExtraCover::refresh(&mut self.cover, &self.extra);
+        ForcedCover::refresh(&mut self.forced_cover, &self.forced);
         self.cover_current = true;
         // The sweeps below walk every loaded column and proto chunk. Run them
         // at once when the view moves and every eighth tick otherwise: a
@@ -1802,6 +1803,7 @@ impl Streaming {
         self.scan_age = if sweep { 0 } else { self.scan_age + 1 };
         self.requeue();
         self.relight_edits(world);
+        hz_laps.lap("st_relight_edits");
         let deferred = std::mem::take(&mut self.deferred).into_iter();
         let received = self.shared.done.take();
         self.resume_plan_update(
@@ -1818,6 +1820,7 @@ impl Streaming {
 
     /// Resume processing the same batch after the caller saves a late column.
     pub fn resume_plan_update(&mut self, world: &mut World, mut resume: PlanResume) -> PlanStep {
+        let mut hz_laps = crate::spans::laps();
         while let Some(done) = resume
             .deferred
             .next()
@@ -1851,38 +1854,7 @@ impl Streaming {
                     }
                     self.lighting.remove(&(x, z));
                     let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
-                    if let Some(chunk) = world.chunks.get_mut(&(x, z)) {
-                        let chunk = Arc::make_mut(chunk);
-                        // Keep blocks edited since the snapshot; take only light.
-                        // A chunk relit (a neighbour loaded or changed) remeshes
-                        // only around the light that changed, as vanilla's light
-                        // updates dirty only their sections (#270).
-                        let first = self.lit.insert((x, z));
-                        let mut changed = LightChanges::default();
-                        if first {
-                            apply_lighting(chunk, sections);
-                        } else {
-                            apply_relighting(chunk, sections, &mut changed);
-                        }
-                        // Saved unlit (at the edge of what was loaded), or its light
-                        // changed: saved again.
-                        if (first && !chunk.light_loaded) || !changed.is_empty() {
-                            world.modified.insert((x, z));
-                        }
-                        chunk.lit = true;
-                        if first {
-                            for dz in -1..=1 {
-                                for dx in -1..=1 {
-                                    for sy in 0..world.layout().sections() as i32 {
-                                        world.dirty_sections.insert((x + dx, sy, z + dz));
-                                    }
-                                }
-                            }
-                        } else {
-                            Self::mark_light_changes(world, &changed);
-                        }
-                        self.replay_light_edits(world, x, z, snapshot);
-                    }
+                    self.apply_lit(world, x, z, sections, snapshot);
                 }
                 Done::Meshed(x, sy, z, mesh, seq) => {
                     if self.meshing.get(&(x, sy, z)) != Some(&seq) {
@@ -1903,6 +1875,7 @@ impl Streaming {
                 }
             }
         }
+        hz_laps.lap("st_results");
         self.free(resume.stale);
         let far = if resume.sweep {
             plan_unloads(world, |x, z| {
@@ -1952,6 +1925,7 @@ impl Streaming {
                 Vec::new(),
             );
         }
+        let mut hz_laps = crate::spans::laps();
         let mut removed = Vec::new();
         let mut proto_saves = Vec::new();
         if sweep {
@@ -2012,6 +1986,7 @@ impl Streaming {
             }
             proto_saves = self.checkout_protos(written);
         }
+        hz_laps.lap("st_sweep");
         (
             StreamingCommit {
                 uploads,
@@ -2036,13 +2011,22 @@ impl Streaming {
         if paused {
             return (uploads, removed);
         }
+        let mut light = std::mem::take(&mut self.light_scratch);
+        light.clear();
+        let mut gone = std::mem::take(&mut self.gone_scratch);
+        gone.clear();
+        let mut candidates = std::mem::take(&mut self.mesh_candidates_scratch);
+        candidates.clear();
+        let mut columns = std::mem::take(&mut self.mesh_columns_scratch);
+        columns.clear();
+        let mut hz_laps = crate::spans::laps();
         let (protos, finishing) = (&self.protos, &self.finishing);
         self.decorated.retain(|k| {
             protos.contains_key(k) || finishing.contains(k) || world.chunks.contains_key(k)
         });
         // Finalize chunks whose neighbourhood is decorated.
-        let candidates: Vec<(i32, i32)> = self.protos.keys().copied().collect();
-        for (x, z) in candidates {
+        let finalize_candidates: Vec<(i32, i32)> = self.protos.keys().copied().collect();
+        for (x, z) in finalize_candidates {
             if world.chunks.contains_key(&(x, z))
                 || self.finishing.contains(&(x, z))
                 || !self.in_range(x, z, 1)
@@ -2067,6 +2051,7 @@ impl Streaming {
                 self.submit(Some((x, z)), 0, Job::Finish(proto));
             }
         }
+        hz_laps.lap("st_finalize");
         // Decorate chunks whose 3x3 proto neighbourhood is available, in
         // vanilla's order: decoration is order dependent where write regions
         // overlap (see `DecorationOrder`).
@@ -2085,6 +2070,7 @@ impl Streaming {
                 extra: &self.extra,
                 forced: &self.forced,
                 cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+                forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
                 band: self.band.as_ref(),
             };
             let (protos, generating) = (&self.protos, &self.generating);
@@ -2157,22 +2143,22 @@ impl Streaming {
                 if keys.iter().any(|k| self.decorating_finals.contains(k)) {
                     continue;
                 }
+                let has_final = keys.iter().any(|k| world.chunks.contains_key(k));
+                if has_final && !self.saves_beside_final {
+                    self.decorated.insert((x, z));
+                    waiting.borrow_mut().insert((x, z), false);
+                    continue;
+                }
+                if !keys.iter().all(|k| {
+                    world.chunks.contains_key(k) || matches!(self.protos.get(k), Some(Some(_)))
+                }) {
+                    continue;
+                }
                 let finals: Vec<(usize, Chunk)> = keys
                     .iter()
                     .enumerate()
                     .filter_map(|(i, k)| Some((i, (**world.chunks.get(k)?).clone())))
                     .collect();
-                if !finals.is_empty() && !self.saves_beside_final {
-                    self.decorated.insert((x, z));
-                    waiting.borrow_mut().insert((x, z), false);
-                    continue;
-                }
-                if !keys.iter().enumerate().all(|(i, k)| {
-                    finals.iter().any(|(f, _)| *f == i)
-                        || matches!(self.protos.get(k), Some(Some(_)))
-                }) {
-                    continue;
-                }
                 let region: Box<[Proto; 9]> = Box::new(std::array::from_fn(|i| {
                     let k = &keys[i];
                     if finals.iter().any(|(f, _)| *f == i) {
@@ -2190,7 +2176,9 @@ impl Streaming {
                 self.submit(Some((x, z)), 1, Job::Decorate(x, z, region, finals));
             }
         }
+        hz_laps.lap("st_decorate");
         self.schedule_generation(world, workers);
+        hz_laps.lap("st_generate");
         // Lighting once all neighbours exist, nearest first and only as
         // much of it as the workers can chew. Vanilla's light engine also
         // hands a bounded queue to its workers and reschedules what did
@@ -2199,8 +2187,6 @@ impl Streaming {
         // grew with the render distance and outlived the columns they
         // were queued for (#3629). What stays in `dirty_light` is asked
         // for again, from the current centre, as capacity frees.
-        let mut light: Vec<(i64, i32, i32)> = Vec::new();
-        let mut gone: Vec<(i32, i32)> = Vec::new();
         for &(x, z) in world.dirty_light.iter() {
             if !world.chunks.contains_key(&(x, z)) {
                 gone.push((x, z));
@@ -2208,12 +2194,12 @@ impl Streaming {
                 light.push((self.distance(x, z), x, z));
             }
         }
-        for key in gone {
+        for key in gone.drain(..) {
             world.dirty_light.remove(&key);
         }
         let room = (self.workers * 4).saturating_sub(self.lighting.len());
         nearest_first(&mut light, room);
-        for (_, x, z) in light {
+        for (_, x, z) in light.drain(..) {
             let Some(region) = self.light_region(world, x, z) else {
                 continue;
             };
@@ -2228,10 +2214,15 @@ impl Streaming {
                 Job::Light(x, z, region, self.sequence, self.sky_light),
             );
         }
+        hz_laps.lap("st_light");
         // A server draws nothing: its sections are never meshed.
         if !self.mesh {
             world.dirty_sections.clear();
             self.cover_current = false;
+            self.light_scratch = light;
+            self.gone_scratch = gone;
+            self.mesh_candidates_scratch = candidates;
+            self.mesh_columns_scratch = columns;
             return (uploads, removed);
         }
         // Meshing once the column and its neighbours are lit, and the column
@@ -2248,6 +2239,7 @@ impl Streaming {
                 extra: &self.extra,
                 forced: &self.forced,
                 cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+                forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
                 band: self.band.as_ref(),
             };
             self.waiting.retain(|&(x, sy, z)| {
@@ -2258,11 +2250,11 @@ impl Streaming {
                 !back
             });
         }
+        hz_laps.lap("st_waiting");
         // Column by column: the checks below hold for all of a column's
         // sections, and columns waiting for light cost one look per frame.
-        let mut candidates: Vec<(i64, i32, i32, SectionMask)> = Vec::new();
-        let columns: Vec<_> = world.dirty_sections.columns().collect();
-        for ((x, z), sections) in columns {
+        columns.extend(world.dirty_sections.columns());
+        for ((x, z), sections) in columns.iter().copied() {
             if !world.chunks.contains_key(&(x, z)) {
                 world.dirty_sections.take_column(x, z);
                 continue;
@@ -2291,6 +2283,7 @@ impl Streaming {
             }
             candidates.push((self.distance(x, z), x, z, sections));
         }
+        hz_laps.lap("st_candidates");
         // Nearest first, and only as many sections as the workers can chew.
         // Every ready column used to be submitted at once, so at a wide
         // render distance the queue — and `meshing`, and each job's 3x3
@@ -2298,9 +2291,12 @@ impl Streaming {
         // jobs went stale long before a worker reached them (#3629). What
         // stays dirty is asked for again, from the current centre, as
         // capacity frees; `requeue` then has a small queue to keep close.
-        let room = (self.workers * 32).saturating_sub(self.meshing.len());
+        // Meshes waiting for upload count too: when uploads fall behind (a
+        // low frame rate at a wide distance), meshing on held gigabytes of
+        // them until the system swapped.
+        let room = (self.workers * 32).saturating_sub(self.meshing.len() + self.upload_backlog);
         nearest_first(&mut candidates, room);
-        for (_, x, z, sections) in candidates {
+        for (_, x, z, sections) in candidates.drain(..) {
             let Some(region) = Self::region(world, x, z) else {
                 continue;
             };
@@ -2336,6 +2332,10 @@ impl Streaming {
             }
         }
         self.cover_current = false;
+        self.light_scratch = light;
+        self.gone_scratch = gone;
+        self.mesh_candidates_scratch = candidates;
+        self.mesh_columns_scratch = columns;
         (uploads, removed)
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
@@ -2346,6 +2346,7 @@ impl Streaming {
                 extra: &self.extra,
                 forced: &self.forced,
                 cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+                forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
                 band: self.band.as_ref(),
             },
             world,
@@ -2461,10 +2462,14 @@ impl Streaming {
         world.dirty_light.extend(columns);
     }
     /// Sections whose meshes sample a changed light value (faces and corners
-    /// read light from neighbouring blocks).
+    /// read light from neighbouring blocks). Every column whose stored light
+    /// changed is saved again (`ChunkHolder.sectionLightChanged` marks the
+    /// chunk unsaved): an edit's light reaches up to 15 blocks into columns
+    /// the edit itself did not mark, which may already have been saved.
     fn mark_light_changes(world: &mut World, changed: &LightChanges) {
-        if let Some(log) = &mut world.light_log {
-            for (x, sy, z) in changed.sections() {
+        for (x, sy, z) in changed.sections() {
+            world.modified.insert((x, z));
+            if let Some(log) = &mut world.light_log {
                 log.entry((x, z)).or_default().insert(sy as usize);
             }
         }
@@ -2479,6 +2484,7 @@ impl Streaming {
             extra: &self.extra,
             forced: &self.forced,
             cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+            forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
             band: self.band.as_ref(),
         }
     }
@@ -2926,6 +2932,8 @@ struct Ranges<'a> {
     /// `extra` indexed by a grid or buckets: coverage queries without a
     /// scan of every area.
     cover: Option<&'a ExtraCover>,
+    /// The combined `forced` set by distance (`Streaming::forced_cover`), while it matches.
+    forced_cover: Option<&'a ForcedCover>,
     band: Option<&'a Band>,
 }
 /// The chunks a pregeneration task (`/pregen`) wants lit now: rows `z0..=z1`
@@ -2974,6 +2982,7 @@ impl Band {
             + i64::from(x - self.x0 + 8).max(0)
     }
 }
+
 /// For every column near the extra areas, how far it lies outside the
 /// nearest one's square (Chebyshev distance less its radius; 0 inside). A server has an area per player, and streaming asks of every
 /// loaded and wanted column whether one reaches it, several times a tick:
@@ -3210,7 +3219,7 @@ impl Ranges<'_> {
             _ => own,
         }
     }
-    fn distance(&self, x: i32, z: i32) -> i64 {
+    fn player_distance(&self, x: i32, z: i32) -> i64 {
         let d = |c: (i32, i32)| {
             let (dx, dz) = (i64::from(x - c.0), i64::from(z - c.1));
             dx * dx + dz * dz
@@ -3292,19 +3301,7 @@ impl Ranges<'_> {
         if self.radius >= 0 && dx * dx + dz * dz <= r * r {
             return true;
         }
-        // A forced chunk holds a FORCED ticket at level 31
-        // (`ChunkMap.FORCED_TICKET_LEVEL`), and the level rises one per ring
-        // (`ChunkTracker.computeLevelFromNeighbor`): the margin is the
-        // vanilla status ring the caller asks for.
-        let reach = match margin {
-            1 => FORCED_FULL_RING,
-            2 => FORCED_FEATURES_RING,
-            3 => FORCED_TERRAIN_RING,
-            _ => margin + 1,
-        };
-        self.forced
-            .iter()
-            .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
+        self.near_forced(x, z, margin)
     }
 }
 impl Drop for Streaming {
@@ -3356,46 +3353,6 @@ fn release_columns(queue: &mut BinaryHeap<Queued>, gone: &FxHashSet<(i32, i32)>)
     let released = before - kept.len();
     *queue = BinaryHeap::from(kept);
     released
-}
-/// Whether the 3x3 a light job for (x, z) reads is all there: every
-/// neighbour a finished column, or a decorated proto chunk past the area
-/// (the last FULL ring lights against neighbours at FEATURES, as
-/// `Streaming::light_region` reads them).
-fn light_region_ready(
-    world: &World,
-    in_range: impl Fn(i32, i32) -> bool,
-    decorated: &FxHashSet<(i32, i32)>,
-    protos: &FxHashMap<(i32, i32), Option<Proto>>,
-    x: i32,
-    z: i32,
-) -> bool {
-    for dz in 0..3 {
-        for dx in 0..3 {
-            let n = (x + dx - 1, z + dz - 1);
-            if world.chunks.contains_key(&n)
-                || (!in_range(n.0, n.1)
-                    && decorated.contains(&n)
-                    && matches!(protos.get(&n), Some(Some(_))))
-            {
-                continue;
-            }
-            return false;
-        }
-    }
-    true
-}
-/// The nearest `room` of the `candidates`, ordered: the light and mesh
-/// stages submit bounded work, chosen from everything that is ready each
-/// `update`, so what runs is always the nearest of what is left — chosen
-/// again, from the current centre, as capacity frees, the way vanilla's
-/// chunk task queues follow the current ticket levels. The selection is
-/// O(n); the sort orders only what is submitted.
-fn nearest_first<T: Ord>(candidates: &mut Vec<T>, room: usize) {
-    if candidates.len() > room {
-        candidates.select_nth_unstable(room);
-        candidates.truncate(room);
-    }
-    candidates.sort_unstable();
 }
 /// What `keep_unchanged_sections` found changed.
 #[derive(Debug, Default, PartialEq)]
@@ -4056,6 +4013,7 @@ mod tests {
             extra: &[],
             forced: &forced,
             cover: None,
+            forced_cover: None,
             band: None,
         };
         let generate = |x, z, priority, order| Queued {
@@ -4152,37 +4110,6 @@ mod tests {
         let all: FxHashSet<(i32, i32)> = [(0, 0), (1, 0), (9, 9)].into_iter().collect();
         assert_eq!(release_columns(&mut queue, &all), 4);
         assert_eq!(pops(queue), [None]);
-    }
-
-    /// The light and mesh stages submit bounded work, the nearest first:
-    /// what exceeds the room stays dirty, to be chosen again — from the
-    /// current centre — as capacity frees. Submitted whole, the queue once
-    /// held every ready column's jobs and grew with the render distance
-    /// (#3629); ties break by position, so the choice is deterministic.
-    #[test]
-    fn bounded_submission_takes_the_nearest_first() {
-        let candidates: Vec<(i64, i32, i32, u32)> = (0..40i32)
-            .map(|i| {
-                let (x, z) = (i / 8 - 2, i % 8 - 3);
-                (
-                    i64::from((x - 3).pow(2) + (z - 2).pow(2)),
-                    x,
-                    z,
-                    1 << (i % 24),
-                )
-            })
-            .collect();
-        let mut expected = candidates.clone();
-        expected.sort_unstable();
-        let mut none = candidates.clone();
-        nearest_first(&mut none, 0);
-        assert!(none.is_empty());
-        let mut nearest = candidates;
-        nearest_first(&mut nearest, 5);
-        assert_eq!(nearest, expected[..5]);
-        let mut past = expected.clone();
-        nearest_first(&mut past, expected.len() + 10);
-        assert_eq!(past, expected);
     }
 
     /// What the scheduler counts as ready to light: every neighbour a
@@ -4326,6 +4253,7 @@ mod tests {
                     extra: &self.extra,
                     forced: &self.forced,
                     cover: None,
+                    forced_cover: None,
                     band: None,
                 },
                 world: &self.world,
@@ -4708,6 +4636,7 @@ mod tests {
                     extra: &[],
                     forced: &forced,
                     cover: None,
+                    forced_cover: None,
                     band: None,
                 };
                 let square = |x: i32, z: i32, n: i32| {
@@ -4764,6 +4693,7 @@ mod tests {
                     extra: &[((radius * 2 + 9, 3), 4)],
                     forced: &forced,
                     cover: None,
+                    forced_cover: None,
                     band: None,
                 };
                 let span = radius * 3 + 20;
@@ -4800,6 +4730,7 @@ mod tests {
             extra: &extra,
             forced: &forced,
             cover: None,
+            forced_cover: None,
             band: None,
         };
         for x in -5i32..=15 {
@@ -4833,6 +4764,7 @@ mod tests {
                 extra: &extra,
                 forced: &forced,
                 cover: None,
+                forced_cover: None,
                 band: None,
             };
             let level = |x: i32, z: i32| 31 + ((x - 40).abs().max((z + 9).abs()) - view).max(0);
@@ -4887,6 +4819,7 @@ mod tests {
             extra: &[],
             forced: &forced,
             cover: None,
+            forced_cover: None,
             band: None,
         };
         let level = |x: i32, z: i32| 31 + (x - 40).abs().max((z + 40).abs());
@@ -4920,6 +4853,38 @@ mod tests {
                 -40 + dz
             );
         }
+    }
+
+    /// An edit's light change in a neighbouring column marks that column
+    /// unsaved too, or a column saved before the edit keeps its old light on
+    /// disk.
+    #[test]
+    fn light_spilling_into_a_saved_neighbour_marks_it_unsaved() {
+        use crate::light::tests::{AIR, TORCH, tables, world};
+        let tables = tables();
+        let mut w = World::new(horizon_world::registry::BlockStateId(0), 0);
+        for (key, chunk) in world(|c| {
+            c.set(14, 0, 8, TORCH);
+        }) {
+            w.chunks.insert(key, chunk);
+        }
+        assert!(w.modified.is_empty());
+        Arc::make_mut(w.chunks.get_mut(&(0, 0)).unwrap()).set(14, 0, 8, AIR);
+        let mut changed = crate::light::LightChanges::default();
+        crate::light::relight(
+            &mut w.chunks,
+            &tables,
+            true,
+            &[(14, 0, 8)],
+            false,
+            &mut changed,
+        );
+        assert_eq!(w.chunks[&(1, 0)].light(0, 0, 8) & 15, 0); // was 12
+        Streaming::mark_light_changes(&mut w, &changed);
+        assert!(w.modified.contains(&(1, 0)));
+        assert!(w.modified.contains(&(0, 0)));
+        // The torch never reached x -1: that column's light is unchanged.
+        assert!(!w.modified.contains(&(-1, 0)));
     }
 
     fn resident_column(world: &mut World, light: u8) -> Chunk {
@@ -4994,6 +4959,7 @@ mod cover_tests {
                 extra: &extra,
                 forced: &forced,
                 cover,
+                forced_cover: None,
                 band: None,
             };
             let (scan, grid) = (ranges(None), ranges(Some(&cover)));
@@ -5036,6 +5002,7 @@ mod cover_tests {
                 extra: &extra,
                 forced: &forced,
                 cover,
+                forced_cover: None,
                 band: None,
             };
             let (scan, buckets) = (ranges(None), ranges(Some(&cover)));
@@ -5101,6 +5068,7 @@ mod cover_tests {
                 extra: &extra,
                 forced: &forced,
                 cover,
+                forced_cover: None,
                 band: None,
             };
             // The columns streaming asks about: everything kept, and the

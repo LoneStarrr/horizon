@@ -20,6 +20,7 @@ use horizon_core::{
     position::BlockPos,
     random::{LegacyRandom, RandomSource},
 };
+use horizon_world::level::Ticks;
 
 pub(super) struct Bolt {
     /// The entity id a server's players know it by (0 until it has one).
@@ -55,6 +56,13 @@ fn in_viewer_box(bolt: [f64; 3], p: [f64; 3]) -> bool {
         && p[1] >= bolt[1] - 15.0
         && p[1] <= bolt[1] + 21.0
 }
+
+/// `ServerLevel.tickThunder` -> `Level.getBlockRandomPos(minX, 0, minZ, 15)`:
+/// picks the strike column from the level's separate `randValue` LCG.
+fn thunder_strike_column(ticks: &mut Ticks, cx: i32, cz: i32) -> (i32, i32) {
+    let r = ticks.block_random_pos(cx * 16, 0, cz * 16, 15);
+    (r.x, r.z)
+}
 impl Game<'_> {
     /// `ServerChunkCache.tickSpawningChunk`: one `tickThunder` roll per
     /// spawning chunk (within 128 blocks of a player) that is in entity
@@ -80,8 +88,7 @@ impl Game<'_> {
                 continue;
             }
             // getBlockRandomPos(minX, 0, minZ, 15)
-            let r = self.world.random.next_int();
-            let (x, z) = (cx * 16 + (r & 15), cz * 16 + (r >> 16 & 15));
+            let (x, z) = thunder_strike_column(&mut self.block_ticks, cx, cz);
             let Some(pos) = self.lightning_target(x, z) else {
                 continue;
             };
@@ -348,6 +355,7 @@ impl Game<'_> {
     }
     /// `LightningBolt.tick` for every bolt.
     pub(super) fn tick_bolts(&mut self) {
+        let _save_lease = horizon_client::join_seq::visibility::PassLease::enter();
         let mut bolts = std::mem::take(&mut self.bolts);
         bolts.retain_mut(|b| {
             if b.life == 2 {
@@ -438,14 +446,14 @@ impl Game<'_> {
                     // is the same block as before, so its placement does not schedule
                     // it, and without this it stayed powered for good.
                     b.schedule_tick(level, ticks, BlockPos::new(p[0], p[1], p[2]), 8);
-                    if level.redstone_experiments {
-                        b.lightning_rod_update_neighbors(
-                            level,
-                            ticks,
-                            BlockPos::new(p[0], p[1], p[2]),
-                            state,
-                        );
-                    }
+                    // `updateNeighbours`: unconditional; the experiments only decide
+                    // whether the update carries an orientation.
+                    b.lightning_rod_update_neighbors(
+                        level,
+                        ticks,
+                        BlockPos::new(p[0], p[1], p[2]),
+                        state,
+                    );
                 });
             }
             // Level event 3002 with the rod's axis: sparks along it.
@@ -684,11 +692,50 @@ impl Game<'_> {
             }
             match h {
                 EntityHandle::Boat(i) => {
-                    self.hurt_boat(i, 5.0, false);
+                    let id = self.boats[i].id;
+                    let kind = self.boats[i].entity_type();
+                    let source = horizon_client::health::HurtSource {
+                        damage_type: "minecraft:lightning_bolt",
+                        causing: bolt as i32,
+                        direct: bolt as i32,
+                        position: Some(at),
+                    };
+                    let vanilla = self.saved_refuses_damage(id, "minecraft:lightning_bolt", false);
+                    if !self.native_nonliving_invulnerable(id, &kind, source, vanilla) {
+                        self.hurt_boat(i, 5.0, false);
+                    }
                 }
-                EntityHandle::Cart(i) => self.hurt_cart(i, 5.0, false, false),
-                EntityHandle::Orb(i) if self.orbs[i].hurt(5.0) => {
-                    self.orbs.remove(i);
+                EntityHandle::Cart(i) => {
+                    let (id, kind) = (self.carts[i].id, self.carts[i].kind.id());
+                    let source = horizon_client::health::HurtSource {
+                        damage_type: "minecraft:lightning_bolt",
+                        causing: bolt as i32,
+                        direct: bolt as i32,
+                        position: Some(at),
+                    };
+                    let vanilla = self.saved_refuses_damage(id, "minecraft:lightning_bolt", false);
+                    if !self.native_nonliving_invulnerable(id, kind, source, vanilla) {
+                        self.hurt_cart(i, 5.0, false, false);
+                    }
+                }
+                EntityHandle::Orb(i) => {
+                    let id = self.orbs[i].id;
+                    let source = horizon_client::health::HurtSource {
+                        damage_type: "minecraft:lightning_bolt",
+                        causing: bolt as i32,
+                        direct: bolt as i32,
+                        position: Some(at),
+                    };
+                    let vanilla = self.saved_refuses_damage(id, "minecraft:lightning_bolt", false);
+                    if !self.native_nonliving_invulnerable(
+                        id,
+                        "minecraft:experience_orb",
+                        source,
+                        vanilla,
+                    ) && self.orbs[i].hurt(5.0)
+                    {
+                        self.orbs.remove(i);
+                    }
                 }
                 _ => {}
             }
@@ -763,7 +810,7 @@ impl Game<'_> {
 impl Game<'_> {
     /// `EntityStruckByLightningEvent`, before `thunderHit` on entity `entity`
     /// from bolt `bolt`: false when a mod cancelled the hit. The entity still
-    /// counts as struck (`hitEntities`), as in NeoForge.
+    /// counts as struck (`hitEntities`).
     fn lightning_may_strike(&mut self, entity: u32, bolt: u32) -> bool {
         if !self.native_authoritative()
             || !mod_api::__private::listened(mod_api::HookId::EntityStruckByLightning)
@@ -846,6 +893,45 @@ mod tests {
         });
     }
 
+    /// `LightningRodBlock.onLightningStrike` updates the neighbours of the block
+    /// in front of the rod whether or not redstone experiments are on (#14371):
+    /// a wire beside that block is strongly powered by the struck rod.
+    #[test]
+    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    fn a_struck_rod_updates_the_wire_beside_the_block_behind_it() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let registry = game.pack.assets.registry;
+        let stone = registry.default_state("minecraft:stone").unwrap();
+        let wire = registry.default_state("minecraft:redstone_wire").unwrap();
+        let mut rod = registry
+            .state(registry.default_state("minecraft:lightning_rod").unwrap())
+            .cloned()
+            .unwrap();
+        rod.properties.insert("facing".into(), "up".into());
+        let rod = registry.id(&rod).unwrap();
+        // The rod on stone at (8, 64, 8); wire on stone beside that block.
+        game.world.set(8, 64, 8, stone).unwrap();
+        game.world.set(9, 63, 8, stone).unwrap();
+        game.world.set(9, 64, 8, wire).unwrap();
+        game.world.set(8, 65, 8, rod).unwrap();
+        assert!(
+            !game
+                .level
+                .enabled_features
+                .iter()
+                .any(|feature| feature == "minecraft:redstone_experiments")
+        );
+        game.strike_rod([8.5, 66.0, 8.5]);
+        let power = registry
+            .state(game.world.block(9, 64, 8))
+            .unwrap()
+            .properties
+            .get("power")
+            .cloned();
+        assert_eq!(power.as_deref(), Some("15"));
+    }
+
     #[test]
     fn viewer_box_reaches_15_around_and_down_and_21_up() {
         let bolt = [0.0, 64.0, 0.0];
@@ -860,9 +946,10 @@ mod tests {
     #[ignore = "needs prepared resources"]
     fn conversion_post_reads_original_and_lightning_outcome() {
         use mod_api::{
-            __private::install, EntityJoinLevelEvent, EquipmentSlot, Flow, Hooks,
-            LivingConversionPostEvent, LivingConversionPreEvent,
+            EntityJoinLevelEvent, EquipmentSlot, Flow, Hooks, LivingConversionPostEvent,
+            LivingConversionPreEvent,
         };
+        use mod_platform::__private::install;
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1096,6 +1183,21 @@ mod tests {
         });
     }
 
+    /// `ServerLevel.tickThunder` picks its strike column from `Level.randValue`
+    /// (`Ticks::block_random_pos`), using bits `2..=5` for X and `10..=13` for Z
+    /// rather than drawing from `Level.random`.
+    #[test]
+    fn thunder_strike_column_uses_block_random_pos_lcg_bits() {
+        let mut ticks = Ticks::new(12345);
+        let mut expected_lcg = 12345i32;
+        for (cx, cz) in [(0, 0), (-3, 5), (12, -8)] {
+            expected_lcg = expected_lcg.wrapping_mul(3).wrapping_add(1_013_904_223);
+            let r = expected_lcg >> 2;
+            let expected = (cx * 16 + (r & 15), cz * 16 + ((r >> 8) & 15));
+            assert_eq!(thunder_strike_column(&mut ticks, cx, cz), expected);
+        }
+    }
+
     /// `Pig.thunderHit`: striking a pig with lightning converts it to a zombified
     /// piglin while preserving age (#7510).
     #[test]
@@ -1144,9 +1246,10 @@ mod tests {
                 brain: Brain::Passive,
                 anim: Anim::Quadruped,
                 sounds: ["", "", ""],
-                step_sound: None,
+                sound_overrides: Default::default(),
                 food: Default::default(),
                 tempt: Default::default(),
+                passenger_attachments: Vec::new(),
             });
             let mut pig = Mob::new(1, kind, Vec3::ZERO, 45.0);
             if baby {
@@ -1168,9 +1271,12 @@ mod tests {
         };
         for (pig, baby) in [(&adult_pig, false), (&baby_pig, true)] {
             let mut zombified = Mob::new(2, Arc::new(kind.clone()), Vec3::ZERO, 0.0);
-            horizon_client::mobs::conversion::single(pig, &mut zombified, params);
+            let mut pig = pig.clone();
+            horizon_client::mobs::conversion::single(&pig, &mut zombified, params);
+            horizon_client::mobs::conversion::pig_thunder_hit(&mut pig, &mut zombified);
             assert_eq!(zombified.is_baby(), baby);
             assert_eq!(zombified.yaw, 45.0);
+            assert!(zombified.persistent);
         }
     }
 
@@ -1205,7 +1311,7 @@ mod tests {
             Box::new(Spare(spared, Arc::clone(&heard))),
         )]
         .into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 game.options.dedicated = Some(Vec::new());
                 game.ui.difficulty = 2;

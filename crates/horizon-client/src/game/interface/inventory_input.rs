@@ -2,6 +2,12 @@
 //! drags, throws and the press/release of a slot click.
 use super::*;
 
+/// Q throws the whole stack with Control down: the same modifier word the
+/// screens read (`has_control_down`), never a latched sprint toggle.
+pub(super) fn drop_whole_stack(modifiers: winit::keyboard::ModifiersState) -> bool {
+    modifiers.control_key()
+}
+
 impl Game<'_> {
     /// `CreativeModeInventoryScreen.keyPressed` on the search tab: a hotbar
     /// key over a slot swaps before the search box sees it.
@@ -40,6 +46,7 @@ impl Game<'_> {
     /// Number keys, F and Q over a slot of the open menu: SWAP with a hotbar
     /// slot or the off hand, THROW one or the whole stack.
     pub(super) fn inventory_hotkey(&mut self, key: KeyCode) -> bool {
+        use horizon_client::container_screen::{HotbarKey, hotbar_swap};
         use horizon_client::menu::Input;
         let Some(size) = self
             .renderer
@@ -52,15 +59,21 @@ impl Game<'_> {
         let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1) else {
             return false;
         };
-        let digit = HOTBAR_DIGITS.iter().position(|k| *k == key);
-        let done = match (digit, key) {
-            (Some(n), _) => self.click_open_inventory(Some(slot), n as i32, Input::Swap),
-            (None, KeyCode::KeyF) => self.click_open_inventory(Some(slot), 40, Input::Swap),
-            (None, KeyCode::KeyQ) => {
-                let all = drop_whole_stack(self.modifiers);
-                self.click_open_inventory(Some(slot), i32::from(all), Input::Throw)
-            }
-            _ => false,
+        let hotbar = HOTBAR_DIGITS
+            .iter()
+            .position(|k| *k == key)
+            .map(HotbarKey::Slot)
+            .or((key == KeyCode::KeyF).then_some(HotbarKey::Offhand));
+        // checkHotbarKeyPressed refuses the swap while the cursor carries a
+        // stack; the drop below is the next arm of keyPressed, which the menu
+        // itself leaves to an empty hand.
+        let done = if let Some(button) = hotbar_swap(hotbar, self.carried.is_none()) {
+            self.click_open_inventory(Some(slot), button, Input::Swap)
+        } else if key == KeyCode::KeyQ {
+            let all = drop_whole_stack(self.modifiers);
+            self.click_open_inventory(Some(slot), i32::from(all), Input::Throw)
+        } else {
+            false
         };
         if done && let Some(key) = self.container {
             self.container_changed(key);
@@ -106,10 +119,6 @@ impl Game<'_> {
         if !right && self.sort_press() {
             return;
         }
-        if self.native_screen_press(right) {
-            self.inv_clicks.skip_release();
-            return;
-        }
         // AbstractRecipeBookScreen lets the book handle its buttons before
         // AbstractContainerScreen starts a drag or chooses an outside slot.
         // Toggling it can move the inventory under the pointer before release.
@@ -117,7 +126,20 @@ impl Game<'_> {
             self.inv_clicks.skip_release();
             return;
         }
+        if self.native_screen_press(right) {
+            self.inv_clicks.skip_release();
+            return;
+        }
         let (slot, outside) = self.inventory_target();
+        // mouseClicked: `lastClickSlot = slot` for every press that reaches
+        // the container, and the double click is the same slot and button
+        // within 250 ms. A click outside records no slot, ending the chain.
+        let double = horizon_client::container_screen::double_click(
+            &mut self.last_inv_click,
+            slot,
+            right,
+            std::time::Instant::now(),
+        );
         let shift = self.has_shift_down();
         let target = Target::of(slot, outside);
         let input = self.inv_clicks.press(
@@ -146,11 +168,6 @@ impl Game<'_> {
             && shift
             && slot != 200
         {
-            let now = std::time::Instant::now();
-            let double = self.last_inv_click.is_some_and(|(at, last, was_right)| {
-                last == slot && was_right == right && now.duration_since(at).as_millis() < 250
-            });
-            self.last_inv_click = Some((now, slot, right));
             // mouseClicked's QUICK_MOVE (and Horizon's at-press QUICK_MOVE
             // of a carried stack, mouseReleased's in vanilla) remember the
             // stack it moves.
@@ -190,15 +207,12 @@ impl Game<'_> {
         {
             // An item tab's display slots take no drags or PICKUP_ALL.
             let display = slot >= Creative::DISPLAY;
-            let now = std::time::Instant::now();
-            let double = !shift
+            let double = double
+                && !shift
                 && !right
                 && !display
                 && self.carried.is_some()
-                && self.last_inv_click.is_some_and(|(at, last, was_right)| {
-                    last == slot && !was_right && now.duration_since(at).as_millis() < 250
-                });
-            self.last_inv_click = Some((now, slot, right));
+                && self.pick_all_allowed(slot);
             if double && self.click_open_inventory(Some(slot), 0, Input::PickupAll) {
                 self.last_inv_click = None;
                 // The double click's own release (`mouseReleased`'s PICKUP_ALL).
@@ -272,6 +286,18 @@ impl Game<'_> {
             slots.push(slot);
         }
     }
+    /// `AbstractContainerMenu.canTakeItemForPickAll` for Horizon slot `slot`
+    /// of the open menu: false for a crafting result (a mod menu type's too),
+    /// whose quick second click is another craft, not a PICKUP_ALL. True for a
+    /// screen the menu engine doesn't model.
+    fn pick_all_allowed(&mut self, slot: usize) -> bool {
+        let mut allowed = true;
+        self.menu_session(|menu, _, to_menu| {
+            allowed = to_menu(slot).is_none_or(|i| menu.can_take_for_pick_all(i));
+            Some(false)
+        });
+        allowed
+    }
     /// The hovered slot and whether the cursor is outside the window.
     pub(super) fn inventory_target(&self) -> (Option<usize>, bool) {
         let Some(r) = self.renderer.as_ref() else {
@@ -339,22 +365,36 @@ impl Game<'_> {
         &self,
         batch: &HudBatch,
     ) -> horizon_client::container_screen::Image {
-        let (ox, oy) = self.inventory_origin(batch);
+        match self.built_container(batch) {
+            Some(layout) => Self::image_of(layout.image),
+            None => Self::image_of(self.container_image_parts(batch)),
+        }
+    }
+    /// `leftPos`, `topPos`, `imageWidth`, `imageHeight` from the game's state
+    /// alone: the container build's own arithmetic, and the fallback when no
+    /// build holds this size.
+    pub(super) fn container_image_parts(&self, batch: &HudBatch) -> [f32; 4] {
+        let (ox, oy) = self.inventory_origin_unbuilt(batch);
         let (shift, width, height) = if self.screen == Screen::Creative {
-            (0.0, Creative::WIDTH as i32, Creative::HEIGHT as i32)
+            (0.0, Creative::WIDTH, Creative::HEIGHT)
         } else {
             let (shift, width) = match self.station.as_ref().map(|s| s.kind) {
-                Some(stations::Kind::Merchant) => (-50.0, 276),
-                Some(stations::Kind::Beacon) => (beacon::SHIFT, 230),
-                _ => (0.0, self.native_screen_width().map_or(176, |w| w as i32)),
+                Some(stations::Kind::Merchant) => (-50.0, 276.0),
+                Some(stations::Kind::Beacon) => (beacon::SHIFT, 230.0),
+                _ => (0.0, self.native_screen_width().unwrap_or(176.0)),
             };
-            (shift, width, self.screen_height() as i32)
+            (shift, width, self.screen_height())
         };
+        [ox + shift, oy, width, height]
+    }
+    /// The build's panel as `AbstractContainerScreen`'s `leftPos`/`topPos`/
+    /// `imageWidth`/`imageHeight`, the shape `hasClickedOutside` reads.
+    fn image_of([left, top, width, height]: [f32; 4]) -> horizon_client::container_screen::Image {
         horizon_client::container_screen::Image {
-            left: (ox + shift) as i32,
-            top: oy as i32,
-            width,
-            height,
+            left: left as i32,
+            top: top as i32,
+            width: width as i32,
+            height: height as i32,
         }
     }
     /// A click outside the window (slot id -999): `THROW` does nothing; a

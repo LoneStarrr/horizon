@@ -1,13 +1,13 @@
 //! Repository tasks, run with `cargo run -p xtask -- TASK`.
 //!
 //! `package BINARY OUTDIR`: a playable Horizon folder with the game binary, horizon-ctl,
-//! horizon-prepare and horizon-server (built beside it: cargo build --release -p horizon-client -p horizon-client-lib
+//! horizon-prepare and horizon-server (built beside it: cargo build --release -p horizon-game -p horizon-client-lib
 //! --bins -p horizon-prepare -p horizon-server), the exporters horizon-prepare compiles, its sources (the launcher compares
 //! them to its own), and PLAY.txt. It holds none of Minecraft's files: players prepare those
 //! from their own copy. .github/workflows/release.yml makes the release folders with it.
 //!
 //! `package-server ENGINE OUTDIR`: a server folder (docs/server.md): the server build of the game
-//! (`cargo build --release -p horizon-client --no-default-features`, without sound or controllers)
+//! (`cargo build --release -p horizon-game --no-default-features`, without sound or controllers)
 //! as horizon-engine, with horizon-prepare and horizon-server from beside it and the same sources.
 //!
 //! `tokens`: writes `crates/horizon-theme/tokens.css`, the design tokens of `crates/horizon-theme` as CSS
@@ -16,6 +16,16 @@
 //! `icons`: renders the icon masters in `docs/media/brand` (with `rsvg-convert`, from librsvg)
 //! into every size the platforms and the website use, and packs `packaging/icons/horizon.ico`
 //! and `horizon.icns`. `docs/media/brand/README.md` lists what goes where.
+//!
+//! `mixins-tool release | patch SOURCE | identity TARGET`: what
+//! `.github/workflows/prebuilt-mixins-tool.yml` needs to build the horizon-mixins tool the launcher
+//! downloads. `release` prints the release's tag, the pinned commit and its source archive as
+//! `name=value` lines; `patch` applies the carried patch to an unpacked source, with the applier
+//! the launcher uses for its own source build; `identity` prints the lines the launcher checks in
+//! the archive's `identity.txt`.
+//! `perf-wasm`: builds `crates/horizon-perf` for `wasm32-unknown-unknown` with the `wasm` feature
+//! and writes `target/perf-wasm/{horizon_perf.wasm,horizon_perf.js}`, which horizon-rust/horizon-site imports into
+//! its static assets (docs/perf-platform.md §7.1).
 
 mod mod_api;
 
@@ -23,7 +33,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | mod-api [notes] | tokens | icons";
+const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | mod-api [notes|coverage] | tokens | icons | perf-wasm | mixins-tool release | mixins-tool patch SOURCE | mixins-tool identity TARGET";
 
 /// What the release folder takes from the repository at HEAD, as `git archive` writes it.
 const ARCHIVED: [&str; 5] = [
@@ -52,8 +62,25 @@ fn main() -> ExitCode {
         }
         [task] if task == "mod-api" => mod_api::run(),
         [task, notes] if task == "mod-api" && notes == "notes" => mod_api::notes(),
+        [task, coverage] if task == "mod-api" && coverage == "coverage" => mod_api::coverage(),
         [task] if task == "tokens" => tokens(),
         [task] if task == "icons" => icons(),
+        [task, what] if task == "mixins-tool" && what == "release" => {
+            use horizon_mod_package::mixins_tool::{REV, release_tag};
+            println!("tag={}\nrev={REV}", release_tag());
+            println!("source={}/{REV}", horizon_addresses::HORIZON_MIXINS_SOURCE);
+            Ok(())
+        }
+        [task, what, source] if task == "mixins-tool" && what == "patch" => {
+            use horizon_mod_package::mixins_tool::{PATCH, PATCH_NAME, apply};
+            apply(Path::new(source), PATCH)
+                .map_err(|why| format!("{PATCH_NAME} does not apply to {source}: {why}"))
+        }
+        [task, what, target] if task == "mixins-tool" && what == "identity" => {
+            print!("{}", horizon_mod_package::mixins_tool::identity(target));
+            Ok(())
+        }
+        [task] if task == "perf-wasm" => perf_wasm(),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -96,6 +123,54 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+/// Builds the web UI's wasm and puts it and its JS wrapper in `target/perf-wasm/`.
+fn perf_wasm() -> Result<(), String> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask has no parent folder")?;
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(&cargo)
+        .current_dir(repo)
+        .args([
+            "build",
+            "--release",
+            "--lib",
+            "-p",
+            "horizon-perf",
+            "--features",
+            "wasm",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .status()
+        .map_err(|e| format!("{cargo} build: {e}"))?;
+    if !status.success() {
+        return Err(
+            "the wasm build failed; `rustup target add wasm32-unknown-unknown` installs the target"
+                .to_string(),
+        );
+    }
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| repo.join("target"), PathBuf::from);
+    let wasm = target.join("wasm32-unknown-unknown/release/horizon_perf.wasm");
+    let script = repo.join("crates/horizon-perf/web/horizon_perf.js");
+    let out = target.join("perf-wasm");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    fs::copy(&wasm, out.join("horizon_perf.wasm"))
+        .map_err(|e| format!("{}: {e}", wasm.display()))?;
+    fs::copy(&script, out.join("horizon_perf.js"))
+        .map_err(|e| format!("{}: {e}", script.display()))?;
+    let size = fs::metadata(out.join("horizon_perf.wasm"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    println!(
+        "wrote {} ({} KiB) and horizon_perf.js",
+        out.join("horizon_perf.wasm").display(),
+        size / 1024
+    );
+    Ok(())
 }
 
 fn tokens() -> Result<(), String> {
@@ -241,7 +316,7 @@ fn icons() -> Result<(), String> {
 fn package(binary: &Path, out: &Path) -> Result<(), String> {
     let repo = new_folder(out)?;
     copy_into(binary, out)?;
-    copy_beside(binary, &TOOLS, out)?;
+    copy_runtime(binary, &TOOLS, out)?;
     copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     let play = repo.join("packaging/PLAY.txt");
     copy(&play, &out.join("PLAY.txt"))
@@ -251,7 +326,7 @@ fn package_server(engine: &Path, out: &Path) -> Result<(), String> {
     let repo = new_folder(out)?;
     copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     copy(engine, &out.join(program_name(engine, "horizon-engine")))?;
-    copy_beside(engine, &SERVER_TOOLS, out)
+    copy_runtime(engine, &SERVER_TOOLS, out)
 }
 
 /// Release builds supply only our compiled classes and their integrity manifest.
@@ -301,6 +376,12 @@ fn program_name(program: &Path, name: &str) -> String {
     }
 }
 
+/// Both bundle layouts require the same wasm runtime beside their engine.
+fn copy_runtime(program: &Path, tools: &[&str], out: &Path) -> Result<(), String> {
+    copy_beside(program, tools, out)?;
+    copy_into(&program.with_file_name("horizon-wasm-std.wasm"), out)
+}
+
 /// Copies `tools`, built beside `program`, into `out`.
 fn copy_beside(program: &Path, tools: &[&str], out: &Path) -> Result<(), String> {
     for tool in tools {
@@ -310,7 +391,7 @@ fn copy_beside(program: &Path, tools: &[&str], out: &Path) -> Result<(), String>
             .join(program_name(program, tool));
         if !path.is_file() {
             return Err(format!(
-                "{} is missing; build it too: cargo build --release -p horizon-client -p horizon-client-lib --bins -p horizon-prepare -p horizon-server",
+                "{} is missing; build it too: cargo build --release -p horizon-game -p horizon-client-lib --bins -p horizon-prepare -p horizon-server",
                 path.display()
             ));
         }

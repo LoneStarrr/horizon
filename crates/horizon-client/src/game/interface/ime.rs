@@ -56,7 +56,7 @@ impl Game<'_> {
             // and the candidate window's place belong to the old one.
             self.ime_area = None;
             if !want {
-                preedit::set_preedit(None);
+                preedit::reset();
             }
         }
     }
@@ -143,7 +143,14 @@ impl Game<'_> {
 
     /// Text the input method committed (`WindowEvent::Ime(Commit)`).
     pub(super) fn ime_commit(&mut self, text: &str) {
-        preedit::set_preedit(None);
+        preedit::mark_committed();
+        if text.is_empty() {
+            return;
+        }
+        // Dialogs have their own fields; the other topmost prompts take no text.
+        if self.prompt_open() && !self.dialog_open() {
+            return;
+        }
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         // ScreenEvent.CharacterTyped.Pre: the input method's committed text
         // reaches a text box by characters, as a key's own text does, so the

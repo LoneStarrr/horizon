@@ -1,90 +1,11 @@
 //! Physical game areas share one logical module scope; compiler and source tools use this list.
 use crate::catalog::Catalog;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{fs, path::Path};
 
 pub(crate) const INCLUDE: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/game_modules.rs\"));";
 
 pub(crate) fn declarations(game: &Path) -> Result<String, String> {
-    let mut modules = BTreeMap::new();
-    for entry in fs::read_dir(game).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if path.extension().is_some_and(|ext| ext == "rs") {
-            if path
-                .file_name()
-                .is_some_and(|name| name == "native_hooks.rs")
-            {
-                continue;
-            }
-            return Err(format!(
-                "{}: put game module roots in an area folder",
-                path.display()
-            ));
-        }
-        if !path.join(".game-area").is_file() {
-            if path.is_dir()
-                && path
-                    .file_name()
-                    .is_none_or(|name| name != "native_hooks" && name != "host")
-            {
-                return Err(format!("{}: missing .game-area marker", path.display()));
-            }
-            continue;
-        }
-        let mut roots: Vec<_> = Catalog::modules(&path)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|name| (name.clone(), path.join(format!("{name}.rs"))))
-            .collect();
-        for child in fs::read_dir(&path).map_err(|e| e.to_string())? {
-            let child = child.map_err(|e| e.to_string())?;
-            let file = child.path().join("mod.rs");
-            if file.is_file() {
-                let name = child.file_name().to_string_lossy().into_owned();
-                syn::parse_str::<syn::Ident>(&name).map_err(|e| e.to_string())?;
-                roots.push((name, file));
-            }
-        }
-        for (name, file) in roots {
-            let source = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-            let visibility = source
-                .lines()
-                .find_map(|line| line.strip_prefix("// game-module-visibility: "))
-                .unwrap_or("");
-            if !matches!(visibility, "" | "pub" | "pub(crate)") {
-                return Err(format!(
-                    "{}: invalid game module visibility",
-                    file.display()
-                ));
-            }
-            let cfg = if name == "friends" {
-                "#[cfg(feature = \"friends\")]\n"
-            } else if name == "friends_off" {
-                "#[cfg(not(feature = \"friends\"))]\n"
-            } else if name.ends_with("_tests")
-                && !source
-                    .lines()
-                    .any(|line| line == "// game-module-cfg: always")
-            {
-                "#[cfg(test)]\n"
-            } else {
-                ""
-            };
-            let absolute = file.canonicalize().map_err(|e| e.to_string())?;
-            let declaration_name = if name == "friends_off" {
-                "friends".to_owned()
-            } else {
-                name.clone()
-            };
-            let declaration = format!(
-                "{cfg}#[path = {:?}]\n{visibility} mod {declaration_name};\n",
-                absolute.to_string_lossy()
-            );
-            if modules.insert(name.clone(), declaration).is_some() {
-                return Err(format!("duplicate game module {name}"));
-            }
-        }
-    }
-    Ok(modules.into_values().collect())
+    horizon_game_discovery::declarations(game, &["native_hooks", "host", "creatures"])
 }
 
 pub(crate) fn lan_action_modules(directory: &Path) -> Result<String, String> {
@@ -111,7 +32,8 @@ pub(crate) fn lan_action_modules(directory: &Path) -> Result<String, String> {
                 if module == "shared"
                     && item.items.iter().all(|member| {
                         matches!(member, syn::ImplItem::Fn(method)
-                        if method.sig.ident == "vehicle_has_other_viewers"
+                        if (method.sig.ident == "vehicle_has_other_viewers"
+                            || method.sig.ident.to_string().starts_with("__fnr_"))
                             && method.sig.receiver().is_none())
                     })
                 {
@@ -206,7 +128,7 @@ pub(crate) fn expand(path: &Path, source: &str) -> Result<String, String> {
 /// traverse it. Uses the same source view as point discovery and internals widening, without
 /// widening visibility, adding points or requiring an OUT_DIR. Never pass a downloaded cache.
 pub fn materialize_game_modules(root: &Path) -> Result<(), String> {
-    for file in crate::points::game_files(&root.join("crates/horizon-client/src"), false)? {
+    for file in crate::source::game_files(&root.join("crates/horizon-client/src"), false)? {
         let source =
             fs::read_to_string(&file.path).map_err(|e| format!("{}: {e}", file.path.display()))?;
         let expanded = expand(&file.path, &source)?;
@@ -300,7 +222,7 @@ mod tests {
         assert!(expand(&root, include).unwrap().contains("mod new_area;"));
         fs::write(
             directory.join("shared.rs"),
-            "impl Game<'_> { fn vehicle_has_other_viewers() {} }",
+            "impl Game<'_> { fn vehicle_has_other_viewers() {} } impl Game<'_> { fn __fnr_vehicle_has_other_viewers(f: fn()) -> bool { true } fn __fnr_get_vehicle_has_other_viewers() -> Option<fn()> { None } }", 
         )
         .unwrap();
         assert!(lan_action_modules(&directory).is_ok());
@@ -336,7 +258,7 @@ mod tests {
         ] {
             assert!(code.contains(&format!("{visibility} mod {name};")));
         }
-        let files = crate::points::game_files(&src, true).unwrap();
+        let files = crate::source::game_files(&src, true).unwrap();
         let game_tests = "horizon_client::game::game_tests";
         assert!(files.iter().any(|file| file.module == game_tests));
     }
@@ -365,7 +287,7 @@ mod tests {
             "// game-module-visibility: pub(crate)\n",
         )
         .unwrap();
-        let files = crate::points::game_files(&root, false).unwrap();
+        let files = crate::source::game_files(&root, false).unwrap();
         let names: Vec<_> = files.iter().map(|file| file.module.as_str()).collect();
         assert!(names.contains(&"horizon_client::game::remote::child"));
         assert!(names.contains(&"horizon_client::game::game_tests"));

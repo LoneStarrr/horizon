@@ -2,9 +2,13 @@
 //! paddling controls, collisions, riding (`positionRider`, `clampRotation`,
 //! dismounting), `BoatItem` placement, `VehicleEntity.hurtServer` breaking,
 //! saving and `AbstractBoatRenderer` with animated paddles.
+mod below_world;
+#[cfg(test)]
+mod friction_tests;
 #[cfg(test)]
 mod lifetime_tests;
 mod placement;
+pub(super) use placement::OutlineFluidRay;
 
 use super::{Game, InteractTarget, entity::Entity, entity_culling::at, view_vector};
 use horizon_client::actions::Action;
@@ -24,9 +28,9 @@ use horizon_client::{
 };
 use horizon_core::nbt::Tag;
 use horizon_core::{
-    geometry::{Aabb, ShapeOp, Vec3, VoxelShape},
+    geometry::{Aabb, ShapeOp, Vec3, VoxelShape, trig},
     position::BlockPos,
-    random::RandomSource,
+    random::{LegacyRandom, RandomSource},
 };
 use horizon_world::collision_context::CollisionContext;
 use std::{collections::HashMap, f32::consts::PI, sync::Arc};
@@ -87,6 +91,9 @@ pub(super) struct Boat {
     /// `Entity.remainingFireTicks` (`Fire` in its save): burning while
     /// positive, a fire block's cooldown while negative.
     pub fire_ticks: i32,
+    /// `Entity.ticksFrozen` (`TicksFrozen` in its save): powder snow builds
+    /// it up (`InsideBlockEffectType.FREEZE`); only a living entity melts it.
+    pub ticks_frozen: i32,
     /// `Entity.noGravity` (`NoGravity` in its save).
     pub no_gravity: bool,
     pub paddles: [f32; 2],
@@ -96,6 +103,12 @@ pub(super) struct Boat {
     /// left, right, up, down
     pub input: [bool; 4],
     pub on_ground: bool,
+    /// `Entity.fallDistance`: counted by `AbstractBoat.checkFallDamage`, saved
+    /// and loaded (`fall_distance`).
+    pub fall_distance: f64,
+    /// `AbstractBoat.lastYd`: the vertical velocity at the last move's
+    /// `checkFallDamage`, before collisions zero it (not saved).
+    pub last_yd: f64,
     /// `Entity.stuckSpeedMultiplier`: set where the boat sits in powder snow
     /// (`PowderSnowBlock.entityInside`), spent by the next move.
     stuck: Vec3,
@@ -112,6 +125,7 @@ pub(super) struct Boat {
     pub leash_spin: f64,
     /// `Entity.tickCount`, for the 100 ticks a saved holder is waited for.
     pub age: i32,
+    pub random: LegacyRandom,
 }
 /// `ChestBoat.CONTAINER_SIZE`.
 pub(super) const CHEST_SLOTS: usize = 27;
@@ -159,8 +173,35 @@ fn snowflake_velocity(known: Vec3, random: &mut impl RandomSource) -> Option<[f6
 pub(super) fn saved_fire(tag: &Tag) -> i32 {
     i32::from(horizon_client::save::number(tag.get("Fire")).unwrap_or(0) as i16)
 }
+/// `Entity.load`'s `TicksFrozen` (an int; 0 when absent).
+pub(super) fn saved_ticks_frozen(tag: &Tag) -> i32 {
+    horizon_client::save::number(tag.get("TicksFrozen")).unwrap_or(0) as i32
+}
+/// `Entity.saveWithoutId`: `TicksFrozen` is written only while positive.
+pub(super) fn put_ticks_frozen(map: &mut horizon_core::nbt::Compound, ticks: i32) {
+    if ticks > 0 {
+        map.insert("TicksFrozen".into(), Tag::Int(ticks));
+    } else {
+        map.remove(&"TicksFrozen".into());
+    }
+}
 pub(super) const WIDTH: f64 = 1.375;
 pub(super) const HEIGHT: f64 = 0.5625;
+/// `AbstractBoat.controlBoat`'s push along the boat's yaw:
+/// `Mth.sin(-yRot * 0.017453292F) * acceleration` and `Mth.cos(..)`, with
+/// `Mth`'s sine table and float products, widened to double.
+fn paddle_push(yaw: f32, acceleration: f32) -> (f64, f64) {
+    let (x, z) = (-yaw * 0.017_453_292, yaw * 0.017_453_292);
+    (
+        f64::from(trig::sin(f64::from(x)) * acceleration),
+        f64::from(trig::cos(f64::from(z)) * acceleration),
+    )
+}
+/// `getBbWidth() * Mth.SQRT_OF_TWO` in `getDismountLocationForPassenger`: a
+/// float product.
+fn boat_escape_width() -> f64 {
+    f64::from(WIDTH as f32 * std::f32::consts::SQRT_2)
+}
 impl Boat {
     /// `AbstractBoat.tick`: the hurt wobble and the damage wear off, before
     /// `Entity.baseTick` can burn the boat.
@@ -210,12 +251,15 @@ impl Boat {
             hurt_dir: 1,
             damage: 0.0,
             fire_ticks: 0,
+            ticks_frozen: 0,
             no_gravity: false,
             paddles: [0.0; 2],
             paddling: [false; 2],
             paddle_controller: false,
             input: [false; 4],
             on_ground: false,
+            fall_distance: 0.0,
+            last_yd: 0.0,
             stuck: Vec3::ZERO,
             chest: false,
             items: Vec::new(),
@@ -224,6 +268,7 @@ impl Boat {
             leash_pending: None,
             leash_spin: 0.0,
             age: 0,
+            random: horizon_client::random_source::entity(),
         }
     }
     /// A chest boat or chest raft.
@@ -251,12 +296,15 @@ impl Boat {
             self.position,
             self.velocity,
             [self.yaw, self.pitch],
+            (self.on_ground, self.fall_distance),
             uuid,
             raw,
             self.chest.then_some(&self.items[..]),
         );
+        horizon_client::entity_nbt::write_saved_flags(&mut tag, self.on_ground, self.no_gravity);
         if let Tag::Compound(map) = &mut tag {
             map.insert("Fire".into(), Tag::Short(self.fire_ticks as i16));
+            put_ticks_frozen(map, self.ticks_frozen);
         }
         tag
     }
@@ -381,6 +429,8 @@ impl Boat {
     /// The vanilla entity type id (`oak_boat`, `bamboo_chest_raft`), also
     /// the item it drops.
     pub(super) fn entity_type(&self) -> String {
+        #[cfg(test)]
+        friction_tests::TYPE_BUILDS.with(|n| n.set(n.get() + 1));
         let chest = if self.chest { "chest_" } else { "" };
         if &*self.wood == "bamboo" {
             format!("minecraft:bamboo_{chest}raft")
@@ -524,7 +574,10 @@ impl Game<'_> {
         if f.fluid == Fluid::None || fluid.is_some_and(|want| f.fluid != want) {
             return None;
         }
-        let above = self.res.facts().get(self.world.block(x, y + 1, z));
+        let above = self
+            .res
+            .facts()
+            .get(self.world.block(x, y.wrapping_add(1), z));
         // FluidState.getHeight: 1 under the same fluid, else amount / 9.
         let height = if above.fluid == f.fluid {
             1.0
@@ -534,10 +587,12 @@ impl Game<'_> {
         Some((height, f.fluid_level == 8 && !f.fluid_falling))
     }
     /// `getWaterLevelAbove`: the top of the water column the hull is in.
-    fn water_level_above(&self, b: &Boat) -> f64 {
+    /// A float, as vanilla's: the block's y plus its water height in float.
+    fn water_level_above(&self, b: &Boat) -> f32 {
         let bb = b.bounds();
         let (lo, hi) = (bb.min_position(), bb.max_position());
-        let (y0, y1) = (hi.y.floor() as i32, hi.y.ceil() as i32);
+        // Up to where a falling boat's top was a move ago (`ceil(maxY - lastYd)`).
+        let (y0, y1) = (hi.y.floor() as i32, (hi.y - b.last_yd).ceil() as i32);
         'rows: for y in y0..y1 {
             let mut height = 0.0f32;
             for x in lo.x.floor() as i32..hi.x.ceil() as i32 {
@@ -551,10 +606,10 @@ impl Game<'_> {
                 }
             }
             if height < 1.0 {
-                return f64::from(y) + f64::from(height);
+                return y as f32 + height;
             }
         }
-        f64::from(y1 + 1)
+        (i64::from(y1) + 1) as f32
     }
     fn boat_status(&self, b: &mut Boat) -> Status {
         let bb = b.bounds();
@@ -566,7 +621,7 @@ impl Game<'_> {
             for y in hi.y.floor() as i32..max_y.ceil() as i32 {
                 for z in lo.z.floor() as i32..hi.z.ceil() as i32 {
                     if let Some((h, source)) = self.fluid_height(x, y, z)
-                        && max_y < f64::from(y) + f64::from(h)
+                        && max_y < f64::from(y as f32 + h)
                     {
                         if !source {
                             b.water_level = hi.y;
@@ -588,7 +643,8 @@ impl Game<'_> {
             for y in lo.y.floor() as i32..(lo.y + 0.001).ceil() as i32 {
                 for z in lo.z.floor() as i32..hi.z.ceil() as i32 {
                     if let Some((h, _)) = self.fluid_height(x, y, z) {
-                        let level = f64::from(y) + f64::from(h);
+                        // `float height = y + getHeight`: summed in float.
+                        let level = f64::from(y as f32 + h);
                         b.water_level = b.water_level.max(level);
                         in_water |= lo.y < level;
                     }
@@ -599,7 +655,7 @@ impl Game<'_> {
             return Status::InWater;
         }
 
-        let friction = self.boat_ground_friction(bb);
+        let friction = self.boat_ground_friction(b, bb);
         if friction > 0.0 {
             b.land_friction = friction;
             Status::OnLand
@@ -609,7 +665,7 @@ impl Game<'_> {
     }
     /// `AbstractBoat.getGroundFriction`: average friction of the blocks whose
     /// collision shape meets a thin slab just under the hull (lily pads skipped).
-    fn boat_ground_friction(&self, bb: Aabb) -> f32 {
+    fn boat_ground_friction(&self, b: &Boat, bb: Aabb) -> f32 {
         let (lo, hi) = (bb.min_position(), bb.max_position());
         let ground = Aabb::new(
             Vec3::new(lo.x, lo.y - 0.001, lo.z),
@@ -617,12 +673,12 @@ impl Game<'_> {
         );
         let (g_lo, g_hi) = (ground.min_position(), ground.max_position());
         let (x0, x1, y0, y1, z0, z1) = (
-            g_lo.x.floor() as i32 - 1,
-            g_hi.x.ceil() as i32 + 1,
-            g_lo.y.floor() as i32 - 1,
-            g_hi.y.ceil() as i32 + 1,
-            g_lo.z.floor() as i32 - 1,
-            g_hi.z.ceil() as i32 + 1,
+            (g_lo.x.floor() - 1.0) as i32,
+            (g_hi.x.ceil() + 1.0) as i32,
+            (g_lo.y.floor() - 1.0) as i32,
+            (g_hi.y.ceil() + 1.0) as i32,
+            (g_lo.z.floor() - 1.0) as i32,
+            (g_hi.z.ceil() + 1.0) as i32,
         );
         let slab = VoxelShape::from_box(ground).unwrap_or_else(|_| VoxelShape::empty());
         let mut scene = SceneCollisions {
@@ -660,7 +716,8 @@ impl Game<'_> {
                         .join_is_not_empty(&slab, ShapeOp::AND)
                         .unwrap_or(false)
                     {
-                        friction += f.friction;
+                        friction +=
+                            self.boat_friction(b, BlockPos::new(x, y, z), state, f.friction);
                         count += 1;
                     }
                 }
@@ -671,6 +728,61 @@ impl Game<'_> {
         } else {
             0.0
         }
+    }
+    /// `Entity.move`'s fall reset for an entity that keeps a fall and moves on
+    /// by `moved` from `from`: a move of a block or more casts up to 8 blocks
+    /// of it (`ClipContext.Block.FALLDAMAGE_RESETTING`, `ClipContext.Fluid.WATER`)
+    /// and a hit resets the fall, before the move's own drop counts.
+    pub(super) fn vehicle_fall_reset(&self, fall: f64, from: Vec3, moved: Vec3) -> f64 {
+        let length = moved.length_squared();
+        if fall == 0.0 || length < 1.0 {
+            return fall;
+        }
+        let reset = &self.res.motion().fall_reset;
+        let fluids = &self.res.motion().fluids;
+        let to = from.add_vector(moved.normalize().scale(length.sqrt().min(8.0)));
+        let hit = horizon_core::geometry::traverse_blocks(from, to, 1_000_000, |p| {
+            // A tagged block clips as a full block, not its collider.
+            let name = &self.res.facts().get(self.world.block(p.x, p.y, p.z)).name;
+            if reset.contains(&**name) && VoxelShape::block().clip(from, to, p).is_some() {
+                return Some(());
+            }
+            // The water's shape, through the shared fluid shape cache.
+            horizon_client::entities::water_clip(
+                &self.loop_context,
+                &self.world,
+                fluids,
+                from,
+                to,
+                p,
+            )
+            .then_some(())
+        });
+        if matches!(hit, Ok(Some(()))) {
+            0.0
+        } else {
+            fall
+        }
+    }
+    /// `AbstractBoat.checkFallDamage` after a move that went `moved_y` (with
+    /// `b` already where it landed): on the ground the fall resets; a move
+    /// down over anything but water (the block under its `blockPosition`)
+    /// adds to it.
+    pub(super) fn boat_fall(&self, b: &Boat, moved_y: f64) -> f64 {
+        if b.on_ground {
+            return 0.0;
+        }
+        if moved_y < 0.0 {
+            let below = self.res.facts().get(self.world.block(
+                b.position.x.floor() as i32,
+                (b.position.y.floor() as i32).wrapping_sub(1),
+                b.position.z.floor() as i32,
+            ));
+            if below.fluid != Fluid::Water {
+                return b.fall_distance - f64::from(moved_y as f32);
+            }
+        }
+        b.fall_distance
     }
     /// `AbstractBoat.tick` for one boat (`controlled` when the player rides it).
     pub(super) fn tick_boat(&mut self, mut b: Boat, controlled: bool) -> Boat {
@@ -700,7 +812,13 @@ impl Game<'_> {
         }
         // `Entity.baseTick`: the boat is immersed and pushed by the current it
         // sits in (`isPushedByFluid`), before `floatBoat` scales the velocity.
-        let _ = b.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context);
+        // updateFluidInteraction: in water the fall resets.
+        if b.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context)
+            .0
+            > 0.0
+        {
+            b.fall_distance = 0.0;
+        }
         // floatBoat
         // `-getGravity()`: none with NoGravity.
         let mut vspeed = 0.0 - b.get_gravity();
@@ -717,8 +835,10 @@ impl Game<'_> {
             && b.status != Status::InAir
             && b.status != Status::OnLand
         {
-            b.water_level = b.position.y;
-            let target = self.water_level_above(&b) - HEIGHT + 0.101;
+            // getY(1.0): the top of its box.
+            b.water_level = b.position.y + HEIGHT;
+            // getWaterLevelAbove() - getBbHeight(): a float subtraction.
+            let target = f64::from(self.water_level_above(&b) - HEIGHT as f32) + 0.101;
             let moved = Aabb::new(
                 Vec3::new(
                     b.bounds().min_position().x,
@@ -747,7 +867,7 @@ impl Game<'_> {
                     inv_friction = 0.9;
                 }
                 Status::UnderWater => {
-                    buoyancy = 0.01;
+                    buoyancy = f64::from(0.01_f32);
                     inv_friction = 0.45;
                 }
                 Status::InAir => inv_friction = 0.9,
@@ -785,9 +905,9 @@ impl Game<'_> {
             if down {
                 acceleration -= 0.005;
             }
-            let r = b.yaw.to_radians();
-            b.velocity.x += f64::from((-r).sin() * acceleration);
-            b.velocity.z += f64::from(r.cos() * acceleration);
+            let (x, z) = paddle_push(b.yaw, acceleration);
+            b.velocity.x += x;
+            b.velocity.z += z;
             b.paddling = [right && !left || up, left && !right || up];
         }
         // Entity.move: collisions zero the blocked components, the world border's
@@ -799,12 +919,15 @@ impl Game<'_> {
         };
         let movement = b.take_movement();
         if let Ok(moved) = scene.resolve(b.bounds(), movement, 0.0, b.on_ground) {
+            b.fall_distance = self.vehicle_fall_reset(b.fall_distance, b.position, moved);
             b.position = Vec3::new(
                 b.position.x + moved.x,
                 b.position.y + moved.y,
                 b.position.z + moved.z,
             );
             b.on_ground = movement.y < 0.0 && moved.y > movement.y;
+            b.last_yd = b.velocity.y;
+            b.fall_distance = self.boat_fall(&b, moved.y);
             if (moved.x - movement.x).abs() > 1.0e-7 {
                 b.velocity.x = 0.0;
             }
@@ -829,15 +952,11 @@ impl Game<'_> {
             None,
         );
         b.velocity = horizon_world::entity_move::scale_by_block_speed(b.velocity, factor);
-        Self::tick_boat_paddles(&mut b, &mut self.audio, &mut self.world.random);
+        Self::tick_boat_paddles(&mut b, &mut self.audio);
         b
     }
     /// `AbstractBoat.tick` advances the oars even when this client does not move the hull.
-    pub(super) fn tick_boat_paddles(
-        b: &mut Boat,
-        audio: &mut super::Audio,
-        random: &mut horizon_core::random::LegacyRandom,
-    ) {
+    pub(super) fn tick_boat_paddles(b: &mut Boat, audio: &mut super::Audio) {
         // Paddle sounds at the top of each stroke.
         for i in 0..2 {
             if b.paddle_state(i) {
@@ -853,7 +972,7 @@ impl Game<'_> {
                     if let Some(sound) = sound {
                         let v = view_vector(b.yaw, 0.0);
                         let (dx, dz) = if i == 1 { (-v[2], v[0]) } else { (v[2], -v[0]) };
-                        let pitch = 0.8 + 0.4 * random.next_float();
+                        let pitch = 0.8 + 0.4 * b.random.next_float();
                         audio.play(
                             sound,
                             Some([b.position.x + dx, b.position.y, b.position.z + dz]),
@@ -913,7 +1032,7 @@ impl Game<'_> {
                         if driven.contains(&id) {
                             self.boats.update(i, |b| b.wear_off_hurt());
                         }
-                        if self.boat_fire_tick(i) {
+                        if self.boat_fire_tick(i) || self.boat_below_world(i) {
                             break 'boat;
                         }
                     }
@@ -946,7 +1065,7 @@ impl Game<'_> {
                 };
                 self.boats.update(i, |b| b.wear_off_hurt());
                 // Entity.baseTick burns it before it moves; the fire may break it.
-                if !self.boat_fire_tick(i) {
+                if !self.boat_fire_tick(i) && !self.boat_below_world(i) {
                     self.with_entity_held_out(id, |game| {
                         let b = game.boats[i].clone();
                         let b = game.tick_boat(b, false);
@@ -1037,9 +1156,12 @@ impl Game<'_> {
         ));
         let (lo, hi) = (b.min_position(), b.max_position());
         let mut columns = Vec::new();
-        for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
-            for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
-                for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
+        // Entity.checkInsideBlocks floors both ends of the deflated box.
+        // Narrowing ceil(max) before subtracting one wraps at i32::MIN,
+        // turning a tiny box into a scan of the entire integer Y domain.
+        for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
+            for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
+                for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
                     if let Some(column) = bubble_column_at(
                         &self.world,
                         self.pack.assets.registry,
@@ -1224,7 +1346,7 @@ impl Game<'_> {
         }
         let burn = self.boats[i].fire_ticks % 20 == 0 && !self.in_lava(self.boats[i].bounds());
         self.boats.update(i, |b| b.fire_ticks -= 1);
-        burn && self.burn_boat(i, 1.0)
+        burn && self.burn_boat(i, 1.0, "minecraft:on_fire")
     }
     /// The fire of the two `applyEffectsFromBlocks` in `AbstractBoat.tick`.
     /// `Entity.checkInsideBlocks` meets the blocks of the box the boat started
@@ -1247,6 +1369,7 @@ impl Game<'_> {
         let rain = self.in_rain(at, top);
         for _ in 0..2 {
             let before = self.boats[i].fire_ticks;
+            let mut in_snow = false;
             let mut seen = Vec::new();
             for &bounds in &steps {
                 let cells = powder_snow_cells(bounds, |p| !seen.contains(&p));
@@ -1266,7 +1389,7 @@ impl Game<'_> {
                         }
                     });
                     for &damage in &fires {
-                        if self.burn_boat(i, damage) {
+                        if self.burn_boat(i, damage, "minecraft:in_fire") {
                             return true;
                         }
                     }
@@ -1277,6 +1400,7 @@ impl Game<'_> {
                     .copied()
                     .filter(|&p| self.is_powder_snow(p))
                     .collect();
+                in_snow |= !snow.is_empty();
                 if self.boats[i].fire_ticks > 0
                     && self
                         .ui
@@ -1293,6 +1417,10 @@ impl Game<'_> {
                 }
             }
             let now = self.boats.update(i, |b| {
+                if in_snow {
+                    b.ticks_frozen = (b.ticks_frozen + 1)
+                        .min(horizon_client::motion::PlayerMotion::TICKS_REQUIRED_TO_FREEZE);
+                }
                 if rain {
                     b.fire_ticks = b.fire_ticks.min(0);
                 }
@@ -1316,13 +1444,18 @@ impl Game<'_> {
     }
     /// `VehicleEntity.hurtServer` for fire (`inFire`, `onFire`), which an
     /// `Invulnerable` boat ignores. True when the boat broke.
-    fn burn_boat(&mut self, i: usize, damage: f32) -> bool {
-        let invulnerable = self
-            .persist
-            .raw
-            .get(&self.boats[i].id)
-            .is_some_and(|tag| horizon_client::entity_nbt::flag(tag, "Invulnerable"));
-        !invulnerable && self.hurt_boat(i, damage, false)
+    fn burn_boat(&mut self, i: usize, damage: f32, damage_type: &str) -> bool {
+        let id = self.boats[i].id;
+        let invulnerable = self.saved_refuses_damage(id, damage_type, false);
+        let kind = self.boats[i].entity_type();
+        let source = horizon_client::health::HurtSource {
+            damage_type,
+            causing: 0,
+            direct: 0,
+            position: None,
+        };
+        !self.native_nonliving_invulnerable(id, &kind, source, invulnerable)
+            && self.hurt_boat(i, damage, false)
     }
     /// `PowderSnowBlock.entityInside`'s `ServerLevel.sendParticles`: a boat that moved
     /// horizontally in powder snow throws snowflakes the players around see. `AbstractBoat.tick`
@@ -1353,7 +1486,17 @@ impl Game<'_> {
         }
         for _ in 0..2 {
             let p = self.boats[i].position;
-            let broke = self.hurt_boat(i, 4.0, false);
+            let id = self.boats[i].id;
+            let kind = self.boats[i].entity_type();
+            let source = horizon_client::health::HurtSource {
+                damage_type: "minecraft:lava",
+                causing: 0,
+                direct: 0,
+                position: None,
+            };
+            let vanilla = self.saved_refuses_damage(id, "minecraft:lava", false);
+            let broke = !self.native_nonliving_invulnerable(id, &kind, source, vanilla)
+                && self.hurt_boat(i, 4.0, false);
             self.lava_hurt_sound([p.x, p.y, p.z]);
             if broke {
                 return true;
@@ -1424,20 +1567,13 @@ impl Game<'_> {
     }
     /// Where the boat at `i` lets a player facing `yaw` off.
     pub(super) fn boat_player_dismount_target(&self, i: usize, yaw: f32) -> Vec3 {
-        self.boat_dismount_target(i, 0.6, yaw)
+        self.boat_dismount_target(&self.boats[i], 0.6, yaw)
     }
     /// `getDismountLocationForPassenger` for a passenger `width` wide
     /// facing `yaw`.
-    pub(super) fn boat_dismount_target(&self, i: usize, width: f64, yaw: f32) -> Vec3 {
-        let b = &self.boats[i];
-        let r = yaw.to_radians();
-        let distance = (WIDTH * std::f64::consts::SQRT_2 + width + 1.0e-5) / 2.0;
-        let (s, c) = (-(r.sin()) as f64, r.cos() as f64);
-        let m = s.abs().max(c.abs());
-        let (x, z) = (
-            b.position.x + s * distance / m,
-            b.position.z + c * distance / m,
-        );
+    pub(super) fn boat_dismount_target(&self, b: &Boat, width: f64, yaw: f32) -> Vec3 {
+        let off = super::mounts::escape_vector(boat_escape_width(), width, yaw);
+        let (x, z) = (b.position.x + off.x, b.position.z + off.z);
         let top = b.bounds().max_position().y;
         let (bx, by, bz) = (x.floor() as i32, top.floor() as i32, z.floor() as i32);
         let below = self.res.facts().get(self.world.block(bx, by - 1, bz));
@@ -1452,6 +1588,15 @@ impl Game<'_> {
         }
     }
     /// `BoatItem.use`: aim at a block or the water surface.
+    /// `Entity.setYRot` on a boat just made (its old rotation moves with it).
+    pub(super) fn set_boat_yaw(&mut self, id: u32, yaw: f32) {
+        if let Some(i) = self.boats.iter().position(|b| b.id == id) {
+            self.boats.update(i, |b| {
+                b.yaw = yaw;
+                b.previous_yaw = yaw;
+            });
+        }
+    }
     pub(super) fn place_boat(&mut self, stack: &ItemStack) -> bool {
         let Some(boat) = self.boat_to_place(stack) else {
             return false;
@@ -1462,7 +1607,11 @@ impl Game<'_> {
             boat.position.z.floor() as i32 >> 4,
         );
         self.world.modified.insert(key);
+        let (id, kind, yaw) = (boat.id, boat.entity_type(), boat.yaw);
         self.boats.push(boat);
+        self.apply_vehicle_stack_config(super::commands::Target::Boat(id), &kind, stack, true);
+        // BoatItem.use: setYRot(player.getYRot()) after the stack's config.
+        self.set_boat_yaw(id, yaw);
         if self.serving.is_some() || self.options.dedicated.is_some() {
             self.native_vehicle_create(
                 self.boats.last().unwrap().entity_type().as_str(),
@@ -1661,10 +1810,28 @@ impl Game<'_> {
         let area = self.boats[i].bounds();
         // Player.attack's full damage against the boat's entity type.
         let (kind, id) = (self.boats[i].entity_type(), self.boats[i].id as i32);
-        let (damage, scale, _, magic) = self.melee_damage(&kind, false);
+        let (damage, scale, _, magic) = self.melee_damage(&kind, false, Some(id as u32));
         let sweep = self.sweep_before_hit(&kind, false);
         let chest = self.boats[i].chest;
-        let hurt = self.hurt_boat_result(i, damage, self.creative);
+        let attacker = self.own_entity_id();
+        let source = horizon_client::health::HurtSource {
+            damage_type: "minecraft:player_attack",
+            causing: attacker,
+            direct: attacker,
+            position: None,
+        };
+        let vanilla =
+            self.saved_refuses_damage(id as u32, "minecraft:player_attack", self.creative);
+        let invulnerable = crate::game::entity::damage_level_of!(self, scoped)
+            .invulnerability_check(
+                horizon_client::health::Hurting::Entity(id, &kind, source),
+                vanilla,
+            );
+        let hurt = if invulnerable {
+            None
+        } else {
+            self.hurt_boat_result(i, damage, self.creative)
+        };
         // AbstractChestBoat.destroy -> ContainerEntity.chestVehicleDestroyed:
         // with entity_drops on, a player whose hit breaks a chest boat (not a
         // creative discard) angers the piglins that see it.
@@ -1694,12 +1861,9 @@ impl Game<'_> {
                     self.boats
                         .update(i, |b| b.velocity.z += f64::from(-(z as f32) * knockback));
                 }
-                if let Some(player) = self.player.as_mut() {
-                    player.velocity.x *= horizon_client::attack_strength::ATTACKER_SLOWDOWN;
-                    player.velocity.z *= horizon_client::attack_strength::ATTACKER_SLOWDOWN;
-                }
-                self.stop_sprint_after_extra_knockback();
+                self.special_attack_slowdown(knockback);
             }
+            self.special_attack_exhaustion();
         }
         // Player.onAttack: the hit starts the attack strength again.
         self.attack_ticks = 0;
@@ -1713,6 +1877,77 @@ impl Game<'_> {
     pub(super) fn hurt_boat(&mut self, i: usize, damage: f32, creative: bool) -> bool {
         self.hurt_boat_result(i, damage, creative).unwrap_or(false)
     }
+    /// Whether a spectator must be refused this boat's menu.
+    pub(super) fn boat_loot_pending(&self, id: u32) -> bool {
+        matches!(
+            self.persist.raw.get(&id),
+            Some(horizon_core::nbt::Tag::Compound(map)) if map.contains_key(&"LootTable".into())
+        )
+    }
+
+    /// `ContainerEntity.unpackChestVehicleLootTable`: slot access rolls once;
+    /// only a player opening the menu fires `CriteriaTriggers.GENERATE_LOOT`, before filling.
+    pub(super) fn unpack_boat_loot(&mut self, i: usize, player: bool) {
+        use horizon_core::nbt::Tag;
+        let id = self.boats[i].id;
+        let (table, seed) = {
+            let Some(Tag::Compound(map)) = self.persist.raw.get(&id) else {
+                return;
+            };
+            let Some(table) = crate::save::text(map.get(&"LootTable".into()))
+                .and_then(|id| horizon_client_core::identifier::normalize_id(&id))
+            else {
+                return;
+            };
+            let seed = match map.get(&"LootTableSeed".into()) {
+                Some(Tag::Long(seed)) => Some(*seed),
+                _ => None,
+            };
+            (table, seed)
+        };
+        if player {
+            self.trigger_loot_table(&table);
+        }
+        // Advancement rewards can remove the boat or shift its index.
+        let Some(i) = self.boats.iter().position(|b| b.id == id) else {
+            return;
+        };
+        if let Some(Tag::Compound(map)) = self.persist.raw.get_mut(&id) {
+            map.remove(&"LootTable".into());
+            map.remove(&"LootTableSeed".into());
+        }
+        let key = (i32::MAX - 15, super::minecarts::CART_KEY_Y, id as i32);
+        self.store_cart_items(key);
+        let loot = crate::structure_blocks::loot_data(
+            &self.options.resources,
+            &self.pack_files(),
+            self.res.item_defaults(),
+        );
+        let b = &self.boats[i];
+        let at = Vec3::new(b.position.x, b.position.y, b.position.z);
+        let biome = self.biome_name_at(at).unwrap_or_default();
+        let pos = (
+            b.position.x.floor() as i32,
+            b.position.y.floor() as i32,
+            b.position.z.floor() as i32,
+        );
+        self.boats.update(i, |b| {
+            crate::structure_blocks::roll_container(
+                &mut b.items,
+                loot.as_deref(),
+                table,
+                seed,
+                pos,
+                &biome,
+            );
+        });
+        if let Some(horizon_client::containers::BlockEntity::Chest(items)) =
+            self.world.block_entities.get_mut(&key)
+        {
+            items.clone_from(&self.boats[i].items);
+        }
+    }
+
     /// None means a canceled hit; Some records whether an accepted hit destroyed it.
     pub(super) fn hurt_boat_result(
         &mut self,
@@ -1720,11 +1955,28 @@ impl Game<'_> {
         mut damage: f32,
         creative: bool,
     ) -> Option<bool> {
+        let id = self.boats[i].id;
+        if self
+            .persist
+            .destroying_vehicles
+            .contains(&super::commands::Target::Boat(id))
+        {
+            return Some(true);
+        }
         let mut cancel = false;
         self.native_vehicle_damage("boat", &mut damage, &mut cancel);
         if cancel {
             return None;
         }
+        let Some(i) = self.boats.iter().position(|b| {
+            b.id == id
+                && !self
+                    .persist
+                    .removals
+                    .contains(&crate::game::commands::Target::Boat(id))
+        }) else {
+            return Some(true);
+        };
         let (destroyed, at) = self.boats.update(i, |b| {
             b.hurt_dir = -b.hurt_dir;
             b.hurt_time = 10;
@@ -1736,9 +1988,37 @@ impl Game<'_> {
         });
         if destroyed {
             self.native_vehicle_destroy("boat", at);
-            self.eject_boat_mobs(i, true);
-            let id = self.boats[i].id;
+            if !self.boats.iter().any(|b| {
+                b.id == id
+                    && !self
+                        .persist
+                        .removals
+                        .contains(&crate::game::commands::Target::Boat(id))
+            }) {
+                return Some(true);
+            }
+            if self
+                .with_destroying_vehicle(super::commands::Target::Boat(id), |game| {
+                    game.dismount_destroyed_vehicle_players(id);
+                    if let Some(i) = game.boats.iter().position(|boat| boat.id == id) {
+                        game.eject_boat_mobs(i, true);
+                    }
+                })
+                .is_none()
+            {
+                return Some(true);
+            }
+            let Some(i) = self.boats.iter().position(|b| {
+                b.id == id
+                    && !self
+                        .persist
+                        .removals
+                        .contains(&crate::game::commands::Target::Boat(id))
+            }) else {
+                return Some(true);
+            };
             self.release_vehicle_container(id);
+            self.unpack_boat_loot(i, false);
             let b = self.boats.remove(i);
             // `AbstractChestBoat.remove` spills the chest through
             // `Containers.dropContents` for every destroying removal reason
@@ -1780,6 +2060,7 @@ impl Game<'_> {
                     self.drop_vehicle_contents(at, &empty);
                 }
             }
+            self.retain_removed_vehicle(id, super::persist::RemovedVehicle::Boat(b));
         }
         Some(destroyed)
     }
@@ -1887,11 +2168,18 @@ impl Game<'_> {
                 && &*b.wood != "bamboo"
                 && !matches!(b.status, Status::UnderWater | Status::UnderFlowingWater)
             {
+                // Depth only, so its texture is never seen; one texel of the white sprite, the
+                // same at every corner (no derivatives, so the base level at any distance), keeps
+                // a shader pack's alpha test from throwing the patch away.
+                let white = (self.gui.atlas.sprites.get("horizon/white")).map_or(uv, |r| {
+                    let (u, v) = ((r.u0 + r.u1) / 2.0, (r.v0 + r.v1) / 2.0);
+                    [u, v, u, v]
+                });
                 horizon_client::mobs::render::draw(
                     patch,
                     base,
                     &Poses::new(patch),
-                    uv,
+                    white,
                     0xFFFF_FFFF,
                     packed,
                     horizon_client::gfx::WATER_MASK_OVERLAY,
@@ -1907,8 +2195,89 @@ impl Game<'_> {
 mod tests {
     use super::*;
 
+    /// `controlBoat`'s push with `Mth`'s sine table (65,536 float entries,
+    /// indexed by `(long)(radians * 10430.378350470453) & 65535`) and float
+    /// products. Expected values worked out apart from Horizon, in Python with
+    /// float32 rounding; the platform's sine differs in the fourth digit.
+    #[test]
+    fn paddling_pushes_along_the_sine_table() {
+        for (yaw, push) in [
+            (17.3, (-0.011893643997609615, 0.03819085285067558)),
+            (-123.45, (0.03337550163269043, -0.022047126665711403)),
+            (250.0, (0.03758755698800087, -0.013681206852197647)),
+        ] {
+            assert_eq!(paddle_push(yaw, 0.04), push, "yaw {yaw}");
+        }
+    }
+
+    /// `getDismountLocationForPassenger`'s escape vector for a player (0.6F
+    /// wide) facing 17.3 degrees: the boat's float width times
+    /// `Mth.SQRT_OF_TWO`, the 1.0E-5F margin and the sine table, worked out
+    /// apart from Horizon as above.
+    #[test]
+    fn a_boat_rider_steps_off_along_the_sine_table() {
+        let v = super::super::mounts::escape_vector(boat_escape_width(), f64::from(0.6f32), 17.3);
+        assert_eq!((v.x, v.z), (-0.3962207300897882, 1.2722768119620014));
+    }
+
     fn boat() -> Boat {
         Boat::new(1, Arc::from("oak"), Vec3::ZERO, 0.0)
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn destruction_and_underwater_ejection_snap_rejected_passenger_descendants() {
+        for broken in [false, true] {
+            super::super::native_entity_refs::tests::with_game(|game| {
+                let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
+                let mut boat = Boat::new(71, "oak".into(), Vec3::new(10.0, 200.0, 20.0), 0.0);
+                boat.status = Status::UnderWater;
+                boat.out_of_control = 60.0;
+                game.boats.push(boat);
+                let mut rider = horizon_client::mobs::Mob::new(
+                    72,
+                    kind.clone(),
+                    Vec3::new(5.0, 190.0, 6.0),
+                    0.0,
+                );
+                rider.extra.mount = Some(71);
+                rider.extra.passenger = true;
+                game.persist
+                    .off_level
+                    .insert(72, super::super::persist::OffLevel::Mob(rider));
+                let mut child = horizon_client::mobs::Mob::new(73, kind, Vec3::ZERO, 0.0);
+                child.extra.mount = Some(72);
+                child.age = 19;
+                game.mobs.push(child);
+                if broken {
+                    assert!(game.hurt_boat(0, 5.0, true));
+                    assert!(game.boats.is_empty());
+                } else {
+                    // The actual ejection entry used by AbstractBoat.tick at 60 submerged ticks.
+                    game.eject_boat_riders(0);
+                    assert_eq!(game.boats.len(), 1);
+                }
+                let rider = game.mob_object(72).unwrap();
+                assert_eq!(rider.extra.mount, None);
+                assert!(!rider.extra.passenger);
+                assert_eq!(rider.extra.boarding_cooldown, 60);
+                // Removed vehicle: retain x/z and clamp y to the boat's y.
+                // Live underwater boat over air: getDismountLocation's box-top fallback.
+                let expected = if broken {
+                    Vec3::new(5.0, 200.0, 6.0)
+                } else {
+                    Vec3::new(10.0, 200.5625, 20.0)
+                };
+                assert_eq!(rider.position, expected);
+                let child = game.mob_object(73).unwrap();
+                assert_eq!(child.position.x, expected.x);
+                assert_eq!(child.position.z, expected.z);
+                assert!((child.position.y - expected.y - 0.86875).abs() < 1e-6);
+                assert_eq!(child.previous, child.position);
+                assert_eq!(child.age, 19);
+                assert_eq!(child.extra.mount, Some(72));
+            });
+        }
     }
 
     /// `AbstractBoat.tickBubbleColumn` on a client: the wobble grows while the
@@ -2034,6 +2403,23 @@ mod tests {
         assert_eq!(b.take_movement(), Vec3::new(0.0, 0.1, 1.0), "spent");
     }
 
+    /// `Entity.saveWithoutId` writes `TicksFrozen` only while positive; `Entity.load` reads it.
+    #[test]
+    fn a_boat_saves_and_loads_ticks_frozen() {
+        let mut b = Boat::new(
+            1,
+            std::sync::Arc::from("oak"),
+            Vec3::new(0.0, 64.0, 0.0),
+            0.0,
+        );
+        assert_eq!(b.to_nbt([0; 4], None).get("TicksFrozen"), None);
+        b.ticks_frozen = 6;
+        let saved = b.to_nbt([0; 4], None);
+        assert_eq!(saved.get("TicksFrozen"), Some(&Tag::Int(6)));
+        assert_eq!(saved_ticks_frozen(&saved), 6);
+        b.ticks_frozen = 0;
+        assert_eq!(b.to_nbt([0; 4], Some(&saved)).get("TicksFrozen"), None);
+    }
     /// `PowderSnowBlock.entityInside`'s snowflake: only for an entity that moved sideways, and
     /// then only when a coin falls so.
     #[test]

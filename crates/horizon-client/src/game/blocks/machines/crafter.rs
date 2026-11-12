@@ -128,7 +128,9 @@ impl Game<'_> {
         Menu::map_crafted(Some(&maps), &mut result);
         self.register_made_maps(maps);
         // The remainders come from the grid as it was before anything moved.
-        let remainders = self.recipes().remainders(&recipe, &grid, 3);
+        let remainders = self
+            .recipes()
+            .remainders(&recipe, &grid, 3, &|s| self.crafting_remainder(s));
         self.crafter_eject(key, facing, result, &recipe);
         for rest in remainders.into_iter().flatten() {
             self.crafter_eject(key, facing, rest, &recipe);
@@ -232,7 +234,7 @@ impl Game<'_> {
         let c = self.crafter_at(key)?;
         self.recipes().craft(&self.loop_context, &c.items, 3)
     }
-    fn crafter_open(&self) -> bool {
+    pub(in crate::game) fn crafter_open(&self) -> bool {
         matches!(self.container_kind(), Some(BlockEntity::Crafter(_)))
     }
     /// `CrafterMenu` slot layout: the grid at (26, 17), the result at (134, 35).
@@ -394,6 +396,41 @@ mod tests {
         c.set_slot_state(4, true);
         assert_eq!(c.redstone_signal(), 1);
     }
+    /// `CrafterBlockEntity.setSlotState`: a slot toggled in the menu lands on
+    /// the block entity itself, whose `setChanged` marks the chunk.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_slot_toggled_in_the_menu_lands_on_the_crafter() {
+        use crate::game::game_tests::tests::server_game;
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        let key = (2, 4, 3);
+        let state = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:crafter")
+            .unwrap();
+        game.world.set(key.0, key.1, key.2, state).unwrap();
+        let mut crafter = Crafter::default();
+        crafter.set_slot_state(3, false);
+        game.world
+            .block_entities
+            .insert(key, BlockEntity::Crafter(crafter));
+        game.container = Some(key);
+        game.world.modified.clear();
+
+        game.crafter_slot_clicked(303, 0, horizon_client::menu::Input::Pickup);
+
+        let Some(BlockEntity::Crafter(c)) = game.world.block_entities.get(&key) else {
+            panic!("no crafter");
+        };
+        assert!(!c.disabled[3], "the click enabled the slot");
+        assert!(
+            game.world.modified.contains(&(0, 0)),
+            "the toggled slot left the chunk unmarked"
+        );
+    }
     #[test]
     fn hoppers_fill_the_smaller_stacks_first() {
         let mut c = Crafter::default();
@@ -426,5 +463,74 @@ mod tests {
             "minecraft:crafter"
         ));
         assert!(recipe_matches(&Value::Null, "minecraft:crafter"));
+    }
+}
+
+#[cfg(test)]
+mod part_remainder_tests {
+    use super::*;
+    struct Milk;
+    #[mod_api::horizon_part]
+    impl mod_api::ItemPart for Milk {
+        fn crafting_remainder(
+            &self,
+            _: &dyn mod_api::Host,
+            event: &mut mod_api::CraftingRemainderEvent<'_>,
+        ) {
+            *event.remainder = None;
+        }
+    }
+    struct Remainders;
+    #[mod_api::__subscriptions]
+    impl mod_api::Hooks for Remainders {
+        fn register(&self, r: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+            let milk = r.item_key("minecraft:milk_bucket");
+            r.item_part(milk, Milk);
+        }
+    }
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn crafter_dispense_observes_part_replaced_remainders() {
+        let mods: mod_api::Mods = vec![mod_api::ModEntry::new("milk", Box::new(Remainders))].into();
+        crate::game::api_values::install_parts(&mods).unwrap();
+        mod_platform::testing::with_mods(mods, || {
+            crate::game::native_entity_refs::tests::with_game(|game| {
+                crate::game::native_entity_refs::tests::resolve_parts(game).unwrap();
+                let state = game
+                    .block_state_id("minecraft:crafter[orientation=north_up]")
+                    .unwrap();
+                let pos = BlockPos::new(0, 100, 0);
+                let grid = [
+                    "milk_bucket",
+                    "milk_bucket",
+                    "milk_bucket",
+                    "sugar",
+                    "egg",
+                    "sugar",
+                    "wheat",
+                    "wheat",
+                    "wheat",
+                ];
+                let mut crafter = Crafter::default();
+                for (slot, item) in crafter.items.iter_mut().zip(grid) {
+                    *slot = Some(ItemStack::new(&format!("minecraft:{item}"), 1));
+                }
+                game.world
+                    .block_entities
+                    .insert((0, 100, 0), BlockEntity::Crafter(crafter));
+                game.dropped.clear();
+                game.crafter_dispense(pos, state).unwrap();
+                let output: Vec<_> = game
+                    .dropped
+                    .iter()
+                    .map(|e| (e.stack.item.to_string(), e.stack.count))
+                    .collect();
+                assert_eq!(
+                    output,
+                    [("minecraft:cake".to_owned(), 1)],
+                    "the Part suppresses all three data-only buckets"
+                );
+            });
+        });
     }
 }

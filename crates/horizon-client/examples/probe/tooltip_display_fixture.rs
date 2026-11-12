@@ -18,7 +18,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             };
             let text = horizon_client::item_tooltip::styled_name(&stack, || "unused".into());
             output.push_str("name\t");
-            for span in text.spans {
+            for span in &text.spans {
                 for c in span.text.chars() {
                     let style = &span.style;
                     write!(

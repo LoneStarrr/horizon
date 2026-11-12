@@ -11,7 +11,6 @@ use horizon_client::{
     screen_effects::{Blend, ScreenQuad},
 };
 use horizon_core::{geometry::Vec3, position::BlockPos};
-use horizon_world::registry::BlockStateId;
 use mod_api::{
     BlockScreenEffect, BlockScreenEffectDrawEvent, ClientHost, ExtractBlockScreenEffectEvent, Flow,
     GuiRenderPostEvent, Hooks, ModEntry, Mods,
@@ -174,7 +173,7 @@ fn a_mod_draws_prepends_replaces_and_cancels_overlays() {
             bytemuck::cast_slice::<_, u8>(&vertices).to_vec()
         };
         let mods: Mods = vec![ModEntry::new("screen-effect", Box::new(Planned))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             let frame = |game: &Game<'_>, plan: Plan| {
                 *PLAN.lock().unwrap() = plan;
                 let quads = quads(game);
@@ -290,6 +289,7 @@ fn drawn_frame(game: &mut Game<'_>) -> (Vec<u8>, usize) {
         path: "unused.png".into(),
         size: None,
         scaled: false,
+        background: false,
     });
     game.render_with(|renderer, frame| renderer.render(frame))
         .unwrap();
@@ -356,7 +356,7 @@ fn screen_effect_quads_draw_over_the_level_and_under_the_gui() {
         return;
     }
     let mods: Mods = vec![ModEntry::new("painter", Box::new(Painter))].into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_client_game(|game| {
             let mut builder = winit::event_loop::EventLoop::builder();
             #[cfg(target_os = "linux")]

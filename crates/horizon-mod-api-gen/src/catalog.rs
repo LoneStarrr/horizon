@@ -1,8 +1,11 @@
-//! The hook catalog as typed data: the declaration files under `crates/horizon-mod-api/src/hooks`, read once.
+//! The hook catalog as typed data: the declaration files under `crates/horizon-mod-vocab/src/hooks`, read once.
 //!
 //! The loader here is the only code that reads the declarations. Every generated output
 //! (the `Hooks` dispatch, the Host traits, the game's entry points, the rustdoc, the mixin hook
 //! names) reads these types.
+
+#[cfg(test)]
+mod collect_validation_tests;
 
 use quote::ToTokens;
 use serde::Deserialize;
@@ -23,7 +26,8 @@ pub enum Side {
 pub enum Contract {
     /// Told about a moment; nothing comes back.
     Listen,
-    /// May veto it; the first listener to cancel stops the rest.
+    /// May veto it; once cancelled, later listeners run only if they receive cancelled events,
+    /// and those may undo it.
     Cancel,
     /// Every listener adds to, changes or removes from one output.
     Collect,
@@ -94,8 +98,14 @@ pub struct Hook {
     pub contract: Contract,
     /// The event field a cancel, collect or replace hook writes; `None` for a listener.
     pub out: Option<String>,
-    /// A replace hook whose output also names the mod that answered.
+    /// A replace hook whose output also names the mod that answered, or a collect hook whose
+    /// entries each name the mod that pushed it.
     pub answered_by_mod: bool,
+    /// A listener about one mod's own things: the event field naming that mod, whose
+    /// subscription alone is told.
+    pub owner: Option<String>,
+    /// Validate a collector's edits at the per-listener ownership boundary.
+    pub collect_validator: Option<String>,
     pub scope: Option<PartScope>,
     pub host: Option<HostAccess>,
     pub context: Option<PhaseContext>,
@@ -135,7 +145,8 @@ pub enum CatalogError {
     MissingDoc(String),
     Counterpart { hook: String, key: &'static str },
     InvalidContract(String),
-    AnsweredNeedsGlobalReplace(String),
+    AnsweredNeedsGlobalOutput(String),
+    OwnerNeedsGlobalListener(String),
     ScopeNeedsKey(String),
     NoHooks,
     Retired(String),
@@ -164,8 +175,14 @@ impl fmt::Display for CatalogError {
                 write!(f, "hook {hook}: {key} must be a string or list of strings")
             }
             Self::InvalidContract(name) => write!(f, "invalid contract for {name}"),
-            Self::AnsweredNeedsGlobalReplace(name) => {
-                write!(f, "{name}: answered_by needs a global replace hook")
+            Self::AnsweredNeedsGlobalOutput(name) => {
+                write!(
+                    f,
+                    "{name}: answered_by needs a global replace or collect hook"
+                )
+            }
+            Self::OwnerNeedsGlobalListener(name) => {
+                write!(f, "{name}: owner needs a global listener")
             }
             Self::ScopeNeedsKey(name) => write!(f, "{name} needs both scope and key, or neither"),
             Self::NoHooks => f.write_str("no native hooks"),
@@ -237,6 +254,8 @@ struct ModApiEntry {
     scope: Option<PartKind>,
     key: Option<String>,
     answered_by: Option<AnsweredBy>,
+    owner: Option<String>,
+    collect_validator: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -278,8 +297,23 @@ impl Hook {
             return Err(CatalogError::InvalidContract(name));
         }
         let answered_by_mod = api.answered_by.is_some();
-        if answered_by_mod && (api.contract != Contract::Replace || scope.is_some()) {
-            return Err(CatalogError::AnsweredNeedsGlobalReplace(name));
+        if answered_by_mod
+            && (!matches!(api.contract, Contract::Replace | Contract::Collect) || scope.is_some())
+        {
+            return Err(CatalogError::AnsweredNeedsGlobalOutput(name));
+        }
+        if api.owner.is_some() && (api.contract != Contract::Listen || scope.is_some()) {
+            return Err(CatalogError::OwnerNeedsGlobalListener(name));
+        }
+        // A validator checks the entries a mod edits in place; an answered collector's mods
+        // only push into their own batch.
+        if let Some(validator) = &api.collect_validator
+            && (api.contract != Contract::Collect
+                || scope.is_some()
+                || answered_by_mod
+                || syn::parse_str::<syn::Path>(validator).is_err())
+        {
+            return Err(CatalogError::InvalidContract(name));
         }
         let counterparts = Counterparts {
             neoforge: counterparts(&name, "neoforge", entry.neoforge)?,
@@ -295,6 +329,8 @@ impl Hook {
             contract: api.contract,
             out: api.out,
             answered_by_mod,
+            owner: api.owner,
+            collect_validator: api.collect_validator,
             scope,
             host: entry.host,
             context: entry.context,
@@ -317,12 +353,13 @@ pub struct Catalog {
 }
 
 /// Where the declarations live, relative to the checkout root.
-pub const DECLARATIONS: &str = "crates/horizon-mod-api/src/hooks";
+pub const DECLARATIONS: &str = "crates/horizon-mod-vocab/src/hooks";
 
 /// What the catalog was declared in before the declarations: a file here is refused, never ignored.
 pub(crate) const RETIRED: &[&str] = &["native-hooks.json", "tools/native-hook-fragments"];
 
-/// The game function a hook or helper named `name` is called from, when its declaration gives no `target`.
+/// A declaration's inferred target, resolved to the definition's module by `Catalog::load`.
+/// Parsing declarations alone does not require engine sources (render-record generation).
 fn default_target(name: &str, area: &str) -> String {
     format!("horizon_client::game::native_hooks::{area}::Game<'_>::native_{name}")
 }
@@ -439,7 +476,7 @@ impl Declared {
             let kind = declarations.ident.to_string();
             if kind == "Helpers" {
                 return Err(invalid(
-                    "helpers are hand-written host traits now: declare the method in `crates/horizon-mod-api/src/host/<area>.rs`"
+                    "helpers are hand-written host traits now: declare the method in `crates/horizon-mod-vocab/src/host/<area>.rs`"
                         .into(),
                 ));
             }
@@ -501,7 +538,15 @@ impl Declared {
                         }
                         // The contract's arguments are the entry's `mod_api` object.
                         let mut api = serde_json::Map::new();
-                        for key in ["contract", "out", "scope", "key", "answered_by"] {
+                        for key in [
+                            "contract",
+                            "out",
+                            "scope",
+                            "key",
+                            "answered_by",
+                            "owner",
+                            "collect_validator",
+                        ] {
                             if let Some(value) = entry.remove(key) {
                                 api.insert(key.into(), value);
                             }
@@ -528,6 +573,17 @@ impl Catalog {
     /// then by name, so the order never depends on a list a PR edits.
     /// The retired JSON catalog is refused wherever it still exists.
     pub fn load(root: &Path) -> Result<Self, CatalogError> {
+        let mut catalog = Self::load_declarations(root)?;
+        crate::hook_targets::resolve(root, &mut catalog).map_err(|error| {
+            CatalogError::Declaration {
+                path: "native hook definitions".into(),
+                error,
+            }
+        })?;
+        Ok(catalog)
+    }
+
+    pub(crate) fn load_declarations(root: &Path) -> Result<Self, CatalogError> {
         let read_error = |path: &Path, e: std::io::Error| CatalogError::Read {
             path: path.display().to_string(),
             error: e.to_string(),
@@ -578,7 +634,38 @@ impl Catalog {
                     .map(str::to_string)
             })
             .collect::<Vec<_>>();
-        modules.sort_by(|a, b| (a != "base", a).cmp(&(b != "base", b)));
+        // Split declarations retain their original HookId positions in per-item metadata.
+        // Unnumbered additions are discovered alphabetically, without a shared registry.
+        let mut order = std::collections::HashMap::new();
+        for module in &modules {
+            let path = dir.join(format!("{module}.rs"));
+            let source = fs::read_to_string(&path).map_err(|e| read_error(&path, e))?;
+            if let Some(value) = source
+                .lines()
+                .find_map(|line| line.strip_prefix("// catalog-order: "))
+            {
+                let ordinal = value
+                    .parse::<usize>()
+                    .map_err(|e| CatalogError::Declaration {
+                        path: path.display().to_string(),
+                        error: format!("invalid catalog-order: {e}"),
+                    })?;
+                if order.values().any(|previous| *previous == ordinal) {
+                    return Err(CatalogError::Declaration {
+                        path: path.display().to_string(),
+                        error: format!("duplicate catalog-order: {ordinal}"),
+                    });
+                }
+                order.insert(module.clone(), ordinal);
+            }
+        }
+        modules.sort_by(|a, b| {
+            (a != "base", order.get(a).copied().unwrap_or(usize::MAX), a).cmp(&(
+                b != "base",
+                order.get(b).copied().unwrap_or(usize::MAX),
+                b,
+            ))
+        });
         for module in &modules {
             if syn::parse_str::<syn::Ident>(module).is_err() {
                 return Err(CatalogError::InvalidModule(module.clone()));
@@ -638,6 +725,8 @@ impl Hook {
             contract: Contract::Listen,
             out: None,
             answered_by_mod: false,
+            owner: None,
+            collect_validator: None,
             scope: None,
             host: None,
             context: None,
@@ -741,7 +830,7 @@ mod tests {
             (&base, HOOK),
             (&index, "mod base;\nmod alpha;"),
         ]);
-        let catalog = Catalog::load(&root).unwrap();
+        let catalog = Catalog::load_declarations(&root).unwrap();
         let names = catalog
             .hooks
             .iter()
@@ -749,10 +838,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["one", "two"], "base.rs first, then by name");
         fs::remove_file(root.join(&index)).unwrap();
-        assert_eq!(Catalog::load(&root).unwrap().hooks.len(), 2);
+        assert_eq!(Catalog::load_declarations(&root).unwrap().hooks.len(), 2);
         fs::write(root.join(DECLARATIONS).join("not-valid.rs"), HOOK).unwrap();
         assert!(
-            Catalog::load(&root)
+            Catalog::load_declarations(&root)
                 .unwrap_err()
                 .to_string()
                 .contains("invalid hook declaration filename")
@@ -967,21 +1056,69 @@ mod tests {
     }
 
     #[test]
-    fn answered_by_needs_a_global_replace_hook() {
-        let answered = |api: serde_json::Value| Hook::parse(hook("a", json!({"mod_api": api})));
-        assert!(
-            answered(json!({"contract": "replace", "out": "o", "answered_by": "mod"}))
+    fn owner_needs_a_global_listener() {
+        let owned = |api: serde_json::Value| Hook::parse(hook("o", json!({"mod_api": api})));
+        assert_eq!(
+            owned(json!({"contract": "listen", "owner": "mod_id"}))
                 .unwrap()
-                .answered_by_mod
+                .owner
+                .as_deref(),
+            Some("mod_id")
         );
+        for api in [
+            json!({"contract": "cancel", "out": "c", "owner": "mod_id"}),
+            json!({"contract": "listen", "owner": "mod_id", "scope": "item", "key": "k"}),
+        ] {
+            assert_eq!(
+                owned(api).unwrap_err(),
+                CatalogError::OwnerNeedsGlobalListener("o".into())
+            );
+        }
+    }
+
+    #[test]
+    fn answered_by_needs_a_global_replace_or_collect_hook() {
+        let answered = |api: serde_json::Value| Hook::parse(hook("a", json!({"mod_api": api})));
+        for contract in ["replace", "collect"] {
+            assert!(
+                answered(json!({"contract": contract, "out": "o", "answered_by": "mod"}))
+                    .unwrap()
+                    .answered_by_mod
+            );
+        }
         for api in [
             json!({"contract": "cancel", "out": "o", "answered_by": "mod"}),
             json!({"contract": "replace", "out": "o", "answered_by": "mod", "scope": "item", "key": "k"}),
+            json!({"contract": "collect", "out": "o", "answered_by": "mod", "scope": "item", "key": "k"}),
         ] {
             assert_eq!(
                 answered(api).unwrap_err(),
-                CatalogError::AnsweredNeedsGlobalReplace("a".into())
+                CatalogError::AnsweredNeedsGlobalOutput("a".into())
             );
         }
+    }
+    #[test]
+    fn split_file_order_is_stable_and_validated() {
+        let dir = std::env::temp_dir().join(format!("hook-order-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("z.rs"), "// catalog-order: 1\n").unwrap();
+        fs::write(dir.join("a.rs"), "// catalog-order: 2\n").unwrap();
+        fs::write(dir.join("b.rs"), "").unwrap();
+        assert_eq!(Catalog::modules(&dir).unwrap(), ["z", "a", "b"]);
+        fs::write(dir.join("b.rs"), "// catalog-order: 2\n").unwrap();
+        assert!(
+            Catalog::modules(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate catalog-order")
+        );
+        fs::write(dir.join("b.rs"), "// catalog-order: bad\n").unwrap();
+        assert!(
+            Catalog::modules(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid catalog-order")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

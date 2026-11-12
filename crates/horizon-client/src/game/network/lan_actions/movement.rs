@@ -12,6 +12,7 @@ impl Game<'_> {
             return;
         };
         let m = &mut self.mobs[index];
+        let camel = crate::mobs::camel::is_camel(m.species()).then_some(m.id);
         let Some((sound, volume)) = crate::game::mounts::start_riding_jump(m, data) else {
             return;
         };
@@ -23,6 +24,12 @@ impl Game<'_> {
             LevelSound::new(&name, at, volume, 1.0).in_source(SoundSource::Neutral),
             None,
         );
+        if let Some(id) = camel {
+            self.post_entity_event(
+                "minecraft:entity_action",
+                horizon_client::mobs::Who::Mob(id),
+            );
+        }
     }
 
     /// ServerGamePacketListenerImpl.handlePlayerCommand START_FALL_FLYING:
@@ -74,7 +81,7 @@ impl Game<'_> {
     /// 20th tick wears the glider by one, and every 10th is an
     /// `elytra_glide` game event. Entity.checkFallDistanceAccumulation runs
     /// first: a glide that isn't diving keeps the fall distance at 1.
-    pub(super) fn guest_glide_tick(&mut self, conn: u32, fell: f64) {
+    pub(in crate::game) fn guest_glide_tick(&mut self, conn: u32, fell: f64) {
         let Some(creative) = self.lan.as_mut().and_then(|host| {
             host.hub
                 .update_guest(conn, |g| {

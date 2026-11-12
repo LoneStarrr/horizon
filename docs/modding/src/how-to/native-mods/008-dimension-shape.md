@@ -77,7 +77,13 @@ gives the timelines and `default_clock` back. The day time itself is the world's
 The level's biomes are the one `biome` everywhere unless `biome_source` says otherwise:
 `BiomeSourceKind::Checkerboard` alternates the `biomes` in cells `2^biome_scale` chunks wide,
 `MultiNoise` uses the Overworld's or the Nether's biomes (`biome_preset`) and `End` the End's islands.
-Only `Fixed` suits a chunk generator of the mod's own, which writes terrain only.
+`Points` places the mod's own biomes: `biome_points` lists a `BiomePoint` per biome, with an interval
+(`(min, max)`, each from -2 to 2, a single value is `(v, v)`) for temperature, humidity, continentalness,
+erosion, depth and weirdness, and an `offset` from 0 to 1. The biome whose point is nearest to the level's
+climate at a position wins, as in a data pack's `minecraft:multi_noise` source with an inline `biomes` list;
+the biomes can be the mod's own or vanilla's. A mod's points shape its own level only: placing a mod's biomes
+among vanilla's in the Overworld or the Nether is a [biome region](../biome-regions.md). Only `Fixed` suits a chunk
+generator of the mod's own, which writes terrain only.
 
 A dimension in another mod's namespace, an empty name, a name that is not a folder of the world
 (lowercase letters, digits and `_ . -` only, with `/` between segments that are not empty, `.` or
@@ -150,6 +156,19 @@ goes back. Match it with a final `Custom(_)` arm. The game's own rules read the 
 too (water that evaporates, fast lava, infiniburn, piglin portals), and `player_respawn_position` may send a player to
 a `Custom` level.
 
+### Players, structures and chunk watchers
+
+`level.online_players(host)` lists the real online players in that server level, including
+when it is parked. Obtain a chunk with `host.chunk(level, pos)`, then call
+`chunk.watchers(host)` to ask which players were sent it and still have it inside their
+view distance; fake players watch nothing.
+
+`level.find_nearest_structure(host, structure, StructureSearch::new(origin, radius))` searches
+for a structure id or `#tag` and returns its structure and locate position. This is a
+synchronous, `/locate`-cost search, not a cheap loaded-chunk lookup: cache results and avoid
+per-tick use. The radius counts placement-cell rings (at most 100); stronghold rings are
+checked regardless of radius. It does not load or generate chunks.
+
 ### Saving a level
 
 `level.request_save(host)` asks the server to save a level, as the autosave and `/save-all` do, with its
@@ -157,6 +176,11 @@ chunks on disk when it ends. The save runs at the start of the next server tick,
 may be running in the tick that is saving), and a level asked for twice before then is saved once. The call
 answers whether the request was taken. `level_save` fires with the level's dimension once it was written; a
 save that fails fires nothing and is logged.
+
+Inside a hook, use `level.request_save(host)`, not a synchronous `save-all` command.
+While an entity pass or held-out row is borrowed, synchronous saving refuses with vanilla's
+`commands.save.failed` feedback and a failed command result, without writing a partial snapshot.
+Requested saves wait for a settled start-of-tick boundary.
 
 ### Chunk generators
 

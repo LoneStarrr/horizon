@@ -346,6 +346,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     pitch: 1.0,
                 });
             }
+            // `CampfireBlock.douse` and `AbstractCandleBlock.extinguish` both
+            // end with `level.gameEvent(null, GameEvent.BLOCK_CHANGE, pos)`,
+            // before `placeLiquid` sets the waterlogged block.
+            self.game_event(pos, "minecraft:block_change");
         }
         self.set_block_and_update(pos, next);
         let delay = self.fluid_tick_delay(fluid.kind(), pos);
@@ -436,7 +440,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             if fluid.kind().same_family(kind)
                 && self.can_pass_through_wall(direction, state, neighbour)
             {
-                // NeoForge asks for each neighbouring source, the fluid's rule
+                // Mods are asked for each neighbouring source, the fluid's rule
                 // as the default (`CreateFluidSourceEvent`).
                 if fluid.is_source()
                     && self
@@ -697,27 +701,27 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let mut state = self.state(pos);
         let mut fluid = self.b.fluid(state);
         let kind = fluid.kind();
-        if kind == FluidKind::Empty {
+        let name = match kind {
+            FluidKind::Water | FluidKind::FlowingWater => "water",
+            FluidKind::Lava | FluidKind::FlowingLava => "lava",
+            FluidKind::Mod(_) | FluidKind::ModFlowing(_) => kind.name(),
+            FluidKind::Empty => return,
+        };
+        if !self.level.allow_fluid_tick(pos, name) {
             return;
         }
         if !fluid.is_source() {
             let new_fluid = self.new_liquid(kind, pos, state);
             let delay = self.spread_delay(kind, pos, fluid, new_fluid);
-            if new_fluid != fluid {
-                let name = match kind {
-                    FluidKind::Water | FluidKind::FlowingWater => "water",
-                    FluidKind::Lava | FluidKind::FlowingLava => "lava",
-                    FluidKind::Mod(_) | FluidKind::ModFlowing(_) => kind.name(),
-                    FluidKind::Empty => return,
-                };
-                if !self.level.allow_fluid_level_change(
+            if new_fluid != fluid
+                && !self.level.allow_fluid_level_change(
                     pos,
                     name,
                     i32::from(fluid.amount()),
                     i32::from(new_fluid.amount()),
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
             }
             if new_fluid.kind() == FluidKind::Empty {
                 fluid = new_fluid;
@@ -826,7 +830,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 if self.b.is_air(state) {
                     if Direction::ALL
                         .into_iter()
-                        .any(|d| self.lava_flammable(rel(test, d)))
+                        .any(|d| self.lava_flammable(rel(test, d), d.opposite()))
                     {
                         if !self.level.allow_block_ignite(test, "lava") {
                             return;
@@ -853,7 +857,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 if !self.level.is_loaded(test) {
                     return;
                 }
-                if self.is_empty_block(above(test)) && self.lava_flammable(test) {
+                if self.is_empty_block(above(test)) && self.lava_flammable(test, Direction::Up) {
                     if !self.level.allow_block_ignite(above(test), "lava") {
                         continue;
                     }
@@ -865,12 +869,20 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             }
         }
     }
-    fn lava_flammable(&self, pos: BlockPos) -> bool {
+    /// `LavaFluid.isFlammable` of the block at `pos`, asked from its side
+    /// `face`: the level's answer, else the state's `ignitedByLava` flag.
+    fn lava_flammable(&self, pos: BlockPos, face: Direction) -> bool {
         if self.is_inside_build_height(pos.y) && !self.level.is_loaded(pos) {
             return false;
         }
-        self.b
-            .has_flag(self.state(pos), super::data::state_flags::IGNITED_BY_LAVA)
+        let state = self.state(pos);
+        let mut ignites = None;
+        self.level
+            .before_ignited_by_lava(state, pos, face, &mut ignites);
+        ignites.unwrap_or_else(|| {
+            self.b
+                .has_flag(state, super::data::state_flags::IGNITED_BY_LAVA)
+        })
     }
 }
 

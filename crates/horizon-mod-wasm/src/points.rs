@@ -1,37 +1,12 @@
 //! Points use the hook transport and register in the native points list.
 use crate::{CallClass, Refusal, WasmMod, WeakWasmMod, boundary::Frame};
-use horizon_mod_package::manifest::Internal;
 use horizon_mod_package::manifest::{
     Manifest,
-    inject::{Access, Kind},
+    inject::{Inject, Kind},
 };
-use mod_points::{
-    __private::{Forward, PointHost, RawForward, SlotListener},
-    PointId,
-    endpoint_policy::{EndpointPolicy, InternalDeclaration, InternalsRefusal, SchemaCatalog},
-    exposure::Plan,
-};
+use mod_points::__private::{Forward, PointHost, SlotListener};
+use mod_points::PointId;
 use std::cell::RefCell;
-use std::sync::Arc;
-
-/// What the game supplies to resolve declared internals: its generated schema catalog and
-/// each raw point's head call layout (the id its staged plan uses; not `PointId` order).
-pub struct InternalsCatalog {
-    pub schema: SchemaCatalog,
-    pub head_calls: Vec<(PointId, usize)>,
-}
-
-/// The one mapping from a manifest's internals to catalog declarations.
-fn declarations(internals: &[Internal]) -> Vec<InternalDeclaration> {
-    internals
-        .iter()
-        .map(|internal| InternalDeclaration {
-            path: internal.path.clone(),
-            kind: internal.kind.clone(),
-            hash: internal.hash.clone(),
-        })
-        .collect()
-}
 
 struct Endpoint {
     owner: &'static str,
@@ -70,15 +45,6 @@ impl Forward for Endpoint {
     }
 }
 
-impl RawForward for Endpoint {
-    fn plan(&self, head_call: usize) -> Option<Arc<Plan>> {
-        self.module.plan(head_call)
-    }
-    fn forward(&self, id: u32, record: &mut dyn mod_api::wire::Record) {
-        self.invoke(Frame::default(), id, |_| {}, record);
-    }
-}
-
 impl Endpoint {
     fn invoke(
         &self,
@@ -110,64 +76,33 @@ impl Endpoint {
     }
 }
 
-/// Check subscriptions completely before registering any listener in the host's list.
-pub(crate) fn listen(
-    manifest: &Manifest,
-    module: &WasmMod,
-    catalog: Option<&InternalsCatalog>,
-) -> Result<(), Refusal> {
-    listen_checked(manifest, module, catalog).map_err(|error| match error {
-        Listen::Internals(why) => Refusal::Internals(why),
-        Listen::Other(why) => Refusal::Runtime(why),
-    })
+/// Check engine subscriptions completely before registering in the host's list.
+pub(crate) fn listen(manifest: &Manifest, module: &WasmMod) -> Result<(), Refusal> {
+    listen_checked(manifest, module).map_err(Refusal::Runtime)
 }
-#[derive(Debug)]
-pub(crate) enum Listen {
-    Internals(InternalsRefusal),
-    Other(String),
-}
-impl<T: Into<String>> From<T> for Listen {
-    fn from(why: T) -> Self {
-        Self::Other(why.into())
-    }
-}
-/// Resolves the manifest's internals against the catalog for the raw points the module listens
-/// to, and gives the module ownership of the resulting plans.
-pub(crate) fn install_policy(
-    manifest: &Manifest,
-    module: &WasmMod,
-    raw_places: &[PointId],
-    catalog: Option<&InternalsCatalog>,
-) -> Result<(), Listen> {
-    let Some(catalog) = catalog else {
-        return if manifest.internals.is_empty() {
-            Ok(())
-        } else {
-            Err(Listen::Internals(InternalsRefusal::NoCatalog))
-        };
-    };
-    let heads: Vec<usize> = raw_places
-        .iter()
-        .filter_map(|place| {
-            catalog
-                .head_calls
-                .iter()
-                .find(|(point, _)| point == place)
-                .map(|(_, head)| *head)
-        })
-        .collect();
-    let policy = EndpointPolicy::build(&catalog.schema, &declarations(&manifest.internals), &heads)
-        .map_err(Listen::Internals)?;
-    module.set_policy(policy);
-    Ok(())
-}
-fn listen_checked(
-    manifest: &Manifest,
-    module: &WasmMod,
-    catalog: Option<&InternalsCatalog>,
-) -> Result<(), Listen> {
-    if manifest.inject.is_empty() {
+
+fn listen_checked(manifest: &Manifest, module: &WasmMod) -> Result<(), String> {
+    let engine: Vec<_> = manifest.inject.iter().collect();
+    if engine.is_empty() {
         return Ok(());
+    }
+    // The table's own answer, before the guest is asked anything: `register` would refuse each.
+    if !mod_points::__private::TABLE.has_sites() {
+        return Err(format!(
+            "{}: {}: this build has no point sites; start the game through the launcher's mod build",
+            manifest.id, engine[0].at
+        ));
+    }
+    for inject in &engine {
+        if let Some((_, reason)) = mod_points::API_REFUSALS.iter().find(|(target, _)| {
+            horizon_mod_point_emit::plain_path(target)
+                == horizon_mod_point_emit::plain_path(&inject.at)
+        }) {
+            return Err(format!(
+                "{}:{}: no API listener at {}: {reason}",
+                manifest.id, inject.id, inject.at
+            ));
+        }
     }
     let listed: Vec<(u32, String)> = module
         .call(
@@ -179,9 +114,8 @@ fn listen_checked(
             |input| input.take(),
         )
         .ok_or("point subscriptions did not answer")?;
-    let mut declared = manifest
-        .inject
-        .iter()
+    let mut declared = engine
+        .into_iter()
         .map(|inject| (inject.id.as_str(), inject))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut slots = Vec::new();
@@ -189,70 +123,213 @@ fn listen_checked(
         let inject = declared
             .remove(id.as_str())
             .ok_or_else(|| format!("undeclared point listener {id}"))?;
-        if place & 0x8000_0000 != 0 {
-            return Err(format!("{id}: invalid point subscription id").into());
-        }
-        let raw = place & 0x4000_0000 != 0;
-        let place = place & 0x3FFF_FFFF;
-        // Raw places run only in a staged game, which installs its catalog; without one a raw
-        // listener would never fire, so it is refused instead of silently registered.
-        if raw && catalog.is_none() {
-            return Err(Listen::Internals(InternalsRefusal::NoCatalog));
-        }
-        let catalog = if raw {
-            mod_points::RAW_PLACES
-        } else {
-            mod_points::API_PLACES
-        };
-        let Some(&(point, target, at_return)) =
-            catalog.iter().find(|(point, _, _)| *point as u32 == place)
-        else {
-            return Err(format!(
-                "{id}: no generated {} snapshot/record for place {place}",
-                if raw { "raw" } else { "API" }
-            )
-            .into());
-        };
-        if inject.access != if raw { Access::Internals } else { Access::Api }
-            || !matches!(
-                inject.kind,
-                Kind::Head | Kind::ModifyArg | Kind::Replace | Kind::Return
-            )
-            || (inject.kind == Kind::Return) != at_return
-            || horizon_mod_point_emit::plain_path(&inject.at)
-                != horizon_mod_point_emit::plain_path(target)
-        {
-            return Err(format!(
-                "{id}: listener does not match its declared API head/return target"
-            )
-            .into());
-        }
-        slots.push((point, index as u32, inject.priority, id, raw));
+        let point =
+            checked_place(&id, inject, place).map_err(|e| format!("{}: {e}", manifest.id))?;
+        slots.push((
+            point,
+            index as u32,
+            inject.priority,
+            id,
+            inject.kind == Kind::Replace,
+        ));
     }
     if let Some(id) = declared.keys().next() {
-        return Err(format!("unfilled point listener {id}").into());
+        return Err(format!("unfilled point listener {id}"));
     }
-    let raw_places: Vec<PointId> = slots
-        .iter()
-        .filter(|slot| slot.4)
-        .map(|slot| slot.0)
-        .collect();
-    install_policy(manifest, module, &raw_places, catalog)?;
     let owner = Box::leak(manifest.id.clone().into_boxed_str());
-    for (place, listener, priority, id, raw) in slots {
+    for (place, listener, priority, id, replace) in slots {
         let endpoint = Box::leak(Box::new(Endpoint {
             owner,
             module: module.downgrade(),
             listener,
         }));
         let id = Box::leak(id.into_boxed_str());
-        let slot = if raw {
-            SlotListener::snapshot(owner, place, endpoint, 0xC000_0000 + place as u32)
-                .map_err(|error| error.to_string())?
-        } else {
-            SlotListener::forwarded(owner, place, endpoint, 0x8000_0000 + place as u32)
-        };
-        mod_points::register(&slot.ordered(priority, id)).map_err(|error| error.to_string())?;
+        let mut slot =
+            SlotListener::forwarded(owner, place.place(), endpoint, 0x8000_0000 + place as u32)
+                .ordered(priority, id);
+        // The guest's listener already owns the outcome (`mod_points::replace!`); the host's
+        // slot carries the mark, so a second replace at the place is refused for either target.
+        if replace {
+            slot = slot.replacing();
+        }
+        mod_points::register(&slot).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// The engine's API place `place` that a guest subscribed as its declared `inject`, checked
+/// against the game's own point list, not what the module says of itself: the target, the phase,
+/// and, for a `replace`, that its head returns `()` or an API value the listener can produce.
+fn checked_place(id: &str, inject: &Inject, place: u32) -> Result<PointId, String> {
+    let Some(&(point, target, at_return, replace_refusal)) = mod_points::API_PLACES
+        .iter()
+        .find(|(point, ..)| *point as u32 == place)
+    else {
+        return Err(format!(
+            "{id}: {}: no API record for place {place}",
+            inject.at
+        ));
+    };
+    if (inject.kind == Kind::Return) != at_return
+        || horizon_mod_point_emit::plain_path(&inject.at)
+            != horizon_mod_point_emit::plain_path(target)
+    {
+        return Err(format!(
+            "{id}: listener does not match its declared API head/return target"
+        ));
+    }
+    if let Some(ty) = replace_refusal.filter(|_| inject.kind == Kind::Replace) {
+        return Err(format!(
+            "{id}: no replace listener at {target}: a replace returns the function's value, and \
+             `{ty}` has no API form"
+        ));
+    }
+    Ok(point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inject(kind: Kind, at: &str) -> Inject {
+        Inject {
+            id: "own".into(),
+            at: at.into(),
+            kind,
+            with: "own".into(),
+            priority: 0,
+            hash: Some("pin".into()),
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "listener-fixture"))]
+    fn unstaged_build_refuses_api_listener_by_mod_and_target() {
+        crate::test_stack::on_guest_stack(|| {
+            const { assert!(!mod_points::STAGED) };
+            let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "id": "site_test", "name": "Sites", "version": "1.0.0", "description": "", "api": "0.2", "capabilities": [],
+            "inject": [{"id": "head", "at": "game::tick", "kind": "head", "with": "listener"}]
+        }))
+        .unwrap();
+            let bytes = wat::parse_str(format!(
+                r#"(module
+            (@custom "dylink.0" "\01\04\00\00\00\00")
+            (import "env" "memory" (memory 1))
+            (func (export "horizon_layout") (result i64) i64.const {})
+            (func (export "horizon_in") (param i32) (result i32) i32.const 0)
+            (func (export "horizon_hook") (param i32) (result i64) i64.const 0))"#,
+                *mod_api::wire::LAYOUT
+            ))
+            .unwrap();
+            let mut modules = WasmMod::instantiate(
+                &crate::runtime::engine().unwrap(),
+                crate::runtime::DEFAULT_GROUP_MEMORY_MIB,
+                &[crate::link::Member {
+                    name: "libsite.so",
+                    module: &bytes,
+                }],
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                listen_checked(&manifest, &modules.remove(0)).unwrap_err(),
+                "site_test: game::tick: this build has no point sites; start the game through the launcher's mod build"
+            );
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "listener-fixture")]
+    fn wasm_loader_refuses_no_wire_by_mod_target_and_type() {
+        crate::test_stack::on_guest_stack(|| {
+            let manifest = Manifest::parse(&format!(
+                r#"id='refused_fixture'
+name='Refused fixture'
+version='1.0.0'
+api='0.2'
+capabilities=['registries']
+[wasm]
+sha512='{}'
+toolchain='fixture'
+[[inject]]
+id='no_wire'
+at='listener_fixture::no_wire'
+kind='head'
+with='no_wire'
+"#,
+                "0".repeat(128)
+            ))
+            .unwrap();
+            let bytes = wat::parse_str(format!(
+                r#"(module
+            (@custom "dylink.0" "\01\04\00\00\00\00")
+            (import "env" "memory" (memory 1))
+            (func (export "horizon_layout") (result i64) i64.const {})
+            (func (export "horizon_in") (param i32) (result i32) i32.const 0)
+            (func (export "horizon_hook") (param i32) (result i64) i64.const 0))"#,
+                *mod_api::wire::LAYOUT
+            ))
+            .unwrap();
+            let mut modules = WasmMod::instantiate(
+                &crate::runtime::engine().unwrap(),
+                crate::runtime::DEFAULT_GROUP_MEMORY_MIB,
+                &[crate::link::Member {
+                    name: "refused.so",
+                    module: &bytes,
+                }],
+                None,
+            )
+            .unwrap();
+            let error = listen(&manifest, &modules.remove(0))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "refused_fixture:no_wire: no API listener at listener_fixture::no_wire: argument 1 `value` (`&RegistrationData`) has no API type yet"
+            );
+        })
+    }
+
+    #[test]
+    fn missing_place_names_mod_row_and_declared_target() {
+        let error =
+            checked_place("addon:own", &inject(Kind::Head, "game::tick"), u32::MAX).unwrap_err();
+        assert_eq!(
+            error,
+            "addon:own: game::tick: no API record for place 4294967295"
+        );
+    }
+
+    /// A module built without the build tool may subscribe a `replace` anywhere: the loader
+    /// refuses one at a head whose return it can't produce, by the game's own point list.
+    #[test]
+    fn a_replace_is_checked_against_the_games_point_list_at_load() {
+        let heads = || {
+            mod_points::API_PLACES
+                .iter()
+                .filter(|(_, _, at_return, _)| !at_return)
+        };
+        let &(fallible, target, _, refusal) = heads()
+            .find(|(.., refusal)| refusal.is_some_and(|ty| ty.starts_with("Result")))
+            .expect("a game point returning Result<(), E> with an API record");
+        let error =
+            checked_place("own", &inject(Kind::Replace, target), fallible as u32).unwrap_err();
+        assert!(
+            error.contains(target) && error.contains(&format!("`{}`", refusal.unwrap())),
+            "{error}"
+        );
+        // An ordinary head listener there is unaffected.
+        assert_eq!(
+            checked_place("own", &inject(Kind::Head, target), fallible as u32),
+            Ok(fallible)
+        );
+        let &(owned, target, ..) = heads()
+            .find(|(.., refusal)| refusal.is_none())
+            .expect("a game point a replace can own");
+        assert_eq!(
+            checked_place("own", &inject(Kind::Replace, target), owned as u32),
+            Ok(owned)
+        );
+    }
 }

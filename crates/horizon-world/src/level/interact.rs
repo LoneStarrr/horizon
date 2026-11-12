@@ -269,7 +269,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     Success
                 }
                 Class::Cake => {
-                    if !player.can_eat {
+                    if !self.level.cake_can_eat(player.can_eat) {
                         return Pass;
                     }
                     self.player_effect(pos, state, PlayerEffect::EatCake);
@@ -284,7 +284,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                     Success
                 }
                 Class::CandleCake => {
-                    if !player.can_eat {
+                    if !self.level.cake_can_eat(player.can_eat) {
                         return Pass;
                     }
                     self.player_effect(pos, state, PlayerEffect::EatCake);
@@ -938,18 +938,6 @@ impl Behaviours {
                         | "minecraft:player_head"
                 )
             })
-        {
-            return Some(InteractionResult::Pass);
-        }
-        // WallHangingSignBlock.useItemOn: a hanging sign aimed at the sign's side
-        // (not its editable faces, `isHittingEditableSide`) chains onto it. Sign
-        // text has no click commands here, so `canExecuteClickCommands` is false.
-        if self.data(state).is(Class::WallHangingSign)
-            && item
-                .and_then(|i| self.item_binding(i))
-                .is_some_and(|binding| binding.kind == super::data::ItemKind::HangingSign)
-            && face != self.facing(state)
-            && face != self.facing(state).opposite()
         {
             return Some(InteractionResult::Pass);
         }

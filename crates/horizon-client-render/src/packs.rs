@@ -4,10 +4,12 @@
 //! and an overlay resource root that layers the enabled packs over the
 //! vanilla resources (later packs win), so every loader sees one tree.
 mod cache;
+mod import;
 use crate::resource_source::stays_inside;
 use crate::text::Style;
 use crate::text::Text;
 pub use horizon_client_core::pattern;
+pub use import::copy_pack;
 use pattern::Pattern;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -495,6 +497,13 @@ fn read_meta(source: &Source) -> Option<serde_json::Value> {
 /// file with a comment after the closing brace. Gson reads past a UTF-8 byte order mark;
 /// serde_json rejects it.
 pub(crate) fn parse_meta(bytes: &[u8]) -> Option<serde_json::Value> {
+    first_json(bytes)
+}
+
+/// Reads the first JSON value from resource metadata, matching Gson's
+/// `JsonReader` (which ignores a trailing signature or comment). Resource
+/// packs commonly append such text to texture metadata as well as pack.mcmeta.
+pub(crate) fn first_json(bytes: &[u8]) -> Option<serde_json::Value> {
     serde_json::Deserializer::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
         .into_iter()
         .next()?
@@ -502,7 +511,7 @@ pub(crate) fn parse_meta(bytes: &[u8]) -> Option<serde_json::Value> {
 }
 /// A pack's Polytone config entries (`assets/<namespace>/polytone/config_entries/<name>.json`,
 /// in the pack's base, not its overlays) at their default values.
-fn polytone_configs(source: &Source) -> horizon_polytone::pack::Configs {
+pub fn polytone_configs(source: &Source) -> horizon_polytone::pack::Configs {
     let mut configs = horizon_polytone::pack::Configs::default();
     let id_of = |name: &str| -> Option<String> {
         let rest = name.strip_prefix("assets/")?;
@@ -523,7 +532,84 @@ fn polytone_configs(source: &Source) -> horizon_polytone::pack::Configs {
             configs.add_entry(id, &json);
         }
     }
+    for (id, value) in polytone_choices() {
+        if configs.entries().contains_key(&id) {
+            configs.set(&id, value);
+        }
+    }
     configs
+}
+
+/// A pack's Polytone config entries and one's value, for the game's Pack Options.
+pub use horizon_polytone::pack::{ConfigValue, Configs};
+
+/// The player's Polytone config choices (#11486): what they changed from the packs' defaults,
+/// by entry id, for every pack. `polytone_configs` lays them over each pack's defaults.
+static POLYTONE_CHOICES: std::sync::RwLock<BTreeMap<String, horizon_polytone::pack::ConfigValue>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+pub fn polytone_choices() -> BTreeMap<String, horizon_polytone::pack::ConfigValue> {
+    POLYTONE_CHOICES
+        .read()
+        .map(|c| c.clone())
+        .unwrap_or_default()
+}
+
+/// Replaces the player's Polytone config choices (packs read them when they load again).
+pub fn set_polytone_choices(choices: BTreeMap<String, horizon_polytone::pack::ConfigValue>) {
+    if let Ok(mut c) = POLYTONE_CHOICES.write() {
+        *c = choices;
+    }
+}
+
+/// Where the choices are kept: `polytone-configs.json` beside `options.txt`.
+pub fn polytone_choices_file() -> std::path::PathBuf {
+    crate::logging::player_dir().join("polytone-configs.json")
+}
+
+/// Reads the choices from `path` (none when it is missing or broken).
+pub fn load_polytone_choices(path: &Path) -> BTreeMap<String, horizon_polytone::pack::ConfigValue> {
+    use horizon_polytone::pack::ConfigValue;
+    let Ok(bytes) = fs::read(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) else {
+        log::warn!("{}: not a JSON object", path.display());
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(id, v)| {
+            let value = match v {
+                serde_json::Value::Number(n) => ConfigValue::Number(n.as_f64()?),
+                serde_json::Value::String(s) => ConfigValue::Text(s),
+                serde_json::Value::Bool(b) => ConfigValue::Bool(b),
+                _ => return None,
+            };
+            Some((id, value))
+        })
+        .collect()
+}
+
+/// Writes the choices to `path`.
+pub fn save_polytone_choices(
+    path: &Path,
+    choices: &BTreeMap<String, horizon_polytone::pack::ConfigValue>,
+) -> std::io::Result<()> {
+    use horizon_polytone::pack::ConfigValue;
+    let map: serde_json::Map<String, serde_json::Value> = choices
+        .iter()
+        .map(|(id, v)| {
+            let json = match v {
+                ConfigValue::Number(n) => serde_json::json!(n),
+                ConfigValue::Text(s) => serde_json::json!(s),
+                ConfigValue::Bool(b) => serde_json::json!(b),
+            };
+            (id.clone(), json)
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .map_err(std::io::Error::other)?;
+    fs::write(path, text)
 }
 fn pack(id: String, title: Text, source: Source) -> Option<Pack> {
     pack_for(id, title, source, RESOURCE_FORMAT)
@@ -578,7 +664,10 @@ pub fn folder(dir: &Path, format: (i64, i64)) -> Vec<Pack> {
             let name = e.file_name().to_string_lossy().into_owned();
             let source = if path.is_dir() {
                 Source::Dir(path)
-            } else if name.ends_with(".zip") {
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            {
                 Source::Zip(path)
             } else {
                 return None;
@@ -771,8 +860,23 @@ fn merged_resources(
         if !filters.iter().any(|filter| filter.blocks(name)) {
             layers.extend(base.read(name).ok());
         }
-        for (_, (_, source, inner)) in stack {
-            layers.extend(source.read(inner).ok());
+        for (owner, (_, source, inner)) in stack {
+            let bytes = source.read(inner).ok();
+            let bytes = match (bytes, merge_kind(name)) {
+                (Some(bytes), Some(Merge::Sounds)) => Some(
+                    packs
+                        .get(*owner)
+                        .and_then(|pack| {
+                            horizon_polytone::pack::sounds_without_unmet(
+                                &bytes,
+                                &pack.polytone_configs,
+                            )
+                        })
+                        .unwrap_or(bytes),
+                ),
+                (bytes, _) => bytes,
+            };
+            layers.extend(bytes);
         }
         if let Some(kind) = merge_kind(name)
             && let Some(bytes) = merge(kind, &layers)
@@ -1738,6 +1842,49 @@ mod tests {
             component(&v(r#"["a",{"text":"b","color":"red"}]"#)).plain(),
             "ab"
         );
+    }
+    #[test]
+    fn a_sound_entry_whose_polytone_condition_fails_is_left_out() {
+        let base =
+            std::env::temp_dir().join(format!("horizon-packs-sound-cond-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (vanilla, dir, out) = (base.join("vanilla"), base.join("pack"), base.join("out"));
+        fs::create_dir_all(vanilla.join("assets/minecraft")).unwrap();
+        fs::write(
+            vanilla.join("assets/minecraft/sounds.json"),
+            r#"{"block.anvil.land":{"sounds":["vanilla"]}}"#,
+        )
+        .unwrap();
+        let configs = dir.join("assets/mypack/polytone/config_entries");
+        fs::create_dir_all(&configs).unwrap();
+        fs::create_dir_all(dir.join("assets/minecraft")).unwrap();
+        fs::write(configs.join("quiet.json"), r#"{"default_value": "OFF"}"#).unwrap();
+        fs::write(
+            dir.join("pack.mcmeta"),
+            r#"{"pack":{"description":"p","pack_format":97}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("assets/minecraft/sounds.json"),
+            r#"{"block.anvil.land":{"replace":true,"polytone_condition":"config('mypack:quiet') == 'ON'","sounds":["soft"]},
+                "block.anvil.use":{"sounds":["kept"]}}"#,
+        )
+        .unwrap();
+        let pack = pack("file/p".into(), Text::literal("p"), Source::Dir(dir)).unwrap();
+        build_overlay(&vanilla, &[pack], &out).unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("assets/minecraft/sounds.json")).unwrap())
+                .unwrap();
+        // The condition is false: the pack's entry doesn't replace vanilla's.
+        assert_eq!(
+            merged["block.anvil.land"]["sounds"],
+            serde_json::json!(["vanilla"])
+        );
+        assert_eq!(
+            merged["block.anvil.use"]["sounds"],
+            serde_json::json!(["kept"])
+        );
+        let _ = fs::remove_dir_all(base);
     }
     #[test]
     fn stacked_resources_merge_like_vanilla() {

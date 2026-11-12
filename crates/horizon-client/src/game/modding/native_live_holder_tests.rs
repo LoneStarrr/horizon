@@ -56,7 +56,7 @@ fn thousand_live_block_entity_ticks() {
         Box::new(BenchMod(mode)),
     )]
     .into();
-    mod_api::testing::with_mods(mods.clone(), || {
+    mod_platform::testing::with_mods(mods.clone(), || {
         crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::__private::mark_game_thread();
         let base = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -108,13 +108,22 @@ fn thousand_live_block_entity_ticks() {
     });
 }
 
-pub(super) fn with_mod_parts(test: impl FnOnce(std::path::PathBuf)) {
+/// Run the test `name` with this file's mod installed, in a fresh process: its content root
+/// freezes the process's block entity types, which another test may already have frozen.
+pub(super) fn with_mod_parts(name: &str, test: impl FnOnce(std::path::PathBuf)) {
+    if super::native_entity_refs::tests::run_fresh_cases(
+        name,
+        "HORIZON_LIVE_HOLDER_GAME_CHILD",
+        &["valid"],
+    ) {
+        return;
+    }
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
         "live_bench",
         Box::new(BenchMod("none")),
     )]
     .into();
-    mod_api::testing::with_mods(mods.clone(), || {
+    mod_platform::testing::with_mods(mods.clone(), || {
         crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::__private::mark_game_thread();
         let base = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -148,10 +157,11 @@ pub(super) fn mod_holder(game: &mut super::Game<'_>) -> mod_api::BlockEntityRef 
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; runs in an isolated scratch process"]
 fn data_slot_sizing_after_creation_and_load_joins_the_existing_journal() {
     use mod_api::BlockEntityDataError;
-    with_mod_parts(|root| {
+    const NAME: &str = "game::native_live_holder_tests::data_slot_sizing_after_creation_and_load_joins_the_existing_journal";
+    with_mod_parts(NAME, |root| {
         super::native_entity_refs::tests::with_game_at(root, |game| {
             let entity = mod_holder(game);
             let pos = (1, 64, 1);
@@ -298,7 +308,7 @@ fn a_declared_type_ticks_once_whichever_path_named_it() {
     }
     let mods: mod_api::Mods =
         vec![mod_api::ModEntry::new("tick_paths", Box::new(TickPaths))].into();
-    mod_api::testing::with_mods(mods.clone(), || {
+    mod_platform::testing::with_mods(mods.clone(), || {
         crate::game::api_values::install_parts(&mods).unwrap();
         mod_api::__private::mark_game_thread();
         let base = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());

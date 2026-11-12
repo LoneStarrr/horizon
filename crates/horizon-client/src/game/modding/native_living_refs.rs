@@ -13,7 +13,7 @@ use crate::mobs::Who;
 use horizon_client::items::ItemStack;
 use horizon_client::mobs::Mob;
 use horizon_world::attributes::{Modifier, Operation};
-use mod_api::first_person::Hand;
+use mod_api::client::first_person::Hand;
 use mod_api::{
     AttributeModifier, AttributeOperation, Direction, EntityRef, EquipmentSlot, Identifier,
     LivingRef, ModifierLifetime,
@@ -607,13 +607,14 @@ impl Game<'_> {
         match self.native_living_target(living) {
             Some(t @ (Target::Player | Target::Guest(_))) => self
                 .for_player(t, |g| {
-                    let p = g.player.as_mut()?;
-                    let max = p.attribute("minecraft:max_health").ok()? as f32;
-                    p.set_health(health.min(max), false).ok()
+                    let max = g.player.as_mut()?.attribute("minecraft:max_health").ok()? as f32;
+                    g.journal_player_health();
+                    g.player.as_mut()?.set_health(health.min(max), false).ok()
                 })
                 .flatten()
                 .is_some(),
             Some(Target::Mob(id)) => {
+                self.journal_mob_health(id);
                 let Some(m) = self.mobs.iter_mut().find(|m| m.id == id && !m.removed) else {
                     return false;
                 };
@@ -1200,8 +1201,7 @@ mod tests {
         use mod_api::ServerHost;
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let living = game.living(game.entity(20).unwrap()).unwrap();
             let mut stack = ItemStack::new("minecraft:diamond_sword", 1);
             stack.data_mut().enchantments = vec![("minecraft:unbreaking".into(), 3)];
@@ -1406,8 +1406,7 @@ mod tests {
         use mod_api::Host;
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let living = game.living(game.entity(20).unwrap()).unwrap();
             let attributes = &mut game.player.as_mut().unwrap().attributes;
             let key = attributes.key("minecraft:max_health").unwrap();
@@ -1555,8 +1554,7 @@ mod tests {
 
             // A player's own map answers the same read.
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let player = game.living(game.entity(20).unwrap()).unwrap();
             let health = "minecraft:max_health";
             assert_eq!(player.attribute_modifiers(game, health), Some(Vec::new()));
@@ -1597,18 +1595,18 @@ mod tests {
             game.mobs.push(Mob::new(12, zombie, Vec3::ZERO, 0.0));
             game.armor_stands.push(ArmorStand::new(13, Vec3::ZERO, 0.0));
             let mut dragon = super::super::dragon::Dragon::new(Vec3::ZERO, 0.0, 0);
-            dragon.id = 14;
+            // The eight dragon parts must not overlap the player at ID 20.
+            dragon.id = 40;
             game.dragon.replace(dragon);
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             // The vanilla attribute defaults: a player and a zombie 20, an
             // armor stand the 20 the game seeds it with, the dragon its 200.
             for (id, health, max, alive) in [
                 (20u32, 20.0, 20.0, true),
                 (12, 20.0, 20.0, true),
                 (13, 20.0, 20.0, true),
-                (14, 200.0, 200.0, true),
+                (40, 200.0, 200.0, true),
             ] {
                 let living = game.living(game.entity(id).unwrap()).unwrap();
                 assert_eq!(living.health(game), Some(health), "health of {id}");
@@ -1616,7 +1614,7 @@ mod tests {
                 assert_eq!(living.alive(game), Some(alive), "alive of {id}");
             }
             // A dead dragon: isAlive is health above zero.
-            let dragon_handle = game.living(game.entity(14).unwrap()).unwrap();
+            let dragon_handle = game.living(game.entity(40).unwrap()).unwrap();
             game.dragon.as_mut().unwrap().health = 0.0;
             assert_eq!(dragon_handle.health(game), Some(0.0));
             assert_eq!(dragon_handle.alive(game), Some(false));
@@ -1627,7 +1625,7 @@ mod tests {
             game.mobs[0].removed = true;
             game.armor_stands.clear();
             game.dragon.discard();
-            for id in [20u32, 12, 13, 14] {
+            for id in [20u32, 12, 13, 40] {
                 let handle = game.entity(id).and_then(|er| game.living(er));
                 assert!(handle.is_none(), "handle of {id} after it is gone");
             }
@@ -1715,8 +1713,7 @@ mod tests {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
             game.player.as_mut().unwrap().entity_id = 20;
             // The host's own turn: the uuid is acting, no guest connection.
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let pig_living = game.living(game.entity(12).unwrap()).unwrap();
             // A mob's hit names the mob's own id.
             game.mobs[0].ai.last_hurt_by = Some(Who::Mob(15));
@@ -1758,6 +1755,94 @@ mod tests {
 
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn set_health_journal_restores_nested_player_and_mob_writes() {
+        use horizon_client::motion::PlayerMotion;
+        use horizon_core::geometry::Vec3;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let zombie = game
+                .res
+                .mob_types()
+                .get("minecraft:zombie")
+                .unwrap()
+                .clone();
+            game.mobs.push(Mob::new(12, zombie, Vec3::ZERO, 0.0));
+            game.mobs[0].needs_sync = false;
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.player.as_mut().unwrap().entity_id = 20;
+            super::super::native_entity_refs::tests::bind_local_player(game, 20, 123);
+            let player = game.living(game.entity(20).unwrap()).unwrap();
+            let mob = game.living(game.entity(12).unwrap()).unwrap();
+            let initial = (player.health(game), mob.health(game));
+            let dirty = game.player.as_ref().unwrap().health.data.is_dirty();
+            let events = game.player.as_ref().unwrap().events.len();
+            let outer = game.transaction_open();
+            assert!(player.set_health(game, 12.0));
+            assert!(mob.set_health(game, 8.0));
+            let inner = game.transaction_open();
+            assert!(player.set_health(game, 0.0));
+            assert!(mob.set_health(game, 0.0));
+            game.transaction_close(&inner, false);
+            assert_eq!(
+                (player.health(game), mob.health(game)),
+                (Some(12.0), Some(8.0))
+            );
+            let inner = game.transaction_open();
+            assert!(player.set_health(game, 0.0));
+            assert!(mob.set_health(game, 0.0));
+            game.transaction_close(&inner, true);
+            game.transaction_close(&outer, false);
+            assert_eq!((player.health(game), mob.health(game)), initial);
+            assert_eq!(game.player.as_ref().unwrap().health.data.is_dirty(), dirty);
+            assert_eq!(game.player.as_ref().unwrap().events.len(), events);
+            assert!(!game.mobs[0].needs_sync);
+            assert!(!game.player.as_ref().unwrap().health.dead);
+            assert!(!game.mobs[0].removed);
+            game.mobs[0].needs_sync = true;
+            let abort = game.transaction_open();
+            assert!(mob.set_health(game, 0.0));
+            game.transaction_close(&abort, false);
+            assert_eq!(mob.health(game), initial.1);
+            assert!(
+                game.mobs[0].needs_sync,
+                "abort preserves preexisting sync dirtiness"
+            );
+            let commit = game.transaction_open();
+            assert!(player.set_health(game, 0.0));
+            assert!(mob.set_health(game, 0.0));
+            game.transaction_close(&commit, true);
+            assert_eq!(
+                (player.health(game), mob.health(game)),
+                (Some(0.0), Some(0.0))
+            );
+            assert!(game.mobs[0].needs_sync);
+            assert!(game.player.as_ref().unwrap().events.len() > events);
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn set_health_journal_restores_zero_health_guest_outside_its_turn() {
+        super::super::native_guest_turn_tests::with_guests(|game| {
+            let guest = game.player(12).unwrap();
+            let living = LivingRef::new(guest.entity());
+            let before = living.health(game).unwrap();
+            let tx = game.transaction_open();
+            assert!(living.set_health(game, before - 2.0));
+            let inner = game.transaction_open();
+            assert!(living.set_health(game, 0.0));
+            assert_eq!(living.health(game), Some(0.0));
+            game.transaction_close(&inner, false);
+            assert_eq!(living.health(game), Some(before - 2.0));
+            let inner = game.transaction_open();
+            assert!(living.set_health(game, 0.0));
+            game.transaction_close(&inner, true);
+            game.transaction_close(&tx, false);
+            assert_eq!(living.health(game), Some(before));
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn heal_uses_the_vanilla_signed_sum() {
         use horizon_client::mobs::Mob;
         use horizon_core::geometry::Vec3;
@@ -1792,8 +1877,6 @@ mod tests {
                 .unwrap()
                 .clone();
             game.mobs.push(Mob::new(15, zombie, Vec3::ZERO, 0.0));
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
             let source = game
                 .motion
                 .health
@@ -1817,6 +1900,7 @@ mod tests {
                     .unwrap();
                 player.set_health(absorption, true).unwrap();
                 game.player = Some(player);
+                crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
                 game.note_attacker("minecraft:mob_attack", 15);
                 let rules = game.world.health_rules;
                 let level = super::super::entity::damage_level_of!(game);
@@ -1866,8 +1950,7 @@ mod tests {
             game.mobs[0].health = 0.0;
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
             game.player.as_mut().unwrap().entity_id = 20;
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let mob_living = game.living(game.entity(12).unwrap()).unwrap();
             assert!(!mob_living.heal(game, 10.0));
             assert_eq!(mob_living.health(game), Some(0.0));
@@ -1898,8 +1981,7 @@ mod tests {
         use mod_api::ServerHost;
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             game.selected = 3;
             let player = game.living(game.entity(20).unwrap()).unwrap();
             let sword = ItemStack::new("minecraft:iron_sword", 1);
@@ -2168,9 +2250,10 @@ mod tests {
             ));
             assert_eq!(game.living_equipment(horse, EquipmentSlot::Body), None);
             let mut dragon = super::super::dragon::Dragon::new(Vec3::ZERO, 0.0, 0);
-            dragon.id = 15;
+            // Reserve the dragon's eight consecutive part IDs away from the stand.
+            dragon.id = 40;
             game.dragon.replace(dragon);
-            let dragon = game.living(game.entity(15).unwrap()).unwrap();
+            let dragon = game.living(game.entity(40).unwrap()).unwrap();
             // The dragon and an armor stand store all eight slots, full
             // stacks included, and save them through the real codecs.
             let mut stand = horizon_client::entities::ArmorStand::new(16, Vec3::ZERO, 0.0);
@@ -2291,7 +2374,7 @@ mod tests {
                 }
             }
         }
-        mod_api::testing::with_mods(
+        mod_platform::testing::with_mods(
             vec![ModEntry::new("first_tick_equipment", Box::new(Reequip))].into(),
             || {
                 super::super::native_entity_refs::tests::with_game(|game| {
@@ -2378,7 +2461,7 @@ mod tests {
         };
         use horizon_client::{chunk::Chunk, entities::ArmorStand};
         use horizon_core::geometry::Vec3;
-        use mod_api::NativeAuthority;
+        use mod_api::Authority;
 
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -2413,7 +2496,7 @@ mod tests {
         let chunk = std::sync::Arc::new(Chunk::empty(0, 0));
         game.world.chunks.insert((0, 0), chunk);
         game.native_lifecycle
-            .begin_open(NativeAuthority::IntegratedServer);
+            .begin_open(Authority::IntegratedServer);
         let id = game
             .spawn_mob(
                 "minecraft:wolf",
@@ -2482,14 +2565,13 @@ mod tests {
             );
             game.yaw = 37.0;
             game.pitch = -21.0;
-            game.world.random = horizon_core::random::LegacyRandom::new(12345);
+            *game.world.random = horizon_core::random::LegacyRandom::new(12345);
             let item = ItemStack::new("minecraft:apple", 1);
             game.inventory[game.selected] = Some(item.clone());
             game.drop_held(true);
             let key_velocity = game.dropped.last().unwrap().velocity;
-            game.world.random = horizon_core::random::LegacyRandom::new(12345);
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(42);
+            *game.world.random = horizon_core::random::LegacyRandom::new(12345);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 42, 123);
             let player = game.living(game.entity(42).unwrap()).unwrap();
             let id = game.living_drop(player, item, false, true).unwrap().id();
             let mod_velocity = game
@@ -2618,8 +2700,7 @@ mod tests {
 
             // A player's own answers: alive and awake, freezable, drowning.
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let player = game.living(game.entity(20).unwrap()).unwrap();
             {
                 let host: &dyn Host = game;
@@ -2733,8 +2814,7 @@ mod tests {
             // A player asleep in the same bed answers the same facing.
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             game.sleeping = Some([2, 63, 2]);
             let player = game.living(game.entity(20).unwrap()).unwrap();
             let host: &dyn Host = game;

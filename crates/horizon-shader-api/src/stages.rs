@@ -25,7 +25,7 @@ pub enum StageKind {
     Weather,
     /// A full-screen pass over the world's picture, under the hand and HUD.
     Post,
-    /// 0.2: the picture for the display, once per pixel of the window after the post chain,
+    /// 0.2: the picture for an output (the display), once per pixel of it after the post chain,
     /// before the camera overlays and the HUD.
     Tonemap,
 }
@@ -130,8 +130,9 @@ const TONEMAP_RESOURCES: [Resource; 4] = [
     NEAREST_SAMPLER,
 ];
 
-/// 0.2's colour boundary, in every 0.2 prelude: vanilla's 2.2 power both ways.
-const COLOR_HELPERS: &str = "\
+/// 0.2's colour boundary, in every 0.2 prelude and in mod pipelines' generated entries:
+/// vanilla's 2.2 power both ways.
+pub const COLOR_HELPERS: &str = "\
 // Negatives and NaN made 0 (a comparison with NaN is false), so no `pow` sees them.
 fn horizon_sanitize(c: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), c, c > vec3<f32>(0.0));

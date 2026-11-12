@@ -135,6 +135,7 @@ impl Game<'_> {
             facts: self.res.facts(),
             collision: self.collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         find_noxious_gas_source_block(&level, [pos.0, pos.1, pos.2])
     }
@@ -190,6 +191,7 @@ impl Game<'_> {
             facts: self.res.facts(),
             collision: self.collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         // The gas reads blocks only, so the mobs it reaches can be found
         // before any gets its effect.
@@ -267,6 +269,7 @@ impl Game<'_> {
                 facts: self.res.facts(),
                 collision: self.collision,
                 player: None,
+                cached_chunk: std::cell::Cell::new(None),
             };
             can_be_reached_by_noxious_gas(&level, source, eye)
         };
@@ -344,8 +347,8 @@ impl Game<'_> {
         self.process_level_events()
     }
 
-    /// `PotentSulfurBlockEntity.LAUNCH_ENTITY_TICKER` on the server: mobs and
-    /// items and primed TNT in the geyser's column with less than
+    /// `PotentSulfurBlockEntity.LAUNCH_ENTITY_TICKER` on the server: mobs, items,
+    /// primed TNT, projectiles, boats and minecarts in the geyser's column with less than
     /// `0.3 + 0.1 * water` upward speed get 0.2 more, unless they ride
     /// something or are of a type geysers do not move. Players are moved by
     /// their own client.
@@ -359,6 +362,7 @@ impl Game<'_> {
             facts: self.res.facts(),
             collision: self.collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         let height = unobstructed_block_count(&level, [pos.0, pos.1 + 1, pos.2], water_blocks);
         let area = launch_area(pos, height);
@@ -407,6 +411,24 @@ impl Game<'_> {
                 tnt.velocity.y += push;
             }
         }
+        // Every entity in the column is launched (`getEntitiesOfClass(Entity.class)`):
+        // a projectile in flight or at rest, a boat and a minecart too.
+        self.creatures.projectiles.for_each_mut(|p| {
+            if p.bounds().intersects(area) && p.velocity.y < limit {
+                p.velocity.y += push;
+                p.needs_sync = true;
+            }
+        });
+        self.boats.for_each_mut(|boat| {
+            if boat.bounds().intersects(area) && boat.velocity.y < limit {
+                boat.velocity.y += push;
+            }
+        });
+        self.carts.for_each_mut(|cart| {
+            if cart.bounds().intersects(area) && cart.velocity.y < limit {
+                cart.velocity.y += push;
+            }
+        });
     }
 
     /// `PotentSulfurBlockEntity.LAUNCH_ENTITY_TICKER` on the client: the local
@@ -422,6 +444,7 @@ impl Game<'_> {
                 facts: self.res.facts(),
                 collision: self.collision,
                 player: None,
+                cached_chunk: std::cell::Cell::new(None),
             };
             unobstructed_block_count(&level, [pos.0, pos.1 + 1, pos.2], water_blocks)
         };
@@ -621,11 +644,23 @@ mod pass_tests {
             game.mobs
                 .push(Mob::new(1, kind.clone(), Vec3::new(1.5, 64.0, 1.5), 0.0));
             game.mobs
-                .push(Mob::new(2, kind, Vec3::new(65.5, 64.0, 1.5), 0.0));
+                .push(Mob::new(2, kind.clone(), Vec3::new(65.5, 64.0, 1.5), 0.0));
+            // The six-block-wide nausea query, expanded by the zombie's width
+            // plus SeenGrid's margin, spans 3 x 3 four-block grid columns.
+            // Populate distinct distant columns so candidates uses the grid
+            // rather than its small-population scan fallback. Keep mob 2 in slot 1.
+            for i in 0..64u32 {
+                game.mobs.push(Mob::new(
+                    i + 3,
+                    kind.clone(),
+                    Vec3::new(256.5 + f64::from(i) * 8.0, 64.0, 256.5),
+                    0.0,
+                ));
+            }
             let moved = game.entity(2).unwrap();
             let mods: mod_api::Mods =
                 vec![ModEntry::new("move-on-nausea", Box::new(MoveMob(moved)))].into();
-            mod_api::testing::with_mods(mods, || {
+            mod_platform::testing::with_mods(mods, || {
                 game.pass_mobs = Some(PassMobs::default());
                 game.server_nausea_effect_ticker((1, 63, 1));
                 assert_eq!(game.mobs[1].position, Vec3::new(33.5, 64.0, 1.5));

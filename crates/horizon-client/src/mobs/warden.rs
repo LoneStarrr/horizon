@@ -3,7 +3,7 @@
 //! tendril animations, the model and its emissive layers. Its brain
 //! (`WardenAi`) is in `warden_brain`.
 use super::{
-    Damage, DamageKind, Mob, MobEvent, MobWorld, Species, Who,
+    Damage, DamageKind, Mob, MobEvent, MobWorld, Species, TargetChange, Who,
     anim::{Poses, State},
     keyframes::Animation,
     path::PathType,
@@ -342,7 +342,14 @@ impl Warden {
 }
 
 pub fn register(m: &mut Mob) {
-    m.extra.warden = Some(Box::default());
+    // The brain at construction, with the mob's own type id so a mod part's
+    // behaviors join it (#824).
+    let id = m.kind.id.clone();
+    let st = Warden {
+        brain: Brain::new(&id, 0),
+        ..Warden::default()
+    };
+    m.extra.warden = Some(Box::new(st));
     m.ai.nav.can_float = true;
     m.set_malus(PathType::UnpassableRail, 0.0);
     m.set_malus(PathType::Damaging, 8.0);
@@ -365,7 +372,8 @@ pub fn delay_sensors(m: &mut Mob) {
 pub fn init_brain(m: &mut Mob, seed: i64) {
     if let Some(st) = m.extra.warden.as_mut() {
         let mem = std::mem::take(&mut st.brain.mem);
-        st.brain = Brain::new(seed);
+        let id = m.kind.id.clone();
+        st.brain = Brain::new(&id, seed);
         st.brain.mem = mem;
     }
     delay_sensors(m);
@@ -390,8 +398,11 @@ pub fn finalize(m: &mut Mob, triggered: bool, events: &mut Vec<MobEvent>) {
 fn at(m: &Mob) -> [f64; 3] {
     [m.position.x, m.position.y, m.position.z]
 }
+/// `Entity.playSound`: nothing from a silent warden.
 fn sound(m: &Mob, name: &'static str, volume: f32, pitch: f32, events: &mut Vec<MobEvent>) {
-    events.push(MobEvent::Sound(name, at(m), volume, pitch));
+    if !m.silent {
+        events.push(MobEvent::Sound(name, at(m), volume, pitch));
+    }
 }
 /// `LivingEntity.getVoicePitch` for an adult.
 fn voice_pitch(m: &mut Mob) -> f32 {
@@ -409,8 +420,7 @@ fn closer_than(m: &Mob, p: Vec3, horizontal: f64, vertical: f64) -> bool {
 pub fn can_target(w: &MobWorld, who: Who) -> bool {
     match who {
         Who::Player => w
-            .player
-            .as_ref()
+            .selected_player()
             .is_some_and(|p| p.alive && !p.creative && !p.spectator),
         Who::Mob(id) => w
             .seen(id)
@@ -442,8 +452,13 @@ pub(super) fn increase_anger(
     };
     let maybe_switch = st.target() != Some(Who::Player);
     let new = st.anger.increase(who, amount);
-    if who == Who::Player && maybe_switch && AngerLevel::by_anger(new).is_angry() {
-        st.brain.mem.attack_target.clear();
+    if who == Who::Player
+        && maybe_switch
+        && AngerLevel::by_anger(new).is_angry()
+        && warden_brain::mem(m).attack_target.present()
+        && let TargetChange::Set(target) = w.change_target(m, true, None)
+    {
+        warden_brain::mem(m).attack_target.set_opt(target);
     }
     if play_sound && pose(m) != Pose::Roaring {
         let level = anger_level(m);
@@ -508,7 +523,7 @@ fn handle_hurt(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
             && let Some(p) = position_of(w, who)
             && (direct || m.distance_sqr(p) < 25.0)
         {
-            warden_brain::set_attack_target(m, who);
+            warden_brain::set_attack_target(m, w, who);
         }
     }
 }
@@ -620,6 +635,8 @@ pub fn listen(
                 pos,
                 source: ctx.source,
                 owner: ctx.owner,
+                source_uuid: ctx.source_uuid,
+                owner_uuid: ctx.owner_uuid,
             },
             now,
         );
@@ -796,8 +813,20 @@ pub fn server_ai_step(
             .tick(|who| can_target(w, who), |uuid| w.who_by_uuid(uuid));
         st.client_anger = st.anger.active_anger(st.target());
     }
+    let target_change = m.extra.warden.as_ref().and_then(|st| {
+        st.brain
+            .will_clear_attack_target()
+            .then(|| st.brain.mem.attack_target.value())
+    });
+    let target_change = target_change.map(|original| match w.change_target(m, true, None) {
+        TargetChange::Keep => original,
+        TargetChange::Set(target) => target,
+    });
     if let Some(st) = m.extra.warden.as_mut() {
         st.brain.update_activity();
+        if let Some(target) = target_change {
+            st.brain.mem.attack_target.set_opt(target);
+        }
     }
 }
 /// `SonicBoom.tick`: face the target; once the sound delay is over, the
@@ -847,11 +876,16 @@ pub(super) fn tick_sonic_boom(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEve
         });
     }
     sound(m, "entity.warden.sonic_boom", 3.0, 1.0, events);
-    events.push(MobEvent::SonicBoom {
+    let event = MobEvent::SonicBoom {
         target,
         attacker: m.id,
         from: at(m),
         direction: normal,
+    };
+    events.push(if target == Who::Player {
+        w.route_player_event(event)
+    } else {
+        event
     });
 }
 /// `Warden.tick` off the window's client: the heart's clock, the tendril and
@@ -1089,6 +1123,25 @@ pub fn emissive_layers(m: &Mob, partial: f32) -> [(&'static str, &'static str, f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Entity.playSound` checks `isSilent`: a `Silent:1b` warden summoned
+    /// out of the ground still growled (#8835).
+    #[test]
+    fn a_silent_warden_climbs_out_without_a_sound() {
+        let sounds = |silent| {
+            let mut m = Mob::new(1, crate::mobs::sensor_scan_tests::kind(), Vec3::ZERO, 0.0);
+            register(&mut m);
+            m.silent = silent;
+            let mut events = Vec::new();
+            finalize(&mut m, true, &mut events);
+            events
+                .iter()
+                .filter(|e| matches!(e, MobEvent::Sound(..)))
+                .count()
+        };
+        assert_eq!(sounds(false), 1);
+        assert_eq!(sounds(true), 0);
+    }
 
     #[test]
     fn anger_levels_follow_the_thresholds() {

@@ -1664,8 +1664,8 @@ mod tests {
         lang::scoped(lang::Language::load(&[], "de_de"), || {
             assert_eq!(
                 ui.status_lines().unwrap()[0],
-                "Splitscreen is off.",
-                "untranslated new keys use bundled English"
+                "Splitscreen ist aus.",
+                "German translation"
             );
         });
     }

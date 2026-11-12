@@ -1456,6 +1456,159 @@ fn h149_oblique_local_offsets_are_grouped_before_the_origin() {
 }
 
 #[test]
+fn a_custom_argument_parses_completes_and_keeps_its_id() {
+    let argument = ArgType::Custom(CustomArgument::new(
+        "example:machine",
+        CustomArgumentKind::Word,
+        |input| {
+            if input == "press" {
+                Ok(input.to_owned())
+            } else {
+                Err(Text::literal(format!("unknown machine `{input}`")))
+            }
+        },
+        |prefix| {
+            ["press", "furnace"]
+                .into_iter()
+                .filter(|machine| machine.starts_with(prefix))
+                .map(|text| CustomSuggestion {
+                    text: text.to_owned(),
+                    tooltip: None,
+                })
+                .collect()
+        },
+    ));
+    let mut dispatcher = Dispatcher::new();
+    let command = dispatcher.literal(0, "machine");
+    let use_node = dispatcher.literal(command, "use");
+    let machine = dispatcher.argument(use_node, "machine", argument);
+    dispatcher.executes(machine, "test");
+
+    let registries = reg();
+    let parsed = dispatcher.parse("machine use press", &registries);
+    let (context, _) = parsed.executable().unwrap();
+    assert_eq!(
+        context.get("machine"),
+        Some(&Arg::Custom {
+            kind: "example:machine".into(),
+            value: "press".into(),
+        })
+    );
+    let error = dispatcher
+        .parse("machine use banana", &registries)
+        .executable()
+        .unwrap_err();
+    assert_eq!(error.message, Text::literal("unknown machine `banana`"));
+
+    let typed = "machine use pr";
+    let (_, suggestions) = dispatcher.suggestions(
+        &dispatcher.parse(typed, &registries),
+        typed.len(),
+        &registries,
+    );
+    assert_eq!(
+        suggestions
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>(),
+        ["press"]
+    );
+}
+
+#[test]
+fn a_greedy_custom_argument_takes_the_rest_of_the_line() {
+    let argument = ArgType::Custom(CustomArgument::new(
+        "example:note",
+        CustomArgumentKind::Greedy,
+        |input| Ok(input.trim().to_owned()),
+        |_| Vec::new(),
+    ));
+    let mut dispatcher = Dispatcher::new();
+    let note = dispatcher.literal(0, "note");
+    let set = dispatcher.literal(note, "set");
+    let text = dispatcher.argument(set, "text", argument);
+    dispatcher.executes(text, "test");
+
+    let registries = reg();
+    let parsed = dispatcher.parse("note set hello there", &registries);
+    let (context, _) = parsed.executable().unwrap();
+    assert_eq!(
+        context.get("text"),
+        Some(&Arg::Custom {
+            kind: "example:note".into(),
+            value: "hello there".into(),
+        })
+    );
+}
+
+#[test]
+fn profiler_commands_parse_and_complete_for_a_player_without_operator_permission() {
+    let reg = Registries {
+        permission: 0,
+        ..reg()
+    };
+    let tree = vanilla::game_dispatcher().with_profiler();
+    for line in [
+        "profiler start",
+        "profiler start client",
+        "profiler start gpu",
+        "profiler start client gpu_detail",
+        "profiler stop server",
+        "profiler status",
+        "profiler share",
+        "profiler share profile-20251107-143844Z",
+        "profiler open",
+        "profiler open profile-20251107-143844Z",
+        "profiler mark slow frame",
+    ] {
+        assert_eq!(
+            tree.parse(line, &reg).executable().unwrap().1,
+            PROFILER_COMMAND,
+            "{line}"
+        );
+    }
+    let input = "profiler start ";
+    let parse = tree.parse(input, &reg);
+    let sides: Vec<_> = tree
+        .client_suggestions(&parse, input.len(), &reg)
+        .1
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    assert_eq!(sides, ["client", "gpu", "gpu_detail", "server"]);
+    for line in [
+        "profiler start --gpu",
+        "profiler stop gpu",
+        "profiler start gpu client",
+    ] {
+        assert!(tree.parse(line, &reg).executable().is_err(), "{line}");
+    }
+    assert!(vanilla::game_dispatcher().find("profiler").is_none());
+    assert!(tree.has_horizon_profiler());
+}
+
+#[test]
+fn a_servers_own_profiler_keeps_its_node_and_is_not_horizons() {
+    let mut server = vanilla::game_dispatcher().clone();
+    let node = server.literal(0, "profiler");
+    server.executes(node, "server:profiler");
+    let open = server.literal(node, "open");
+    server.executes(open, "server:profiler");
+    let tree = server.with_profiler();
+    assert!(!tree.has_horizon_profiler());
+    let input = "profiler ";
+    let parse = tree.parse(input, &reg());
+    let offered: Vec<_> = tree
+        .client_suggestions(&parse, input.len(), &reg())
+        .1
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    assert_eq!(offered, ["open"]);
+    assert!(!vanilla::game_dispatcher().has_horizon_profiler());
+}
+
+#[test]
 fn execute_in_suggests_every_level_the_server_has() {
     // DimensionArgument.listSuggestions: SharedSuggestionProvider.levels(), the
     // level keys of the login packet, data-pack and mod dimensions included.

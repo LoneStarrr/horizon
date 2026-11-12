@@ -144,7 +144,7 @@ impl Goal for DrinkItem {
         if m.extra.using_item == 0 {
             return;
         }
-        m.extra.using_item += 1;
+        super::spear_use::count_use_tick(m);
         if m.extra.using_item > DRINK_TICKS {
             // LivingEntity.completeUsingItem: the potion or the milk takes effect.
             if self.dark {
@@ -187,8 +187,7 @@ impl Goal for TradeWithPlayer {
             && m.on_ground
             && cx
                 .w
-                .player
-                .as_ref()
+                .selected_player()
                 .is_some_and(|p| m.distance_sqr(p.position) <= 16.0)
     }
     fn start(&mut self, m: &mut Mob, _: &mut Cx) {
@@ -204,13 +203,13 @@ impl Goal for LookAtTradingPlayer {
         LOOK
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        m.extra.flag2 && cx.w.player.is_some()
+        m.extra.flag2 && cx.w.selected_player().is_some()
     }
     fn every_tick(&self) -> bool {
         true
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        if let Some(p) = &cx.w.player {
+        if let Some(p) = cx.w.selected_player() {
             m.look_at([p.position.x, p.eye[1], p.position.z]);
         }
     }
@@ -452,4 +451,49 @@ mod trade_start_tests {
             "TradeWithPlayerGoal starts only for an unhurt trader within four blocks"
         );
     }
+}
+
+#[cfg(test)]
+mod use_overflow_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires prepared entity resources in .local/horizon-client"]
+    fn trader_drink_completes_at_max_use_counter() {
+        assert!(
+            with_test_world(&[], |w, types| {
+                let kind = Arc::new(types.types["minecraft:wandering_trader"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 80.0, 0.5), 0.0);
+                m.extra.using_item = i32::MAX;
+                let mut world = w.clone();
+                world.player = Some(test_player(Vec3::new(2.5, 80.0, 0.5)));
+                let mut goal = DrinkItem {
+                    item: "minecraft:potion",
+                    finish_sound: "entity.wandering_trader.disappeared",
+                    dark: true,
+                };
+                let mut fixture = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                goal.tick(
+                    &mut m,
+                    &mut Cx {
+                        w: &world,
+                        level: &mut fixture.level(),
+                        events: &mut events,
+                    },
+                );
+                assert_eq!(m.extra.using_item, 0);
+                assert!(invisible(&m));
+            }),
+            "prepared mob resources required"
+        );
+    }
+}
+
+/// Whether the wandering trader currently has invisibility.
+pub fn is_invisible(m: &Mob) -> bool {
+    invisible(m)
 }

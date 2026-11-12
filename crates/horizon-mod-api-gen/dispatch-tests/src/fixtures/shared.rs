@@ -1,6 +1,6 @@
 //! Shared exception: dispatch infrastructure and cross-area fixture types/tests; no new hooks.
 use horizon_core::game_mode::GameMode;
-use mod_api::mod_api::hud_layout::GuiDraw;
+use mod_api::mod_api::client::hud_layout::GuiDraw;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,25 +21,33 @@ impl ItemStack {
         ItemKey(&self.item)
     }
 }
-mod registry_keys {
-    pub(super) fn block_key(name: &str) -> Option<super::BlockKey> {
-        match name {
-            "test:block" => Some(super::BlockKey::Test),
-            "test:other" => Some(super::BlockKey::Other),
-            _ => None,
+mod content {
+    pub(super) mod registry_keys {
+        pub(in crate::tests) fn block_key(name: &str) -> Option<super::super::BlockKey> {
+            match name {
+                "test:block" => Some(super::super::BlockKey::Test),
+                "test:other" => Some(super::super::BlockKey::Other),
+                _ => None,
+            }
+        }
+        pub(in crate::tests) fn block_entity_type_name(
+            _: super::super::BlockEntityTypeKey,
+        ) -> Option<&'static str> {
+            Some("test:counter")
+        }
+        pub(in crate::tests) fn item_id(key: super::super::ItemKey<'_>) -> Option<&str> {
+            Some(key.0)
         }
     }
-    pub(super) fn item_id(key: super::ItemKey<'_>) -> Option<&str> {
-        Some(key.0)
-    }
 }
+
 struct BlockEntityDraw(Vec<u32>);
 use serde_json::{Map, Value};
 use stubs::*;
 struct Text;
 struct ScreenshotImage;
 #[derive(Debug, PartialEq)]
-struct NativeZoom(u32);
+struct Zoom(u32);
 enum Flow {
     Continue,
     Cancel,
@@ -99,9 +107,17 @@ impl ClientHost for TestHost {}
 #[allow(dead_code)]
 mod generated {
     pub(super) mod mod_api {
-        pub struct Block;
-        pub struct Item;
+        pub struct Block {
+            pub id: String,
+        }
+        pub struct Item {
+            pub id: String,
+        }
         pub(super) use super::super::ItemStack;
+        pub(super) use super::super::{
+            Command, Config, Dispensed, InteractionResult, MapDecoration, MapInfo, Minimap, Screen,
+            Zoom,
+        };
         pub struct FluidModel;
         include!(concat!(env!("OUT_DIR"), "/dispatch_fixtures_api.rs"));
     }
@@ -121,12 +137,20 @@ thread_local! {
 }
 fn install(mods: Arc<[ModEntry]>) {
     let subscriptions = mods.iter().enumerate().flat_map(|(index, entry)| {
-        entry
-            .hooks
-            .subscribed()
-            .iter()
-            .flatten()
-            .map(move |hook| (index, *hook as usize))
+        let listeners = entry.hooks.listeners();
+        entry.hooks.subscribed().iter().flatten().map(move |hook| {
+            let listener = listeners.iter().find(|listener| {
+                listener
+                    .hook
+                    .is_some_and(|id| id as usize == *hook as usize)
+            });
+            horizon_mod_runtime::subscribers::Subscription {
+                index,
+                hook: *hook as usize,
+                priority: listener.map_or(0, |listener| listener.priority),
+                receives_cancelled: listener.is_some_and(|listener| listener.receive_cancelled),
+            }
+        })
     });
     let subscribers =
         horizon_mod_runtime::subscribers::Subscribers::new(HOOK_COUNT, mods.len(), subscriptions);
@@ -137,6 +161,10 @@ fn listened(hook: HookId) -> bool {
     MODS.get()
         .is_some_and(|installed| installed.subscribers.contains_any(hook as usize))
 }
+fn receives_cancelled(hook: HookId) -> bool {
+    MODS.get()
+        .is_some_and(|installed| installed.subscribers.receives_cancelled(hook as usize))
+}
 fn entered(hook_id: HookId, hook: &'static str) -> impl Iterator<Item = &'static dyn Hooks> {
     entered_with_id(hook_id, hook).map(|(_, hooks)| hooks)
 }
@@ -144,16 +172,49 @@ fn entered_with_id(
     hook_id: HookId,
     hook: &'static str,
 ) -> impl Iterator<Item = (&'static str, &'static dyn Hooks)> {
+    listening(hook_id).map(move |(_, entry)| {
+        let ((), hooks) = enter_listener(entry, hook);
+        (entry.id, hooks)
+    })
+}
+fn listening(hook_id: HookId) -> impl Iterator<Item = (bool, &'static ModEntry)> {
     MODS.get().into_iter().flat_map(move |installed| {
         installed
             .subscribers
-            .indices(hook_id as usize)
-            .map(move |index| {
-                let entry = &installed.mods[index];
-                ENTERED.with(|entered| entered.borrow_mut().push((index, hook)));
-                (entry.id, &*entry.hooks)
+            .subscribers(hook_id as usize)
+            .map(move |subscriber| {
+                (
+                    subscriber.receives_cancelled,
+                    &installed.mods[subscriber.index],
+                )
             })
     })
+}
+mod runtime {
+    pub(super) struct ListenerScope;
+    impl ListenerScope {
+        pub(super) fn new() -> Self {
+            Self
+        }
+        pub(super) fn enter(
+            &mut self,
+            entry: &'static super::ModEntry,
+            hook: &'static str,
+        ) -> &'static dyn super::Hooks {
+            super::enter_listener(entry, hook).1
+        }
+    }
+}
+fn enter_listener(entry: &'static ModEntry, hook: &'static str) -> ((), &'static dyn Hooks) {
+    let index = MODS
+        .get()
+        .unwrap()
+        .mods
+        .iter()
+        .position(|e| std::ptr::eq(e, entry))
+        .unwrap();
+    ENTERED.with(|entered| entered.borrow_mut().push((index, hook)));
+    ((), &*entry.hooks)
 }
 struct ModEntry {
     id: &'static str,
@@ -169,6 +230,12 @@ trait Registrar {}
 /// it: no methods, its type is all the generated trait asks of the scope.
 #[expect(dead_code)]
 struct GoalRegistrar<'a> {
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+/// The behavior registrar of the generated `EntityPart` (#824), as the
+/// fixture sees it: like [`GoalRegistrar`], only its type is asked for.
+#[expect(dead_code)]
+struct BehaviorRegistrar<'a> {
     _lifetime: std::marker::PhantomData<&'a ()>,
 }
 /// Scope fixtures install their own Parts. Block attachments retain their API keys;
@@ -344,7 +411,7 @@ impl ItemPart for Mod {
 impl Hooks for Mod {
     fn living_entity_use_item_finish(
         &self,
-        _: &mut dyn ServerHost,
+        _: HostSide,
         event: &mut LivingEntityUseItemFinishEvent<'_>,
     ) {
         *event.result = None;
@@ -384,12 +451,12 @@ impl Hooks for Mod {
             .or_insert_with(|| serde_json::json!([]));
         value.as_array_mut().unwrap().push(self.id.into());
     }
-    fn level_tick_pre(&self, _: &mut dyn ServerHost, _: &mut LevelTickPreEvent<'_>) {
+    fn level_tick_pre(&self, _: HostSide, _: &mut LevelTickPreEvent) {
         self.calls.lock().unwrap().push(self.id);
     }
-    fn zoom(&self, _: &dyn ClientHost, _: &mut ZoomEvent) -> Option<NativeZoom> {
+    fn zoom(&self, _: &dyn ClientHost, _: &mut ZoomEvent) -> Option<Zoom> {
         self.calls.lock().unwrap().push(self.id);
-        Some(NativeZoom(self.id))
+        Some(Zoom(self.id))
     }
     fn should_apply_effect_tick_this_tick(
         &self,
@@ -461,12 +528,12 @@ mod stubs {
     pub(super) trait LevelTicksHost: LevelHost {}
     pub(super) trait LevelRandomHost: LevelHost {}
     pub(super) trait LevelWriteHost: LevelTicksHost + LevelRandomHost {}
-    pub(super) struct NativeDifficulty;
-    pub(super) struct NativeSpawner;
+    pub(super) struct Difficulty;
+    pub(super) struct SpawnSource;
     pub(super) struct Tag;
     pub(super) struct FeatureFlags(pub ());
-    pub(super) struct NativeNoteInstrument;
-    pub(super) struct NativeScreenView<'a>(pub &'a ());
+    pub(super) struct NoteInstrument;
+    pub(super) struct ScreenView<'a>(pub &'a ());
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct EffectKey(pub(super) u32);
     #[derive(Debug, PartialEq)]
@@ -487,18 +554,21 @@ mod stubs {
     pub(super) struct HudBatch(pub Vec<u32>);
     #[derive(Clone, Copy)]
     pub(super) struct TooltipPlace;
-    #[derive(Clone, Copy)]
-    pub(super) struct Hand;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Hand {
+        Main,
+        Off,
+    }
     #[derive(Clone, Copy)]
     pub(super) struct BlockHit;
-    pub(super) struct NativeBlockClick<'a>(pub &'a ());
+    pub(super) struct BlockClick<'a>(pub &'a ());
     #[derive(Clone, Copy)]
     pub(super) enum BonemealSource {
         Interaction,
     }
     pub(super) struct TooltipDisplay<'a>(pub &'a ());
-    pub(super) struct NativeTriState;
-    pub(super) struct NativeInteractionResult;
+    pub(super) struct TriState;
+    pub(super) struct InteractionResult;
     pub(super) struct HurtSource<'a> {
         pub(super) damage_type: &'a str,
         pub(super) position: Option<[f64; 3]>,
@@ -540,14 +610,16 @@ mod stubs {
         }
     }
     pub(super) struct LootStack;
-    pub(super) struct NativeLootContext;
+    pub(super) struct LootContext;
+    pub(super) trait Tags {}
     pub(super) struct NativeReloadListener;
+    #[derive(Clone)]
     pub(super) struct RecipePropertyAddition;
     pub(super) struct AdvancementProgress {
         pub done: bool,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum NativeProgressType {
+    pub(super) enum ProgressType {
         Grant,
         Revoke,
     }
@@ -572,15 +644,14 @@ mod stubs {
     pub(super) struct SoundPlay;
     pub(super) struct ChannelRef;
     #[derive(Clone, Copy)]
-    pub(super) struct NativePlayerFood;
-    #[derive(Clone, Copy)]
-    pub(super) struct LivingRef;
+    pub(super) struct PlayerFood;
+    pub(super) use super::generated::mod_api::LivingRef;
     #[derive(Clone, Copy)]
     pub(super) struct EntityRef;
     #[derive(Clone, Copy)]
     pub(super) struct MinecartRef;
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum NativeMinecartKind {
+    pub(super) enum MinecartKind {
         Rideable,
     }
     pub(super) struct EffectTickChange;
@@ -612,42 +683,54 @@ mod api {
         }
     }
     pub struct DamageContainer(pub f32);
-    pub mod camera {
-        pub struct CameraEntity;
-        pub struct FovPlayer;
-    }
+    #[derive(Clone, Copy)]
+    pub struct LivingRef;
+    #[derive(Clone, Copy)]
+    pub struct OriginalPlayerRef;
+
     #[derive(Clone, Copy)]
     pub struct FluidKey;
-    pub mod menu {
-        pub struct MenuButtonContext {
-            pub player: u128,
-            pub player_entity_id: i32,
-            pub pos: [i32; 3],
-            pub id: i32,
-        }
-        pub struct AnvilCraft;
-        pub struct AnvilUpdate;
-        pub struct GrindstonePlace;
-        pub struct GrindstoneTake;
-    }
+
     pub mod mod_chunk_tickets {
         pub trait TicketValidation {}
     }
     pub use mod_chunk_tickets::TicketValidation;
-    pub mod stations {
-        pub struct EnchantmentRow<'a>(std::marker::PhantomData<&'a ()>);
+
+    pub mod client {
+        pub use super::fog;
+        pub mod camera {
+            pub struct CameraEntity;
+            pub struct FovPlayer;
+        }
+        pub mod first_person {
+            #[derive(Clone, Copy)]
+            pub struct Hand;
+        }
+        pub mod widgets {
+            pub struct TextEdit;
+        }
+        pub mod hud_layout {
+            pub struct HealthInputs;
+            pub struct GuiDraw;
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub enum HeartKind {}
+        }
     }
-    pub mod first_person {
-        #[derive(Clone, Copy)]
-        pub struct Hand;
-    }
-    pub mod widgets {
-        pub struct TextEdit;
-    }
-    pub mod hud_layout {
-        pub struct HealthInputs;
-        pub struct GuiDraw;
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub enum HeartKind {}
+    pub mod item {
+        pub mod menu {
+            pub struct MenuButtonContext {
+                pub player: u128,
+                pub player_entity_id: i32,
+                pub pos: [i32; 3],
+                pub id: i32,
+            }
+            pub struct AnvilCraft;
+            pub struct AnvilUpdate;
+            pub struct GrindstonePlace;
+            pub struct GrindstoneTake;
+        }
+        pub mod stations {
+            pub struct EnchantmentRow<'a>(std::marker::PhantomData<&'a ()>);
+        }
     }
 }

@@ -443,11 +443,6 @@ pub struct Rule {
     memo: std::cell::RefCell<HashMap<String, Crossing>>,
     /// Every non-generic listed trait, by path: the trait objects that cross as method tables.
     traits: HashMap<String, TraitDecl>,
-    /// Set while a codec is built for a call at a staged point, where a widened layout's fields
-    /// are public: its constructor is then not private.
-    pub(crate) widened: std::cell::Cell<bool>,
-    /// Whether a named layout has a generated decoder, decided once per rule.
-    pub(crate) decodable: std::cell::RefCell<HashMap<String, bool>>,
 }
 
 /// `a::b::C<'_>` as `a::b::C`.
@@ -546,7 +541,7 @@ impl Rule {
         let mut refs: HashMap<String, BTreeMap<String, Option<String>>> = HashMap::new();
         for internal in internals {
             if !internal.cfg.is_empty()
-                || !matches!(internal.kind, "struct" | "enum" | "fn" | "method")
+                || !matches!(internal.kind, "struct" | "enum" | "type" | "fn" | "method")
             {
                 continue;
             }
@@ -584,36 +579,7 @@ impl Rule {
             refs,
             memo: Default::default(),
             traits,
-            widened: Default::default(),
-            decodable: Default::default(),
         }
-    }
-
-    /// `ty` with every path to a listed layout spelled out in full, so that it means the same
-    /// type in another module than the one it was written in.
-    pub fn qualify(&self, module: &str, ty: &Type) -> Type {
-        use syn::visit_mut::VisitMut;
-        struct Qualify<'a>(&'a Rule, &'a str);
-        impl VisitMut for Qualify<'_> {
-            fn visit_type_path_mut(&mut self, node: &mut syn::TypePath) {
-                syn::visit_mut::visit_type_path_mut(self, node);
-                if node.qself.is_none()
-                    && let Some(found) = self.0.resolve(self.1, &node.path)
-                    && self.0.named.contains_key(&found)
-                    && let Ok(full) = syn::parse_str::<syn::Path>(&found)
-                {
-                    node.path = full;
-                }
-            }
-        }
-        let mut ty = ty.clone();
-        Qualify(self, module).visit_type_mut(&mut ty);
-        ty
-    }
-
-    /// The listed trait at `path`.
-    pub fn trait_decl(&self, path: &str) -> Option<&TraitDecl> {
-        self.traits.get(path)
     }
 
     /// The listed trait a `dyn` object of `ty`, written in `module`, is an object of, through
@@ -1091,22 +1057,6 @@ impl Rule {
             (true, true) if leaves <= LEAVES => Crossing::Copy(leaves),
             _ => Crossing::Handle,
         }
-    }
-
-    /// Layouts conservatively left opaque, counted once per listed type.
-    pub fn skipped_types(&self) -> BTreeMap<&'static str, usize> {
-        let mut counts = BTreeMap::new();
-        for named in self.named.values() {
-            if let Some(reason) = named.opaque_reason {
-                *counts.entry(reason).or_default() += 1;
-            }
-        }
-        counts
-    }
-
-    /// Every listed type's path.
-    pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.named.keys().map(String::as_str)
     }
 }
 

@@ -14,7 +14,8 @@ impl Game<'_> {
         if !host.hub.guests[i].dead {
             return;
         }
-        let uuid = host.hub.guests[i].uuid;
+        let (uuid, entity_id) = (host.hub.guests[i].uuid, host.hub.guests[i].entity_id);
+        let original = self.capture_original_player(conn);
         // PlayerList.respawn replaces the player, retaining only opted-in data.
         if let Some(attachments) = self
             .lan
@@ -25,6 +26,8 @@ impl Game<'_> {
             attachments.replace_contents(copy);
         }
         self.reinitialize_server_player(uuid, conn);
+        // The new `ServerPlayer` is filed where it is placed, untold.
+        self.entity_section_forget(entity_id as u32);
         // PlayerList.respawn removes the dead player (Player.remove).
         self.guest_drop_carried(i);
         // AbstractContainerScreen.tick / ServerPlayer.closeContainer: the dead
@@ -39,6 +42,7 @@ impl Game<'_> {
         // empty: the mods hear each worn item again from empty (`native_players_equipment`).
         if let Some(play) = host.play.get_mut(&conn) {
             play.equipment_heard = None;
+            play.inventory_heard = None;
             play.level_up_sound = Default::default();
         }
         // PlayerList.respawn: a server's player comes back in its respawn
@@ -131,18 +135,23 @@ impl Game<'_> {
                 progress: g.xp_progress,
                 total: g.xp_total,
             };
-            xp.respawn(
-                self.ui
-                    .rules
-                    .bool_at(horizon_client::gamerules::vanilla::KEEP_INVENTORY)
-                    || g.game_mode == SPECTATOR,
-            );
+            let keep_inventory = self
+                .ui
+                .rules
+                .bool_at(horizon_client::gamerules::vanilla::KEEP_INVENTORY)
+                || g.game_mode == SPECTATOR;
+            xp.respawn(keep_inventory);
+            g.effects = Default::default();
             (g.xp_level, g.xp_progress, g.xp_total) = (xp.level, xp.progress, xp.total);
             // PlayerEvent.Clone, at the end of `restoreFrom`: the data is copied,
             // the new player not yet placed.
             (g.uuid, g.name.clone())
         });
-        self.native_player_clone(cloned, &name, true);
+        if let Some(original) = original {
+            self.with_original_player(original, |game, original| {
+                game.native_player_clone(cloned, &name, true, original);
+            });
+        }
         let clock_rate = self.network_clock_rate();
         let ctx = TickCtx {
             world: &mut self.world,
@@ -152,6 +161,7 @@ impl Game<'_> {
             // independently of the personal destination passed to Hub::respawn.
             spawn: world,
             spawn_angle: self.level.world_spawn_angle,
+            sea_level: self.end.locator().map_or(63, |terrain| terrain.sea_level()),
             difficulty: i32::from(self.ui.difficulty),
             difficulty_locked: self.level.difficulty_locked,
             clock_rate,
@@ -252,10 +262,13 @@ impl Game<'_> {
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
-            let at = found.map_or(world, |(at, yaw)| {
+            let at = found.map_or(world, |(at, yaw, pitch)| {
                 {
                     let value = yaw;
-                    host.hub.guests.update(i, |guest| guest.yaw = value);
+                    host.hub.guests.update(i, |guest| {
+                        guest.yaw = value;
+                        guest.pitch = pitch;
+                    });
                 }
                 [at.x, at.y, at.z]
             });
@@ -330,7 +343,7 @@ impl Game<'_> {
             self.guest_forget_digging(conn);
             // FishingHook.shouldStopFishing: its owner is dead.
             if let Some(play) = self.lan.as_mut().and_then(|host| host.play.get_mut(&conn)) {
-                play.hook = None;
+                play.hook.discard();
             }
         }
         let Some(host) = self.lan.as_mut() else {
@@ -380,7 +393,7 @@ impl Game<'_> {
             // The death's last blow, read before the death message empties the
             // combat record: ServerPlayer.die's triggers read it from a record
             // that CombatTracker.recheckStatus clears only at the end of die.
-            let blow = self.guest_combat.get(&conn).and_then(|c| c.killing_blow());
+            let killing = self.guest_combat.get(&conn).and_then(|c| c.killing_blow());
             // ServerPlayer.die: with showDeathMessages, the message goes to
             // the dying player's death screen and to everyone the team lets
             // see it; without it, the death screen gets an empty one.
@@ -392,7 +405,7 @@ impl Game<'_> {
                 let me = self.player_text(&name, uuid);
                 let text = match cause {
                     Some(key) => horizon_client::text::Text::translate(&key, &[me]),
-                    None if at[1] < f64::from(self.world.bottom_y() - 64) => {
+                    None if at[1] < self.world.below_world_y() => {
                         horizon_client::text::Text::translate("death.attack.outOfWorld", &[me])
                     }
                     None => self.guest_death_message(conn, me),
@@ -405,7 +418,7 @@ impl Game<'_> {
                 host.hub.system_message_to(message.clone(), |other| {
                     horizon_client::scoreboard::death_message_reaches(board, &name, other)
                 });
-                if self.options.dedicated.is_some() {
+                if self.is_dedicated_server() {
                     crate::game::dedicated::events::record(
                         "death",
                         &name,
@@ -443,7 +456,7 @@ impl Game<'_> {
             );
             // LivingEntity.die: the death animation, the dying player included.
             host.hub.entity_event(id, 3);
-            let recently_hit = blow.is_some()
+            let recently_hit = killing.is_some()
                 && self
                     .guest_combat
                     .get(&conn)
@@ -452,7 +465,7 @@ impl Game<'_> {
                 entity: id as u32,
                 kind: "minecraft:player",
                 player: Some(uuid),
-                source: blow.as_ref().map(|(damage_type, attacker)| {
+                source: killing.as_ref().map(|(damage_type, attacker)| {
                     crate::game::creatures::death_hurt_source(damage_type, attacker.unwrap_or(0))
                 }),
                 recently_hit,
@@ -481,7 +494,7 @@ impl Game<'_> {
                     game.award_stat("killed_by", kind, 1);
                 }
             });
-            self.guest_killed_player_trigger(conn, at, blow);
+            self.guest_killed_player_trigger(conn, at, killing);
             self.as_guest(conn, |game| {
                 game.award_custom_stat("deaths", 1);
                 game.stats.reset_death_timers();
@@ -507,6 +520,15 @@ impl Game<'_> {
                 if !consumed {
                     self.spawn_orbs(at, reward as u32);
                 }
+            }
+            // `ServerPlayer.die`'s `broadcastEntityEvent`, after the message,
+            // the loot and the experience: Fabric's AFTER_DEATH. The blow is
+            // the one `living_death` heard, so a death it cancelled returns
+            // above and is never told here.
+            if let Some((damage_type, attacker)) = &blow
+                && mod_api::__private::listened(mod_api::HookId::LivingDeathPost)
+            {
+                self.native_living_death_post(id as u32, damage_type, *attacker);
             }
         }
     }

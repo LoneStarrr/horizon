@@ -225,6 +225,7 @@ impl Game<'_> {
             | Target::Other(id)
             | Target::Fangs(id)
             | Target::Cloud(id)
+            | Target::General(id)
             | Target::Hook(id) => Some(uuid_text(self.uuid_for(id))),
             // It keeps its UUID with itself.
             Target::Spawner(id) => self
@@ -232,13 +233,16 @@ impl Game<'_> {
                 .iter()
                 .find(|s| s.id == id)
                 .map(|s| uuid_text(s.uuid)),
-            // Orbs, projectiles and dragon parts have no UUID here.
-            Target::Orb(_) | Target::Projectile(_) | Target::DragonPart(_) => None,
+            // An orb's registered identity, as its saved UUID reads.
+            Target::Orb(id) => Some(uuid_text(self.uuid_for(id))),
+            // Projectiles have no UUID here.
+            Target::Projectile(_) | Target::DragonPart(_) => None,
+            Target::Knot(id) => self.persist.uuids.get(&id).map(|&u| uuid_text(u)),
         }
     }
     fn holder_for(&mut self, t: Target) -> Option<Holder> {
         let name = self.holder_name(t)?;
-        let shown = self.target_name(t);
+        let shown = feedback_name(self.target_name(t), &name);
         Some(Holder {
             display: Some(literal(&shown.plain())),
             text: shown,
@@ -270,6 +274,7 @@ impl Game<'_> {
             | Target::Crystal(id)
             | Target::Dragon(id)
             | Target::Rocket(id)
+            | Target::General(id)
             | Target::Trident(id)
             | Target::Other(id)
             | Target::Fangs(id)
@@ -289,6 +294,8 @@ impl Game<'_> {
                 .iter()
                 .find(|f| f.id == id)
                 .and_then(|f| f.saved.as_ref().map(|s| &s.1)),
+            // A natural knot keeps no saved compound: it has no tags.
+            Target::Knot(_) => None,
         };
         match raw.and_then(|r| r.get("Tags")) {
             Some(Tag::List(l)) => l
@@ -575,8 +582,66 @@ impl Game<'_> {
         }
         self.team_with_owner(m.id, || tame_owner(m))
     }
+    /// `mob_team_of` while the mob tick has lent its mobs out of `Game`.
+    /// The active mob and the disjoint live loan replace `self.mobs` for
+    /// resolving a tame owner's UUID; other live entities still use Game.
+    pub(super) fn mob_team_scoped(
+        &self,
+        m: &horizon_client::mobs::Mob,
+        actor: &horizon_client::mobs::Mob,
+        world: &horizon_client::mobs::MobWorld<'_>,
+    ) -> Option<&sb::Team> {
+        if self.score.board.teams.is_empty() {
+            return None;
+        }
+        let own_uuid = *self.persist.uuids.get(&m.id)?;
+        let own = self.scoreboard_name(m.id, own_uuid);
+        if let Some(team) = self.score.board.players_team(&own) {
+            return Some(team);
+        }
+        let owner = tame_owner(m)?;
+        let loaned = |uuid: [i32; 4]| {
+            self.persist
+                .uuids
+                .iter()
+                .filter(|(_, found)| **found == uuid)
+                .find_map(|(&id, _)| {
+                    if id == actor.id {
+                        (!actor.removed).then_some(actor)
+                    } else {
+                        world
+                            .live_mobs
+                            .and_then(|mobs| mobs.find(id))
+                            .filter(|mob| !mob.removed)
+                    }
+                })
+        };
+        let root = root_owner(owner, |uuid| {
+            if let Some(mob) = loaned(uuid) {
+                return tame_owner(mob);
+            }
+            let Target::Mob(id) = self.target_by_uuid(ints_uuid(uuid))? else {
+                return None;
+            };
+            self.mobs
+                .iter()
+                .find(|mob| mob.id == id)
+                .and_then(tame_owner)
+        });
+        let owner_name = if let Some(mob) = loaned(root) {
+            self.scoreboard_name(mob.id, root)
+        } else {
+            match self.target_by_uuid(ints_uuid(root))? {
+                Target::Player => self.acting_player_name().to_owned(),
+                Target::Guest(conn) => self.command_guest(conn)?.name.clone(),
+                Target::Mob(id) => self.scoreboard_name(id, root),
+                _ => uuid_text(root),
+            }
+        };
+        pet_team(&self.score.board, &own, Some(&owner_name))
+    }
     /// A mob's own team, else its tamed owner's (`owner` is asked only then).
-    fn team_with_owner(
+    pub(super) fn team_with_owner(
         &self,
         id: u32,
         owner: impl FnOnce() -> Option<[i32; 4]>,
@@ -636,6 +701,31 @@ impl Game<'_> {
                 })
                 .collect(),
         }
+    }
+    /// The carts (indices into `carts`, as `near` holds them) that cart `i`
+    /// pushes this tick, as `OldMinecartBehavior.pushAndPickupEntities` asks
+    /// `EntitySelector.pushableBy(cart)`: a moving rideable cart keeps only
+    /// what its own team's and the target's collision rules allow; a still or
+    /// unrideable cart pushes every minecart in its box (no team filter).
+    pub(super) fn cart_push_allowed(
+        &self,
+        carts: &[super::minecarts::Minecart],
+        i: usize,
+        near: &[u32],
+    ) -> Vec<bool> {
+        let v = carts[i].velocity;
+        let moving =
+            carts[i].kind == super::minecarts::CartKind::Rideable && v.x * v.x + v.z * v.z >= 0.01;
+        if !moving {
+            return vec![true; near.len()];
+        }
+        let own = self.team_with_owner(carts[i].id, || None);
+        near.iter()
+            .map(|&j| {
+                let target = &carts[j as usize];
+                sb::pushable_by(own, self.team_with_owner(target.id, || None), true)
+            })
+            .collect()
     }
     /// The mobs on the player's team (`isAlliedTo`).
     pub(super) fn player_allies(&self) -> HashSet<u32> {
@@ -733,7 +823,7 @@ impl Game<'_> {
             other => other,
         }
     }
-    fn resolve_selector_text(&mut self, raw: &str) -> String {
+    pub(super) fn resolve_selector_text(&mut self, raw: &str) -> String {
         let mut reader = horizon_client::command::Reader::new(raw);
         let ty = horizon_client::command::args::ArgType::Entity {
             single: false,
@@ -817,6 +907,7 @@ impl Game<'_> {
         for (location, rgba) in ready {
             self.store_skin(location, rgba);
         }
+        self.client_hooks_frame();
     }
     /// `Hud.extractTabList`: the player list while the player-list key is
     /// held. A local world shows it with a joined LAN guest or a `list`
@@ -893,6 +984,12 @@ impl Game<'_> {
         let board = &self.score.board;
         let objective = board.display_objective(sb::SLOT_LIST);
         let up = |id: u128| upside_down.contains(&id);
+        debug_assert!(
+            self.serving.is_none(),
+            "a server thread calls no client hook"
+        );
+        let marked = horizon_hooks::engine::player_mark;
+
         let inputs = TabInputs {
             players: &players,
             board,
@@ -906,6 +1003,7 @@ impl Game<'_> {
                 f64::from(self.settings.text_background_opacity),
             ),
             upside_down: &up,
+            mark: &marked,
         };
         let draws = self.tab_list.layout(&inputs, &self.gui.atlas.font);
         horizon_client::hud_layout::paint(batch, &self.gui.atlas, &draws);
@@ -941,6 +1039,20 @@ pub(super) fn local_tab_players(me: TabPlayer, guests: &[Guest]) -> Vec<TabPlaye
         player
     }));
     players
+}
+
+/// `ScoreHolder.getFeedbackDisplayName`: the holder's display name with its
+/// hover replaced by `HoverEvent.ShowText` of its scoreboard name (a player's
+/// name, an entity's UUID string); the insertion stays.
+fn feedback_name(display: Text, scoreboard_name: &str) -> Text {
+    let mut component = display.component();
+    if let serde_json::Value::Object(o) = &mut component {
+        o.insert(
+            "hover_event".into(),
+            serde_json::json!({"action": "show_text", "value": scoreboard_name}),
+        );
+    }
+    display.with_component(component)
 }
 
 /// The commands' view of the game.
@@ -983,7 +1095,7 @@ impl Env for GameEnv<'_, '_> {
             Target::Mob(id) | Target::Item(id) => uuid_text(self.g.uuid_for(id)),
             _ => return None,
         };
-        let text = self.g.target_name(entity);
+        let text = feedback_name(self.g.target_name(entity), &name);
         Some((
             Holder {
                 display: Some(literal(&text.plain())),
@@ -1092,6 +1204,26 @@ mod tab_list_tests {
 #[cfg(test)]
 mod team_tests {
     use super::*;
+    /// #14279: `ScoreHolder.getFeedbackDisplayName` keeps the display name and
+    /// its insertion, and shows the scoreboard name (an entity's UUID) on hover.
+    #[test]
+    fn a_feedback_name_shows_the_scoreboard_name_on_hover() {
+        let uuid = "00000001-0000-0002-0000-000300000004";
+        let display = Text::translate("entity.minecraft.pig", &[]).with_component_fields(vec![
+            (
+                "hover_event".into(),
+                serde_json::json!({"action": "show_entity", "id": "minecraft:pig", "uuid": uuid}),
+            ),
+            ("insertion".into(), uuid.into()),
+        ]);
+        let c = feedback_name(display, uuid).component();
+        assert_eq!(c["translate"], "entity.minecraft.pig");
+        assert_eq!(c["insertion"], uuid);
+        assert_eq!(
+            c["hover_event"],
+            serde_json::json!({"action": "show_text", "value": uuid})
+        );
+    }
 
     const WOLF: [i32; 4] = [1, 2, 3, 4];
     const CAT: [i32; 4] = [5, 6, 7, 8];

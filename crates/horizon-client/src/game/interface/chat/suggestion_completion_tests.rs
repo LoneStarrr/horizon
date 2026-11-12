@@ -7,6 +7,13 @@ use std::sync::{Arc, Mutex};
 #[test]
 #[ignore = "needs prepared resources and a fresh HORIZON_HOME; run in isolation"]
 fn chat_completion_reaches_mods_from_keyboard_and_mouse() {
+    crate::game::in_own_process(
+        "game::chat::suggestion_completion_tests::chat_completion_reaches_mods_from_keyboard_and_mouse",
+        chat_completion_reaches_mods_from_keyboard_and_mouse_isolated,
+    );
+}
+
+fn chat_completion_reaches_mods_from_keyboard_and_mouse_isolated() {
     let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let scratch = PathBuf::from(std::env::var_os("HORIZON_HOME").unwrap()).join("suggestion-game");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -67,7 +74,7 @@ fn chat_completion_reaches_mods_from_keyboard_and_mouse() {
         Box::new(Listener(calls.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         game.screen = Screen::Chat;
         game.ui.registries.players = vec!["Steve".into(), "Steven".into()];
         game.ui.chat_screen = Some(ChatScreen::new(

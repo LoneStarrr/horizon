@@ -3,26 +3,24 @@
 
 ## Cache and disk
 
-The key hashes the commit, the horizon-mixins commit, Rust's version, the profile and features, and every file of
-every bundle. The same set on the same commit is never built twice. A change gives a new build, and
-`native/target/` stays, so a rebuild compiles only `horizon-client` and what the mods touched.
+The native build key includes the pinned game and horizon-mixins commits, Rust version, target,
+compilation settings and mod files. A matching installed build is reused. Editing a mod creates
+a new build; the launcher compiles mods and their patch library, not the game.
 
-**Incremental rebuilds.** With Balanced and Developer, Cargo recompiles only the changed parts of `horizon-client`, not the whole
-crate with LTO. Patched source is cached separately by its mixin inputs and pins (the three most
-recent snapshots are kept), so editing only a trait crate skips the mixins pass. This holds because
-the stage (`native/stage/`) is one folder for every build and the launcher writes
-only the files whose content changed (Cargo goes by file times), switching mods on the same commit reuses the same
-`native/target/`, and the launcher removes `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL` from the build's
-environment. Optimized has no incremental compilation (the release profile's own).
+The launcher keeps these managed caches under its data folder:
 
-**Build status.** Before it starts, the build identifies its plan and profile: up to date, incremental rebuild,
-first build, or prebuilt game. While compiling it shows the crate and crates done of the total, from Cargo's own
-progress. Afterwards it identifies the completed profile and plan. Neither the window nor `native-build` promises
-or displays a build duration. `native/build.log` retains Cargo's diagnostic output, without the progress bar.
+- `native/prebuilt/`: checked SDK archives extracted by commit and target.
+- `native/source/`: pinned source used to copy functions for mixins.
+- `native/tools/`: pinned horizon-mixins executables.
+- `native/prebuilt-build/`: mod, registry dependency, patch-library and linking outputs.
+- `native/internals-sync/`: separate metadata-only discovery source and check outputs.
+- `rust/` and `cargo/`: the pinned compiler and Cargo downloads.
 
-Disk use varies with the platform, profile and set of mods. Run `horizon-launcher storage` to inspect the actual
-cache rather than estimating its size from another computer's build.
+`native/build.log` records build diagnostics. `native-mods.json` in an installed build records its
+inputs and embedded mod inventory. Client builds share their base version's prepared resources,
+so retain that base while its native builds are installed. Dedicated server exports are standalone.
 
-The native builds an instance plays are kept, and the three newest no instance plays (`native_mods::prune`, by when
-each was built or last used): switching a mod off and on again plays the kept build again without compiling.
-`native/target/` stays for the next one.
+Run `horizon-launcher storage` to inspect actual disk use and cleanup eligibility. Storage keeps
+in-use versions and shared caches protected through runtime leases and publication locks. A busy
+or unverifiable unit is retained with a reason; it is not counted as freed. Cargo lock files also
+prevent unsafe cleanup. Do not delete managed cache directories while a build or game is running.

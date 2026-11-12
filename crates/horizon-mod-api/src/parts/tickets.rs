@@ -1,17 +1,13 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
 use super::*;
-/// The ticket controllers registered at startup.
-pub(crate) fn installed_controllers() -> &'static [ControllerInfo] {
-    installed().map_or(&[], |installed| installed.controllers.as_slice())
-}
 
 /// The ticket controllers `mods` register, for a test's mods.
 #[cfg(any(test, feature = "testing"))]
-pub(crate) fn registered_controllers(mods: &[ModEntry]) -> Vec<ControllerInfo> {
-    if mods.is_empty() {
-        return Vec::new();
-    }
-    register_all(mods, |_| false).controllers
+pub(crate) fn registered_controllers(mods: &[ModEntry]) -> (Vec<ControllerInfo>, Vec<PoseInfo>) {
+    let registered = register_all(mods, |_| false);
+    (registered.controllers, registered.arm_poses)
 }
+
 /// Fixtures that tests of other crates use to install Parts.
 #[cfg(any(test, feature = "testing"))]
 pub mod tests {
@@ -35,9 +31,12 @@ pub mod tests {
         r.register_ticket_controller("first:", true);
         r.register_ticket_controller("", true);
         assert_eq!(r.refused.len(), 3, "{:?}", r.refused);
-        assert!(r.refused[0].contains("first registered ticket controller \"second:quarry\""));
-        assert!(r.refused[0].contains("not its own"));
-        assert!(r.refused[1].contains("no name") && r.refused[2].contains("no name"));
+        assert!(r.refused[0].contains("first declares \"second:quarry\""));
+        assert!(r.refused[0].contains("unowned namespace \"second\""));
+        assert!(
+            r.refused[1].contains("invalid identifier")
+                && r.refused[2].contains("invalid identifier")
+        );
         assert_eq!(r.controllers.len(), 2);
     }
 
@@ -46,7 +45,7 @@ pub mod tests {
         let mut registrar = PartRegistrar::new("first");
         registrar.register_ticket_controller("quarry", true);
         install_registrar(registrar, &crate::parts::tests::rule_schema()).unwrap();
-        let controllers = installed_controllers();
+        let controllers = mod_vocab::__private::parts_installation::testing_controllers();
         assert_eq!(controllers.len(), 1);
         assert_eq!(&*controllers[0].id, "first:quarry");
         assert!(controllers[0].validates);
@@ -70,22 +69,9 @@ pub mod tests {
     }
 }
 
-/// Registrar operations for tickets.
-pub trait TicketsRegistrar {
-    /// Register ticket controller `name`, the way NeoForge's `RegisterTicketControllersEvent`
-    /// does once at startup, and keep the handle for `chunk.set_mod_forced`. `name` is
-    /// `quarry` or `mymod:quarry`; the controller's id is in the calling mod's namespace
-    /// (`mymod:quarry`), and another mod's namespace refuses the mods at startup, as does an id
-    /// registered twice. `validates` is whether it validates its saved tickets: the
-    /// `validate_tickets` hook then runs for it when a level loads them (NeoForge's
-    /// `LoadingValidationCallback`). A world's tickets of a controller no loaded mod registers are
-    /// dropped when it loads.
-    fn register_ticket_controller(&mut self, name: &str, validates: bool) -> TicketController;
-}
-
 impl TicketsRegistrar for PartRegistrar {
     fn register_ticket_controller(&mut self, name: &str, validates: bool) -> TicketController {
-        ticket_controller::register(
+        register(
             &mut self.controllers,
             &mut self.refused,
             self.mod_id,
@@ -93,4 +79,38 @@ impl TicketsRegistrar for PartRegistrar {
             validates,
         )
     }
+}
+
+/// Adds controller `name` of mod `mod_id` to `table`. A name in another mod's namespace, an empty
+/// one and a repeated id are written to `refused` and give a handle no table resolves.
+pub(crate) fn register(
+    table: &mut Vec<ControllerInfo>,
+    refused: &mut Vec<String>,
+    mod_id: &'static str,
+    name: &str,
+    validates: bool,
+) -> TicketController {
+    let id = match owned_declaration_id(mod_id, name) {
+        Ok(id) => id,
+        Err(reason) => {
+            refused.push(reason);
+            return mod_vocab::__private::parts_installation::ticket_controller(u32::MAX);
+        }
+    };
+    let refusal = {
+        table
+            .iter()
+            .any(|info| *info.id == *id)
+            .then(|| format!("{mod_id} registered ticket controller {id} twice"))
+    };
+    if let Some(refusal) = refusal {
+        refused.push(refusal);
+        return mod_vocab::__private::parts_installation::ticket_controller(u32::MAX);
+    }
+    table.push(ControllerInfo {
+        id: id.into(),
+        mod_id,
+        validates,
+    });
+    mod_vocab::__private::parts_installation::ticket_controller((table.len() - 1) as u32)
 }

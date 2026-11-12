@@ -14,8 +14,8 @@ use super::{
     goals::{Cx, Goal as EngineGoal, GoalSelector},
 };
 use mod_api::{
-    NativeWorldEpoch,
-    crash::{NativeModCall, enter_native_mod},
+    WorldEpoch,
+    content::crash::{ModCall, enter_native_mod},
 };
 
 /// The native side a mod goal runs against (the `mob_hooks` pattern): the
@@ -25,7 +25,62 @@ use mod_api::{
 /// wherever no mod attached an entity part — so no other side runs one.
 pub trait GoalHost {
     /// The handles' epoch: a handle of an earlier world refuses.
-    fn epoch(&self) -> Option<NativeWorldEpoch>;
+    fn epoch(&self) -> Option<WorldEpoch>;
+    /// Whether a merchant lent to this tick remains available to server hooks.
+    fn merchant_is_live(&self, mob: &Mob) -> bool;
+    /// Read the current offers, including a guest's more recent trade session.
+    fn merchant_offers_lent(&self, mob: &Mob) -> Option<Vec<mod_api::MerchantOffer>>;
+    /// Resolve the player currently trading with the lent merchant.
+    fn merchant_trading_player_lent(&self, mob: &Mob) -> Option<mod_api::PlayerRef>;
+    /// Current XP and level, including an open guest's trading session.
+    fn merchant_trade_state_lent(&self, mob: &Mob) -> (i32, i32);
+    /// Live player passengers of a vehicle, with their boarding order.
+    fn player_passenger_seats(&self, vehicle: u32) -> Vec<(i64, u32)>;
+    /// Whether this player steers the lent mob.
+    fn mob_player_controls(&self, mob: &Mob, player: u32) -> bool;
+    /// Dismount location using a mob lent out of the game list.
+    fn mob_dismount_location(
+        &self,
+        vehicle: Option<&Mob>,
+        vehicle_id: u32,
+        rider: Option<&Mob>,
+        passenger: mod_api::EntityRef,
+    ) -> Option<[f64; 3]>;
+    /// The game's complete portal eligibility, including player passengers.
+    fn mob_can_use_portal(&self, mob: &Mob) -> bool;
+    /// Compute climbing from the game's collision and climbing registry.
+    fn mob_is_climbing(&self, mob: &Mob) -> bool;
+    /// Player credit for a mob, distinguishing absent credit from an unresolved player.
+    fn mob_player_credit(&self, mob: &Mob) -> Option<Option<u32>>;
+    /// Read a lent mob's current target with the game's target validation.
+    fn mob_target(
+        &self,
+        mob: &Mob,
+        actor: &Mob,
+        world: &MobWorld<'_>,
+    ) -> Option<mod_api::LivingRef>;
+    /// Tags of a mob currently lent to the tick.
+    fn mob_tags(&self, mob: &Mob) -> Option<Vec<String>>;
+    /// Display name of a mob currently lent to the tick.
+    fn mob_name(&self, mob: &Mob, actor: &Mob, world: &MobWorld<'_>) -> String;
+    /// Whether a mob currently lent to the tick has joined its level.
+    fn mob_added_to_level(&self, mob: &Mob) -> bool;
+    /// Portal cooldown of a mob currently lent to the tick.
+    fn mob_portal_cooldown(&self, mob: &Mob) -> i32;
+    /// Whether a mob currently lent to the tick refuses a damage type.
+    fn mob_invulnerable_to_damage(&self, mob: &Mob, damage_type: &str) -> bool;
+    /// A lent mob's supporting block, or the block just below its feet.
+    fn mob_on_block(&self, mob: &Mob) -> [i32; 3];
+    /// Whether two validated entities may damage each other through teams.
+    fn entities_team_damage_allowed(
+        &self,
+        entity: mod_api::EntityRef,
+        entity_mob: Option<&Mob>,
+        source: mod_api::EntityRef,
+        source_mob: Option<&Mob>,
+        actor: &Mob,
+        world: &MobWorld<'_>,
+    ) -> Option<bool>;
     /// Run `goal`'s `op` on the mob in hand with the tick's `MobWorld`, naming
     /// `mod_id`'s `part` in a panic. None where this side runs no mod goals.
     fn run_goal(
@@ -34,6 +89,18 @@ pub trait GoalHost {
         m: &mut Mob,
         w: &MobWorld<'_>,
         op: GoalOp,
+        mod_id: &'static str,
+        part: &'static str,
+    ) -> Option<bool>;
+    /// Run `behavior`'s `op` on the mob in hand with the tick's `MobWorld`,
+    /// naming `mod_id`'s `part` in a panic, over the same mob-tick view a
+    /// goal gets (#824). None where this side runs no mod behaviors.
+    fn run_behavior(
+        &self,
+        behavior: &mut Box<dyn mod_api::Behavior>,
+        m: &mut Mob,
+        w: &MobWorld<'_>,
+        op: BehaviorOp,
         mod_id: &'static str,
         part: &'static str,
     ) -> Option<bool>;
@@ -54,6 +121,22 @@ pub enum GoalOp {
     Tick,
 }
 
+/// One mod behavior call the ported brains make (#824), as [`GoalOp`] names
+/// a goal's.
+#[derive(Clone, Copy, Debug)]
+pub enum BehaviorOp {
+    /// `Behavior::check_extra_start_conditions`.
+    CheckExtraStartConditions,
+    /// `Behavior::start`.
+    Start,
+    /// `Behavior::can_still_use`.
+    CanStillUse,
+    /// `Behavior::tick`.
+    Tick,
+    /// `Behavior::stop`.
+    Stop,
+}
+
 /// Ask the installed entity parts for the mob's mod goals (#1077), right after
 /// the species' own `ai::register` — vanilla's `registerGoals` moment, which a
 /// mob loaded from a chunk passes through as a spawned one does.
@@ -68,7 +151,7 @@ pub fn attach(m: &mut Mob) {
     }
     let (id, mob_id) = (m.id, &m.kind.id);
     for attached in list {
-        let _guard = enter_native_mod(NativeModCall {
+        let _guard = enter_native_mod(ModCall {
             id: attached.mod_id(),
             hook: "register_goals",
             part: Some(attached.type_name()),

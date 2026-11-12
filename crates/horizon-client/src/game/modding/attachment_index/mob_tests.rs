@@ -108,11 +108,14 @@ fn saved_mob_binding_tracks_serialized_transfer_and_parked_levels() {
         game.enter_level(Dim::Overworld).unwrap();
         assert_eq!(VALUE.get(game, Holder::Entity(id)), Ok(11));
         // Serialized portals discard the source owner before destination load.
+        let state = game.take_transferred_entity_state(id);
         game.mobs.retain(|m| m.id != id);
         game.detach_entity(id);
         assert!(source.lock().unwrap().snapshot(&key).is_empty());
         game.enter_level(Dim::Nether).unwrap();
-        let moved = game.load_mob(mob(uuid), None).unwrap();
+        let moved = game
+            .load_mob_transferred(mob(uuid), None, Some(state))
+            .unwrap();
         assert_ne!(moved, id); // This route allocates; retained-id vehicles have their own arrival seam.
         assert_eq!(
             game.attachment_indexes[&Dim::Nether]
@@ -157,7 +160,7 @@ fn saved_mob_binding_rebinds_retained_id_with_a_new_generation() {
         owner.attachment_lifetime.retire();
         assert!(source.lock().unwrap().snapshot(&key).is_empty());
         game.enter_level(Dim::Nether).unwrap();
-        game.rebind_transferred_entity(Dim::Overworld, id, &mut owner);
+        game.rebind_transferred_entity(id, &mut owner);
         game.mobs.push(owner);
         let current = game.attachment_indexes[&Dim::Nether]
             .lock()
@@ -179,5 +182,165 @@ fn saved_mob_binding_rebinds_retained_id_with_a_new_generation() {
                 .snapshot(&key)
                 .is_empty()
         );
+    });
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn mob_first_store_binds_and_nested_rollback_retires_authority() {
+    use mod_api::{AttachmentError, HostTransaction};
+    with_game(|game| {
+        game.options.dedicated = Some(Vec::new());
+        game.native_level_opened(Dim::Overworld);
+        let uuid = [71, 72, 73, 74];
+        let Tag::Compound(mut tag) = mob(uuid) else {
+            unreachable!()
+        };
+        tag.remove(&horizon_mod_runtime::attachments::ATTACHMENTS_KEY.into());
+        let id = game.load_mob(Tag::Compound(tag), None).unwrap();
+        let holder = Holder::Entity(id);
+        assert_eq!(VALUE.get_existing(game, holder), Ok(None));
+        assert!(!game.mobs[0].attachment_lifetime.is_bound());
+        let result: Result<(), AttachmentError> = game.transaction(|host, _| {
+            VALUE.set(host, holder, 7)?;
+            let index = host.attachment_indexes[&Dim::Overworld].clone();
+            assert_eq!(
+                index
+                    .lock()
+                    .unwrap()
+                    .snapshot(&("test".into(), "mana".into()))
+                    .len(),
+                1
+            );
+            let inner: Result<(), AttachmentError> = host.transaction(|host, _| {
+                VALUE.set(host, holder, 8)?;
+                Err(AttachmentError::MissingHolder)
+            });
+            assert!(inner.is_err());
+            assert_eq!(VALUE.get_existing(host, holder), Ok(Some(7)));
+            let committed: Result<(), AttachmentError> = host.transaction(|host, _| {
+                VALUE.set(host, holder, 9)?;
+                Ok(())
+            });
+            committed?;
+            Err(AttachmentError::MissingHolder)
+        });
+        assert!(result.is_err());
+        assert!(!game.mobs[0].attachment_lifetime.is_bound());
+        assert!(!game.entity_attachments[&id].has_index_binding());
+        let index = game.attachment_indexes[&Dim::Overworld].clone();
+        assert!(
+            index
+                .lock()
+                .unwrap()
+                .snapshot(&("test".into(), "mana".into()))
+                .is_empty()
+        );
+        VALUE.set(game, holder, 11).unwrap();
+        assert!(game.mobs[0].attachment_lifetime.is_bound());
+        assert_eq!(
+            game.query(&VALUE)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .unwrap()
+                .value,
+            &11
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn mob_taken_store_refuses_without_writing_and_missing_store_refuses() {
+    use mod_api::AttachmentError;
+    with_game(|game| {
+        game.options.dedicated = Some(Vec::new());
+        game.native_level_opened(Dim::Overworld);
+        let uuid = [81, 82, 83, 84];
+        let Tag::Compound(mut tag) = mob(uuid) else {
+            unreachable!()
+        };
+        tag.remove(&horizon_mod_runtime::attachments::ATTACHMENTS_KEY.into());
+        let id = game.load_mob(Tag::Compound(tag), None).unwrap();
+        let taken = game.mobs.lift();
+        assert_eq!(
+            VALUE.set(game, Holder::Entity(id), 1),
+            Err(AttachmentError::HolderBusy)
+        );
+        assert!(
+            !game
+                .entity_attachments
+                .get(&id)
+                .is_some_and(|map| map.has_index_binding())
+        );
+        game.mobs.restore(
+            taken,
+            horizon_client::join_seq::RestoreOrder::SurvivorsFirst,
+        );
+        assert_eq!(VALUE.get_existing(game, Holder::Entity(id)), Ok(None));
+        for id in [0, u32::MAX] {
+            assert_eq!(
+                VALUE.set(game, Holder::Entity(id), 1),
+                Err(AttachmentError::MissingHolder)
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn tnt_with_real_lifetime_accepts_first_store() {
+    with_game(|game| {
+        game.options.dedicated = Some(Vec::new());
+        game.native_level_opened(Dim::Overworld);
+        game.summon_with_nbt("minecraft:tnt", [0.5, 70.0, 0.5], "{}")
+            .unwrap();
+        game.lan_assign_ids();
+        let id = game.tnts[0].id;
+        assert_eq!(VALUE.set(game, Holder::Entity(id), 7), Ok(()));
+    });
+}
+
+#[test]
+#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+fn mob_inner_first_binding_commit_outer_abort_invalidates_retained_row() {
+    use mod_api::{AttachmentError, HostTransaction};
+    with_game(|game| {
+        game.options.dedicated = Some(Vec::new());
+        game.native_level_opened(Dim::Overworld);
+        let uuid = [91, 92, 93, 94];
+        let Tag::Compound(mut tag) = mob(uuid) else {
+            unreachable!()
+        };
+        tag.remove(&horizon_mod_runtime::attachments::ATTACHMENTS_KEY.into());
+        let id = game.load_mob(Tag::Compound(tag), None).unwrap();
+        let holder = Holder::Entity(id);
+        let mut retained = None;
+        let result: Result<(), AttachmentError> = game.transaction(|host, _| {
+            let inner: Result<(), AttachmentError> = host.transaction(|host, _| {
+                VALUE.set(host, holder, 13)?;
+                retained = Some(host.query_mut(&VALUE).unwrap());
+                Ok(())
+            });
+            inner?;
+            Err(AttachmentError::MissingHolder)
+        });
+        assert!(result.is_err());
+        assert!(!game.mobs[0].attachment_lifetime.is_bound());
+        let batch = retained.unwrap();
+        let row = batch.iter().next().unwrap().unwrap();
+        assert_eq!(row.value(), &13);
+        assert_eq!(
+            row.set(game, 99),
+            Err(mod_api::AttachmentRowError::StaleHolder)
+        );
+        VALUE.set(game, holder, 17).unwrap();
+        assert_eq!(
+            row.set(game, 99),
+            Err(mod_api::AttachmentRowError::StaleHolder)
+        );
+        assert_eq!(VALUE.get_existing(game, holder), Ok(Some(17)));
     });
 }

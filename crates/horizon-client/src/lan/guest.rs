@@ -1,6 +1,7 @@
 //! A remote player: connection, position, chunk and entity views, and the
 //! player state (inventory, health, game mode) that the host's gameplay code
 //! operates on when it acts for them.
+use super::prediction::record::{Change, Record};
 use super::{Joined, PlayerSender, entity::Tracker};
 use crate::{
     items::ItemStack,
@@ -134,7 +135,30 @@ struct GuestInit {
     expected: bool,
 }
 
+/// One physical connection's ordered main-thread input. Provider credit follows
+/// the value through the inbox and derived HostEvent segments, never a wire-size
+/// refund/re-reserve gap. Raw work is not subject to vanilla movement freezing.
+pub enum InboxItem {
+    Packet(
+        play::Serverbound,
+        Option<crate::net::ingress::ReceiveLease<super::NetEvent>>,
+    ),
+    Raw(
+        Box<crate::raw_payloads::Delivery>,
+        crate::net::ingress::ReceiveLease<super::NetEvent>,
+    ),
+}
+#[cfg(test)]
+impl InboxItem {
+    /// Unit-test input without a network provider reservation.
+    pub fn uncredited(packet: play::Serverbound) -> Self {
+        Self::Packet(packet, None)
+    }
+}
+
 pub struct Guest {
+    /// Identity generation and journal binding travel with the actual player record.
+    pub residency: crate::join_seq::residency::member::Member,
     pub kind: GuestKind,
     pub conn: u32,
     /// The client's address (IP bans, `list`).
@@ -166,6 +190,7 @@ pub struct Guest {
     pub latency: Arc<AtomicI32>,
     pub info: ClientInformation,
     pub brand: String,
+    pub recipe_sync: super::recipes::PlayerRecipeSync,
     /// The chunk radius this client is sent.
     pub view_distance: i32,
     pub position: [f64; 3],
@@ -211,10 +236,10 @@ pub struct Guest {
     /// Where the player respawns (a bed's spot; `ServerPlayer.respawnConfig`),
     /// None for the world spawn.
     pub spawn: Option<[f64; 3]>,
-    /// A respawn point outside the Overworld (a respawn anchor, or one
-    /// `spawnpoint` set there): its dimension, block, yaw and whether it is
-    /// forced, as the player's save keeps it (`respawn`).
-    pub respawn_elsewhere: Option<(String, [i32; 3], f32, bool)>,
+    /// A block-resolved personal respawn point: its dimension, block, yaw,
+    /// pitch and whether it is forced, as the player's save keeps it
+    /// (`respawn`).
+    pub respawn_elsewhere: Option<(String, [i32; 3], f32, f32, bool)>,
     /// Pending ClientboundPlayerPositionPacket id; movement is ignored until
     /// the client accepts it (ServerGamePacketListenerImpl.awaitingPositionFromClient).
     pub awaiting_teleport: Option<(i32, [f64; 3])>,
@@ -259,10 +284,19 @@ pub struct Guest {
     pub position_this_tick: bool,
     /// Violation levels and the checks' state (the anticheat, when on).
     pub anticheat: horizon_anticheat::Player,
+    /// The client ticks the movement prediction plays again (only while it records).
+    pub record: Option<Box<Record>>,
+    /// Sprinting as the client's own commands left it (ServerboundPlayerCommandPacket's
+    /// START_SPRINTING and STOP_SPRINTING: LocalPlayer.wasSprinting), which the record's ticks take.
+    /// Not the server's player: a hit with extra knockback stops its sprint
+    /// (Player.causeExtraKnockback), the client's own `Player.attack` doesn't (a mob's `hurtClient`
+    /// is false), and once the server's flag reaches it LocalPlayer.aiStep starts the sprint again
+    /// while the sprint key is held, with nothing to say: wasSprinting never changed.
+    pub client_sprinting: bool,
     /// The movement prediction's replay of the client's own moves (only while it runs).
     pub replay: Option<Box<super::prediction::Replay>>,
     /// What the server sent this tick that changes how the client moves (only while it records).
-    pub changes: std::sync::Mutex<Vec<horizon_anticheat::prediction::Change>>,
+    pub changes: std::sync::Mutex<Vec<Change>>,
     /// It accepted a move since the last entity range checks
     /// (ServerChunkCache.move), which then check all of its pairs again.
     pub moved: bool,
@@ -290,6 +324,8 @@ pub struct Guest {
     pub chunk_queue: Vec<(i32, i32)>,
     /// The far ring's chunks still to send, past the view distance (`lan::far`), closest first.
     pub far_queue: Vec<(i32, i32)>,
+    /// Where the bounded far-ring scan resumes; reset when the view changes.
+    pub far_cursor: usize,
     /// PlayerChunkSender: batches sent but not yet acknowledged, how many
     /// may be (1 until the client's first acknowledgement, then 10), the
     /// rate the client asks for and the chunks the next batch may hold.
@@ -328,6 +364,8 @@ pub struct Guest {
     pub offhand: Option<ItemStack>,
     /// `EquipmentSlot.BODY` and `SADDLE`, kept and saved like `Game::equipment`.
     pub equipment: horizon_items::equipment::Equipment,
+    /// Converted tracking stacks, invalidated when their full source stack changes.
+    pub equipment_cache: super::equipment_cache::EquipmentCache,
     pub selected: usize,
     pub carried: Option<ItemStack>,
     /// The inventory menu's crafting grid (2x2) and its result
@@ -372,6 +410,8 @@ pub struct Guest {
     /// The shared flags (Entity.DATA_SHARED_FLAGS_ID) the player's client was
     /// last sent about itself.
     pub sent_shared: i8,
+    /// Pose last delivered to this player's own entity data, initially Standing.
+    pub sent_pose: Pose,
     /// The shoulder parrots (Player.DATA_SHOULDER_PARROT_LEFT and _RIGHT) the
     /// player's client was last sent about itself.
     pub sent_shoulders: [Option<i32>; 2],
@@ -384,8 +424,7 @@ pub struct Guest {
     pub ack_up_to: std::cell::Cell<i32>,
     pub sent_selected: usize,
     /// Packets waiting for the player's next turn, and their bytes on the wire.
-    pub inbox: VecDeque<(play::Serverbound, usize)>,
-    pub inbox_bytes: usize,
+    pub inbox: VecDeque<InboxItem>,
     pub joined_tick: u64,
     pub ticks: u64,
     /// The moves accepted since the game last looked (movement, on ground),
@@ -564,6 +603,26 @@ impl Guest {
     pub fn is_fake(&self) -> bool {
         self.kind == GuestKind::Fake
     }
+    /// Whether the guest is online and placed in level `dimension`: one of the
+    /// level's players (`ServerLevel.players`).
+    pub fn placed_in(&self, dimension: &str) -> bool {
+        self.participates_online() && self.placed && self.dimension == dimension
+    }
+    /// Whether the guest is sent level `dimension`: placed in it, or held, which
+    /// looks at it without being part of it.
+    pub fn watches_level(&self, dimension: &str) -> bool {
+        self.participates_online() && (self.placed || self.held) && self.dimension == dimension
+    }
+    /// `ChunkMap.isChunkTracked`: whether the guest watches chunk `(x, z)` of
+    /// level `dimension`, inside its view (`ChunkTrackingView.contains`) and
+    /// sent rather than pending. A far-ring column past the view is not tracked.
+    pub fn tracks_chunk(&self, dimension: &str, (x, z): (i32, i32)) -> bool {
+        self.watches_level(dimension)
+            && self.sent_chunks.contains(&(x, z))
+            && self
+                .center
+                .is_some_and(|(cx, cz)| super::hub::tracked(cx, cz, self.view_distance, x, z))
+    }
 
     fn with_defaults(
         kind: GuestKind,
@@ -573,6 +632,7 @@ impl Guest {
         view_distance: i32,
     ) -> Self {
         Self {
+            residency: Default::default(),
             kind,
             conn: j.conn,
             address: j.address,
@@ -593,6 +653,7 @@ impl Guest {
             view_distance: i32::from(j.info.view_distance).max(2).min(view_distance),
             info: j.info,
             brand: j.brand,
+            recipe_sync: Default::default(),
             position,
             previous_position: position,
             yaw: 0.0,
@@ -638,6 +699,8 @@ impl Guest {
             support_blocks_sent: 0,
             position_this_tick: false,
             anticheat: Default::default(),
+            record: None,
+            client_sprinting: false,
             replay: None,
             changes: Default::default(),
             moved: false,
@@ -651,6 +714,7 @@ impl Guest {
             watched: Default::default(),
             chunk_queue: Vec::new(),
             far_queue: Vec::new(),
+            far_cursor: 0,
             unacknowledged: 0,
             max_unacknowledged: 1,
             chunks_per_tick: 9.0,
@@ -666,6 +730,7 @@ impl Guest {
             location_armor: [None, None, None, None],
             offhand: None,
             equipment: Default::default(),
+            equipment_cache: Default::default(),
             selected: 0,
             carried: None,
             craft_grid: Default::default(),
@@ -690,13 +755,13 @@ impl Guest {
             sent_air: (300, 0.0),
             sent_frozen: 0,
             sent_shared: 0,
+            sent_pose: Pose::Standing,
             sent_shoulders: [None; 2],
             sent_stuck: (0, 0),
             last_death: None,
             ack_up_to: std::cell::Cell::new(-1),
             sent_selected: 0,
             inbox: VecDeque::new(),
-            inbox_bytes: 0,
             joined_tick: 0,
             ticks: 0,
             moves: Vec::new(),
@@ -745,10 +810,13 @@ impl Guest {
         if !self.participates_online() {
             return;
         }
-        if self.anticheat.record.is_some() {
+        if self.record.is_some() {
             self.note_change(packet);
         }
-        self.sender.send(packet.encode());
+        match packet.try_encode() {
+            Ok(body) => self.sender.send(body),
+            Err(error) => eprintln!("[lan] send refused: {error}"),
+        }
     }
     /// Whether the guest is placed and on a Horizon client (the only one that
     /// reads synced attachments).
@@ -769,10 +837,17 @@ impl Guest {
             Err(e) => log::debug!("Horizon: attachment sync not sent: {e}"),
         }
     }
+    /// [`Self::send`] of a `ChunksBiomes` whose body is `packet.encode()`, the same
+    /// bytes for each guest with those columns. `note_change` ignores that packet.
+    pub fn send_chunks_biomes_body(&self, body: Vec<u8>) {
+        if !self.participates_online() {
+            return;
+        }
+        self.sender.send(body);
+    }
     /// What `packet` changes about how the client moves, for the prediction's replay: kept until
     /// the tick's ping places it (`Hub::anticheat_ping`).
     fn note_change(&self, packet: &play::Clientbound) {
-        use horizon_anticheat::prediction::Change;
         use play::Clientbound as C;
         let own = |id: i32| id == self.entity_id;
         let change = match packet {
@@ -931,13 +1006,16 @@ impl Guest {
     /// `Player.isWithinBlockInteractionRange(pos, buffer)` for the guest:
     /// its block interaction range is 4.5, 5 in creative.
     pub fn within_block_range(&self, pos: [i32; 3], buffer: f64) -> bool {
-        let eye = [
+        let range = if self.creative() { 5.0 } else { 4.5 };
+        within_block_range(self.eye(), range + buffer, pos)
+    }
+    /// Where the guest's eyes are: its feet raised by its pose's eye height.
+    pub fn eye(&self) -> [f64; 3] {
+        [
             self.position[0],
             self.position[1] + self.eye_height(),
             self.position[2],
-        ];
-        let range = if self.creative() { 5.0 } else { 4.5 };
-        within_block_range(eye, range + buffer, pos)
+        ]
     }
     /// `Player.isWithinBlockInteractionRange(pos, 1.0)`, which the server
     /// checks a block action against (ServerPlayerGameMode.handleBlockBreakAction,
@@ -981,6 +1059,22 @@ impl Guest {
     pub fn inventory_told(&mut self) {
         for slot in 9..45 {
             self.menu_sent[slot] = self.menu_slot(slot);
+        }
+    }
+    /// `ServerPlayer.drop(boolean)`: `setRemoteSlot` on the selected hotbar
+    /// slot of the open menu (the inventory menu without one) records what the
+    /// dropping client already predicted, so the next broadcast sends the slot
+    /// again once it changes back (a pickup refilling the stack).
+    pub fn told_selected(&mut self) {
+        let slot = 36 + self.selected;
+        self.menu_sent[slot] = self.menu_slot(slot);
+        let told = self.inventory.get(self.selected).cloned().flatten();
+        if let Some(m) = self.menu.as_mut() {
+            let at = m.size + 27 + self.selected;
+            if m.sent.len() <= at {
+                m.sent.resize(at + 1, None);
+            }
+            m.sent[at] = told;
         }
     }
     pub fn set_menu_slot(&mut self, slot: usize, item: Option<ItemStack>) {
@@ -1530,19 +1624,28 @@ fn network_stack(
                 .push((horizon_protocol::item::component::TRIM, component));
         }
         // BannerPatternLayers: each pattern a reference into the synced registry;
-        // a layer that has none leaves the stack without the component.
-        let layers: Option<Vec<(i32, i32)>> = d
-            .banner_patterns
+        // a layer that has none leaves the stack without the component. An
+        // ominous banner made by the raid keeps only its flag, so its layers
+        // are the ones the NBT encoder synthesises from it.
+        let patterns: Vec<(&str, &str)> = if d.ominous_banner && d.banner_patterns.is_empty() {
+            crate::item_data::OMINOUS_LAYERS.to_vec()
+        } else {
+            d.banner_patterns
+                .iter()
+                .map(|layer| (&*layer.pattern, &*layer.color))
+                .collect()
+        };
+        let layers: Option<Vec<(i32, i32)>> = patterns
             .iter()
-            .map(|layer| {
-                let name = if layer.pattern.contains(':') {
-                    layer.pattern.to_string()
+            .map(|(pattern, color)| {
+                let name = if pattern.contains(':') {
+                    pattern.to_string()
                 } else {
-                    format!("minecraft:{}", layer.pattern)
+                    format!("minecraft:{pattern}")
                 };
                 Some((
                     synced_id("minecraft:banner_pattern", &name)?,
-                    dye_id(&layer.color)?,
+                    dye_id(color)?,
                 ))
             })
             .collect();
@@ -1550,6 +1653,29 @@ fn network_stack(
             stack.added.push((
                 horizon_protocol::item::component::BANNER_PATTERNS,
                 horizon_protocol::item::Component::BannerPatterns(layers),
+            ));
+        }
+        // The raid captain's banner: `Raid.getBannerComponentPatch` gives it
+        // the ominous name, rarity and hidden layers, which `StackData` keeps
+        // as `ominous_banner` rather than in `other` (#12530).
+        if d.ominous_banner {
+            stack.added.push((
+                horizon_protocol::item::component::ITEM_NAME,
+                horizon_protocol::item::Component::Text(horizon_core::nbt::Tag::compound([(
+                    "translate",
+                    horizon_core::nbt::Tag::String("block.minecraft.ominous_banner".into()),
+                )])),
+            ));
+            stack.added.push((
+                horizon_protocol::item::component::RARITY,
+                horizon_protocol::item::Component::Int(1),
+            ));
+            stack.added.push((
+                horizon_protocol::item::component::TOOLTIP_DISPLAY,
+                horizon_protocol::item::Component::TooltipDisplay {
+                    hide: false,
+                    hidden: vec![horizon_protocol::item::component::BANNER_PATTERNS],
+                },
             ));
         }
         // `painting/variant`: a reference into the synced registry.
@@ -2366,5 +2492,38 @@ mod tests {
                 &format!("scale {scale}"),
             );
         }
+    }
+
+    #[test]
+    fn told_selected_records_the_predicted_drop() {
+        use crate::lan::PlayerSender;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicI32;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut guest = Guest::new(
+            Joined {
+                conn: 2,
+                uuid: 2,
+                name: "Dropper".into(),
+                properties: Vec::new(),
+                info: horizon_protocol::packets::configuration::ClientInformation::new(2),
+                brand: "test".into(),
+                sender: PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 64.0, 0.5],
+            0,
+        );
+        guest.selected = 3;
+        guest.inventory[3] = Some(ItemStack::new("minecraft:netherrack", 63));
+        guest.told_selected();
+        // Dropping one is already known to the client (63); the pickup that
+        // refills the slot must then differ from `menu_sent` and be sent.
+        assert_eq!(guest.menu_sent[39].as_ref().map(|s| s.count), Some(63));
+        guest.inventory[3].as_mut().unwrap().count = 64;
+        assert_ne!(guest.menu_sent[39], guest.menu_slot(39));
     }
 }

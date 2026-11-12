@@ -48,13 +48,12 @@ mod tests {
         use horizon_client::motion::PlayerMotion;
         use horizon_client::projectiles::{Projectile, ProjectileKind};
         use horizon_core::geometry::Vec3;
-        use mod_api::NativeWorldEpoch;
+        use mod_api::WorldEpoch;
 
         with_game(|game| {
             game.options.dedicated = Some(Vec::new());
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.lan_acting_uuid = Some(123);
-            game.lan_acting_entity = Some(20);
+            crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
             let player = game.entity(20).unwrap();
             game.player.as_mut().unwrap().spectator = false;
             assert_eq!(player.no_physics(game), Some(false));
@@ -132,7 +131,7 @@ mod tests {
             ));
             let boat = game.entity(44).unwrap();
             assert_eq!(boat.no_physics(game), None);
-            let stale = EntityRef::new(NativeWorldEpoch::new(mob.epoch().get() + 1), mob.id());
+            let stale = EntityRef::new(WorldEpoch::new(mob.epoch().get() + 1), mob.id());
             assert_eq!(stale.no_physics(game), None);
         });
     }

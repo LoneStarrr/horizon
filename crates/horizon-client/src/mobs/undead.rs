@@ -18,6 +18,14 @@ use crate::health::DamageLevel;
 use crate::projectiles::{Projectile, ProjectileKind};
 use horizon_core::{geometry::Vec3, random::RandomSource};
 
+/// `ZombifiedPiglin.alertOthers` keeps the source's player identity.
+#[derive(Clone, Debug)]
+pub struct PiglinAlert {
+    pub mob: u32,
+    pub source: u32,
+    pub target: Who,
+}
+
 /// `Zombie.hurtServer`, once the hit landed: a zombie with a target (its own,
 /// else a living attacker) asks the game to try calling a reinforcement; the
 /// difficulty, chance and spawn tests are the game's (`call_reinforcements`).
@@ -183,7 +191,9 @@ pub fn register(m: &mut Mob) {
 }
 /// Drowned.okTarget: at night, or when the target is in water.
 fn drowned_can_attack(_m: &Mob, w: &super::MobWorld) -> bool {
-    let Some(p) = &w.player else { return false };
+    let Some(p) = w.selected_player() else {
+        return false;
+    };
     !w.daylight || in_water_at(w, p.position)
 }
 /// The target's isInWater, from the water at its feet.
@@ -296,8 +306,7 @@ fn drowned_throw(m: &mut Mob, who: Who, _power: f32, cx: &mut Cx) {
     if let Some(a) = p.arrow.as_mut() {
         a.set_item(&trident);
     }
-    p.shoot(
-        &mut crate::random_source::entity(),
+    p.shoot_own(
         [xd, yd + dist * f64::from(0.2_f32), zd],
         1.6,
         ranged_attack_uncertainty(cx.w.difficulty.id),
@@ -475,26 +484,15 @@ fn drowned_close_to_next_pos(m: &Mob) -> bool {
 /// `ZombifiedPiglin.customServerAiStep`: faster and loud while angry,
 /// forgetting the player when the anger runs out, rallying the others.
 fn zombified_piglin_step(m: &mut Mob, cx: &mut Cx) {
-    let base = 0.23;
-    // NeutralMob.updatePersistentAnger: a new target starts 20-39 s of anger.
-    if m.ai.target.is_some() && !m.extra.flag2 {
-        m.extra.flag2 = true;
-        m.extra.anger = 400 + m.random.next_int_bound(380).unwrap_or(0);
-        m.extra.counter = m.random.next_int_bound(21).unwrap_or(0).max(1);
-        m.extra.counter2 = 80 + m.random.next_int_bound(41).unwrap_or(0);
-    } else if m.ai.target.is_none() {
-        m.extra.flag2 = false;
-    }
-    // The anger's target is whoever the piglin holds as its target, so a
-    // piglin hit by another mob is angry at that mob and not at the player
-    // (`NearestAttackableTargetGoal` tests `isAngryAt`).
-    if m.ai.target.is_some() {
-        m.extra.angry_at = m.ai.target;
-    }
+    use super::finalize::{self, Attr, Op};
+    let speed = Attr::MovementSpeed;
+    let attacking = "minecraft:attacking";
+    let has_speed = finalize::has_modifier(m, speed, attacking)
+        || finalize::has_transient_modifier(m, speed, attacking);
     if m.extra.anger > 0 {
         m.extra.anger -= 1;
-        if !m.is_baby() {
-            m.attrs.speed = base + 0.05;
+        if !m.is_baby() && !has_speed {
+            finalize::add_transient_modifier(m, speed, attacking, 0.05, Op::AddValue);
         }
         // playFirstAngerSoundIn
         if m.extra.counter > 0 {
@@ -510,13 +508,23 @@ fn zombified_piglin_step(m: &mut Mob, cx: &mut Cx) {
                 ));
             }
         }
-        if m.extra.anger == 0 {
-            m.ai.target = None;
+        if m.extra.anger == 0 && m.ai.target.is_none() {
+            m.set_ai_target(cx.w, None);
             m.extra.angry_at = None;
+            m.extra.anger_end = -1;
             m.extra.flag2 = false;
         }
+    } else if has_speed {
+        finalize::remove_modifier(m, speed, attacking);
+    }
+    // NeutralMob.updatePersistentAnger(level, true): an existing target
+    // refreshes the persistent anger on every server AI step.
+    if let Some(target) = m.ai.target {
+        m.extra.flag2 = true;
+        m.extra.angry_at = Some(target);
+        m.extra.anger = 400 + m.random.next_int_bound(381).unwrap_or(0);
     } else {
-        m.attrs.speed = base;
+        m.extra.flag2 = false;
     }
     // maybeAlertOthers every 4 to 6 seconds while seeing the target.
     if let Some(target) = m.ai.target {
@@ -541,7 +549,11 @@ fn zombified_piglin_step(m: &mut Mob, cx: &mut Cx) {
                         .map(|s| s.id)
                         .collect();
                 for other in others {
-                    cx.events.push(MobEvent::SetTarget { mob: other, target });
+                    cx.events.push(MobEvent::PiglinAlertTarget(PiglinAlert {
+                        mob: other,
+                        source: m.id,
+                        target,
+                    }));
                 }
             }
             m.extra.counter2 = 80 + m.random.next_int_bound(41).unwrap_or(0);
@@ -641,7 +653,7 @@ pub fn custom_server_ai_step(m: &mut Mob, cx: &mut Cx) {
         } else if m.fluids.eye_in_water {
             m.extra.counter += 1;
             if m.extra.counter >= 600 {
-                m.extra.counter2 = 300;
+                m.extra.counter2 = 301;
             }
         } else {
             m.extra.counter = -1;
@@ -862,7 +874,7 @@ impl Goal for BowAttack {
                 }
             }
             if m.extra.using_item > 0 {
-                m.extra.using_item += 1;
+                super::spear_use::count_use_tick(m);
             }
         } else {
             self.attack_time -= 1;
@@ -875,6 +887,43 @@ impl Goal for BowAttack {
         }
     }
 }
+#[cfg(test)]
+mod use_overflow_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires prepared entity resources in .local/horizon-client"]
+    fn bow_use_counter_saturates_when_target_hidden() {
+        assert!(
+            with_test_world(&[], |w, types| {
+                let kind = Arc::new(types.types["minecraft:skeleton"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 80.0, 0.5), 0.0);
+                m.extra.using_item = i32::MAX;
+                let mut world = w.clone();
+                world.player = Some(test_player(Vec3::new(2.5, 80.0, 0.5)));
+                m.ai.target = Some(Who::Player);
+                m.ai.seen_cache.push((Who::Player, false));
+                let mut goal = BowAttack::new(1.0, 20, 15.0);
+                let mut fixture = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                goal.tick(
+                    &mut m,
+                    &mut Cx {
+                        w: &world,
+                        level: &mut fixture.level(),
+                        events: &mut events,
+                    },
+                );
+                assert_eq!(m.extra.using_item, i32::MAX);
+            }),
+            "prepared mob resources required"
+        );
+    }
+}
+
 /// BowItem.getPowerForTime
 pub fn bow_power(ticks: i32) -> f32 {
     let t = ticks as f32 / 20.0;
@@ -886,7 +935,8 @@ pub fn perform_ranged_attack(m: &mut Mob, who: Who, cx: &mut Cx, power: f32) {
     let Some(t) = cx.w.target_info(who) else {
         return;
     };
-    let start = Vec3::new(m.position.x, m.eye_y() - 0.1, m.position.z);
+    // AbstractArrow(type, mob, ...) starts at getEyeY() - 0.1F, widened.
+    let start = Vec3::new(m.position.x, m.eye_y() - f64::from(0.1_f32), m.position.z);
     let height = t.bounds.max_position().y - t.bounds.min_position().y;
     let xd = t.position.x - m.position.x;
     let yd = t.position.y + height / 3.0 - start.y;
@@ -894,8 +944,6 @@ pub fn perform_ranged_attack(m: &mut Mob, who: Who, cx: &mut Cx, power: f32) {
     let dist = (xd * xd + zd * zd).sqrt();
     // AbstractArrow.setBaseDamageFromMob: power * 2 + triangle(difficulty * 0.11, 0.57425).
     let id = i32::from(cx.w.difficulty.id);
-    let mut arrow_random = crate::random_source::entity();
-    let base = f64::from(power) * 2.0 + arrow_random.triangle(f64::from(id) * 0.11, 0.574_25);
     let effect = match m.species() {
         Species::Stray => Some(("minecraft:slowness", 600)),
         Species::Bogged => Some(("minecraft:poison", 100)),
@@ -904,18 +952,23 @@ pub fn perform_ranged_attack(m: &mut Mob, who: Who, cx: &mut Cx, power: f32) {
     };
     let mut p = Projectile::new(
         ProjectileKind::Arrow {
-            base_damage: base,
+            base_damage: 0.0,
             critical: false,
             effect,
         },
         start,
         Some(Who::Mob(m.id)),
     );
+    // From the arrow's own random, after its UUID.
+    let damage =
+        f64::from(power) * 2.0 + p.entity_random().triangle(f64::from(id) * 0.11, 0.574_25);
+    if let ProjectileKind::Arrow { base_damage, .. } = &mut p.kind {
+        *base_damage = damage;
+    }
     p.set_bonus(super::gear::arrow_bonus(m));
     ignite_for_wither_skeleton(m, &mut p);
-    p.shoot(
-        &mut arrow_random,
-        [xd, yd + dist * 0.2, zd],
+    p.shoot_own(
+        [xd, yd + dist * f64::from(0.2_f32), zd],
         1.6,
         (14 - id * 4) as f32,
     );
@@ -1276,7 +1329,9 @@ impl Goal for AttackTurtleEgg {
                     count: 1,
                 });
             }
-            // The break sound's pitch draws from the level random.
+            // `playBreakSound`: volume 0.7, pitch 0.9 + the level random's
+            // float * 0.2.
+            let pitch = 0.9 + cx.level.random().next_float() * 0.2;
             cx.events.push(MobEvent::Sound(
                 "entity.turtle.egg_break",
                 [
@@ -1285,7 +1340,7 @@ impl Goal for AttackTurtleEgg {
                     f64::from(eat[2]) + 0.5,
                 ],
                 0.7,
-                1.0,
+                pitch,
             ));
             super::after_break(cx.events, cx.w.asks_living_destroy_block, m.id, effects);
         }
@@ -1517,6 +1572,75 @@ mod go_to_water_tests {
 }
 
 #[cfg(test)]
+mod turtle_egg_tests {
+    use super::*;
+    use crate::mobs::world::with_built_test_world;
+    use std::sync::Arc;
+
+    /// The pitch of the `entity.turtle.egg_break` sound the goal plays on the
+    /// tick it breaks the egg, and the level random's next draw afterwards,
+    /// with the level random seeded `level_seed`. `None` without the extracted
+    /// data.
+    fn break_tick(level_seed: i64) -> Option<(f32, f32)> {
+        let build = |world: &mut crate::world::World,
+                     registry: &horizon_world::registry::BlockRegistry| {
+            world
+                .chunks
+                .insert((0, 0), Arc::new(crate::chunk::Chunk::empty(0, 0)));
+            let egg = registry.default_state("minecraft:turtle_egg").unwrap();
+            world.set(0, 63, 0, egg).unwrap();
+        };
+        let mut out = None;
+        let ran = with_built_test_world(&[], build, |w, types| {
+            let kind = Arc::new(types.types["minecraft:zombie"].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+            let mut goal = AttackTurtleEgg::default();
+            goal.base.block = [0, 63, 0];
+            goal.base.reached = true;
+            // Past `RemoveBlockGoal`'s sixty ticks: the egg goes this tick.
+            goal.since_reached = 61;
+            let mut lr = crate::health::TestLevel::new(level_seed);
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut lr.level(),
+                events: &mut events,
+            };
+            goal.tick(&mut m, &mut cx);
+            out = events
+                .iter()
+                .find_map(|e| match e {
+                    MobEvent::Sound("entity.turtle.egg_break", _, volume, pitch) => {
+                        assert_eq!(*volume, 0.7);
+                        Some(*pitch)
+                    }
+                    _ => None,
+                })
+                .map(|pitch| (pitch, lr.random().next_float()));
+        });
+        ran.then_some(out).flatten()
+    }
+
+    /// `Zombie.ZombieAttackTurtleEggGoal.playBreakSound`:
+    /// `0.9F + level.getRandom().nextFloat() * 0.2F`. One draw of the level's
+    /// random, not the mob's, so the pitch varies with the level seed over
+    /// 0.9-1.1 rather than a fixed 1.0.
+    #[test]
+    fn the_egg_break_pitch_draws_from_the_level_random() {
+        // java.util.Random(seed)'s first nextFloat, from an independent
+        // implementation: 0.7306990027427673 for 7, 0.0978928804397583 for
+        // 4096, so the pitches are 0.9 + f * 0.2 in f32.
+        let Some((pitch, next)) = break_tick(7) else {
+            return;
+        };
+        assert_eq!(pitch, 1.046_139_7);
+        // Exactly one draw: the seed's second float is what comes next.
+        assert_eq!(next, 0.638_537_65);
+        assert_eq!(break_tick(4096), Some((0.919_578_55, 0.875_477_85)));
+    }
+}
+
+#[cfg(test)]
 mod wither_arrow_tests {
     use super::*;
     use crate::mobs::world::{test_player, with_test_world};
@@ -1690,5 +1814,49 @@ mod trident_continue_tests {
             Some((true, false)),
             "a trident attack starts for a drowned holding one and stops when it is gone"
         );
+    }
+
+    #[test]
+    fn drowned_and_husk_conversion_starts_at_301_ticks_and_converts_on_tick_301() {
+        let ran = with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:zombie"].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+            m.fluids.eye_in_water = true;
+            m.extra.counter = 599;
+
+            let mut lr = crate::health::TestLevel::new(0);
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut lr.level(),
+                events: &mut events,
+            };
+
+            // Tick 600 of being in water starts conversion with counter2 = 301.
+            custom_server_ai_step(&mut m, &mut cx);
+            assert_eq!(m.extra.counter, 600);
+            assert_eq!(m.extra.counter2, 301);
+
+            // Conversion ticks down across 300 ticks without firing.
+            for i in (2..=301).rev() {
+                assert_eq!(m.extra.counter2, i);
+                cx.events.clear();
+                custom_server_ai_step(&mut m, &mut cx);
+                assert!(cx.events.is_empty(), "tick {i} should not convert yet");
+            }
+            assert_eq!(m.extra.counter2, 1);
+
+            // On the 301st tick of conversion, counter2 reaches 0 and converts.
+            cx.events.clear();
+            custom_server_ai_step(&mut m, &mut cx);
+            assert_eq!(m.extra.counter2, 0);
+            assert!(
+                cx.events
+                    .iter()
+                    .any(|e| matches!(e, MobEvent::Convert { .. })),
+                "conversion should trigger on tick 301"
+            );
+        });
+        let _ = ran;
     }
 }

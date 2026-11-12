@@ -3,18 +3,27 @@
 //! Written to `crash-reports/crash-<yyyy-MM-dd_HH.mm.ss>-client.txt` in the game folder when
 //! the main thread panics or `main` gets an error back. It stays a local file: the player
 //! reads it and shares it by hand.
-pub use mod_api::crash::{
-    ConvertedCall, ConvertedPackage, ConvertedPackageGuard, ConvertedPackages, NativeModCall,
-    NativeModGuard, clear_detail, current_converted_call, current_native_mod, enter_native_mod,
-    set_detail,
+pub use mod_api::content::crash::{
+    ConvertedCall, ConvertedPackage, ConvertedPackageGuard, ConvertedPackages, ModCall, ModGuard,
+    current_converted_call, current_native_mod,
 };
+// Tests run without the executable's startup: the platform's versions install the crash
+// backend on first use and keep details, as the started game's do.
+#[cfg(not(test))]
+use mod_api::content::crash::details;
+#[cfg(not(test))]
+pub use mod_api::content::crash::{clear_detail, enter_native_mod, set_detail};
+#[cfg(test)]
+use mod_platform::content::crash::details;
+#[cfg(test)]
+pub use mod_platform::content::crash::{clear_detail, enter_native_mod, set_detail};
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Local};
-use horizon_system::system::machine_arch;
+use horizon_system::{command_output, machine_arch};
 
 static REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -28,7 +37,7 @@ thread_local! {
 /// `message`, with the native mod hook this thread is inside, if any, and the converted package
 /// the hook's runtime is executing.
 fn attributed(message: String) -> String {
-    let Some(call) = mod_api::crash::current_native_call() else {
+    let Some(call) = mod_api::content::crash::current_native_call() else {
         return message;
     };
     let part = call
@@ -39,13 +48,17 @@ fn attributed(message: String) -> String {
         "{message}\nin native mod {}, hook {}{part}",
         call.id, call.hook
     );
-    if let Some(scoped) = mod_api::crash::current_converted_call()
+    if let Some(scoped) = mod_api::content::crash::current_converted_call()
         && scoped.runtime == call.id
     {
+        // `export` and `site` come from the runtime, and for wasm from module bytes: a name
+        // with a newline could forge another line of this report, so keep each on one line.
         let _ = write!(
             out,
             "\nin converted package {}, export {}, call site {}",
-            scoped.package, scoped.export, scoped.site
+            scoped.package,
+            scoped.export.escape_debug(),
+            scoped.site.escape_debug()
         );
     }
     out
@@ -190,15 +203,6 @@ pub fn release_tag() -> Option<String> {
         .then(|| folder.to_owned())
 }
 
-fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (out.status.success() && !text.is_empty()).then_some(text)
-}
-
 fn read(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -213,7 +217,7 @@ fn arch_label(build: &str, machine: &str) -> String {
 }
 
 /// `PRETTY_NAME` of /etc/os-release and the kernel, or the system's own version string.
-fn operating_system() -> String {
+pub(crate) fn operating_system() -> String {
     let arch = arch_label(std::env::consts::ARCH, machine_arch());
     let version = if cfg!(target_os = "linux") {
         let name = read("/etc/os-release").and_then(|t| {
@@ -229,7 +233,7 @@ fn operating_system() -> String {
     } else if cfg!(target_os = "macos") {
         command_output("sw_vers", &["-productVersion"]).map(|v| format!("macOS {v}"))
     } else if cfg!(windows) {
-        horizon_system::system::windows_version()
+        horizon_system::windows_version()
     } else {
         None
     };
@@ -244,11 +248,11 @@ fn operating_system() -> String {
 pub fn cpu() -> String {
     let threads = std::thread::available_parallelism().map_or(0, |n| n.get());
     let name = if cfg!(target_os = "linux") {
-        read("/proc/cpuinfo").and_then(|t| horizon_system::system::linux_cpu_name(&t))
+        read("/proc/cpuinfo").and_then(|t| horizon_system::linux_cpu_name(&t))
     } else if cfg!(target_os = "macos") {
         command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
     } else if cfg!(windows) {
-        horizon_system::system::windows_cpu()
+        horizon_system::windows_cpu()
     } else {
         std::env::var("PROCESSOR_IDENTIFIER").ok()
     };
@@ -324,7 +328,7 @@ pub fn system_details(side: &str) -> Vec<(String, String)> {
         ("Memory".to_owned(), memory()),
     ];
     out.extend(
-        mod_api::crash::details()
+        details()
             .into_iter()
             .filter(|(k, _)| side != "server" || *k != "Render Settings")
             .map(|(k, v)| (k.to_owned(), v)),
@@ -347,6 +351,21 @@ fn thread_name(side: &str) -> String {
 /// promise to launchers (docs/api/launch.md), so it never changes within a line of that API.
 pub const SAVED_LINE: &str = "Horizon: crash report saved to ";
 
+/// What runs on each report before it is saved ([`on_report`]).
+pub type ReportHook = fn(&Path, &Report);
+
+static REPORT_HOOKS: std::sync::RwLock<Vec<ReportHook>> = std::sync::RwLock::new(Vec::new());
+
+/// Runs `hook` with every crash report, before it is saved: the game folder and the report. An
+/// extension point for what lives above the engine (Horizon's opt-in telemetry keeps the
+/// report). A hook runs inside the crash handler: it must not panic or block.
+pub fn on_report(hook: ReportHook) {
+    REPORT_HOOKS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(hook);
+}
+
 /// Writes the report and tells where it is; the log gets the error too.
 fn deliver(home: &Path, report: Report) -> Option<PathBuf> {
     if REPORTED.swap(true, Ordering::SeqCst) {
@@ -367,6 +386,13 @@ fn deliver(home: &Path, report: Report) -> Option<PathBuf> {
         ),
     );
     crate::logging::flush();
+    for hook in REPORT_HOOKS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        hook(home, &report);
+    }
     // A player of a shared game folder (`--player-dir`) finds the report beside its own log.
     match report.save(crate::logging::player_dir_override().unwrap_or(home)) {
         Ok(path) => {
@@ -381,20 +407,33 @@ fn deliver(home: &Path, report: Report) -> Option<PathBuf> {
     }
 }
 
-/// The report for a hung server tick, written by the watchdog thread
-/// (`ServerWatchdog`): the stuck thread's stack is not available to Rust, so
-/// the report carries none.
-pub fn report_watchdog(home: &Path, side: &'static str, message: String) -> Option<PathBuf> {
+/// The report for a hung server tick, written by the watchdog thread (`ServerWatchdog`): the
+/// stack is the server thread's, read from the watchdog (`horizon_threads::stack_dump`), as
+/// vanilla's report carries the server thread's stack; without it, the details say why.
+pub fn report_watchdog(
+    home: &Path,
+    side: &'static str,
+    message: String,
+    server_stack: Result<String, horizon_threads::stack_dump::NoStack>,
+) -> Option<PathBuf> {
+    let mut details = system_details(side);
+    let stack = match server_stack {
+        Ok(stack) => stack_lines(&stack, false),
+        Err(why) => {
+            details.push(("Server thread stack".into(), why.to_string()));
+            String::new()
+        }
+    };
     deliver(
         home,
         Report {
             time: Local::now(),
             description: "Watching Server".into(),
             error: format!("{message} (Watching Server)"),
-            stack: String::new(),
+            stack,
             thread: thread_name(side),
             side,
-            details: system_details(side),
+            details,
             log: crate::logging::recent_lines(),
         },
     )
@@ -533,6 +572,16 @@ pub fn panic_report(info: &std::panic::PanicHookInfo, side: &'static str) -> Rep
     }
 }
 
+/// Shared with the integrated server spawn so reporting follows its exact name.
+pub const INTEGRATED_SERVER_THREAD: &str = "Server thread";
+
+static SERVER_CRASHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the server has already delivered the fatal report.
+pub fn server_crashed() -> bool {
+    SERVER_CRASHED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Whether `name` is one of the shared worker pool's threads (`horizon_threads::jobs`), vanilla's
 /// `Util` worker threads.
 fn is_worker_thread(name: Option<&str>) -> bool {
@@ -550,7 +599,7 @@ pub fn worker_panic_report(info: &std::panic::PanicHookInfo, side: &'static str)
 }
 
 /// Reports panics: on the main thread a crash report (the panic then ends the game, exit code
-/// 101); on a worker thread (`Util.onThreadException`) a crash report too, and the game ends
+/// 101); on the integrated server thread a server report relayed to the window; on a worker thread (`Util.onThreadException`) a crash report too, and the game ends
 /// with it; on other threads the error goes to the log, as vanilla's uncaught exception handler
 /// does. The default hook still prints the panic. A panic inside `contain` is only logged. A
 /// panic inside a native mod's hook names the mod and the hook.
@@ -562,7 +611,16 @@ pub fn install(home: PathBuf, side: &'static str) {
         }
         default(info);
         let main = std::thread::current().name() == Some("main");
-        if main {
+        if std::thread::current().name() == Some(INTEGRATED_SERVER_THREAD) {
+            // `MinecraftServer.runServer` saves its own `-server.txt` report before
+            // `onServerCrash` hands it to the client, which then only prints its path.
+            let report = Report {
+                description: "Exception in server tick loop".into(),
+                ..panic_report(info, "server")
+            };
+            deliver(&home, report);
+            SERVER_CRASHED.store(true, std::sync::atomic::Ordering::Release);
+        } else if main {
             deliver(&home, panic_report(info, side));
         } else if is_worker_thread(std::thread::current().name()) {
             deliver(&home, worker_panic_report(info, side));
@@ -680,6 +738,88 @@ mod tests {
     static PANIC_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn reporting_threads_write_once_and_contained_server_panics_write_nothing() {
+        let _lock = PANIC_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, native, contained, count, title) in [
+            (
+                "Server thread",
+                false,
+                false,
+                1,
+                "Exception in server tick loop",
+            ),
+            (
+                "Server thread",
+                true,
+                false,
+                1,
+                "Exception in server tick loop",
+            ),
+            ("Server thread", false, true, 0, ""),
+            ("main", false, false, 1, "Unexpected error"),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let home = scratch.path().to_path_buf();
+            let previous = std::panic::take_hook();
+            REPORTED.store(false, Ordering::SeqCst);
+            install(
+                home.clone(),
+                if name == "main" { "server" } else { "client" },
+            );
+            let result = std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || {
+                    let crash = || {
+                        let _guard = native.then(|| {
+                            enter_native_mod(ModCall {
+                                id: "example:broken",
+                                hook: "server_tick",
+                                part: None,
+                            })
+                        });
+                        panic!("posted server crash 3494");
+                    };
+                    if contained {
+                        assert!(contain(crash).is_err());
+                    } else {
+                        crash();
+                    }
+                })
+                .unwrap()
+                .join();
+            std::panic::set_hook(previous);
+            assert_eq!(result.is_ok(), contained);
+            let reports: Vec<_> = std::fs::read_dir(home.join("crash-reports"))
+                .into_iter()
+                .flatten()
+                .map(|p| p.unwrap().path())
+                .collect();
+            assert_eq!(reports.len(), count);
+            if count == 1 {
+                // Both are server reports: `main` is installed as a dedicated server here,
+                // and the integrated server thread writes its own even under a client install.
+                let file = reports[0]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(file.ends_with("-server.txt"), "{file}");
+                let text = std::fs::read_to_string(&reports[0]).unwrap();
+                assert!(text.contains(&format!("Description: {title}")));
+                assert!(text.contains("posted server crash 3494"));
+                if name == "Server thread" {
+                    assert!(text.contains("Server thread"));
+                }
+                if native {
+                    assert!(text.contains("in native mod example:broken, hook server_tick"));
+                }
+            }
+            REPORTED.store(false, Ordering::SeqCst);
+            SERVER_CRASHED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
     fn an_emulated_build_names_both_architectures() {
         // A Windows ARM64 PC playing the x64 build: its reports say so (#7513 read "x86_64").
         assert_eq!(arch_label("x86_64", "aarch64"), "x86_64 on aarch64");
@@ -709,12 +849,12 @@ mod tests {
 
     #[test]
     fn a_panic_in_a_native_mods_hook_names_it() {
-        let outer = enter_native_mod(NativeModCall {
+        let outer = enter_native_mod(ModCall {
             id: "outer",
             hook: "render",
             part: None,
         });
-        let inner = enter_native_mod(NativeModCall {
+        let inner = enter_native_mod(ModCall {
             id: "b",
             hook: "tick",
             part: None,
@@ -724,7 +864,7 @@ mod tests {
         assert!(attributed("boom".into()).ends_with("\nin native mod outer, hook render"));
         drop(outer);
         assert_eq!(attributed("boom".into()), "boom");
-        let part = enter_native_mod(NativeModCall {
+        let part = enter_native_mod(ModCall {
             id: "c",
             hook: "analog_output",
             part: Some("c::Gauge"),
@@ -738,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_panic_in_a_converted_package_names_the_runtime_package_export_and_site() {
-        let runtime = enter_native_mod(NativeModCall {
+        let runtime = enter_native_mod(ModCall {
             id: "portizon",
             hook: "client_tick_pre",
             part: None,
@@ -755,7 +895,7 @@ mod tests {
         ));
         // Another mod's hook inside the package keeps its own attribution: the runtime's
         // package is not named for a crash in somebody else's code.
-        let other = enter_native_mod(NativeModCall {
+        let other = enter_native_mod(ModCall {
             id: "other",
             hook: "tick",
             part: None,
@@ -777,6 +917,44 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_export_cannot_forge_a_report_line() {
+        let runtime = enter_native_mod(ModCall {
+            id: "portizon",
+            hook: "client_tick_pre",
+            part: None,
+        });
+        let packages = ConvertedPackages::new("portizon", ["example:mod"]);
+        let scope = packages
+            .package("example:mod")
+            .unwrap()
+            .enter(
+                "tick\nin native mod forged, hook render",
+                "Foo.tick(\nforged)",
+            )
+            .unwrap();
+        let report = attributed("boom".into());
+        // One attributed line each: the guest's text stays inside them, escaped.
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("in native mod"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("in converted package"))
+                .count(),
+            1
+        );
+        assert!(report.contains(r"export tick\nin native mod forged, hook render"));
+        assert!(report.contains(r"call site Foo.tick(\nforged)"));
+        drop(scope);
+        drop(runtime);
+    }
+
+    #[test]
     fn a_panic_in_a_converted_package_becomes_a_report() {
         let caught = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = caught.clone();
@@ -787,7 +965,7 @@ mod tests {
                 *sink.lock().unwrap() = Some(panic_report(info, "client"));
             }
         }));
-        let _runtime = enter_native_mod(NativeModCall {
+        let _runtime = enter_native_mod(ModCall {
             id: "runtime",
             hook: "dispatch",
             part: None,
@@ -938,7 +1116,7 @@ mod tests {
         let _ = std::panic::catch_unwind(|| panic!("the test crash"));
         // The same panic inside a native mod's hook, which the hook sees before the unwind.
         let _ = std::panic::catch_unwind(|| {
-            let _guard = enter_native_mod(NativeModCall {
+            let _guard = enter_native_mod(ModCall {
                 id: "a",
                 hook: "tick",
                 part: None,
@@ -1016,7 +1194,7 @@ mod tests {
                 sink.lock().unwrap().push(error);
             }
         }));
-        let unwound = mod_api::testing::with_mods(mods.into(), || {
+        let unwound = mod_platform::testing::with_mods(mods.into(), || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 mod_api::dispatch_component_types(
                     &mod_api::RegistrationContext::new(),

@@ -35,7 +35,7 @@ and call `state.property(&metadata, "facing")` or `state.with(&metadata, "facing
 supplied `StateConstraint`s. Changes return a new value and never mutate the original.
 Unknown keys, ordinals and property combinations return typed `BlockStateError`s.
 
-`NativeSceneBlock::new(pos, state, entity)` and `StructureTemplateBlock::new(pos, state, nbt)`
+`SceneBlock::new(pos, state, entity)` and `StructureTemplateBlock::new(pos, state, nbt)`
 use this owned `BlockState`, including all properties. Structure reads preserve vanilla palette
 selection, mirror-then-rotation and placement order; an unavailable state mapping refuses the
 whole snapshot with `None`. `DrawContext::draw_scene` checks the entire scene before drawing:
@@ -67,6 +67,17 @@ and return `Result<bool, LevelWriteError>`. `Stale` identifies a closed or reope
 retains the block-state refusal. Errors do not mutate the level. `Ok(false)` is still
 vanilla refusal, such as an unloaded or out-of-height position or an unchanged block,
 not a lost handle or a guessed replacement state. Update flags retain their vanilla effect.
+
+Walking a whole registry uses the typed keys, never names: `host.block_keys()` and
+`host.item_keys()` return every entry in the registry's registration order (vanilla's
+entries first, then mods' in the order they registered); `host.entity_type_keys()`,
+`host.menu_keys()` do the same for the built-in entity-type and menu registries.
+`host.enchantment_keys()` uses global sorted loaded-registry order, with vanilla and mod
+data-pack entries sorted together. A block registry lists a name once
+per state, and its iteration lists the block once. Build lookup tables from these lists at
+load time instead of resolving names per tick. A table is empty before its registry loads
+(blocks and items during rest load, enchantments with the item tables); registration-time
+`RegistrationContext` does not see any of them (#1001).
 
 Keys are small, private `u32` registration slots on both native and wasm. `key.id(host)`
 returns an owned canonical `String` through the generated read backend for diagnostics; it
@@ -117,8 +128,8 @@ A saved tank whose fluid's mod is absent carries an opaque unresolved identity. 
 `key()` is `None`; `UnresolvedFluid::id(host)` reads its saved name. It can move between
 name-backed mod tanks, but not into vanilla buckets or cauldrons.
 
-`NativeActiveEffect::id` and effect hook payloads carry `EffectKey`; living effect queries,
-application and removal use the same resolved key. `NativeActiveEffect::new(speed, …)`
+`ActiveEffect::id` and effect hook payloads carry `EffectKey`; living effect queries,
+application and removal use the same resolved key. `ActiveEffect::new(speed, …)`
 uses a key requested through `r.effect_key("minecraft:speed")`. Beacon-selection hooks
 carry `Option<EffectKey>` for each power; `None` is no selection. Enchantment effect-component
 names (for example `minecraft:damage` in `has_enchantment_effect`) are a different registry
@@ -130,8 +141,8 @@ Resolve item and block keys during load and keep them for tick and menu calls.
 `item_burn_time`, `item_compost_chance`, `give`, `enchantment_supports`'s item,
 and GUI `item` / `item_model` take `ItemKey`. `block_item`, `fluid_bucket` and
 `screen_hovered_item` return item keys. `level.block`, `lit_block_name` and
-`NativeHit.block` return block keys; `BlockEntityDrawContext::block` takes one.
-`NativeHeldItem.id` (including use-start/stop events) and `NativeStack.item`
+`Hit.block` return block keys; `BlockEntityDrawContext::block` takes one.
+`HeldItemSlot.id` (including use-start/stop events) and `Stack.item`
 carry item keys, not names. Unknown incoming slots are refused at the boundary.
 `block_sprites` takes API-owned `BlockState` values, preserving properties without
 parsing state strings or exposing numeric engine state IDs. The pre-change block event carries resolved `from` / `to`
@@ -172,22 +183,28 @@ predicate occurs anywhere in the tree; a displayed item list is not a safe subst
 The sample's `ProcessingRecipes::publish` retains these keys; `result` then checks
 `input.item()` locally, with no `Ingredient::test` host call per candidate.
 
+Stack placement predicates and drawing consumers (HUD items, GUI item decorations,
+block-entity items and tooltip images) encode API stacks without enforcing resident
+count or damage maxima. Engine-legal over-limit stacks can still be inspected and drawn.
+Unknown item keys and invalid/unrepresentable effect payloads still refuse encoding;
+this is not a total conversion. Insertion and other world writes retain strict validation.
+
 ### API-owned values: migration table
 
 | Previous engine value | API-owned value | Mod changes |
 | --- | --- | --- |
 | Engine stack in `TooltipDisplay::for_stack` | `mod_api::ItemStack` | Pass the owned API stack supplied to the tooltip event. Its effective tooltip component includes vanilla's implicit defaults. Normal game rendering borrows the engine component without creating an API stack. |
-| Engine loot context and candidate stack | `mod_api::{NativeLootContext, LootStack}` | Contexts own their facts; candidate items are `ItemKey`s. Counts remain signed. Ordered `Option<Tag>` patches preserve removals and NBT types, and names are API `Text` trees. Writeback is atomic. |
+| Engine loot context and candidate stack | `mod_api::{LootContext, LootStack}` | Contexts own their facts; candidate items are `ItemKey`s. Counts remain signed. Ordered `Option<Tag>` patches preserve removals and NBT types, and names are API `Text` trees. Writeback is atomic. |
 | Engine `ParticleType` and options | `ParticleKey` and API `ParticleOptions` | Retain a key requested through `Registrar::particle_key`. Every parameter-family constructor takes its key; `simple(key)` also replaces string-based custom provider construction. The engine enum is no longer exported. |
 | Engine damage containers | `mod_api::{DamageContainer, DamageValues, Reduction}` | Hooks receive an owned scalar snapshot. Read reductions with `reduction`; edit damage and cooldown through the container setters. Sequencing methods remain game-only. |
 | Engine item property values | `mod_api::{ItemBar, ItemRarity}` | Resource methods retain their signatures; damageability, glint and repair checks use game-owned metadata reads. |
 | Package manifest `Side` | `mod_api::Side` | Match `Client` and `Both` on the package metadata snapshot. This is not `HostSide` or the executing logical side. |
 | Command `Suggestion` | `mod_api::Suggestion` | Construct with `Suggestion::new((start, end), text)`; optional `tooltip` and `int_value` remain writable. Offsets are byte offsets. |
-| Package block and item declarations | `mod_api::{Block, Item}` | Use API-owned declaration records in the registration events. Component patches are ordered `(String, Option<Tag>)` entries, with `None` removing the component; the game converts once at load and applies content-file admission checks. |
+| Package block and item declarations | `mod_api::{Block, Item}` | Use API-owned declaration records in the registration events. Component patches are `(String, Option<Tag>)` entries, with `None` removing the component; the game converts once at load and applies content-file admission checks. |
 | Package block entity type storage | `mod_api::BlockEntityTypeDecl` | Existing `r.block_entity_type(...).build()` registration is unchanged. The declaration snapshot no longer exposes the package parser's model; the game converts it once when declarations freeze. |
 | Component protocol vocabulary | `text::{TextContent, TextNbtSource, TextObject, TextClick, TextHover}` | Match these enums exhaustively: their serialized vocabulary is closed. Records remain `non_exhaustive`. |
 | Renderer GUI commands | `mod_api::GuiDraw` | `DrawContext::gui_paint` returns a typed text-conversion result; handle refusal before drawing. HUD hooks reject invalid writeback as a whole. |
-| File-opening click actions | Not in `text::TextClick` | Mods can neither produce nor round-trip `OpenFile`; untrusted file-opening action metadata is dropped. Part of [per-node origin tracking #1738](https://github.com/arismoko/horizon/issues/1738). |
+| File-opening click actions | Not in `text::TextClick` | Mods can neither produce nor round-trip `OpenFile`; untrusted file-opening action metadata is dropped. Core tracks local/remote origin per node, including mixed trees; exporting JSON or `TextForm` and decoding it makes every node remote. Adding API `OpenFile` remains a separate vocabulary/link-contract change. |
 
 `mod_api::GameRuleValue` owns the `Bool(bool)` and `Int(i32)` cases, in that order.
 `level.game_rule(host, id)` returns `Result<Option<GameRuleValue>, LevelReadError>`:
@@ -255,6 +272,11 @@ container path exceeds 512. Unavailable backends are distinct from invalid text 
 unrepresentable payloads.
 A refused hook capture does not dispatch; a refused writeback leaves every field unchanged.
 No subscriber means no conversion or snapshot allocation.
+Mutable stack arguments are compared using value equality with the snapshot passed to
+the listener. An unchanged argument retains the original engine value without strict
+write validation (including engine-legal stacks above effective count or damage maxima).
+A changed argument is validated in full; a refusal still commits no outputs. The same
+rule applies to anvil/grindstone records and menu cursor/quick-move stacks.
 
 Recursive `Clone`, `Eq` and `Drop` of a tree a mod itself built are ordinary Rust ownership,
 not part of the boundary guarantee.
@@ -332,8 +354,8 @@ A hook whose catalog entry has a `scope` (`block`, `block_entity`, `item`, `menu
 naming the thing it is about, is a method on that scope's trait only: `BlockPart`, `BlockEntityPart` (a
 `BlockPart` too), `ItemPart` and `MenuPart`, as vanilla's and NeoForge's `Block` and `Item` methods are. It has
 no `Hooks` method: a thing without parts is never asked, and the game asks the parts attached to it in dispatch
-order, through the hook's contract, so a `Cancel` or a replacement skips the parts after it. Where NeoForge fires
-a bus event at that moment, the event is a hook of its own on `Hooks`, asked first for every thing, and its cancel
+order, through the hook's contract, so a `Cancel` or a replacement skips the parts after it. Where a NeoForge
+bus event is the counterpart for that moment, the event is a hook of its own on `Hooks`, asked first for every thing, and its cancel
 skips the parts: a mod reacting to its own blocks uses a part, one reacting to every block the event. A part's kind is its type: the same kind twice on one
 thing, an invalid key declaration, or an unnamespaced id in the other Part registrations stops
 the game at startup with a message naming the mods. A panic in a part

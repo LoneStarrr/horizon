@@ -68,6 +68,7 @@ pub(super) fn first_join<T: Joined>(list: &[T]) -> Option<JoinSeq> {
 impl Game<'_> {
     /// A level tick starts: what has joined so far ticks this tick.
     pub(super) fn begin_ordered_ticks(&mut self) {
+        let _span = horizon_client::spans::guard("ordered_ticks");
         let pending_buf = std::mem::take(&mut self.ordered.pending_buf);
         let firsts = [
             first_join(&self.armor_stands),
@@ -100,6 +101,7 @@ impl Game<'_> {
     /// Ticks, one at a time in join order, every orb, primed TNT and falling
     /// block that joined before `cut` and has not ticked this tick.
     pub(super) fn run_ordered_ticks(&mut self, cut: JoinSeq, late: bool) -> Result<()> {
+        let _span = horizon_client::spans::guard("ordered_ticks");
         let mut first_error = None;
         let mut followed = None;
         let mut events = false;
@@ -187,6 +189,10 @@ impl Game<'_> {
                     let Some(i) = self.orbs.locate(join) else {
                         continue;
                     };
+                    let at = self.orbs[i].position;
+                    if !entity_ticking(at.x.floor() as i32, at.z.floor() as i32) {
+                        continue;
+                    }
                     // ExperienceOrb.tick runs scanForMerges before it moves.
                     // An orb absorbed here is gone before its own turn's
                     // find_join finds it.
@@ -212,6 +218,12 @@ impl Game<'_> {
                             )
                         })
                         .near(area.inflate(Vec3::new(1.0, 1.0, 1.0)), &mut nearby);
+                    let orb_id = self.orbs[i].id;
+                    let vanilla = self.saved_refuses_damage(orb_id, "minecraft:lava", false);
+                    let registry = self.pack.assets.registry;
+                    let tags = world_items!(self);
+                    let block_registries = &self.pack.block_registries;
+                    let hooks = &self.damage_hooks;
                     let o = &mut self.orbs[i];
                     // An orb has no random of its own here: lava draws from one
                     // made on first use, apart from the level stream.
@@ -221,13 +233,13 @@ impl Game<'_> {
                             .get_or_insert_with(random_source::entity)
                             .next_float()
                     };
-                    let stays = {
+                    let (stays, step) = {
                         let audio = &mut self.audio;
                         let mut on_sound = |pos: [f64; 3], pitch: f32| {
                             audio.play("minecraft:entity.generic.burn", Some(pos), 0.4, pitch);
                         };
-                        o.tick_among(
-                            &self.world,
+                        o.tick_among_with_hook(
+                            &mut self.world,
                             self.res.facts(),
                             self.collision,
                             target,
@@ -238,12 +250,39 @@ impl Game<'_> {
                             &self.loop_context,
                             &mut on_sound,
                             &nearby,
+                            &mut |world| {
+                                let source = horizon_client::health::HurtSource {
+                                    damage_type: "minecraft:lava",
+                                    causing: 0,
+                                    direct: 0,
+                                    position: None,
+                                };
+                                horizon_client::health::DamageLevel::of(
+                                    world,
+                                    registry,
+                                    Some(tags),
+                                    Some(block_registries),
+                                    hooks,
+                                )
+                                .invulnerability_check(
+                                    horizon_client::health::Hurting::Entity(
+                                        orb_id as i32,
+                                        "minecraft:experience_orb",
+                                        source,
+                                    ),
+                                    vanilla,
+                                )
+                            },
                         )
                     };
                     // PowderSnowBlock.entityInside during the move, before an
                     // orb that is done is removed.
                     let snow = (o.previous, o.position, o.bounds(), o.velocity);
                     self.entity_powder_snow_particles(snow.0, snow.1, snow.2, snow.3, false);
+                    // Its move is filed at once, also for an orb about to go.
+                    let (from, to) = (snow.0, snow.1);
+                    self.entity_section_step(orb_id, [from.x, from.y, from.z], [to.x, to.y, to.z]);
+                    self.orb_moved(i, step);
                     if !stays {
                         self.orbs.remove(i);
                     }
@@ -254,6 +293,7 @@ impl Game<'_> {
         if events && let Err(e) = self.process_level_events() {
             first_error.get_or_insert(e);
         }
+        self.entity_sections_stepped(super::entity_sections::Family::Ordered);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -265,6 +305,30 @@ impl Game<'_> {
             return Ok(());
         }
         self.run_ordered_ticks(cut, false)
+    }
+}
+
+impl Game<'_> {
+    /// `Entity.move`'s fall bookkeeping after orb `i`'s move: a move of a
+    /// block or more casts for a reset block or water, `checkFallDamage` adds
+    /// the drop outside water and, on the ground after a fall, posts
+    /// HIT_GROUND, then forgets it. `Block.fallOn` (farmland's random draw,
+    /// honey's slide) is not run for an orb yet, nor for the other entities
+    /// that are not living.
+    pub(super) fn orb_moved(&mut self, i: usize, step: horizon_client::entities::OrbMove) {
+        let o = &self.orbs[i];
+        let mut fall = self.vehicle_fall_reset(o.fall_distance, step.from, step.moved);
+        if !step.in_water && step.moved.y < 0.0 {
+            fall -= f64::from(step.moved.y as f32);
+        }
+        if o.on_ground {
+            if fall > 0.0 {
+                let (position, bounds) = (o.position, o.bounds());
+                self.post_landing_event(position, bounds, false);
+            }
+            fall = 0.0;
+        }
+        self.orbs[i].fall_distance = fall;
     }
 }
 

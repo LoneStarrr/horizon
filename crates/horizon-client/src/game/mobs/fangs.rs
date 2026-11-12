@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(super) struct Fangs {
+    /// Entity-owned registration metadata; content clones are detached.
+    pub(super) attachment_lifetime: horizon_mod_runtime::attachments::AttachmentLifetime,
     pub(in crate::game) join: horizon_client::join_seq::JoinSeq,
     pub id: u32,
     pub pos: [f64; 3],
@@ -22,6 +24,7 @@ pub(super) struct Fangs {
 }
 
 horizon_client::impl_joined!(Fangs);
+horizon_mod_runtime::impl_attachment_lifetime!(Fangs);
 
 /// `EvokerFangs.handleEntityEvent`: `nextFloat() * 0.2 + 0.85`.
 pub(super) fn fang_attack_pitch(random: &mut impl RandomSource) -> f32 {
@@ -44,6 +47,11 @@ pub(super) struct FangState {
     pub list: horizon_client::join_seq::ResidentList<Fangs>,
     model: Option<Arc<Part>>,
 }
+impl FangState {
+    pub(in crate::game) fn perf_count(&self) -> usize {
+        self.list.len()
+    }
+}
 impl Game<'_> {
     pub(super) fn add_fangs(&mut self, at: [f64; 3], yaw: f32, delay: i32, owner: u32) {
         self.next_entity += 1;
@@ -55,6 +63,7 @@ impl Game<'_> {
             self.fangs.model = self.entity_models.evoker_fangs.clone();
         }
         self.fangs.list.push(Fangs {
+            attachment_lifetime: Default::default(),
             join: Default::default(),
             id,
             pos: at,
@@ -139,6 +148,7 @@ impl Game<'_> {
 
     /// `EvokerFangs.tick`.
     pub(super) fn tick_fangs(&mut self) {
+        horizon_threads::work::clear_work();
         let mut list = self.fangs.list.lift();
         #[cfg(test)]
         super::entity::taken_pass_tests::after_take(self);
@@ -241,18 +251,34 @@ impl Game<'_> {
         } else {
             Vec::new()
         };
-        for m in &mut self.mobs {
-            let ally = allies.contains(&m.id);
-            if m.id != f.owner && !ally && m.alive() && m.bounds().intersects(b) {
-                m.damage(
+        for index in 0..self.mobs.len() {
+            let m = &mut self.mobs[index];
+            let id = m.id;
+            if id != f.owner
+                && !allies.contains(&id)
+                && m.alive()
+                && m.bounds().intersects(b)
+                && m.damage(
                     crate::game::entity::damage_level_of!(self),
                     6.0,
                     horizon_client::mobs::Damage {
-                        kind: horizon_client::mobs::DamageKind::Magic,
+                        kind: if owner.is_some() {
+                            horizon_client::mobs::DamageKind::IndirectMagic
+                        } else {
+                            horizon_client::mobs::DamageKind::Magic
+                        },
                         attacker: owner.map(horizon_client::mobs::Who::Mob),
                         from: Some(f.pos),
                         attacker_species: None,
                     },
+                )
+                && owner.is_some()
+            {
+                self.mob_post_attack(
+                    id,
+                    owner.map(horizon_client::mobs::Who::Mob),
+                    Some("minecraft:evoker_fangs"),
+                    Some("minecraft:indirect_magic"),
                 );
             }
         }
@@ -262,7 +288,7 @@ impl Game<'_> {
         &self,
         camera: glam::DVec3,
         alpha: f64,
-        out: &mut Vec<mod_render::render::Vertex>,
+        out: &mut Vec<horizon_client_render::render_geometry::Vertex>,
     ) {
         let Some(model) = self.fangs.model.as_ref() else {
             return;

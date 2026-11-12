@@ -1,7 +1,7 @@
 //! The benchmark report format, version 1 (docs/benchmark-report.md).
 //!
 //! One JSON file per run, the same for the game, the launcher and `tools/perf_bench.py`: the local log
-//! a player can attach by hand. Nothing is sent anywhere.
+//! a player can attach, and, with consent, what the telemetry upload sends ([`Report::for_upload`]).
 //! It holds summaries and fixed-edge histogram counts, never raw frame streams.
 
 use std::collections::BTreeMap;
@@ -11,9 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod compare;
 mod hardware;
 
-pub use hardware::{cpu_seconds, load_average, power_source, rss_bytes, Display, Gpu, Hardware};
+#[cfg(not(target_arch = "wasm32"))]
+pub use hardware::power_source;
+pub use hardware::{Display, Gpu, Hardware};
+/// The process probes, from the platform (`horizon-system`).
+#[cfg(not(target_arch = "wasm32"))]
+pub use horizon_system::{cpu_seconds, load_average, rss_bytes};
 
 pub const FORMAT: &str = "horizon-benchmark-report";
 pub const VERSION: u32 = 1;
@@ -234,6 +240,9 @@ pub struct Report {
     pub metrics: BTreeMap<String, Summary>,
     #[serde(default)]
     pub frames: Vec<Frames>,
+    /// Present in A/B runs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ab: Option<compare::Ab>,
     /// Local only: a name the person running it chose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -244,6 +253,7 @@ pub struct Report {
 
 impl Report {
     /// An empty report for this machine, created now.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(kind: Kind, app: App) -> Report {
         Self::with_hardware(kind, app, Hardware::detect())
     }
@@ -261,6 +271,7 @@ impl Report {
             conditions: Conditions::default(),
             metrics: BTreeMap::new(),
             frames: Vec::new(),
+            ab: None,
             label: None,
             local: Vec::new(),
         }
@@ -289,6 +300,17 @@ impl Report {
             ));
         }
         Ok(report)
+    }
+
+    /// The report without its local-only fields, dated to the day: what an upload sends.
+    pub fn for_upload(&self) -> Report {
+        let day = self.created.get(..10).unwrap_or_default();
+        Report {
+            label: None,
+            local: Vec::new(),
+            created: format!("{day}T00:00:00Z"),
+            ..self.clone()
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -396,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_round_trips() {
+    fn round_trip_and_upload_strips_local_fields() {
         let mut r = Report::new(
             Kind::Game,
             App {
@@ -413,6 +435,14 @@ mod tests {
         r.local.push("/home/someone/logs/latest.log".into());
         let back = Report::parse(&r.to_json()).unwrap();
         assert_eq!(back, r);
+        r.created = "2026-10-15T14:03:27Z".into();
+        let upload = r.for_upload();
+        assert_eq!(upload.created, "2026-10-15T00:00:00Z", "the day only");
+        let upload = upload.to_json();
+        assert!(
+            !upload.contains("my run") && !upload.contains("someone"),
+            "{upload}"
+        );
     }
 
     #[test]

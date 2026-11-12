@@ -1,15 +1,18 @@
 //! Writes to a living entity for native server mods, through a `LivingRef`
 //! (docs/modding/src/how-to/native-mods.md, "Entity and level handles"): `LivingEntity.swing`,
-//! the arrows and bee stingers stuck in a player (`setArrowCount`,
+//! the arrows and bee stingers stuck in a player or a mob (`setArrowCount`,
 //! `setStingerCount`, `removeArrowTime`, `removeStingerTime`),
-//! `Mob.setLeftHanded`, `Mob.setCanPickUpLoot`, `useItemRemaining`, and
-//! `getUsedItemHand`, `startUsingItem` and `releaseUsingItem`. Reads
-//! return None and writes false for a stale handle, on a client, and for a
-//! kind Horizon keeps no such state for (each doc says which).
-use super::{Game, combat::Stuck, commands::Target};
+//! `Mob.setLeftHanded`, `Mob.setCanPickUpLoot`, `useItemRemaining`,
+//! `getUsedItemHand`, `startUsingItem` and `releaseUsingItem`, a player's
+//! Riptide spin (`startAutoSpinAttack`) and the style and colour of a
+//! waypoint (`Waypoint.Icon`). Reads return None and writes false for a stale
+//! handle, on a client, and for a kind Horizon keeps no such state for (each
+//! doc says which).
+use super::{Game, commands::Target};
 use horizon_client::first_person::{Hand, SwingAnimation};
-use horizon_client::mobs::spear_use;
-use mod_api::LivingRef;
+use horizon_client::lan::waypoints::Icon;
+use horizon_client::mobs::{spear_use, stuck::Stuck};
+use mod_api::{Identifier, LivingRef};
 
 impl Game<'_> {
     /// The UUID of the player a living handle names.
@@ -31,11 +34,16 @@ impl Game<'_> {
         self.native_as_player(uuid, |game| out = Some(f(game)));
         out
     }
-    /// What is stuck in the player a handle names.
+    /// What is stuck in the player or the mob a handle names.
     fn native_living_stuck(&mut self, living: LivingRef) -> Option<&mut Stuck> {
         match self.native_living_target(living)? {
             Target::Player => Some(&mut self.combat.stuck),
             Target::Guest(conn) => Some(&mut self.guest_combat.entry(conn).or_default().stuck),
+            Target::Mob(id) => self
+                .mobs
+                .iter_mut()
+                .find(|m| m.id == id)
+                .map(|m| &mut m.extra.stuck),
             _ => None,
         }
     }
@@ -85,33 +93,34 @@ impl Game<'_> {
         }
     }
 
-    /// `LivingEntity.getArrowCount`: the arrows stuck in a player. None for
-    /// the other kinds, which Horizon keeps no count for.
+    /// `LivingEntity.getArrowCount`: the arrows stuck in a player or a mob.
+    /// None for armor stands and the dragon, which Horizon keeps no count
+    /// for.
     pub(super) fn living_arrow_count(&mut self, living: LivingRef) -> Option<i32> {
         Some(self.native_living_stuck(living)?.arrows)
     }
     /// `LivingEntity.setArrowCount`: players around see the arrows (vanilla
-    /// does not limit the count). False for the other kinds.
+    /// does not limit the count). False for armor stands and the dragon.
     pub(super) fn living_set_arrow_count(&mut self, living: LivingRef, count: i32) -> bool {
         self.native_living_stuck(living)
             .map(|s| s.arrows = count)
             .is_some()
     }
-    /// `LivingEntity.getStingerCount`: the bee stingers stuck in a player.
-    /// None for the other kinds.
+    /// `LivingEntity.getStingerCount`: the bee stingers stuck in a player or
+    /// a mob. None for armor stands and the dragon.
     pub(super) fn living_stinger_count(&mut self, living: LivingRef) -> Option<i32> {
         Some(self.native_living_stuck(living)?.stingers)
     }
     /// `LivingEntity.setStingerCount`: players around see the stingers. False
-    /// for the other kinds.
+    /// for armor stands and the dragon.
     pub(super) fn living_set_stinger_count(&mut self, living: LivingRef, count: i32) -> bool {
         self.native_living_stuck(living)
             .map(|s| s.stingers = count)
             .is_some()
     }
     /// `LivingEntity.removeArrowTime`: the ticks until the next arrow falls
-    /// out of a player; at 0 or less it restarts at `20 * (30 - arrows)`.
-    /// False for the other kinds.
+    /// out of a player or a mob; at 0 or less it restarts at
+    /// `20 * (30 - arrows)`. False for armor stands and the dragon.
     pub(super) fn living_set_arrow_removal_ticks(&mut self, living: LivingRef, ticks: i32) -> bool {
         self.native_living_stuck(living)
             .map(|s| s.remove_arrow_time = ticks)
@@ -130,12 +139,14 @@ impl Game<'_> {
     }
 
     /// `LivingEntity.getUseItemRemainingTicks`: the ticks left of the item a
-    /// player uses, 0 when they use none. None for the other kinds (a mob's
-    /// item use is a counter of its goal, not this timer).
+    /// player or a mob uses, 0 when it uses none. A mob's is the item's use
+    /// duration less the ticks its use counter has run. None for armor stands
+    /// and the dragon.
     pub(super) fn living_item_use_remaining(&self, living: LivingRef) -> Option<i32> {
         match self.native_living_target(living)? {
             Target::Player => Some(super::item_use::remaining_of(self.using, self.use_duration)),
             Target::Guest(conn) => Some(self.lan.as_ref()?.play.get(&conn)?.use_remaining()),
+            Target::Mob(id) => self.mob_item_use_remaining(id),
             _ => None,
         }
     }
@@ -145,10 +156,15 @@ impl Game<'_> {
     /// vanilla. It moves the deadline the use-item Tick hook moves, so only
     /// the uses that count it (food, drink, mod items) follow it: shield, bow,
     /// trident, spear, instrument and bundle uses ignore it, and a call from
-    /// inside the Tick hook itself is overwritten by that hook's result. False
-    /// when the player uses nothing, and for the other kinds.
+    /// inside the Tick hook itself is overwritten by that hook's result.
+    ///
+    /// A mob's use never runs out, so the write moves its use counter to where
+    /// `ticks` are left; what reads the counter (a spear's stabs, a bow's draw)
+    /// follows it. False when the entity uses nothing, and for armor stands and
+    /// the dragon.
     pub(super) fn living_set_item_use_remaining(&mut self, living: LivingRef, ticks: i32) -> bool {
         match self.native_living_target(living) {
+            Some(Target::Mob(id)) => self.mob_set_item_use_remaining(id, ticks),
             Some(Target::Player) => {
                 super::item_use::set_remaining(self.using, &mut self.use_duration, ticks)
             }
@@ -223,20 +239,89 @@ impl Game<'_> {
             _ => false,
         }
     }
+
+    /// `LivingEntity.startAutoSpinAttack(ticks, damage)` of a player: the
+    /// spin of a Riptide launch for `ticks` ticks, ended by the first mob its
+    /// box touches, which takes `damage`. Its motion counts it down and the
+    /// players around see the spin (living flag 4). A `ticks` of 0 or less ends
+    /// the spin and clears its damage. False for the other kinds, a dead
+    /// player and a non-finite `damage`.
+    pub(in crate::game) fn living_set_riptiding(
+        &mut self,
+        living: LivingRef,
+        ticks: i32,
+        damage: f32,
+    ) -> bool {
+        if !damage.is_finite() {
+            return false;
+        }
+        self.native_living_as_player(living, |game| {
+            let Some(p) = game.player.as_mut() else {
+                return false;
+            };
+            p.auto_spin_attack_ticks = ticks.max(0);
+            p.auto_spin_attack_dmg = if ticks > 0 { damage } else { 0.0 };
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// `/waypoint modify <entity> style`: `edit` changes the icon of the
+    /// waypoint a handle names, which is then tracked again. False for the
+    /// dragon.
+    fn native_edit_waypoint_icon(
+        &mut self,
+        living: LivingRef,
+        edit: impl FnOnce(&mut Icon),
+    ) -> bool {
+        match self.native_living_target(living) {
+            Some(t @ (Target::Player | Target::Guest(_) | Target::Mob(_) | Target::Stand(_))) => {
+                let mut icon = self.waypoint_icon(t);
+                edit(&mut icon);
+                self.set_waypoint_icon(t, icon);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// `Waypoint.Icon.style` of the waypoint a handle names, as
+    /// `/waypoint modify <entity> style` sets it: a player's reaches the
+    /// players it transmits to. False for the dragon.
+    pub(in crate::game) fn living_set_waypoint_style(
+        &mut self,
+        living: LivingRef,
+        style: &Identifier,
+    ) -> bool {
+        self.native_edit_waypoint_icon(living, |icon| icon.style = style.to_string())
+    }
+    /// `Waypoint.Icon.color` of the waypoint a handle names: the RGB colour,
+    /// or none to show a player in their team's colour. False for the dragon.
+    pub(in crate::game) fn living_set_waypoint_color(
+        &mut self,
+        living: LivingRef,
+        rgb: Option<u32>,
+    ) -> bool {
+        self.native_edit_waypoint_icon(living, |icon| {
+            icon.color = rgb.map(|rgb| (rgb & 0xFF_FFFF) as i32);
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::native_entity_refs::tests::with_game;
+    use super::super::native_living_flags::tests::{guest, guest_server, packets, sync_guests};
+    use super::super::native_living_position::tests::floor_and_zombies;
     use super::Stuck;
     use horizon_client::items::ItemStack;
+    use horizon_client::lan::waypoints::Icon;
     use horizon_client::mobs::Mob;
     use horizon_core::geometry::Vec3;
-    use mod_api::first_person::Hand;
+    use mod_api::client::first_person::Hand;
     use mod_api::{
-        EntityRef, Flow, Hooks, HostSide, ItemPart, LivingEntityUseItemStartEvent,
+        EntityRef, Flow, Hooks, HostSide, Identifier, ItemPart, LivingEntityUseItemStartEvent,
         LivingEntityUseItemStopEvent, LivingEntityUseItemTickEvent, LivingRef, ModEntry, Mods,
-        NativeWorldEpoch, OnUseTickEvent, Registrar, ReleaseUsingEvent,
+        OnUseTickEvent, Registrar, ReleaseUsingEvent, WorldEpoch,
     };
     use std::sync::{Arc, Mutex};
 
@@ -331,14 +416,13 @@ mod tests {
         let uses = Shared::default();
         let mods: Mods = vec![ModEntry::new("uses", Box::new(UseMod(uses.clone())))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             with_game(|game| {
                 crate::game::native_entity_refs::tests::resolve_parts(game).unwrap();
                 game.player = Some(
                     horizon_client::motion::PlayerMotion::new(game.motion, Vec3::ZERO).unwrap(),
                 );
-                game.lan_acting_uuid = Some(123);
-                game.lan_acting_entity = Some(20);
+                crate::game::native_entity_refs::tests::bind_local_player(game, 20, 123);
                 game.screen = super::super::Screen::Playing;
                 game.right = true;
                 let player = game.living(game.entity(20).unwrap()).unwrap();
@@ -476,12 +560,21 @@ mod tests {
                 // Its clients are told through the counter and the hand.
                 assert_eq!(game.mobs[0].extra.using_item, 1);
                 assert_eq!(game.mobs[0].extra.using_off_hand, hand == Hand::Off);
+                // A bow is used for 72000 ticks, and a write moves the counter
+                // to where 100 are left of them.
+                assert_eq!(game.living_item_use_remaining(zombie), Some(72_000));
+                assert!(game.living_set_item_use_remaining(zombie, 100));
+                assert_eq!(game.mobs[0].extra.using_item, 71_901);
+                assert_eq!(game.living_item_use_remaining(zombie), Some(100));
 
                 game.mobs[0].extra.using_item = 6;
                 let arrows = game.creatures.projectiles.len();
                 assert!(game.living_release_using_item(zombie));
                 assert_eq!(game.living_used_item_hand(zombie), None);
                 assert!(!game.living_release_using_item(zombie));
+                // Nothing in use: nothing left, and nothing to move.
+                assert_eq!(game.living_item_use_remaining(zombie), Some(0));
+                assert!(!game.living_set_item_use_remaining(zombie, 5));
                 // `BowItem.releaseUsing` shoots for a player only.
                 assert_eq!(game.creatures.projectiles.len(), arrows);
                 let uses = uses.lock().unwrap();
@@ -500,6 +593,7 @@ mod tests {
             game.mobs[1].extra.set_slot_stack(MAINHAND, Some(gold));
             assert!(!game.living_start_using_item(piglin, Hand::Main));
             assert_eq!(game.mobs[1].extra.using_item, 0);
+            assert_eq!(game.living_item_use_remaining(piglin), Some(0));
 
             // A witch's drink is its own timer: no use to read, end or replace.
             let witch = game.living(game.entity(14).unwrap()).unwrap();
@@ -510,6 +604,8 @@ mod tests {
             assert_eq!(game.living_used_item_hand(witch), None);
             assert!(!game.living_start_using_item(witch, Hand::Main));
             assert!(!game.living_release_using_item(witch));
+            assert_eq!(game.living_item_use_remaining(witch), Some(0));
+            assert!(!game.living_set_item_use_remaining(witch, 5));
             assert_eq!(game.mobs[2].extra.using_item, 10);
         });
     }
@@ -534,18 +630,207 @@ mod tests {
             assert!(game.living_swing(zombie, Hand::Main, false));
             assert_eq!(game.mobs[0].ai.swing_time, -1);
 
-            // A mob keeps no stuck arrows, item use timer or player state.
-            assert_eq!(game.living_arrow_count(zombie), None);
-            assert!(!game.living_set_arrow_count(zombie, 3));
-            assert!(!game.living_set_stinger_count(zombie, 3));
-            assert!(!game.living_set_arrow_removal_ticks(zombie, 3));
-            assert_eq!(game.living_item_use_remaining(zombie), None);
+            // A mob keeps what is stuck in it, but no spin and, using nothing,
+            // no item use timer.
+            assert_eq!(game.living_arrow_count(zombie), Some(0));
+            assert!(game.living_set_arrow_count(zombie, 3));
+            assert!(game.living_set_stinger_count(zombie, 2));
+            assert!(game.living_set_arrow_removal_ticks(zombie, 4));
+            assert!(game.living_set_stinger_removal_ticks(zombie, 5));
+            assert_eq!(
+                game.mobs[0].extra.stuck,
+                Stuck {
+                    arrows: 3,
+                    stingers: 2,
+                    remove_arrow_time: 4,
+                    remove_stinger_time: 5,
+                }
+            );
+            assert_eq!(game.living_arrow_count(zombie), Some(3));
+            assert_eq!(game.living_stinger_count(zombie), Some(2));
+            assert_eq!(game.living_item_use_remaining(zombie), Some(0));
             assert!(!game.living_set_item_use_remaining(zombie, 3));
+            assert!(!game.living_set_riptiding(zombie, 20, 8.0));
 
-            let stale =
-                EntityRef::new(NativeWorldEpoch::new(zombie.entity().epoch().get() + 1), 12);
+            let stale = EntityRef::new(WorldEpoch::new(zombie.entity().epoch().get() + 1), 12);
             let stale = mod_api::LivingRef::new(stale);
             assert!(!game.living_swing(stale, Hand::Main, true));
+            assert_eq!(game.living_arrow_count(stale), None);
+            assert!(!game.living_set_stinger_count(stale, 1));
+            assert_eq!(game.living_item_use_remaining(stale), None);
+            assert!(!game.living_set_item_use_remaining(stale, 1));
+            assert!(!game.living_set_riptiding(stale, 20, 8.0));
+            let style = Identifier::parse("example:flag").unwrap();
+            assert!(!game.living_set_waypoint_style(stale, &style));
+            assert!(!game.living_set_waypoint_color(stale, Some(0xFF)));
+        });
+    }
+
+    /// What is stuck in a mob falls out in the mob's own ticks, one in a count's
+    /// worth of `20 * (30 - count)` ticks as for a player, the timer a write set
+    /// running first.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_mobs_stuck_arrows_and_stingers_fall_out_in_its_ticks() {
+        with_game(|game| {
+            floor_and_zombies(game);
+            let zombie = game.living(game.entity(12).unwrap()).unwrap();
+            assert!(game.living_set_arrow_count(zombie, 3));
+            assert!(game.living_set_arrow_removal_ticks(zombie, 2));
+            assert!(game.living_set_stinger_count(zombie, 1));
+            assert!(game.living_set_stinger_removal_ticks(zombie, 1));
+            game.tick_mobs().unwrap();
+            // The stinger's last tick ran, the arrow's has one more.
+            assert_eq!(game.living_stinger_count(zombie), Some(0));
+            assert_eq!(game.living_arrow_count(zombie), Some(3));
+            game.tick_mobs().unwrap();
+            assert_eq!(game.living_arrow_count(zombie), Some(2));
+            // The next one waits `20 * (30 - 2)` ticks from the new count.
+            assert_eq!(game.mobs[0].extra.stuck.remove_arrow_time, 0);
+            game.tick_mobs().unwrap();
+            assert_eq!(
+                game.mobs[0].extra.stuck.remove_arrow_time,
+                20 * (30 - 2) - 1
+            );
+            // The other zombie has none of it.
+            assert_eq!(game.mobs[1].extra.stuck, Stuck::default());
+        });
+    }
+
+    /// A spear's use counts its own ticks, which a write to the ticks left
+    /// moves: the next tick goes on from there.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_mobs_spear_use_goes_on_from_the_ticks_a_write_left() {
+        use horizon_items::equipment::MAINHAND;
+        with_game(|game| {
+            floor_and_zombies(game);
+            let zombie = game.living(game.entity(12).unwrap()).unwrap();
+            let spear = ItemStack::new("minecraft:iron_spear", 1);
+            game.mobs[0].extra.set_slot_stack(MAINHAND, Some(spear));
+            game.mobs[0].ai.targets.clear();
+            game.mobs[0].ai.goals.clear();
+            assert!(game.living_start_using_item(zombie, Hand::Main));
+            let own = game.living_item_use_remaining(zombie).unwrap();
+            assert!(own > 10);
+            assert!(game.living_set_item_use_remaining(zombie, own - 10));
+            assert_eq!(game.mobs[0].extra.using_item, 11);
+            game.tick_mobs().unwrap();
+            assert_eq!(game.mobs[0].extra.using_item, 12);
+            assert_eq!(game.living_item_use_remaining(zombie), Some(own - 11));
+        });
+    }
+
+    /// A waypoint write is `/waypoint modify`: what it stores is what the command
+    /// stores, for the entities the command takes.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_waypoint_write_on_a_mob_is_kept_with_the_waypoint() {
+        use super::super::commands::Target;
+        with_game(|game| {
+            floor_and_zombies(game);
+            let zombie = game.living(game.entity(12).unwrap()).unwrap();
+            let style = Identifier::parse("example:flag").unwrap();
+            assert!(game.living_set_waypoint_style(zombie, &style));
+            // The bits above the colour are dropped.
+            assert!(game.living_set_waypoint_color(zombie, Some(0xAB12_34CD)));
+            let icon = game.waypoint_icon(Target::Mob(12));
+            assert_eq!(icon.style, "example:flag");
+            assert_eq!(icon.color, Some(0x12_34CD));
+            // The other zombie keeps the default icon, and a colour of none
+            // gives the colour back.
+            assert_eq!(game.waypoint_icon(Target::Mob(13)), Icon::default());
+            assert!(game.living_set_waypoint_color(zombie, None));
+            let icon = game.waypoint_icon(Target::Mob(12));
+            assert_eq!((icon.style.as_str(), icon.color), ("example:flag", None));
+        });
+    }
+
+    /// A guest's waypoint is told again to the players who see it, with the new
+    /// style and colour, and a spin shows in the flags the players around get,
+    /// counts down in the guest's ticks and ends when asked to.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_guests_waypoint_and_riptide_writes_reach_the_players_around() {
+        use horizon_protocol::{
+            entity_data::Value,
+            packets::play::{Clientbound as C, waypoint_operation},
+        };
+        with_game(|game| {
+            guest_server(game, false, true);
+            let (spinner, _rx) = guest(game, 12);
+            let (_, observer) = guest(game, 13);
+            let host = game.lan.as_mut().unwrap();
+            for conn in [12, 13] {
+                host.hub.update_guest(conn, |g| g.ticks = 5).unwrap();
+            }
+            let waypoints = |sent: &[C]| -> Vec<(i32, String, Option<i32>)> {
+                sent.iter()
+                    .filter_map(|p| match p {
+                        C::TrackedWaypoint(w) => Some((w.operation, w.style.clone(), w.color)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+            game.lan_update_waypoints();
+            assert_eq!(
+                waypoints(&packets(&observer)),
+                [(waypoint_operation::TRACK, "minecraft:default".into(), None)]
+            );
+            let style = Identifier::parse("example:flag").unwrap();
+            assert!(game.living_set_waypoint_style(spinner, &style));
+            assert!(game.living_set_waypoint_color(spinner, Some(0x12_34AB)));
+            game.lan_update_waypoints();
+            assert_eq!(
+                waypoints(&packets(&observer)),
+                [
+                    (
+                        waypoint_operation::UNTRACK,
+                        "minecraft:default".into(),
+                        None
+                    ),
+                    (
+                        waypoint_operation::TRACK,
+                        "example:flag".into(),
+                        // The packet carries the colour as ARGB, opaque.
+                        Some(0xFF12_34AB_u32 as i32)
+                    ),
+                ]
+            );
+
+            let spin_flag = |sent: &[C]| -> Option<bool> {
+                sent.iter().rev().find_map(|p| match p {
+                    C::SetEntityData(p) if p.id == 12 => p.values.iter().find_map(|v| match v {
+                        (8, _, Value::Byte(flags)) => Some(flags & 4 != 0),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+            };
+            assert!(!game.living_set_riptiding(spinner, 20, f32::INFINITY));
+            assert!(game.living_set_riptiding(spinner, 20, 8.0));
+            game.lan_living_flags();
+            sync_guests(game);
+            assert_eq!(spin_flag(&packets(&observer)), Some(true));
+            game.tick_guests();
+            game.as_guest(12, |game| {
+                let player = game.player.as_ref().unwrap();
+                assert_eq!(player.auto_spin_attack_ticks, 19);
+                assert_eq!(player.auto_spin_attack_dmg, 8.0);
+            })
+            .unwrap();
+            // Ended by a write: the damage goes with it, and the flag.
+            assert!(game.living_set_riptiding(spinner, 0, 8.0));
+            game.lan_living_flags();
+            sync_guests(game);
+            assert_eq!(spin_flag(&packets(&observer)), Some(false));
+            game.as_guest(12, |game| {
+                let player = game.player.as_ref().unwrap();
+                assert_eq!(player.auto_spin_attack_ticks, 0);
+                assert_eq!(player.auto_spin_attack_dmg, 0.0);
+            })
+            .unwrap();
         });
     }
 

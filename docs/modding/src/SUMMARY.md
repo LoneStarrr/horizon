@@ -9,29 +9,36 @@
 
 # Concepts
 
-<!-- Per-concept child chapters are discovered at build time; keep these aggregate links for published anchors. -->
+<!-- The concept-pages preprocessor adds every other page of concepts/ (and of how-to/ under How-to)
+     after the ones listed here, in title order, and fails the build on a page the book doesn't render.
+     List a page here only to place it first or to show it in a part outside its folder. Aggregate
+     chapters keep their published anchors; their child chapters are discovered too. -->
 
+- [Wire types](how-to/wire-types.md)
 - [Trait mods, Parts and attachments](concepts/trait-mods.md)
 - [Where the mod API is going](concepts/design.md)
-- [Design: transactional block-entity removal](concepts/block-entity-removal.md)
-- [Design: client action pipeline](concepts/client-action-pipeline.md)
+- [Design: server read tier](concepts/server-read-tier.md)
+- [Design: vehicle health layout](concepts/vehicle-health-layout.md)
+- [Design: per-type batched block entity ticks](concepts/block-entity-batching.md)
+- [Design: Source-validated guest point artifact](concepts/guest-point-artifact.md)
+- [Design: typed cauldron interactions](concepts/cauldron-interactions.md)
+- [Design: villager professions and trades](concepts/villager-professions.md)
+- [Villager profession resources and clients](concepts/villager-professions-client.md)
+- [Design: decide, fire, apply](concepts/decide-fire-apply.md)
+- [Design: decide, fire, apply: route inventory](concepts/decide-fire-apply-routes.md)
 
 # How-to
 
 - [Making a content mod](how-to/content-mods.md)
 - [Native mods](how-to/native-mods.md)
-  - [Typed bulk block edits](how-to/native-mods/typed-block-edits.md)
-- [Caching reload-stable recipe definitions](how-to/reload-recipes.md)
-- [Query attachment holders](how-to/attachments.md)
-- [Game rule categories](how-to/game-rule-categories.md)
-- [Declaring a machine's menu data](how-to/block-entities.md)
-- [Controlling spawns](how-to/spawning.md)
-- [Drawing resolved models](how-to/model-drawing.md)
-- [Temporary client sound effects](how-to/client-effects.md)
-- [Slowing or boosting entities on a block](how-to/movement-factors.md)
-- [Building to `mod.wasm`](how-to/wasm-mods.md)
 - [Injections](injections.md)
-- [Publishing your mod](how-to/publish.md)
+- [The native route](native-route.md)
+  - [Mixins: `[[native.mixin]]`](mixins.md)
+  - [Published loops: `[[native.loop]]`](loops.md)
+  - [Bridges: `[[native.bridge]]`](bridges.md)
+  - [Support modules: `[[native.module]]`](support-modules.md)
+  - [Native state: refused](native-state.md)
+  - [How the native route works](native-how-it-works.md)
 
 # Reference
 
@@ -40,8 +47,8 @@
 - [The manifest and the package](reference/manifest.md)
 - [The registry index and `.hpack`](reference/registry-index.md)
 - [The mod API (rustdoc)](reference/api.md)
-- [Wasm boundary coverage](wasm-coverage.md)
-- [Legacy native hook API history (frozen)](reference/native-api-history.md)
+<!-- The wasm-coverage preprocessor renders this chapter from the generator at its published URL. -->
+- [Wasm boundary coverage]()
 <!-- The hook-notes preprocessor supplies this chapter and its published URL from catalog notes. -->
 - [Hook notes]()
 <!-- The counterparts preprocessor renders the current declarations at the published URL. -->
@@ -54,3 +61,4 @@
 # Contributing
 
 - [Where each doc lives](contributing.md)
+- [Design: scoped whole-stack rollback](reference/design-stack-snapshot.md)

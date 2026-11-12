@@ -7,6 +7,7 @@ use mod_api::{__private::ParticleKind, ParticleOptions as ApiOptions};
 pub(crate) enum ParticleValueError {
     UnknownProvider,
     NonFinite,
+    InvalidStack,
 }
 
 fn finite(options: &ApiOptions) -> bool {
@@ -23,18 +24,31 @@ fn finite(options: &ApiOptions) -> bool {
         && options.vibration.as_ref().is_none_or(|(source, at, _)| {
             at.iter().all(|v| v.is_finite())
                 && match source {
-                    mod_api::particles::PositionSource::Block(_) => true,
-                    mod_api::particles::PositionSource::Entity { y_offset, .. } => {
+                    mod_api::client::particles::PositionSource::Block(_) => true,
+                    mod_api::client::particles::PositionSource::Entity { y_offset, .. } => {
                         y_offset.is_finite()
                     }
                     _ => false,
                 }
         })
 }
-impl<C: ?Sized> TryIntoEngine<C> for ApiOptions {
+pub(crate) trait ParticleItems {
+    fn particle_items(&self) -> Option<&horizon_items::items::Items>;
+}
+impl ParticleItems for () {
+    fn particle_items(&self) -> Option<&horizon_items::items::Items> {
+        None
+    }
+}
+impl ParticleItems for horizon_items::items::Items {
+    fn particle_items(&self) -> Option<&Self> {
+        Some(self)
+    }
+}
+impl<C: ParticleItems + ?Sized> TryIntoEngine<C> for ApiOptions {
     type Engine = EngineOptions;
     type Error = ParticleValueError;
-    fn try_into_engine(&self, _: &C) -> Result<Self::Engine, Self::Error> {
+    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
         if !finite(self) {
             return Err(ParticleValueError::NonFinite);
         }
@@ -56,6 +70,8 @@ impl<C: ?Sized> TryIntoEngine<C> for ApiOptions {
             ),
         };
         Ok(EngineOptions {
+            polytone_seed: None,
+            source: None,
             ty,
             mod_particle: custom,
             block: self.block.clone(),
@@ -64,6 +80,19 @@ impl<C: ?Sized> TryIntoEngine<C> for ApiOptions {
             to_color: self.to_color,
             trail: self.trail,
             item: self.item.clone(),
+            item_stack: self
+                .item_stack
+                .as_ref()
+                .map(|stack| {
+                    stack
+                        .try_into_engine(
+                            context
+                                .particle_items()
+                                .ok_or(ParticleValueError::InvalidStack)?,
+                        )
+                        .map_err(|_| ParticleValueError::InvalidStack)
+                })
+                .transpose()?,
             geyser: self.geyser,
             vibration: self.vibration.clone(),
             legacy_entity_effect: self.legacy_entity_effect,
@@ -88,10 +117,32 @@ impl TryIntoApi for EngineOptions {
             to_color: self.to_color,
             trail: self.trail,
             item: self.item.clone(),
+            item_stack: self
+                .item_stack
+                .as_ref()
+                .map(|stack| {
+                    stack
+                        .try_into_api()
+                        .map_err(|_| ParticleValueError::InvalidStack)
+                })
+                .transpose()?,
             geyser: self.geyser,
             vibration: self.vibration.clone(),
             legacy_entity_effect: self.legacy_entity_effect,
             legacy_trail_lifetime: self.legacy_trail_lifetime,
+        })
+    }
+}
+impl TryIntoEngine<()> for mod_api::FireworkExplosion {
+    type Engine = horizon_items::firework::FireworkExplosion;
+    type Error = std::convert::Infallible;
+    fn try_into_engine(&self, context: &()) -> Result<Self::Engine, Self::Error> {
+        Ok(Self::Engine {
+            shape: self.shape.try_into_engine(context)?,
+            colors: self.colors.clone(),
+            fade: self.fade_colors.clone(),
+            trail: self.trail,
+            twinkle: self.twinkle,
         })
     }
 }
@@ -100,7 +151,7 @@ impl TryIntoApi for EngineOptions {
 mod tests {
     use super::*;
     fn prepare() {
-        mod_api::__private::part_tests::install_parts_fixture(&[]).unwrap();
+        mod_platform::__private::part_tests::install_parts_fixture(&[]).unwrap();
         mod_api::__private::resolve_particles(
             ["minecraft:smoke", "minecraft:trail", "test:spark"],
             |id| {
@@ -124,7 +175,7 @@ mod tests {
         original.block = Some(("test:sprite".into(), 0x123456));
         original.item = Some(vec!["test:layer".into()]);
         original.vibration = Some((
-            mod_api::particles::PositionSource::Entity {
+            mod_api::client::particles::PositionSource::Entity {
                 id: -7,
                 y_offset: 0.5,
             },
@@ -154,7 +205,7 @@ mod tests {
         assert_eq!(
             result.vibration,
             Some((
-                mod_api::particles::PositionSource::Entity {
+                mod_api::client::particles::PositionSource::Entity {
                     id: -7,
                     y_offset: 0.5
                 },
@@ -190,7 +241,7 @@ mod tests {
             .try_into_api()
             .unwrap();
         options.vibration = Some((
-            mod_api::particles::PositionSource::Entity {
+            mod_api::client::particles::PositionSource::Entity {
                 id: 1,
                 y_offset: f32::NAN,
             },

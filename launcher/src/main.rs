@@ -9,11 +9,12 @@ mod blocks;
 mod build_mode;
 mod cli;
 mod cli_tools;
+mod collection;
 mod console;
 mod console_page;
 mod cull;
 mod datapacks_page;
-mod dev_options;
+mod developer_play;
 mod export_page;
 mod frame;
 mod game_tools;
@@ -30,6 +31,7 @@ mod glass_instance_java;
 mod glass_palette;
 mod glass_settings;
 mod glass_shot_blur;
+mod glass_storage;
 mod glass_toast;
 mod glass_ui;
 mod glass_versions;
@@ -54,11 +56,13 @@ mod mods_page;
 mod mods_project;
 mod motion;
 mod multiplayer_page;
+mod native_consent;
 mod native_log_page;
+mod native_registry_consent;
 mod new_instance;
-mod open_card;
 mod owner_page;
 mod packs_page;
+mod partner;
 mod perf;
 mod picture_cache;
 mod plate;
@@ -71,7 +75,6 @@ mod servers_page;
 mod setup_page;
 mod shell;
 mod shortcut_page;
-mod skin_page;
 mod sky;
 mod specimen;
 mod sticky;
@@ -79,28 +82,32 @@ mod switch_page;
 mod theme;
 mod themes_page;
 mod titlebar;
+mod wardrobe_page;
 mod while_playing;
 mod worlds_page;
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, Div, ElementId,
-    FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, SharedString, Stateful, Subscription, Window, WindowBounds,
-    WindowOptions, actions, div, ease_out_quint, prelude::*, px, relative, size,
+    actions, div, ease_out_quint, prelude::*, px, relative, size, Animation, AnimationExt,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, Hsla,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseDownEvent, PathPromptOptions, Pixels, Point,
+    SharedString, Stateful, Subscription, Window, WindowBounds, WindowOptions,
 };
 use horizon_launcher::account::{self, Accounts, SignIn, SignInState};
 use horizon_launcher::backend::{self, Job, Msg, Release, Running, Settings, Updates};
-use horizon_launcher::build_import;
 use horizon_launcher::i18n::{self, tr, trf};
 use horizon_launcher::instances;
 use horizon_launcher::native_mods;
 use horizon_launcher::native_status;
+use horizon_launcher::storage;
+use horizon_launcher::telemetry;
+use horizon_launcher::{build_import, identity};
+use native_consent::PendingConsent;
 use scrollbar::Scrollbar;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use theme::Theme;
 
@@ -111,6 +118,11 @@ enum Page {
     /// Mods, resource packs and modpacks (imported ones and the browser's).
     Mods,
     Servers,
+    /// What the player wears (`wardrobe_page.rs`), with the cosmetics flag on.
+    Wardrobe,
+    /// Cosmetics to try on and buy (`wardrobe_page/shop.rs`), beside the Wardrobe and under the
+    /// same rule. A plain tab: no badge, and it never opens by itself.
+    Shop,
     Settings,
 }
 
@@ -124,6 +136,8 @@ impl Page {
         let page = match std::env::var("HORIZON_LAUNCHER_PAGE").as_deref() {
             Ok("mods" | "modpacks" | "resourcepacks" | "shaders" | "datapacks") => Page::Mods,
             Ok("servers") => Page::Servers,
+            Ok("wardrobe") if horizon_cosmetics::forced() => Page::Wardrobe,
+            Ok("shop") if horizon_cosmetics::forced() => Page::Shop,
             Ok("versions") => Page::Versions,
             Ok("settings") => Page::Settings,
             _ => Page::Play,
@@ -138,19 +152,24 @@ impl Page {
 
     /// Every page, with its name and icon: the top bar shows all but Settings, which has its
     /// own button.
-    const ALL: [(Page, &'static str, &'static str); 5] = [
+    const ALL: [(Page, &'static str, &'static str); 7] = [
         (Page::Play, "Home", "home"),
         (Page::Mods, "Mods", "package"),
         (Page::Servers, "Servers", "server"),
+        (Page::Wardrobe, "Wardrobe", "user"),
+        (Page::Shop, "Shop", "bag"),
         (Page::Versions, "Versions", "archive"),
         (Page::Settings, "Settings", "sliders"),
     ];
 
-    /// The pages the top bar shows: all but Settings.
-    fn in_top_bar() -> impl Iterator<Item = (Page, &'static str, &'static str)> {
-        Self::ALL
-            .into_iter()
-            .filter(|(page, ..)| *page != Page::Settings)
+    /// The pages the top bar shows: all but Settings, and the Wardrobe and the Shop only when
+    /// `wardrobe` (`Launcher::wardrobe_shown`).
+    fn in_top_bar(wardrobe: bool) -> impl Iterator<Item = (Page, &'static str, &'static str)> {
+        Self::ALL.into_iter().filter(move |(page, ..)| match page {
+            Page::Settings => false,
+            Page::Wardrobe | Page::Shop => wardrobe,
+            _ => true,
+        })
     }
 }
 
@@ -213,6 +232,8 @@ struct Launcher {
     content_scroll: Scrollbar,
     /// The glass Settings page's own scroll: its sections beside their list.
     settings_pane: gpui::ScrollHandle,
+    /// The glass Home's patch log scroll, for its wheel to chain to the page.
+    patch_scroll: Scrollbar,
     /// The section the glass Settings list marked when last drawn (`glass_settings`).
     settings_marked: usize,
     /// The Mods page's project card, kept in view beside its list.
@@ -244,6 +265,11 @@ struct Launcher {
     /// What each installed version takes on disk, measured on a thread for the Versions page, and
     /// the installed list it was measured for.
     disk: Vec<(String, u64)>,
+    storage_report: Option<storage::Report>,
+    storage_pending: bool,
+    /// A Clear the player still has to confirm: `Some(None)` is Clear all.
+    storage_confirm: Option<Option<storage::Category>>,
+    storage_error: Option<String>,
     disk_for: Vec<String>,
     install_error: Option<(String, String)>,
     /// Import a game build (`build_import`, on the Versions page): whether one is being copied in,
@@ -258,7 +284,9 @@ struct Launcher {
     /// How the last native build ended ("Built (balanced, incremental)", or "Up to date").
     native_done: Option<String>,
     native_error: Option<String>,
-    native_confirm: Option<Result<Vec<native_mods::Bundle>, String>>,
+    pending_consent: Option<PendingConsent>,
+    /// Why the last Allow or Cancel failed, shown inside the dialog that the page is behind.
+    consent_error: Option<String>,
     /// The instance (id) the build under way, or the last one's error, is for.
     native_for: Option<String>,
     /// What each installed native build was made from, by version. A build's version names its
@@ -270,7 +298,7 @@ struct Launcher {
     confirm_remove: Option<String>,
     /// The releases whose patch notes the Versions page shows open.
     notes_open: std::collections::HashSet<String>,
-    picker_open: bool,
+    picker: glass_home::PickerState,
     /// Settings' any-colour swatch shows the hue strip (the glass look).
     accent_strip: bool,
     /// Settings' Glass and Blur sliders (the glass look).
@@ -291,8 +319,20 @@ struct Launcher {
     /// Where the mouse went down to close a menu by pressing outside it, so that the
     /// same press, ending on the menu's own button, doesn't open it again.
     menu_closed_at: Option<Point<Pixels>>,
-    /// Settings > Account's skin panel for an offline name (`skin_page.rs`).
-    skin: Option<skin_page::SkinPanel>,
+    /// The Wardrobe page's account and outfit (`wardrobe_page.rs`).
+    wardrobe: Option<wardrobe_page::Wardrobe>,
+    /// Name tag styles' marks; they outlive the account's `wardrobe`.
+    wardrobe_marks: wardrobe_page::Marks,
+    /// Ask the service again on the next draw of the Wardrobe (set by each visit).
+    wardrobe_reload: bool,
+    /// The Shop page's basket and choices (`wardrobe_page/shop.rs`).
+    shop: wardrobe_page::Shop,
+    /// The cosmetics service's last word on the founder set's window (`GET /v1/shop`): whether
+    /// the top bar has the Wardrobe page with cosmetics off (`wardrobe_shown`).
+    shop_status: Option<horizon_launcher::wardrobe::Claim>,
+    /// The selected account's own answer on it from its last Wardrobe visit, kept on disk (a
+    /// preview the service grants it, its claim).
+    shop_kept: Option<horizon_launcher::wardrobe::Claim>,
     /// Work the look out again on the next frame (a launcher theme put on or taken off).
     restyle: bool,
     /// Why the last picture for Home's background was refused.
@@ -304,7 +344,7 @@ struct Launcher {
     settings: Settings,
     /// The last failed settings write, kept across page changes until a save succeeds.
     settings_save_error: Option<String>,
-    /// The Roadmap and Documentation links: built in until links.json on the fork's main has been read.
+    /// The Discord, sponsor and website links: built in until links.json on main has been read.
     links: backend::Links,
     preparing: bool,
     prepare_log: VecDeque<String>,
@@ -345,10 +385,6 @@ struct Launcher {
     owner: Option<bool>,
     /// Play was refused (or Home's Sign in pressed): the owner gate's screen is open.
     owner_screen_open: bool,
-    /// Clicks on the sidebar's launcher version, and whether they revealed the developer options
-    /// (`dev_options`) for this run.
-    dev_clicks: u8,
-    dev_options: bool,
     /// The game is waiting for its session (a token renewal), or a Java instance for its files
     /// and Java (`start_java`), before it starts.
     starting_client: Option<String>,
@@ -380,8 +416,14 @@ struct Launcher {
     proxy_input: line_edit::LineEdit,
     proxy_focused: bool,
     proxy_focus: FocusHandle,
+    /// Opt-in data collection: the player's answer and Settings' section (`collection`).
+    collection: collection::Collection,
     /// Settings' "Connect an AI agent" (`agents_page`).
     agents: agents_page::AgentsUi,
+    /// How many play Horizon now, while the server answers ("N playing now" on the Play page).
+    playing: Option<u64>,
+    /// How many play on the official server now, while it answers ("M on the official SMP").
+    official_players: Option<u64>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     _appearance: Subscription,
@@ -457,8 +499,6 @@ struct Launcher {
     aside: while_playing::Aside,
     /// The selected instance's desktop shortcut (`shortcut_page.rs`).
     shortcuts: shortcut_page::Shortcuts,
-    /// The name the game made up for an offline player (`horizon-player.txt`), for the top bar.
-    offline_name: Option<String>,
     /// The player's servers, for the sidebar until the Servers page has read them.
     side_servers: Vec<horizon_launcher::servers::Entry>,
     /// The pixel art made for this window (`art.rs`), and pictures downloaded by URL.
@@ -474,23 +514,46 @@ struct Launcher {
 
 impl Launcher {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        horizon_launcher::storage::eviction::cleanup_after_start();
         let (tx, rx) = channel();
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             this.theme = this.settings_theme(window);
             cx.notify();
         });
         let window_handle = window.window_handle();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(80))
-                    .await;
-                if this
-                    .update(cx, |this, cx| this.drain(window_handle, cx))
-                    .is_err()
-                {
-                    break;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            if this
+                .update(cx, |this, cx| this.drain(window_handle, cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+        // Counts the time a partner banner is on screen, until it may be hidden.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(10))
+                .await;
+            let counting = this.update(cx, |this, cx| {
+                let s = &mut this.settings;
+                if s.partner_hidden || s.partner_seen_secs >= partner::SEEN_BEFORE_HIDE {
+                    return false;
                 }
+                // On screen on every page: the card in the sidebar, the banner on Servers.
+                s.partner_seen_secs += 10;
+                if s.partner_seen_secs % 60 == 0 || s.partner_seen_secs >= partner::SEEN_BEFORE_HIDE
+                {
+                    this.save_settings();
+                    cx.notify();
+                }
+                true
+            });
+            if !matches!(counting, Ok(true)) {
+                break;
             }
         })
         .detach();
@@ -528,6 +591,7 @@ impl Launcher {
             switches: 0,
             content_scroll: Scrollbar::default(),
             settings_pane: gpui::ScrollHandle::new(),
+            patch_scroll: Scrollbar::default(),
             settings_marked: 0,
             mods_sticky: sticky::Sticky::default(),
             long_list: cull::Cull::default(),
@@ -556,6 +620,10 @@ impl Launcher {
             installing: None,
             removing: Vec::new(),
             disk: Vec::new(),
+            storage_report: None,
+            storage_pending: false,
+            storage_confirm: None,
+            storage_error: None,
             disk_for: Vec::new(),
             install_error: None,
             importing_build: false,
@@ -564,13 +632,14 @@ impl Launcher {
             native_progress: None,
             native_done: None,
             native_error: None,
-            native_confirm: None,
+            pending_consent: None,
+            consent_error: None,
             native_for: None,
             native_builds: Default::default(),
             native_log: Default::default(),
             confirm_remove: None,
             notes_open: Default::default(),
-            picker_open: false,
+            picker: glass_home::PickerState::default(),
             accent_strip: false,
             look_sliders: Default::default(),
             hue_area: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -580,7 +649,12 @@ impl Launcher {
             row_menu: Default::default(),
             look: horizon_theme::glass::Glass::default_look(),
             menu_closed_at: None,
-            skin: None,
+            wardrobe: None,
+            wardrobe_marks: Default::default(),
+            wardrobe_reload: false,
+            shop: Default::default(),
+            shop_status: None,
+            shop_kept: None,
             // The first draw takes the launcher theme from Settings.
             restyle: true,
             background_error: None,
@@ -626,8 +700,6 @@ impl Launcher {
             keychain: None,
             owner: None,
             owner_screen_open: false,
-            dev_clicks: 0,
-            dev_options: false,
             starting_client: None,
             play_when_prepared: None,
             friend_code: line_edit::LineEdit::new(String::new(), 256, 32),
@@ -640,7 +712,10 @@ impl Launcher {
             quick_play: None,
             client_run: None,
             client_vars: Vec::new(),
+            collection: collection::Collection::load(),
             agents: agents_page::AgentsUi::default(),
+            playing: None,
+            official_players: None,
             tx,
             rx,
             _appearance: appearance,
@@ -688,7 +763,6 @@ impl Launcher {
             console: Default::default(),
             aside: while_playing::Aside::new(window.window_handle()),
             shortcuts: Default::default(),
-            offline_name: offline_name(),
             side_servers: horizon_launcher::servers::list(),
             sky: sky::Sky::default(),
             scene: cx.new(|_| scene::Scene::new()),
@@ -722,6 +796,7 @@ impl Launcher {
         this.fetch_startup_releases();
         this.mods_auto_update();
         this.fetch_links();
+        this.watch_shop(cx);
         if home::getting_ready_preview() {
             this.preparing = true;
             this.play_when_prepared = this.selected().cloned();
@@ -738,19 +813,21 @@ impl Launcher {
             this.open_instance_dialog(None);
             this.pick_kind(kind, cx);
         }
-        // `HORIZON_LAUNCHER_PAGE=instance-mods-building`: the Mods tab with a build shown at about 65%
-        // in its Compile stage, for screenshots; nothing builds and Cancel has nothing to stop.
-        if std::env::var("HORIZON_LAUNCHER_PAGE").as_deref() == Ok("instance-mods-building") {
-            this.native_step = Some(tr("Starting the build").into());
-            this.native_progress = Some(native_mods::Progress {
-                stage: native_mods::Stage::Compile,
-                fraction: Some(0.62),
-            });
-            this.native_for = this.selected_instance().map(|i| i.id.clone());
-        }
         if std::env::var("HORIZON_LAUNCHER_PAGE").as_deref() == Ok("edit-instance") {
             this.open_instance_dialog(this.selected_instance().cloned());
         }
+        if cfg!(debug_assertions)
+            && matches!(
+                std::env::var("HORIZON_LAUNCHER_PAGE").as_deref(),
+                Ok("wardrobe" | "shop")
+            )
+        {
+            this.wardrobe_preview();
+        }
+        // What the game and the launcher kept, if the player allows it and there is a server.
+        telemetry::send_in_background();
+        telemetry::watch_playing(this.tx.clone());
+        telemetry::watch_official(this.tx.clone());
         this
     }
 
@@ -802,9 +879,8 @@ impl Launcher {
     }
 
     fn go(&mut self, page: Page) {
-        // The game may have made up a name since, and the CLI or another window may have
-        // changed the accounts: read them again (small files, once a switch).
-        self.offline_name = offline_name();
+        // The CLI or another window may have changed the accounts: read them again (a small
+        // file, once a switch).
         self.accounts = Accounts::load();
         // Each check reads the keychain (a prompt on macOS): page switches check every account
         // at most once a minute, and an account added meanwhile at once.
@@ -816,6 +892,7 @@ impl Launcher {
             self.load_auth_statuses(false);
         }
         self.load_profile_heads();
+        self.wardrobe_reload |= matches!(page, Page::Wardrobe | Page::Shop);
         if page != self.page {
             self.page = page;
             self.switches += 1;
@@ -826,7 +903,7 @@ impl Launcher {
                 self.mods.reset_lists();
             }
         }
-        self.picker_open = false;
+        self.picker.open = false;
         self.language_menu = false;
         self.mods.browse.sort_menu = false;
         self.account_menu = false;
@@ -939,48 +1016,6 @@ impl Launcher {
             .clone()
     }
 
-    /// Builds the selected instance's native mods, once the player accepted the warning. The
-    /// build stays on the Horizon the instance plays (`native_mods::base_for`), unless the
-    /// warning was Update's: then it moves to that newer Horizon.
-    fn build_native(&mut self) {
-        if self.native_step.is_some() {
-            return;
-        }
-        self.native_confirm = None;
-        self.native_error = None;
-        // This attempt's own log, starting empty: an open panel shows it rather than the last
-        // attempt's (`native_log_page`).
-        self.native_log_reset();
-        let instance = instances::selected();
-        self.native_for = Some(instance.id.clone());
-        let plays = self.version_of(&instance).cloned();
-        let base = native_mods::base_for(plays.as_deref(), &self.installed, false);
-        let Some(base) = base else {
-            let error = tr("Install Horizon first.").to_string();
-            self.native_log_preflight(&error);
-            self.native_error = Some(error);
-            return;
-        };
-        let folder = match self.native_mods_to_build() {
-            Ok((folder, _)) => folder,
-            Err(e) => {
-                self.native_log_preflight(&e);
-                self.native_error = Some(e);
-                return;
-            }
-        };
-        self.native_step = Some(tr("Starting the build").into());
-        self.native_progress = None;
-        self.native_done = None;
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = native_mods::build(&base, &folder, &instance, None, |step| {
-                let _ = tx.send(Msg::NativeProgress(step.label(), step.progress()));
-            });
-            let _ = tx.send(Msg::Native(result));
-        });
-    }
-
     fn fetch_releases(&mut self) {
         self.releases = Load::Loading;
         let tx = self.tx.clone();
@@ -1012,7 +1047,9 @@ impl Launcher {
         self.perf.tick();
         match self.bench.as_mut().map(|b| b.tick(&self.perf)) {
             Some(perf::Step::Go(page)) => {
-                let pages: Vec<Page> = (Page::ALL.iter().map(|p| p.0)).collect();
+                let pages: Vec<Page> = (Page::ALL.iter().map(|p| p.0))
+                    .filter(|p| !matches!(p, Page::Wardrobe | Page::Shop) || self.wardrobe_shown())
+                    .collect();
                 self.go(pages[page % pages.len()]);
                 changed = true;
             }
@@ -1033,6 +1070,9 @@ impl Launcher {
                     self.releases = r.map_or_else(Load::Failed, Load::Ready)
                 }
                 Msg::Links(links) => {
+                    // The official server may have moved: its list entry and its count follow.
+                    self.multiplayer.stale();
+                    telemetry::set_official_server(&links.official_server);
                     self.links = links;
                 }
                 // The page reads is_prepared when drawn; `changed` redraws it.
@@ -1081,6 +1121,8 @@ impl Launcher {
                         Err(e) => self.sign_in_state = Some(SignInState::Done(Err(e))),
                     }
                 }
+                Msg::Playing(playing) => self.playing = playing,
+                Msg::OfficialPlayers(players) => self.official_players = players,
                 Msg::JavaGame(id, home, cmd) => {
                     self.starting_client = None;
                     let spawned = cmd.and_then(|(cmd, vars)| {
@@ -1106,90 +1148,7 @@ impl Launcher {
                         }
                     }
                 }
-                Msg::Session(session) => {
-                    self.load_auth_statuses(false);
-                    if let Some(tag) = self.starting_client.take() {
-                        let mut cmd = backend::client_command(&tag);
-                        let account::GameSession { file, offline, env } = match session {
-                            Ok(pass) => pass,
-                            Err(refused) => {
-                                // A keyring that didn't answer isn't a missing owner (#12179).
-                                if refused.keyring.is_none() {
-                                    self.owner = Some(false);
-                                    self.owner_screen_open = true;
-                                }
-                                self.client_error = Some(refused.in_window());
-                                self.starting_pack = None;
-                                self.joining = None;
-                                self.quick_play = None;
-                                continue;
-                            }
-                        };
-                        // Past the gate by the developer option alone is no owner.
-                        if !self.settings.dev_offline {
-                            self.owner = Some(true);
-                        }
-                        if let Some(file) = file {
-                            cmd.arg("--session-file").arg(file);
-                        }
-                        cmd.envs(env);
-                        // Still play, offline, and say why.
-                        if let Some(e) = offline {
-                            self.client_error = Some(format!("Playing offline: {e}"));
-                        } else if let Some(e) = account::take_unsaved() {
-                            self.client_error = Some(e);
-                        }
-                        self.accounts = Accounts::load();
-                        // An offline name the player picked (the quick switch).
-                        if let Some(name) = self.accounts.name_arg() {
-                            cmd.arg("--name").arg(name);
-                        }
-                        cmd.envs(self.accounts.look_env());
-                        // A pack's Play button plays that pack; Play plays the selected instance.
-                        let (profile, run) = match self.starting_pack.take() {
-                            Some(work) => {
-                                let id = instances::list()
-                                    .into_iter()
-                                    .find(|i| i.work == work)
-                                    .map(|i| i.id);
-                                let applied =
-                                    horizon_launcher::modpacks::apply_profile(&mut cmd, &work);
-                                (applied, id)
-                            }
-                            None => {
-                                let instance = instances::selected();
-                                (instances::apply(&mut cmd, &instance), Some(instance.id))
-                            }
-                        };
-                        if let Err(e) = profile {
-                            self.client_error = Some(e);
-                            account::discard_unread_sessions();
-                            continue;
-                        }
-                        if let Some(code) = self.joining.take() {
-                            if let Err(e) = backend::join_friend(&mut cmd, &code) {
-                                self.client_error = Some(e);
-                            }
-                        }
-                        if let Some((flag, value)) = self.quick_play.take() {
-                            cmd.arg(flag).arg(value);
-                        }
-                        backend::append_game_args(&mut cmd);
-                        // Last, around every argument: the instance's pre-launch command,
-                        // wrapper and variables.
-                        let instance = run
-                            .as_ref()
-                            .and_then(|id| instances::list().into_iter().find(|i| &i.id == id));
-                        self.client_vars = instance
-                            .as_ref()
-                            .map(|i| i.vars(cmd.get_program()))
-                            .unwrap_or_default();
-                        cmd.envs(self.client_vars.iter().map(|(k, v)| (k, v)));
-                        let launch = instance.map(|i| i.launch).unwrap_or_default();
-                        self.starting_client = Some(tag);
-                        jar_launch::client(cmd, launch, run, self.tx.clone());
-                    }
-                }
+                Msg::Session(session) => self.handle_game_session(session),
                 Msg::JarConsent { jars, reply } => jar_launch::consent(window, jars, reply, cx),
                 Msg::JarClient { run, prepared } => {
                     self.starting_client = None;
@@ -1280,6 +1239,7 @@ impl Launcher {
                     }
                 }
                 Msg::DiskUse(disk) => self.disk = disk,
+                Msg::Storage(result) => self.storage_arrived(result),
                 Msg::Imported(result) => {
                     self.importing_build = false;
                     self.installed = backend::installed();
@@ -1305,6 +1265,9 @@ impl Launcher {
                     }
                 }
                 Msg::Updates(Err(e)) => self.update_error = Some(e),
+                Msg::NativeRegistryConsent(inventory, reply) => {
+                    native_registry_consent::show(window, inventory, reply, cx)
+                }
                 Msg::NativeProgress(step, progress) => {
                     self.native_step = Some(step);
                     self.native_progress = Some(progress);
@@ -1324,6 +1287,9 @@ impl Launcher {
                     // A build attempt ended: an open panel reads the log it left.
                     self.native_log.stale = true;
                     if let (Err(e), false) = (result, cancelled) {
+                        if matches!(e, native_mods::Failed::NoConsent) {
+                            self.request_native_build_consent();
+                        }
                         self.native_error = Some(String::from(e));
                     }
                 }
@@ -1657,7 +1623,7 @@ impl Launcher {
             .settings
             .minecraft_dir
             .clone()
-            .unwrap_or_else(|| horizon_prepare::artifacts::minecraft_dir(None));
+            .unwrap_or_else(|| horizon_platform::prepare::artifacts::minecraft_dir(None));
         self.prepare_log.clear();
         self.prepare_error = None;
         self.prepare_log
@@ -1791,7 +1757,6 @@ impl Launcher {
         self.starting_client = Some(tag.clone());
         self.play_pressed = Some(Instant::now());
         let tx = self.tx.clone();
-        let offline_without_owner = self.settings.dev_offline;
         let auto = self
             .selected_instance()
             .filter(|_| self.starting_pack.is_none())
@@ -1812,27 +1777,29 @@ impl Launcher {
                 }
             }
             backend::play_step("reading the sign-in");
-            let session = account::session_for_game(&backend::game_home(), offline_without_owner);
+            let session = if horizon_launcher::developer_offline::enabled(&tag) {
+                Ok(None)
+            } else {
+                account::session_for_game(&backend::game_home()).map(Some)
+            };
             backend::play_step("starting the game");
             let _ = tx.send(Msg::Session(session));
         });
     }
 
-    fn load_profile_heads(&mut self) {
-        let resources = self
-            .selected()
+    /// The prepared game files of the selected version (else the first installed): where the
+    /// default skins are.
+    fn game_resources(&self) -> std::path::PathBuf {
+        self.selected()
             .or_else(|| self.installed.first())
             .map(|tag| backend::resources(tag))
-            .unwrap_or_default();
-        // Offline names wear their own skin's face, or the default skin of their offline UUID.
-        let offline: Vec<String> = self
-            .players()
-            .into_iter()
-            .filter(|(who, _, _)| !matches!(who, account::Player::Microsoft(_)))
-            .map(|(_, name, _)| name)
-            .collect();
+            .unwrap_or_default()
+    }
+
+    fn load_profile_heads(&mut self) {
+        let resources = self.game_resources();
         self.profile_heads
-            .request(&self.accounts.accounts, &offline, resources, &self.tx);
+            .request(&self.accounts.accounts, resources, &self.tx);
     }
 
     fn begin_auth_job(&mut self, uuid: &str) -> Option<u64> {
@@ -2655,21 +2622,6 @@ fn centered(text_: &str, t: &Theme) -> Div {
         .child(text(theme::UI).text_color(t.muted).child(text_.to_string()))
 }
 
-/// The name the game made up for a player without an account, once it has run.
-fn offline_name() -> Option<String> {
-    player_name(&std::fs::read_to_string(backend::game_home().join("horizon-player.txt")).ok()?)
-}
-
-/// The name in `horizon-player.txt`: the game writes `name:Player12345` (horizon-client's
-/// offline_name.rs).
-fn player_name(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("name:"))
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(str::to_owned)
-}
-
 /// `1234` as `1,234`.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -2723,7 +2675,7 @@ impl Launcher {
             .flex_wrap()
             .items_center()
             .gap(px(4.));
-        for (page, label, _) in Page::in_top_bar() {
+        for (page, label, _) in Page::in_top_bar(self.wardrobe_shown()) {
             nav = nav.child(
                 shell::tab(format!("nav-{label}"), tr(label), self.page == page, &t).on_click(
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -2733,13 +2685,9 @@ impl Launcher {
                 ),
             );
         }
-        // Only a signed-in account says "Microsoft account"; otherwise an offline name, or the
-        // one the game made up. A signed-in one shows its face (its skin, else its UUID's default).
+        // A signed-in account shows its face (its skin, else its UUID's default).
         let (name, how) = self.who_plays();
-        let face = match self.accounts.player() {
-            account::Player::Microsoft(_) => self.accounts.selected().map(|a| a.uuid.clone()),
-            _ => None,
-        };
+        let face = self.accounts.selected().map(|a| a.uuid.clone());
         let picture = match face {
             Some(uuid) => (self.profile_heads)
                 .draw(Some(&uuid), 28., self.scale, &t)
@@ -2853,6 +2801,7 @@ impl Launcher {
             },
         ));
         let items = self.instance_items(heading, cx);
+        let mut rows = items.len();
         let list = div()
             .flex()
             .flex_col()
@@ -2868,6 +2817,8 @@ impl Launcher {
         if !servers.is_empty() {
             list = list.child(heading(tr("SERVERS").into()));
         }
+        rows += servers.len();
+        let headings = 1 + usize::from(!servers.is_empty());
         for e in servers {
             let up = self.servers.is_up(&e.dir);
             let open = self.page == Page::Servers && self.servers.open.as_ref() == Some(&e.dir);
@@ -3014,39 +2965,80 @@ impl Launcher {
             }
             _ => {}
         }
-        foot = foot.child(div().mb(px(8.)).child(open_card::card(
-            "open-card",
-            theme::FONT,
-            open_card::Palette {
-                ink: shell::c(n.ink),
-                soft: shell::c(n.muted),
-                accent: gpui::rgb(0x6b4bff).into(),
-            },
-            &self.theme,
-        )));
-        for (id, label, icon, url) in [
-            ("roadmap", tr("Roadmap"), "map", &self.links.roadmap),
-            (
-                "documentation",
-                tr("Documentation"),
-                "book-open",
-                &self.links.docs,
-            ),
-        ] {
-            if !url.is_empty() {
-                foot = foot.child(link(id, label, icon, url.clone()));
+        // Sculk's card above the links: seen without scrolling, on every page but Servers, which shows
+        // its wide banner. Tall where the sidebar has the height for it besides the wordmark, its rows
+        // (52 high each, under headings of 40) and the links, compact otherwise. After a while on
+        // screen a "Hide" beside its label puts it away for good.
+        if self.page != Page::Servers && !self.settings.partner_hidden {
+            let free = f32::from(window.viewport_size().height)
+                - theme::TOPBAR
+                - 40. * headings as f32
+                - 52. * rows as f32
+                - 110.;
+            let mut side = div().relative().mb(px(8.)).child(partner::card(
+                "partner-side",
+                theme::SIDEBAR - 20.,
+                free < partner::TALL_HEIGHT,
+                &t,
+            ));
+            if self.settings.partner_seen_secs >= partner::SEEN_BEFORE_HIDE {
+                let hide = partner::hide_button("partner-hide", &t).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.settings.partner_hidden = true;
+                        this.save_settings();
+                        cx.notify();
+                    },
+                ));
+                side = side.child(hide);
             }
+            foot = foot.child(side);
+        }
+        if !self.links.sponsor.is_empty() {
+            foot = foot.child(link(
+                "sponsor",
+                tr("Sponsor"),
+                "heart",
+                self.links.sponsor.clone(),
+            ));
+        }
+        if !self.links.discord.is_empty() {
+            foot = foot.child(link(
+                "discord",
+                "Discord",
+                "message",
+                self.links.discord.clone(),
+            ));
+        }
+        if !self.links.roadmap.is_empty() {
+            foot = foot.child(link(
+                "roadmap",
+                tr("Roadmap"),
+                "map",
+                self.links.roadmap.clone(),
+            ));
+        }
+        if !self.links.docs.is_empty() {
+            foot = foot.child(link(
+                "docs",
+                tr("Documentation"),
+                "book",
+                self.links.docs.clone(),
+            ));
+        }
+        if !self.links.website.is_empty() {
+            foot = foot.child(link(
+                "website",
+                tr("Website"),
+                "globe",
+                self.links.website.clone(),
+            ));
         }
         foot = foot.child(
             shell::text(theme::night::CAPTION, shell::c(n.muted))
                 .id("launcher-version")
                 .px(px(8.))
                 .pt(px(6.))
-                .child(trf("Launcher {version}", &[("version", backend::VERSION)]))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.version_clicked();
-                    cx.notify();
-                })),
+                .child(trf("Launcher {version}", &[("version", backend::VERSION)])),
         );
         // Custom title bars carry the mark and name already.
         let brand = (!titlebar::draws_brand(window)).then(|| {
@@ -3061,7 +3053,7 @@ impl Launcher {
                 .child(
                     shell::text(theme::night::TITLE, shell::c(n.ink))
                         .font_family(theme::DISPLAY_FONT)
-                        .child("Horizon"),
+                        .child(tr(identity::WINDOW_TITLE)),
                 )
         });
         shell::sidebar_plate(&t)
@@ -3093,7 +3085,7 @@ impl Launcher {
             |tag| {
                 horizon_launcher::nightly::label(tag)
                     .or_else(|| build_import::label(tag))
-                    .unwrap_or_else(|| horizon_launcher::nightly::short_commit(tag))
+                    .unwrap_or_else(|| tag.clone())
             },
         );
         // As tall as Play: "Version" over the tag, and a chevron.
@@ -3128,12 +3120,12 @@ impl Launcher {
                 .child(blocks::icon("chevron-down", 20., t.muted))
                 .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                     if !this.closed_by_this_press(event) {
-                        this.picker_open = !this.picker_open;
+                        this.picker.open = !this.picker.open;
                     }
                     cx.notify();
                 })),
         );
-        if self.picker_open {
+        if self.picker.open {
             let mut menu = div()
                 .absolute()
                 .top(px(theme::night::PLAY + 6.))
@@ -3147,7 +3139,7 @@ impl Launcher {
                 .flex()
                 .flex_col()
                 .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.picker_open = false;
+                    this.picker.open = false;
                     this.menu_closed_at = Some(event.position);
                     cx.notify();
                 }));
@@ -3187,7 +3179,7 @@ impl Launcher {
                         )
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.pin_version((!latest).then(|| tag.clone()));
-                            this.picker_open = false;
+                            this.picker.open = false;
                             cx.notify();
                         })),
                 );
@@ -3207,7 +3199,7 @@ impl Launcher {
                     .child(tr("Manage versions"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.go(Page::Versions);
-                        this.picker_open = false;
+                        this.picker.open = false;
                         cx.notify();
                     })),
             );
@@ -3264,7 +3256,7 @@ impl Launcher {
         // Not prepared: an owner can have Horizon download Minecraft from Mojang; without an
         // owner there is nothing to play, so signing in comes first.
         let first = (!prepared && !self.preparing)
-            .then_some(self.owner_shown())
+            .then_some(self.owner)
             .flatten();
         // No launcher folder with Minecraft on this computer: an owner needs none.
         let no_install = self.settings.minecraft_dir.is_none();
@@ -3415,7 +3407,7 @@ impl Launcher {
         // account that owns the game (Play needs one), or offline. The glass look's top bar has
         // Sign in with Microsoft and says Offline itself.
         if !t.glass {
-            if self.owner_shown() == Some(false) {
+            if self.owner == Some(false) {
                 rows = rows.child(index_row(
                     5,
                     tr("Microsoft account"),
@@ -3610,11 +3602,14 @@ impl Launcher {
                     crate::glass_toast::open(cx, &dir);
                 }),
         );
-        actions = actions.child(
-            button("crash-report", "Report on GitHub", Kind::Secondary, &t)
-                .bg(t.plate)
-                .on_click(|_, _, cx| cx.open_url(&backend::issues_url())),
-        );
+        let discord = self.links.discord.clone();
+        if !discord.is_empty() {
+            actions = actions.child(
+                button("crash-discord", "Report on Discord", Kind::Secondary, &t)
+                    .bg(t.plate)
+                    .on_click(move |_, _, cx| cx.open_url(&discord)),
+            );
+        }
         actions = actions.child(
             button("crash-dismiss", "Dismiss", Kind::Ghost, &t).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
@@ -3624,9 +3619,9 @@ impl Launcher {
             )),
         );
         let help = tr(if crash.report.is_some() {
-            "When you report it on GitHub, attach the crash report file (or paste it with Copy report) and say what you were doing."
+            "When you report it on Discord, attach the crash report file (or paste it with Copy report) and say what you were doing."
         } else {
-            "The game ended without a crash report. When you report it on GitHub, attach latest.log from the logs folder and say what you were doing."
+            "The game ended without a crash report. When you report it on Discord, attach latest.log from the logs folder and say what you were doing."
         });
         let mut body = div()
             .flex_1()
@@ -3851,7 +3846,6 @@ impl Launcher {
             );
         }
         let (accounts, n) = self.account_rows(cx);
-        let (offline, n) = self.offline_rows(n, cx);
         let group = |label: &'static str, icon: &'static str| {
             section_title(label, icon, &t).mt(px(20.)).mb(px(12.))
         };
@@ -3870,7 +3864,6 @@ impl Launcher {
                     .flex_col()
                     .child(group("Account", "user").mt_0())
                     .child(accounts)
-                    .child(offline)
                     .child(group("Updates", "reload"))
                     .child(index_row(n + 1, "Horizon", Some(plain(&horizon)), horizon_action, &t))
                     .child(index_row(
@@ -3965,65 +3958,91 @@ impl Launcher {
                         ))
                     }),
             )
+            .child(self.collection_section(cx))
             .children(self.agents_section(cx))
-            .children(self.dev_options_section(cx))
     }
 
-    /// The warning before a native build: what the mods can do and which mods. The build starts
-    /// only from its button.
-    fn native_warning(
-        &self,
-        mods: &Result<Vec<native_mods::Bundle>, String>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let t = self.theme;
-        let list = match mods {
-            Ok(found) => found
-                .iter()
-                .map(|b| format!("{} {}", b.manifest.id, b.manifest.version))
-                .collect::<Vec<_>>()
-                .join(", "),
-            Err(e) => e.clone(),
-        };
-        let panel = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .mt(px(8.))
-            .p(px(12.))
-            .bg(t.well)
-            .child(div().text_color(t.danger).child(tr("These mods will run with full access to your computer").to_string()))
-            .child(tr("They can read, change or delete your files, and use your accounts and network, like any program you run. Build them only if you trust their authors: the Mods page names them.").to_string())
-            .child(trf("Mods: {mods}", &[("mods", &list)]))
-            .child(tr("Native builds may download Rust and other build tools. Source builds compile the game on this computer.").to_string());
-        let mut buttons = div().flex().gap(px(8.)).mt(px(4.));
-        if mods.is_ok() {
-            buttons = buttons.child(
-                button(
-                    "native-trust",
-                    "I trust these mods: build",
-                    Kind::Primary,
-                    &t,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    if let Err(error) = this.settings.allow_native_mods() {
-                        this.native_error = Some(error);
-                        cx.notify();
-                        return;
-                    }
-                    this.build_native();
-                    cx.notify();
-                })),
-            );
+    fn request_native_build_consent(&mut self) {
+        self.pending_consent = Some(PendingConsent::Build(
+            native_status::enabled(&self.mods.home())
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect(),
+        ));
+    }
+
+    /// Cancel and Escape share the transition; neither can execute a pending action.
+    fn cancel_native_consent(&mut self) {
+        if let Err(error) = native_consent::resolve(
+            &mut self.pending_consent,
+            false,
+            true,
+            &mut self.settings,
+            &self.mods.home(),
+        ) {
+            self.mods.message = Some(Err(error));
         }
-        panel.child(buttons.child(
-            button("native-cancel", "Cancel", Kind::Secondary, &t).on_click(cx.listener(
-                |this, _: &ClickEvent, _, cx| {
-                    this.native_confirm = None;
-                    cx.notify();
-                },
-            )),
-        ))
+        self.consent_error = None;
+        self.instance_mods_changed();
+    }
+
+    fn native_consent(&self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        // A build refused for consent with no native mod enabled names none: the generic text.
+        let name = self
+            .pending_consent
+            .as_ref()
+            .map(PendingConsent::name)
+            .filter(|name| !name.is_empty());
+        let bytes = horizon_launcher::rust_toolchain::host().map(|host| host.download_bytes());
+        let size = bytes
+            .map(megabytes)
+            .unwrap_or_else(|| tr("Unavailable on this platform").into());
+        div().absolute().inset_0().occlude().flex().items_center().justify_center().bg(crate::glass_ui::scrim())
+            .child(plate(&t).w(px(520.)).p(px(28.)).bg(t.surface).rounded(px(16.)).border_1().border_color(t.rule).shadow_lg().flex().flex_col().gap(px(18.))
+                .child(div().size(px(48.)).rounded(px(12.)).bg(t.warn.opacity(0.12)).flex().items_center().justify_center().child(crate::glass_ui::icon("information-circle", 26., t.warn)))
+                .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).child(tr("Allow native mods?")))
+                .child(match name {
+                    Some(name) => {
+                        let body = trf("{mod} is a native mod. Native mods are native code that runs inside your game, with your rights: like any program you install, they can read and change your files. Allow them only if you trust their authors.", &[("mod", &name)]);
+                        let highlight = body.find(&name).map(|start| (start..start + name.len(), gpui::HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() }));
+                        div().child(gpui::StyledText::new(body).with_highlights(highlight))
+                    }
+                    None => div().child(tr("Native mods are native code that runs inside your game, with your rights: like any program you install, they can read and change your files. Allow them only if you trust their authors.")),
+                })
+                .child(trf("Horizon will download the Rust compiler ({size}) to build them. You can turn this off in Settings, Storage.", &[("size", &size)]))
+                .children(self.consent_error.clone().map(|error| div().text_color(t.danger).child(error)))
+                .children(bytes.is_none().then(|| div().text_color(t.danger).child(tr("Native mods can't be built on this computer, so they can't be allowed here."))))
+                .child(div().flex().justify_end().gap(px(12.))
+                    .child(button("native-cancel", "Cancel", Kind::Secondary, &t).w(px(120.)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.cancel_native_consent();
+                        cx.notify();
+                    })))
+                    .child({
+                        let allow = button("native-allow", "Allow", Kind::Primary, &t).w(px(120.));
+                        if bytes.is_none() {
+                            disabled(allow)
+                        } else {
+                            allow.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        match native_consent::resolve(&mut this.pending_consent, true, true, &mut this.settings, &this.mods.home()) {
+                            Err(error) => this.consent_error = Some(error),
+                            Ok(Some(action)) => { this.consent_error = None; match action {
+                                PendingConsent::Build(_) => this.build_native(),
+                                PendingConsent::Toggle(entry) => this.mods_switch(&entry),
+                                PendingConsent::Install(source, id, known) => this.mods_install(source, id, known),
+                                PendingConsent::Github(found, only) => this.github_install(found, only),
+                                PendingConsent::Local(id) => {
+                                    this.mods.message = horizon_launcher::browser::java::set_enabled(&this.mods.home(), &id, true).err().map(Err);
+                                    this.instance_mods_changed();
+                                }
+                            } }
+                            Ok(None) => {},
+                        }
+                        cx.notify();
+                    }))
+                        }
+                    })
+                ))
     }
 
     /// Settings' Game arguments row: the extra arguments the game starts with, kept in
@@ -4271,7 +4290,7 @@ impl Launcher {
                 actions = actions.child(
                     button(format!("select-{i}"), "Play as", Kind::Secondary, &t).on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.play_as(account::Player::Microsoft(uuid.clone()));
+                            this.play_as(&uuid);
                             cx.notify();
                         }),
                     ),
@@ -4766,11 +4785,42 @@ impl Launcher {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.import_build(cx)))
                 .into_any_element()
         };
+        let sponsor = (!self.links.sponsor.is_empty()).then(|| {
+            plate(&t)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.))
+                .p(px(24.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            text(theme::HEADING)
+                                .text_color(t.ink)
+                                .child(tr("Support the work below")),
+                        )
+                        .child(text(theme::UI).text_color(t.muted).child(tr(
+                            "Horizon is built in the open. Sponsors fund the next release.",
+                        ))),
+                )
+                .child(
+                    button("sponsor", "Sponsor on GitHub", Kind::Secondary, &t)
+                        .bg(t.plate)
+                        .on_click({
+                            let url = self.links.sponsor.clone();
+                            move |_: &ClickEvent, _, cx| cx.open_url(&url)
+                        }),
+                )
+        });
         let page = div()
             .flex()
             .flex_col()
             .gap(px(32.))
             .child(header)
+            .children(sponsor)
             .child(
                 div()
                     .flex()
@@ -4817,7 +4867,7 @@ impl Launcher {
                             },
                         )),
                     ),
-                );
+                )
             }
             Load::Ready(r) if r.is_empty() => {
                 return page.child(centered(tr("No releases yet."), &t));
@@ -5090,10 +5140,14 @@ impl Render for Launcher {
             Page::Versions => self.versions_page(cx),
             Page::Mods => self.mods_page(cx),
             Page::Servers => self.servers_page(cx),
+            Page::Wardrobe => self.wardrobe_page(cx),
+            Page::Shop => self.shop_page(cx),
             Page::Settings => self.settings_page(cx),
         };
         self.sky.free_replaced(window);
         self.pictures.free_retired(window);
+        self.wardrobe_marks.free_replaced(window);
+        self.shop.free_replaced(window);
         // The new page fades in and rises a few pixels, as the website's tabs do (`hzl-pop`).
         let content = div()
             .relative()
@@ -5134,7 +5188,7 @@ impl Render for Launcher {
         let (topbar, sidebar) = if t.glass {
             (
                 self.glass_topbar(cx),
-                self.glass_sidebar(cx).into_any_element(),
+                self.glass_sidebar(window, cx).into_any_element(),
             )
         } else {
             (self.topbar(cx), self.sidebar(window, cx).into_any_element())
@@ -5147,6 +5201,13 @@ impl Render for Launcher {
         let mut root = div()
             .id("root")
             .track_focus(&self.root_focus)
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && this.pending_consent.is_some() {
+                    this.cancel_native_consent();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let k = &ev.keystroke;
                 match k.key.as_str() {
@@ -5293,6 +5354,12 @@ impl Render for Launcher {
         if let Some(palette) = self.palette_overlay(window, cx) {
             root = root.child(palette);
         }
+        if self.pending_consent.is_some() {
+            root = root.child(self.native_consent(cx));
+        }
+        if self.asking_consent() {
+            root = root.child(self.consent_screen(cx));
+        }
         if self.asking_owner() {
             root = root.child(self.owner_screen(cx));
         }
@@ -5425,9 +5492,11 @@ impl Launcher {
 
 actions!(horizon_launcher, [Quit, CloseWindow]);
 
-/// What closing the last window does: stop the servers this launcher started, exit. A game that is running keeps running. Cmd+Q goes through here too.
+/// What closing the last window does: stop the servers this launcher started, send the telemetry,
+/// exit. A game that is running keeps running. Cmd+Q goes through here too.
 fn shut_down(cx: &mut App) {
     servers_page::stop_on_quit();
+    telemetry::send_before_exit();
     // A staged launcher update goes in once this process has exited.
     horizon_launcher::update_handoff::on_quit();
     cx.quit()
@@ -5461,8 +5530,8 @@ fn page_after_startup(page: Page, data_folder_failed: bool) -> Page {
 fn menus() -> Vec<Menu> {
     vec![
         Menu {
-            name: "Horizon Launcher".into(),
-            items: vec![MenuItem::action("Quit Horizon Launcher", Quit)],
+            name: identity::DISPLAY_NAME.into(),
+            items: vec![MenuItem::action(tr(identity::QUIT_LABEL), Quit)],
             disabled: false,
         },
         Menu {
@@ -5567,7 +5636,7 @@ fn main() {
                     titlebar: Some(titlebar::options()),
                     #[cfg(target_os = "linux")]
                     window_decorations: Some(gpui::WindowDecorations::Client),
-                    app_id: Some("horizon-launcher".into()),
+                    app_id: Some(identity::APP_ID.into()),
                     // GPUI draws a window without focus at most every 33 ms to save energy. A
                     // benchmark's window often starts without it (KDE keeps focus from windows
                     // a background process opens), and it measures drawing, not that limit.
@@ -5596,7 +5665,7 @@ fn closed_by_press(closed_at: Option<Point<Pixels>>, event: &ClickEvent) -> bool
 mod tests {
     #[test]
     fn an_unopenable_data_folder_starts_on_settings_instead_of_exiting() {
-        use super::{Page, page_after_startup};
+        use super::{page_after_startup, Page};
         assert!(matches!(
             page_after_startup(Page::Play, true),
             Page::Settings
@@ -5608,7 +5677,7 @@ mod tests {
     #[test]
     fn a_menu_button_stays_closed_after_the_press_that_closed_its_menu() {
         use super::closed_by_press;
-        use gpui::{ClickEvent, KeyboardClickEvent, MouseClickEvent, MouseDownEvent, point, px};
+        use gpui::{point, px, ClickEvent, KeyboardClickEvent, MouseClickEvent, MouseDownEvent};
         let click = |x: f32| {
             ClickEvent::Mouse(MouseClickEvent {
                 down: MouseDownEvent {
@@ -5631,7 +5700,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cmd_q_quits_and_cmd_w_closes_the_window() {
-        use super::{CloseWindow, Quit, key_bindings};
+        use super::{key_bindings, CloseWindow, Quit};
         use gpui::{Keymap, Keystroke};
         let keymap = Keymap::new(key_bindings());
         let key = |s: &'static str| [Keystroke::parse(s).unwrap()];
@@ -5697,7 +5766,7 @@ mod tests {
     /// it stays off: signing in comes first.
     #[test]
     fn play_prepares_first_for_an_owner() {
-        use super::{PlayPress, play_press};
+        use super::{play_press, PlayPress};
         assert_eq!(play_press(true, Some(true), false), PlayPress::Play);
         assert_eq!(play_press(true, None, false), PlayPress::Play);
         assert_eq!(
@@ -5727,7 +5796,7 @@ mod tests {
 
     #[test]
     fn a_completed_sign_in_is_handled_once_across_ui_polls() {
-        use super::{SignInState, sign_in_change};
+        use super::{sign_in_change, SignInState};
         let mut shown = None;
         let completed = SignInState::Done(Ok(horizon_launcher::account::Account {
             uuid: "11111111111111111111111111111111".into(),
@@ -5758,23 +5827,18 @@ mod tests {
     #[test]
     fn the_app_menu_has_quit() {
         let menus = super::menus();
-        assert_eq!(menus[0].name, "Horizon Launcher");
+        assert_eq!(
+            menus[0].name,
+            if cfg!(horizon_fork_launcher) {
+                "Horizon Fork Launcher (arismoko)"
+            } else {
+                "Horizon Launcher"
+            }
+        );
         assert!(matches!(
             &menus[0].items[0],
-            gpui::MenuItem::Action { name, .. } if name == "Quit Horizon Launcher"
+            gpui::MenuItem::Action { name, .. } if name == horizon_launcher::identity::QUIT_LABEL
         ));
-    }
-
-    #[test]
-    fn the_offline_name_is_read_from_its_key() {
-        use super::player_name;
-        assert_eq!(
-            player_name("name:Player63010\n").as_deref(),
-            Some("Player63010")
-        );
-        assert_eq!(player_name("name:Steve\r\n").as_deref(), Some("Steve"));
-        assert_eq!(player_name("Player63010\n"), None);
-        assert_eq!(player_name(""), None);
     }
 
     #[test]
@@ -5786,3 +5850,5 @@ mod tests {
         assert_eq!(shown, ["0", "7", "999", "1,000", "12,300", "1,234,500"]);
     }
 }
+
+mod native_build;

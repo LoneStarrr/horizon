@@ -1,3 +1,5 @@
+//! Concrete authoring extracted verbatim from the vocabulary layer.
+
 /// Fixtures that tests of other crates use to install Parts.
 #[cfg(any(test, feature = "testing"))]
 pub mod tests {
@@ -14,9 +16,10 @@ pub mod tests {
     /// Puts a battery of capacity 1000 at `pos`, as the game answers it, holding `amount`, of
     /// which one insert moves at most `limit`.
     pub(crate) fn battery(host: &mut FakeHost, pos: [i32; 3], amount: u32, limit: u32) {
-        host.level.block_entity(pos).energy = Some(FakeBattery {
-            max_insert: limit,
-            ..FakeBattery::new(amount, 1000)
+        host.level.block_entity(pos).energy = Some({
+            let mut value: FakeBattery = FakeBattery::new(amount, 1000);
+            value.max_insert = limit;
+            value
         });
     }
 
@@ -105,7 +108,13 @@ pub mod tests {
                 Ok(first + second)
             });
             let owner = "doubler".to_owned();
-            assert_eq!(moved, Err(Overanswered { owner }), "{liar}");
+            assert_eq!(
+                moved,
+                Err(mod_vocab::__private::parts_installation::overanswered(
+                    owner
+                )),
+                "{liar}"
+            );
             assert_eq!(
                 energy(&world, &[SOURCE, OTHER, TANK]),
                 [500, 500, 0],

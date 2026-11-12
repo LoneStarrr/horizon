@@ -43,7 +43,10 @@ impl mod_api::Hooks for Tuner {
         Flow::Continue
     }
     fn play_sound(&self, _: &dyn mod_api::LoopContext, e: &mut mod_api::PlaySoundEvent<'_>) {
-        self.0.lock().unwrap().played.push(e.original.clone());
+        // Active sounds also refresh their playback parameters on ticks.
+        if e.starting {
+            self.0.lock().unwrap().played.push(e.original.clone());
+        }
     }
 }
 
@@ -102,7 +105,7 @@ fn local_level_requests_can_mute_sound_without_undoing_prediction() {
         Box::new(LocalTuner(requests.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_client_game(|game| {
             let _server = logged_client(game);
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(1.0, 64.0, 1.0)).unwrap());
@@ -204,7 +207,7 @@ fn game_events_ask_client_level_before_playback() {
         Box::new(LocalTuner(requests.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_client_game(|game| {
             let _server = logged_client(game);
             let mut player = PlayerMotion::new(game.motion, Vec3::new(1.0, 64.0, 1.0)).unwrap();
@@ -256,6 +259,7 @@ fn game_events_ask_client_level_before_playback() {
                 facts: game.res.facts(),
                 collision: game.collision,
                 player: None,
+                cached_chunk: std::cell::Cell::new(None),
             };
             game.particles.tick(&level);
             assert_eq!(
@@ -277,7 +281,7 @@ fn packets_ask_client_level_before_playback_not_ui() {
         Box::new(Tuner(log.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         with_client_game(|game| {
             let _server = logged_client(game);
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(3.0, 64.0, 4.0)).unwrap());
@@ -363,11 +367,15 @@ fn packets_ask_client_level_before_playback_not_ui() {
             game.tick_sound_engine();
             assert_eq!(bound[0].state().position, [9.0, 64.0, 4.0]);
             deliver(game, entity(999));
-            assert_eq!(
-                log.lock().unwrap().played.len(),
-                2,
-                "absent emitter is not positional"
-            );
+            {
+                let log = log.lock().unwrap();
+                assert_eq!(
+                    log.requests,
+                    ["position", "position", "entity"],
+                    "absent emitter asks no level hook"
+                );
+                assert_eq!(log.played.len(), 2, "absent emitter starts no playback");
+            }
             game.audio.play_button_click();
             let log = log.lock().unwrap();
             assert_eq!(log.requests.len(), 3, "UI playback adds no level request");

@@ -16,7 +16,10 @@ use horizon_client::{
     random_source,
 };
 use horizon_core::nbt::Tag;
-use horizon_core::{geometry::Vec3, random::RandomSource};
+use horizon_core::{
+    geometry::Vec3,
+    random::{LegacyRandom, LevelRandom, RandomSource},
+};
 use std::collections::{HashMap, HashSet};
 
 /// Patrol and raid state owned by the game.
@@ -1268,7 +1271,12 @@ impl Game<'_> {
                 twinkle: false,
             }],
         ));
-        let rocket = self.new_rocket(Vec3::new(at[0], at[1], at[2]), &stack, false);
+        let rocket = self.new_rocket(
+            Vec3::new(at[0], at[1], at[2]),
+            &stack,
+            false,
+            &mut random_source::entity(),
+        );
         self.rockets.push(rocket);
     }
     /// `BehaviorUtils.throwItem`: a hero's gift tossed toward the player.
@@ -1299,7 +1307,9 @@ impl Game<'_> {
             let bed = m.extra.bed.filter(|&[x, y, z]| {
                 !self.world.loaded(x, z)
                     || horizon_client::mobs::villager_brain::poi_at(&world, x, y, z)
-                        == Some(horizon_world::poi::PoiType::Home)
+                        == Some(horizon_world::poi::PoiIdentity::Vanilla(
+                            horizon_world::poi::PoiType::Home,
+                        ))
             });
             for p in [m.extra.home, bed, m.extra.meeting].into_iter().flatten() {
                 out.insert(section(p));
@@ -1345,7 +1355,7 @@ impl Game<'_> {
                 .bool_at(horizon_client::gamerules::vanilla::SPAWN_MONSTERS);
         let mut random = std::mem::replace(
             &mut self.world.random,
-            horizon_core::random::LegacyRandom::new(0),
+            LevelRandom::for_level(LegacyRandom::new(0)),
         );
         let mut members: Vec<Member> = Vec::new();
         let mut spawner = std::mem::take(&mut self.raiding.patrol);
@@ -1355,15 +1365,14 @@ impl Game<'_> {
                 centers: self.village_centers(),
                 can_spawn: &biome_ok,
             };
-            let mut spawn =
-                |l: &PatrolCx, m: Member, _: &mut horizon_core::random::LegacyRandom| {
-                    // EntityType.create makes no monsters in peaceful.
-                    if l.level.game.difficulty_id() == 0 {
-                        return false;
-                    }
-                    members.push(m);
-                    true
-                };
+            let mut spawn = |l: &PatrolCx, m: Member, _: &mut horizon_core::random::LevelRandom| {
+                // EntityType.create makes no monsters in peaceful.
+                if l.level.game.difficulty_id() == 0 {
+                    return false;
+                }
+                members.push(m);
+                true
+            };
             spawner.tick(&level, enemies, &mut random, &mut spawn);
         }
         self.raiding.patrol = spawner;
@@ -1499,7 +1508,7 @@ impl Game<'_> {
     ) -> Option<[f64; 3]> {
         let mut random = std::mem::replace(
             &mut self.world.random,
-            horizon_core::random::LegacyRandom::new(0),
+            LevelRandom::for_level(LegacyRandom::new(0)),
         );
         let mut found = None;
         for _ in 0..10 {

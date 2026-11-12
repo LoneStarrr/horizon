@@ -1,11 +1,12 @@
 # The #[ignore]d library tests tools/ci/ignored_tests.py expects to fail on main, one per line:
-#   PACKAGE TEST REFERENCE [flaky|harness|gpu] [# note]
-# REFERENCE is the issue or PR that tracks it. A listed test that passes fails the job until its line is
+#   PACKAGE TEST REFERENCE [flaky|harness|gpu|needs] [# note]
+# REFERENCE is the issue or PR that tracks it (for `needs`, the variable). A listed test that passes fails the job until its line is
 # removed, so this list only shrinks; `flaky` lets one pass. `harness` marks a parity harness's own step:
 # its harness runs it with the environment it needs, and the job skips it. `gpu` marks a test that needs a
 # graphics adapter: it runs, and must pass, only where the runner has a Vulkan driver.
 
 # Parity harness steps.
+horizon-client-lib mobs::villager_brain::poi_classification_tests::vanilla_bed_poi_states tools/test_bed_poi_parity.py harness
 horizon-client-lib arrows::client_tests::client_arrow_parity_fixture tools/test_client_arrow_parity.py harness
 horizon-client-lib mobs::shulker::space_tests::shulker_space_parity_fixture tools/test_shulker_space_parity.py harness
 horizon-client-lib save::loot_tests::opened_loot_parity_fixture tools/test_opened_loot_parity.py harness
@@ -21,20 +22,36 @@ horizon-client game::remote_mob_data::tests::raider_celebration_parity_fixture t
 horizon-client-lib item_render::glint_tests::external_item_atlas_oracle HORIZON_GLINT_ROOT harness
 horizon-client-lib mobs::dragon_contacts::parity::contact_transcript tools/test_dragon_contacts_parity.py harness
 horizon-client-lib mobs::villager_brain::farming_tests::vanilla_farming_classification_matches_the_oracle tools/test_villager_farming_parity.py harness
+horizon-client-lib mobs::villager_brain::reputation_witness_tests::witnesses_use_sensor_candidates_radius_invisibility_and_cached_results tools/test_villager_witness_parity.py harness
 horizon-client-render packs::cache::tests::benchmark_real_resource_root HORIZON_OVERLAY_BENCH_VANILLA harness
+
+# Tests that read an input only their parity harness provides (REFERENCE is the variable): refused by name at
+# the start of the shard when the variable is unset; with it set they run and must pass. Not known failures.
+# The HORIZON_WASM_FIXTURE ones run in wasm-mods.yml, against the fixture that run builds.
+horizon-client game::end::cooldown_tests::gateway_counters_match_actual_vanilla_methods HORIZON_PORTAL_REFERENCE needs
+horizon-client game::nether_portal::cooldown_tests::portal_contact_and_waiting_handoff_match_vanilla_counters HORIZON_PORTAL_REFERENCE needs
+horizon-client game::functions::typed_state_range_read_tests::loaded_pack_state_ranges_match_typed_controls HORIZON_TYPED_RANGE_PACK needs
+horizon-client game::functions::typed_state_range_read_tests::loaded_pack_direction_ranges_keep_full_and_filtered_domains HORIZON_TYPED_RANGE_PACK needs
+horizon-client game::potions::arrow_contents::actual_arrow_contents_match_pinned_methods HORIZON_POTION_INPUT needs
+horizon-client game::special_attack_fixture::tests::special_attack_cases_without_world_startup HORIZON_SPECIAL_ATTACK_CASES needs
+horizon-client game::native_server::wasm_selector_tests::wasm_selectors_resolve_in_game_and_refuse_before_guest_dispatch HORIZON_WASM_FIXTURE needs
+horizon-client game::native_server::wasm_selector_tests::wasm_server_tick_messages_reach_dedicated_game HORIZON_WASM_FIXTURE needs
+horizon-client game::payload_transport::wasm_tests::compiled_guest_runs_in_actual_game_roots HORIZON_WASM_FIXTURE needs
+horizon-client game::remote::interaction_event_tests::interaction_event_wasm_tests::wasm_interaction_shared_matrix HORIZON_WASM_FIXTURE needs
+horizon-client-lib raw_payloads::wasm_tests::compiled_guest_observes_physical_provider_pressure HORIZON_WASM_FIXTURE needs
+
+# Disabled by the owner's decision until H077_OLD_WORLD is wired into CI.
+# needs the private old-world fixture: see followups
+horizon-client game::levels::tests::features_write_a_full_neighbour_only_through_its_sections H077_OLD_WORLD needs
+horizon-client game::levels::tests::an_old_chunk_saves_the_heights_its_new_neighbour_calculated H077_OLD_WORLD needs
+horizon-client game::levels::tests::the_overworld_cache_holds_the_edge_chunks_calculated_heights H077_OLD_WORLD needs
 
 # Tests that need a graphics adapter (REFERENCE is the ignore reason's word).
 horizon-client-render gfx::crumbling_tests::crack_samples_stay_aligned_between_stages adapter gpu
 horizon-client-render gfx::pack_uniforms::initial_history_tests::core_matrix_inputs_render_provider_values adapter gpu
 horizon-client-render gfx::weather::tests::weather_shader_uvs_match_legacy_bits adapter gpu
-# These require a non-CPU GPU, not merely a Vulkan driver; `flaky` admits host-dependent results.
-horizon-client-render gfx::pack_post::material_tests::terrain_material_samplers_preserve_surface_and_encoded_bytes adapter flaky
-horizon-client-render gfx::pack_post::weather_depth_tests::rain_depth_controls_writes_for_rain_snow_and_fallbacks adapter flaky
 
 # Known failures on main.
-# Load starvation: the far-decoration worker runs at idle priority against a fixed 30 s deadline, so it passes on
-# an idle host.
-horizon-client-lib vanillagen::lod::tests::decorated_lod_refines_real_seed_canopies_and_all_dimensions horizon-rust/horizon#8583 flaky
 horizon-client-render gfx::frame_gen::optical_flow::tests::finds_a_shift_and_a_scene_change horizon-rust/horizon#8627 flaky # llvmpipe/lavapipe scene-change threshold; horizon-rust/horizon#9138 fixes the race
 # The clear-budget fixture writes colortexNFormat in the one-line comment form Iris ignores
 # (fixture bug, one-line fix tracked in the issue); red where the runner has an adapter, a skip-pass where it has none.
@@ -44,70 +61,6 @@ horizon-client-render gfx::pack_post::destination_tests::clear_budget_tests::siz
 horizon-client-render gfx::pack_post::destination_tests::clear_budget_tests::sized_hdr_clear_respects_byte_budget horizon-rust/horizon#9303 flaky
 
 # Client failures exposed after enforcing target completion (#2137).
-horizon-client game::commands::data::boat_passenger_tree_tests::actual_boat_getter_projects_runtime_children_and_existing_bookkeeping #2174
-horizon-client game::commands::effective_presence_tests::registered_presence_uses_actual_catalog_and_stack_patch #2174
-horizon-client game::creatures::loaded_mob_arrow_permission_tests::loaded_mob_arrow_predicate_survives_model_and_controls_actual_block_hit #2174
-horizon-client game::first_tick_registration_tests::an_unloaded_chunk_saves_its_ticks_and_a_reloaded_one_gets_them_back #2174
-horizon-client game::first_tick_registration_tests::early_registration_keeps_saved_ticks_and_ticks_nothing #2174
-horizon-client game::first_tick_registration_tests::saved_block_and_fluid_ticks_unpack_when_the_chunk_starts_ticking #2174
-horizon-client game::first_tick_registration_tests::water_placed_before_the_first_world_tick_keeps_its_flow_tick #2174
-horizon-client game::functions::tests::forked_function_replies_keep_task_order_and_actual_callbacks #2174
-horizon-client game::functions::tests::prepared_function_calls_keep_causality_and_fallback_boundaries #2174
-horizon-client game::commands::execute::passenger_relation_tests::h150_actual_registered_passengers_select_direct_live_mob_and_boat_children #2175
-horizon-client game::dragon::tests::dragon_summon_command_finalizes_only_without_nbt #2175
-horizon-client game::native_entities::tests::native_roots_keep_the_loaded_id_and_do_not_allocate_twice #2175
-horizon-client game::persist::summon_uuid_conflict_tests::summon_skips_a_uuid_taken_earlier_in_the_same_tree #2175
-horizon-client game::creatures::chorus_projectile_drop_tests::a_registered_arrow_collision_keeps_the_actual_projectile_for_chorus_loot #2176
-horizon-client game::creatures::chorus_projectile_drop_tests::a_registered_snowball_collision_keeps_the_actual_projectile_for_chorus_loot #2176
-horizon-client game::explosion::tests::explosion_and_mob_breaks_apply_block_drops #2176
-horizon-client game::kill_die_cancel_tests::a_vetoed_kill_keeps_the_mob_and_a_later_kill_dies_once #2176
-horizon-client game::kill_die_vibration_tests::a_killed_mob_posts_its_death_before_the_command_returns #2176
-horizon-client game::native_player_break::tests::a_mod_breaks_stone_as_the_player_with_their_pickaxe #2176
-horizon-client game::native_player_break::tests::drops_go_into_the_inventory_rolled_for_the_tools_enchantments #2176
 horizon-client game::explosion::tests::explosion_items_parity_fixture #2177 harness
 horizon-client game::native_live_holder_tests::thousand_live_block_entity_ticks #2177 harness
 horizon-client game::remote_vehicles::tests::steering_mount_control_matches_vanilla #2177 harness
-horizon-client game::falling_damage::tests::no_helmet_or_a_refused_hit_fires_no_helmet_wear #2178
-horizon-client game::native_damage_tests::arrow_hits_name_the_projectile_on_players_mobs_and_the_dragon #2178
-horizon-client game::native_player_modes::tests::one_player_may_harm_another_by_the_pvp_rule_and_their_teams #2178
-horizon-client game::functions::tests::world_open_loads_functions_before_first_tick #2179
-horizon-client game::pack_finders::tests::registered_data_commands_respect_flags_required_packs_and_default_priority #2179
-horizon-client game::server_reload::tests::missing_original_at_reload_preserves_the_published_data_and_reports_its_owners #2179
-horizon-client game::server_reload::tests::server_reload_delivers_mod_files_overrides_and_preserves_all_data_on_failure #2179
-horizon-client game::server_reload::tests::server_reload_retains_listeners_for_other_hooks #2179
-horizon-client game::server_reload::tests::server_reload_skips_unparsable_files_and_delivers_the_rest #2179
-horizon-client game::world_test_def_tests::a_world_keeps_the_test_instances_it_opened_with #2179
-horizon-client game::item_contact_tests::the_active_stack_survives_a_partial_contact_and_consumption_removes_the_entity #2180
-horizon-client game::item_interact_mob_tests::actual_item_interact_mob_fallback_priority_and_filters #2180
-horizon-client game::native_hooks::fluid_draw::tests::a_mod_edits_a_fluid_tooltip #2180
-horizon-client game::spill::tests::a_block_entity_removing_itself_in_its_tick_is_not_asked #2180
-horizon-client game::lan::tests::datapack_damage_lazy_wire_load_caches_after_all_packs_are_removed #2181
-horizon-client game::lan::world_spawn_sync_tests::setworldspawn_reaches_guests_in_other_dimensions_and_keeps_compass_overrides #2181
-horizon-client game::lan_actions::crack_feedback_tests::crack_packets_follow_start_clock_and_strict_observer_radius #2181
-horizon-client game::remote::level_sound_tests::packets_ask_client_level_before_playback_not_ui #2181
-horizon-client game::native_block_entity_item_tests::internal_slots_preserve_automation_limits_and_nested_transactions #2182
-horizon-client game::native_hooks::tests::declared_types_create_tick_and_reload_through_game #2182
-horizon-client game::native_live_holder_tests::data_slot_sizing_after_creation_and_load_joins_the_existing_journal #2182
-horizon-client game::stateful_block_entity_tests::stateful_creation_uses_actual_state_and_preserves_existing_entity #2182
-horizon-client game::native_components::item_resource_property_tests::effective_resource_properties_match_vanilla #2183
-horizon-client game::native_components::item_resource_property_tests::item_resource_changed_defaults_and_consumption #2183
-horizon-client game::transactions::tests::an_aborted_transaction_puts_back_what_it_and_its_committed_children_changed #2183
-horizon-client game::native_hooks::base::screen_open_tests::client_gui_state_matches_screen_init_hook #2184
-horizon-client game::options::resize_state_tests::viewport_resize_notifications_follow_each_player #2184
-horizon-client game::persist::baby_modifier_mutation_tests::a_removed_baby_modifier_stays_removed_until_set_baby #2185
-horizon-client game::persist::baby_modifier_mutation_tests::the_baby_speed_modifier_answers_add_and_remove_like_any_other #2185
-horizon-client game::persist::sulfur_body_attribute_tests::a_bodiless_cube_keeps_its_command_knockback_resistance_effect #2185
-horizon-client game::persist::sulfur_body_attribute_tests::command_knockback_changes_reach_the_cache_without_archetype_values #2185
-horizon-client game::potions::mob_absorption_max_tests::absorption_follows_the_max_absorption_it_adds_and_leaves #2185
-horizon-client game::piston_push::order_tests::a_pushed_entity_meets_the_other_moving_blocks_as_they_are_at_its_push #2186
-horizon-client game::piston_push::order_tests::a_pushed_tnt_bounces_on_slime #2186
-horizon-client game::potent_sulfur::pass_tests::nausea_listener_moving_a_mob_invalidates_the_pass_grid #2186
-horizon-client game::potions::tests::lifecycle_cloud_commands_and_parked_owners #2186
-
-# Deterministic CPU work at or over its 30 s deadline in the unoptimized shard (no deadlock); see the issue.
-horizon-client-lib vanillagen::lod::tests::decorated_lod_refines_real_seed_canopies_and_all_dimensions #2132 flaky
-
-# Additional failures in the current-main honest run (42497697222).
-horizon-client game::living_attributes::tests::a_hits_armor_follows_the_live_map_at_once #2199
-horizon-client game::native_living_refs::tests::mob_equipment_writes_keep_full_stacks #2199
-horizon-client game::native_mob_refs::tests::mob_handles_read_write_and_refuse_unavailable_entities #2199

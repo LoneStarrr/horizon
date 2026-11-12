@@ -131,34 +131,10 @@ impl Game<'_> {
     /// isn't here or is dead, an item entity not in the level in place, any other place
     /// (`ItemPlace::stack` reads those), and on a client.
     pub(super) fn game_stack(&mut self, place: &ItemPlace) -> Option<ItemStack> {
-        if !self.places_simulated() {
-            return None;
+        if self.block_entity_tick_items.is_some() {
+            return self.scoped_game_stack(place);
         }
-        if let ItemPlace::ItemEntity { id } = place {
-            return self
-                .dropped
-                .iter()
-                .find(|e| e.id == *id)
-                .map(|e| e.stack.clone());
-        }
-        if let ItemPlace::EntitySlot { entity, slot } = place {
-            return self
-                .edit_entity_slots(*entity, |slots, _| {
-                    slots.get(*slot).cloned().flatten().filter(|s| s.count > 0)
-                })
-                .flatten();
-        }
-        if let ItemPlace::Equipment { entity, slot } = place {
-            return self
-                .equipment_stack(*entity, *slot)
-                .flatten()
-                .filter(|s| s.count > 0);
-        }
-        let mut stack = None;
-        self.native_as_player(self.place_player(place)?, |g| {
-            stack = g.player_place(place).and_then(|slot| slot.clone());
-        });
-        stack.filter(|s| s.count > 0)
+        self.unscoped_game_stack(place)
     }
     /// `ItemAccess.insert` at a player's place, an item entity's or an entity's slot: up to
     /// `stack.count` of `stack`, into the place where it's empty or holds the same item and
@@ -180,7 +156,9 @@ impl Game<'_> {
             count: amount,
             ..resource.clone()
         };
-        let _ = tx;
+        if !self.transaction_holds(tx) {
+            return 0;
+        }
         if !self.places_simulated() || stack.count == 0 {
             return 0;
         }
@@ -310,7 +288,9 @@ impl Game<'_> {
             count: amount,
             ..resource.clone()
         };
-        let _ = tx;
+        if !self.transaction_holds(tx) {
+            return 0;
+        }
         if !self.places_simulated() {
             return 0;
         }
@@ -447,6 +427,8 @@ impl Game<'_> {
     }
 }
 
+include!("native_item_places/tick_item_read.rs");
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::BlockEntity;
@@ -521,7 +503,7 @@ pub(super) mod tests {
     #[ignore = "needs prepared resources"]
     fn a_bucket_fills_and_empties_whole_through_its_place_and_splits_off_its_stack() {
         use horizon_client::chunk::Chunk;
-        use mod_api::{FLUIDS, ITEM_FLUIDS, NativeBlockUpdateFlags, move_resources};
+        use mod_api::{BlockUpdateFlags, FLUIDS, ITEM_FLUIDS, move_resources};
         with_game(|game| {
             open_to_lan(game);
             game.world
@@ -541,7 +523,7 @@ pub(super) mod tests {
             };
             let set = |game: &mut super::Game<'_>, pos, n| {
                 let state = cauldron(game, n);
-                let flags = NativeBlockUpdateFlags::NEIGHBORS;
+                let flags = BlockUpdateFlags::NEIGHBORS;
                 assert_eq!(game.level_set_block(level, pos, state, flags), Ok(true));
             };
             let (a, b) = ([0, 64, 0], [2, 64, 0]);
@@ -1092,7 +1074,7 @@ pub(super) mod tests {
     #[ignore = "needs prepared resources"]
     fn a_chest_menus_slots_write_the_chest_and_the_inventory_and_an_abort_puts_them_back() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
         with_game(|game| {
             open_to_lan(game);
             game.world
@@ -1100,7 +1082,7 @@ pub(super) mod tests {
                 .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
             let level = game.level("minecraft:overworld").unwrap();
             let chest = game.pack.assets.registry.default_state("minecraft:chest");
-            let flags = NativeBlockUpdateFlags::NEIGHBORS;
+            let flags = BlockUpdateFlags::NEIGHBORS;
             assert_eq!(
                 game.level_set_block(level, [0, 64, 0], chest.unwrap(), flags),
                 Ok(true)
@@ -1175,7 +1157,7 @@ pub(super) mod tests {
     #[ignore = "needs prepared resources"]
     fn a_chests_menu_over_the_furnace_set_in_its_place_reaches_none_of_its_slots() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
         with_game(|game| {
             open_to_lan(game);
             game.world
@@ -1189,7 +1171,7 @@ pub(super) mod tests {
                 state(game, "minecraft:chest"),
                 state(game, "minecraft:furnace"),
             );
-            let flags = NativeBlockUpdateFlags::NEIGHBORS;
+            let flags = BlockUpdateFlags::NEIGHBORS;
             assert_eq!(
                 game.level_set_block(level, [0, 64, 0], chest, flags),
                 Ok(true)
@@ -1349,7 +1331,7 @@ pub(super) mod tests {
     #[ignore = "needs prepared resources"]
     fn a_furnace_menus_fuel_slot_takes_one_bucket_as_its_slot_does() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
         with_game(|game| {
             open_to_lan(game);
             game.world
@@ -1357,7 +1339,7 @@ pub(super) mod tests {
                 .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
             let level = game.level("minecraft:overworld").unwrap();
             let furnace = game.pack.assets.registry.default_state("minecraft:furnace");
-            let flags = NativeBlockUpdateFlags::NEIGHBORS;
+            let flags = BlockUpdateFlags::NEIGHBORS;
             assert_eq!(
                 game.level_set_block(level, [0, 64, 0], furnace.unwrap(), flags),
                 Ok(true)
@@ -1845,7 +1827,7 @@ pub(super) mod tests {
         }
         let mods: Mods = vec![ModEntry::new("pigs", Box::new(Pigs(bin.clone())))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || with_game(test));
+        mod_platform::testing::with_mods(mods, || with_game(test));
     }
 
     /// A hopper at (0, 64, 0) facing `facing` holding `stack`, in an otherwise empty world.
@@ -1907,6 +1889,94 @@ pub(super) mod tests {
             let sides = bin.sides.lock().unwrap();
             assert!(!sides.is_empty());
             assert!(sides.iter().all(|side| *side == Some(Direction::Up)));
+        });
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_hopper_pushes_into_a_block_with_no_block_entity_whose_provider_voids_the_items() {
+        use mod_api::{self, Hooks, ModEntry, Mods, Registrar};
+        /// A trash can's one slot: it takes anything and keeps nothing.
+        struct Voids;
+        impl mod_api::ResourceHandler<ItemResource> for Voids {
+            fn size(&self, _: &mut dyn ServerHost) -> usize {
+                1
+            }
+            fn resource(&self, _: &mut dyn ServerHost, _: usize) -> Option<ItemResource> {
+                None
+            }
+            fn amount(&self, _: &mut dyn ServerHost, _: usize) -> u32 {
+                0
+            }
+            fn capacity(&self, _: &mut dyn ServerHost, _: usize, _: &ItemResource) -> u32 {
+                64
+            }
+            fn insert(
+                &self,
+                _: &mut dyn ServerHost,
+                _: &mod_api::Transaction,
+                _: usize,
+                _: &ItemResource,
+                amount: u32,
+            ) -> u32 {
+                amount
+            }
+            fn extract(
+                &self,
+                _: &mut dyn ServerHost,
+                _: &mod_api::Transaction,
+                _: usize,
+                _: &ItemResource,
+                _: u32,
+            ) -> u32 {
+                0
+            }
+        }
+        struct TrashCan;
+        #[mod_api::__subscriptions]
+        impl Hooks for TrashCan {
+            fn register(&self, r: &mut dyn Registrar, _: &mod_api::RegistrationContext) {
+                let lodestone = r.block_key("minecraft:lodestone");
+                r.block_capability(&mod_api::ITEMS, &lodestone, |_, _, _, entity| {
+                    entity.is_none().then(|| Box::new(Voids) as _)
+                });
+            }
+        }
+        let mods: Mods = vec![ModEntry::new("trash_can", Box::new(TrashCan))].into();
+        crate::game::api_values::install_parts(&mods).unwrap();
+        mod_platform::testing::with_mods(mods, || {
+            with_game(|game| {
+                hopper_with(game, "down", Some(ItemStack::new("minecraft:stick", 3)));
+                let registry = &game.pack.assets.registry;
+                let lodestone = registry.default_state("minecraft:lodestone").unwrap();
+                let stone = registry.default_state("minecraft:stone").unwrap();
+                game.world.set(0, 63, 0, lodestone).unwrap();
+                game.world.set(1, 63, 0, stone).unwrap();
+                // The hopper pushes one stick down into the lodestone, which keeps none.
+                game.hopper_try_move_items((0, 64, 0));
+                assert_eq!(
+                    hopper_slot(game),
+                    Some(ItemStack::new("minecraft:stick", 2))
+                );
+                let host: &mut dyn ServerHost = game;
+                let level = host.level("minecraft:overworld").unwrap();
+                let bin = level
+                    .capability(
+                        host,
+                        &mod_api::ITEMS,
+                        [0, 63, 0],
+                        Some(mod_api::Direction::Up),
+                    )
+                    .expect("the lodestone's provider");
+                assert_eq!(bin.owner(), "trash_can");
+                assert_eq!(bin.amount(host, 0), 0);
+                // Stone has no provider and no slots of the game's.
+                assert!(
+                    level
+                        .capability(host, &mod_api::ITEMS, [1, 63, 0], None)
+                        .is_none()
+                );
+            })
         });
     }
 
@@ -2015,7 +2085,7 @@ pub(super) mod tests {
     fn a_crafter_puts_into_a_mod_entity_and_dispenses_only_what_it_refuses() {
         use horizon_client::chunk::Chunk;
         use horizon_core::{position::BlockPos, random::RandomSource as _};
-        use mod_api::NativeBlockUpdateFlags;
+        use mod_api::BlockUpdateFlags;
 
         let bin = Bin::default();
         with_bin_pigs(&bin, |game| {
@@ -2034,7 +2104,7 @@ pub(super) mod tests {
                 .unwrap();
             let level = game.level("minecraft:overworld").unwrap();
             assert_eq!(
-                game.level_set_block(level, [0, 64, 0], crafter, NativeBlockUpdateFlags::NONE),
+                game.level_set_block(level, [0, 64, 0], crafter, BlockUpdateFlags::NONE),
                 Ok(true)
             );
             pig(game, 700, 63.0);
@@ -2095,7 +2165,7 @@ pub(super) mod tests {
         }
         let mods: Mods = vec![ModEntry::new("energy", Box::new(Energy))].into();
         crate::game::api_values::install_parts(&mods).unwrap();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             assert!(!has_entity_providers(&ENTITY_AUTOMATION));
             with_game(|game| {
                 hopper_with(game, "down", Some(ItemStack::new("minecraft:stick", 3)));

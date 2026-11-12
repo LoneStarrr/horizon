@@ -22,17 +22,24 @@ impl Game<'_> {
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, TurnRefused> {
         let swap = self.enter_guest_at(gi, conn, self.dim)?;
-        crate::game::dedicated::crash_fixture("guest", || {
-            self.lan
-                .as_ref()
-                .is_some_and(|host| host.hub.guest(conn).is_some_and(|g| g.placed))
-        });
-        let dimension =
-            (self.serving.is_some() || self.options.dedicated.is_some()).then_some(self.dim.id());
-        let result = horizon_client::block_contact::in_level(dimension, || f(self));
-        self.drain_entity_inside();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::game::dedicated::crash_fixture("guest", || {
+                self.lan
+                    .as_ref()
+                    .is_some_and(|host| host.hub.guest(conn).is_some_and(|g| g.placed))
+            });
+            let dimension = (self.serving.is_some() || self.options.dedicated.is_some())
+                .then_some(self.dim.id());
+            let result = horizon_client::block_contact::in_level(dimension, || f(self));
+            self.drain_entity_inside();
+            result
+        }));
+        // Commit the guest's progress and restore the outer player before propagating a panic.
         self.leave_guest(swap);
-        Ok(result)
+        match result {
+            Ok(result) => Ok(result),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Where guest `conn` is in the hub's list.
@@ -47,23 +54,30 @@ impl Game<'_> {
         conn: u32,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
+        // The outer capture comes back even when `f` panics (a native callback can), so later
+        // feedback isn't trapped in this guest's capture. What the guest was already told still
+        // reaches them before the panic goes on, after `as_guest` has restored the swap.
         let (result, lines) = self.as_guest(conn, |game| {
             let outer = game.chat_capture.replace(Vec::new());
-            let result = f(game);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(game)));
             let lines = std::mem::replace(&mut game.chat_capture, outer).unwrap_or_default();
             (result, lines)
         })?;
-        let host = self.lan.as_ref()?;
-        for line in lines {
-            host.hub.send_to(
-                conn,
-                &C::SystemChat(play::SystemChat {
-                    content: horizon_client::lan::data::component_nbt(&line.component()),
-                    overlay: false,
-                }),
-            );
+        if let Some(host) = self.lan.as_ref() {
+            for line in lines {
+                host.hub.send_to(
+                    conn,
+                    &C::SystemChat(play::SystemChat {
+                        content: horizon_client::lan::data::component_nbt(&line.component()),
+                        overlay: false,
+                    }),
+                );
+            }
         }
-        Some(result)
+        match result {
+            Ok(result) => self.lan.is_some().then_some(result),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// The first half of `as_guest`: the guest's state in place of the
@@ -121,6 +135,21 @@ impl Game<'_> {
         let other_boxes =
             self.lan_building_boxes
                 .for_turn(conn, Some(outer), building_players(host));
+        let fresh = host.hub.guests[i].motion.is_none();
+        if fresh {
+            let initialized = host
+                .hub
+                .guests
+                .update(i, |guest| super::guest_body::initialize(self.motion, guest));
+            if !initialized {
+                return Err(TurnRefused::Gone);
+            }
+        }
+        // Refusal must leave canonical records and loan state untouched.
+        let Some(mut motion) = host.hub.guests.update(i, |g| g.motion.take()) else {
+            return Err(TurnRefused::Gone);
+        };
+        host.hub.guests[i].residency.extract();
         self.lan_guest_swaps.push(conn);
         // `ServerPlayer.permissions()`: the guest's own command level for its
         // turn, so game-master checks see it (not the host's).
@@ -128,52 +157,8 @@ impl Game<'_> {
             &mut self.ui.registries.permission,
             host.hub.guests[i].permission,
         );
-        let fresh = host.hub.guests[i].motion.is_none();
-        if fresh {
-            let p = Vec3::new(
-                host.hub.guests[i].position[0],
-                host.hub.guests[i].position[1],
-                host.hub.guests[i].position[2],
-            );
-            {
-                let value = PlayerMotion::new(self.motion, p).ok().map(Box::new);
-                host.hub.guests.update(i, |guest| guest.motion = value);
-            }
-            // The first body after joining burns, breathes and falls on as saved.
-            host.hub.guests.update(i, |g| {
-                if let Some(saved) = g.loaded_body.take()
-                    && let Some(m) = g.motion.as_mut()
-                {
-                    saved.apply(m);
-                    // LivingEntity.readAdditionalSaveData: the saved attributes.
-                    let _ = m
-                        .apply_saved_attributes(g.saved.as_ref().and_then(|t| t.get("attributes")));
-                    // The abilities' walking speed is the movement speed's base.
-                    let _ = m.set_walking_speed_base(g.abilities.walking_speed);
-                }
-                // ServerPlayer.restoreFrom: a body that follows another takes its
-                // attributes (a scale of 0.1 stays 0.1 after a respawn or a trip
-                // to another level).
-
-                if let Some(carried) = g.carried_attributes.take()
-                    && let Some(m) = g.motion.as_mut()
-                {
-                    let _ = m.apply_saved_attributes(Some(&carried));
-                }
-                // The saved golden hearts go on the first body of a player who
-                // has been here before.
-                let saved = g.saved_absorption.take();
-                if let (Some(m), Some(amount)) = (g.motion.as_mut(), saved) {
-                    let _ = m.internal_set_absorption(amount);
-                }
-                let kept = g.logs_kept.take();
-                if let (Some(m), Some((hurts, attacks))) = (g.motion.as_mut(), kept) {
-                    m.hurt_log = hurts;
-                    m.attack_log = attacks;
-                }
-            });
-        }
         let mut play = host.play.remove(&conn).unwrap_or_default();
+        play.hook.begin_loan();
         if fresh {
             // A new body (joined, respawned, changed level): nothing on it yet,
             // its effects' modifiers and armor protection included.
@@ -183,14 +168,8 @@ impl Game<'_> {
             // A new ServerPlayer has everything to record again.
             play.score_recorded = Default::default();
         }
-        // The guest's body.
-        let Some(mut motion) = host.hub.guests.update(i, |g| g.motion.take()) else {
-            self.ui.registries.permission = permission;
-            host.play.insert(conn, play);
-            return Err(TurnRefused::Gone);
-        };
         let attachments = std::mem::replace(
-            &mut self.player_attachments,
+            &mut self.player_state.attachments,
             std::mem::take(host.hub.guests.attachments_mut(conn).unwrap()),
         );
         self.sculk.swap_player(&mut play.sculk);
@@ -226,6 +205,14 @@ impl Game<'_> {
         motion.health.food.food = g.food;
         motion.health.food.saturation = g.saturation;
         let mut player = Some(*motion);
+        match self.lan_acting {
+            Some(outer) => {
+                if let Some(guest) = host.hub.guest(outer) {
+                    guest.residency.extract();
+                }
+            }
+            None => self.resident_entities.local_player.extract(),
+        }
         std::mem::swap(&mut self.player, &mut player);
         let eye = (g.eye_height() as f32, self.eye);
         self.eye = eye.0;
@@ -282,7 +269,10 @@ impl Game<'_> {
         // opens shows as the 3x3 size.
         let craft_size = std::mem::replace(&mut self.craft_size, 2);
         let craft_table = self.craft_table.take();
-        let craft_grid = std::mem::replace(&mut self.craft_grid, vec![None; 9]);
+        play.craft_grid.clear();
+        play.craft_grid.resize(9, None);
+        let craft_grid =
+            std::mem::replace(&mut self.craft_grid, std::mem::take(&mut play.craft_grid));
         let container = self.container.take();
         let mining = std::mem::replace(&mut self.mining, play.mining.take());
         let destroy_delay = std::mem::replace(&mut self.destroy_delay, play.destroy_delay);
@@ -361,6 +351,7 @@ impl Game<'_> {
         );
         let g = &host.hub.guests[i];
         std::mem::swap(&mut self.stats, &mut play.stats);
+        self.hook.begin_loan();
         std::mem::swap(&mut self.hook, &mut play.hook);
         let adv_loaded = std::mem::replace(&mut self.adv.loaded, true);
         let last_inventory = std::mem::replace(&mut self.adv.last_inventory, play.last_inventory);
@@ -378,6 +369,9 @@ impl Game<'_> {
             std::mem::replace(&mut self.lan_acting_spawn_protection, spawn_protection),
         );
         let acting_fake = std::mem::replace(&mut self.lan_acting_fake, !g.participates_online());
+        g.residency.put_back();
+        self.hook.finish_loan();
+        self.bind_current_hook_residency();
         let packets = std::mem::take(&mut self.guest_packets);
         let entity_events = std::mem::take(&mut self.guest_entity_events);
         let cooldown_events = std::mem::take(&mut self.guest_cooldowns);
@@ -391,9 +385,15 @@ impl Game<'_> {
             std::mem::take(&mut play.modifiers),
         );
         // Its worn armour on its attributes, when it changed.
-        let mut equipped: Vec<Option<ItemStack>> = self.armor.to_vec();
-        equipped.push(self.inventory.get(self.selected).cloned().flatten());
-        if play.equipped.as_ref() != Some(&equipped) {
+        let selected_item = self.inventory.get(self.selected).and_then(Option::as_ref);
+        let unchanged = play.equipped.as_deref().is_some_and(|eq| {
+            eq.len() == self.armor.len() + 1
+                && eq[..self.armor.len()] == self.armor[..]
+                && eq[self.armor.len()].as_ref() == selected_item
+        });
+        if !unchanged {
+            let mut equipped: Vec<Option<ItemStack>> = self.armor.to_vec();
+            equipped.push(selected_item.cloned());
             self.apply_equipment();
             play.equipped = Some(equipped);
         }
@@ -493,39 +493,50 @@ impl Game<'_> {
             .as_mut()
             .map(|p| std::mem::take(&mut p.events))
             .unwrap_or_default();
-        if !turn_events.is_empty() {
-            self.record_combat(&turn_events);
-            self.wear_armor(&turn_events);
-        }
-        // A totem that saved the guest this turn (its hurt set it off).
-        let totem = self.apply_totem();
-        // The mods hear the food level the turn changed (eating, hunger,
-        // starving...), once for the change it made as a whole, with the
-        // guest's state still swapped in; they may change or undo it before it
-        // reaches the guest.
-        let now = self.player.as_ref().map(|p| p.health.food.food);
-        let food = self
-            .lan
-            .as_ref()
-            .and_then(|host| host.hub.guests.get(swap.i))
-            .filter(|g| now.is_some_and(|now| g.food != now))
-            .map(|g| (g.uuid, g.name.clone(), g.food, g.saturation));
-        if let Some(now) = now
-            && let Some((uuid, name, from, saturation)) = food
-        {
-            let (mut to, mut cancel) = (now, false);
-            self.native_food_level_changed(uuid, &name, from, &mut to, &mut cancel);
-            if let Some(p) = self.player.as_mut() {
-                if cancel {
-                    p.health.food.food = from;
-                    p.health.food.saturation = saturation;
-                } else if to != now {
-                    p.health.food.food = to.clamp(0, 20);
-                    p.health.food.saturation =
-                        p.health.food.saturation.min(p.health.food.food as f32);
+        // The callbacks a turn ends with (combat, armor, the totem, the food hook) can reach a
+        // mod and panic. The swap is still restored below and the guest's progress written
+        // back; the panic resumes at the end (#2240). `as_guest_at` calls this after catching a
+        // panic of the turn itself, so a panic here then goes on in place of that one.
+        let callbacks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !turn_events.is_empty() {
+                self.record_combat(&turn_events);
+                self.wear_armor(&turn_events);
+            }
+            // A totem that saved the guest this turn (its hurt set it off).
+            let totem = self.apply_totem();
+            // The mods hear the food level the turn changed (eating, hunger,
+            // starving...), once for the change it made as a whole, with the
+            // guest's state still swapped in; they may change or undo it before it
+            // reaches the guest.
+            let now = self.player.as_ref().map(|p| p.health.food.food);
+            let food = self
+                .lan
+                .as_ref()
+                .and_then(|host| host.hub.guests.get(swap.i))
+                .filter(|g| now.is_some_and(|now| g.food != now))
+                .map(|g| (g.uuid, g.name.clone(), g.food, g.saturation));
+            if let Some(now) = now
+                && let Some((uuid, name, from, saturation)) = food
+            {
+                let (mut to, mut cancel) = (now, false);
+                self.native_food_level_changed(uuid, &name, from, &mut to, &mut cancel);
+                if let Some(p) = self.player.as_mut() {
+                    if cancel {
+                        p.health.food.food = from;
+                        p.health.food.saturation = saturation;
+                    } else if to != now {
+                        p.health.food.food = to.clamp(0, 20);
+                        p.health.food.saturation =
+                            p.health.food.saturation.min(p.health.food.food as f32);
+                    }
                 }
             }
-        }
+            totem
+        }));
+        let (totem, panic) = match callbacks {
+            Ok(totem) => (totem, None),
+            Err(payload) => (None, Some(payload)),
+        };
         let GuestSwap {
             attachments,
             conn,
@@ -703,6 +714,8 @@ impl Game<'_> {
                 );
             }
         }
+        host.hub.guests[i].residency.extract();
+        self.hook.begin_loan();
         (
             self.lan_acting,
             self.lan_acting_name,
@@ -725,7 +738,7 @@ impl Game<'_> {
         let opened_table = (std::mem::replace(&mut self.craft_size, craft_size) == 3)
             .then_some(guest_table)
             .flatten();
-        self.craft_grid = craft_grid;
+        play.craft_grid = std::mem::replace(&mut self.craft_grid, craft_grid);
         let opened_station = std::mem::replace(&mut self.station, host_station);
         let bed = std::mem::replace(&mut self.sleeping, sleeping);
         let guest_sleep_timer = std::mem::replace(&mut self.sleep_timer, sleep_timer);
@@ -780,9 +793,12 @@ impl Game<'_> {
             Position([f64; 3]),
             Rider([f64; 3]),
         }
+        let released_vehicle = host.hub.guests[i]
+            .vehicle
+            .filter(|id| Some(*id) != guest_vehicle);
         let (stat_events, name, teleport) = host.hub.guests.update(i, |g| {
             let mut teleport = None;
-            g.attachments = std::mem::replace(&mut self.player_attachments, attachments);
+            g.attachments = std::mem::replace(&mut self.player_state.attachments, attachments);
             let left_vehicle = g.vehicle.filter(|_| guest_vehicle.is_none());
             if guest_vehicle.is_none() {
                 g.vehicle_good = None;
@@ -947,7 +963,7 @@ impl Game<'_> {
             let id = host.hub.guests[i].entity_id;
             host.hub.entity_event(id, crate::game::totem::TOTEM_EVENT);
             if self.player.is_some() {
-                self.totem_event(body, false);
+                self.totem_event(horizon_client::particles::TrackingTarget::Entity(id), body);
             }
         }
         let Some(host) = self.lan.as_mut() else {
@@ -956,6 +972,21 @@ impl Game<'_> {
         host.play.insert(conn, play);
         let finished = self.lan_guest_swaps.pop();
         debug_assert_eq!(finished, Some(conn));
+        host.hub.guests[i].residency.put_back();
+        host.play[&conn].hook.finish_loan();
+        match self.lan_acting {
+            Some(outer) => {
+                if let Some(guest) = host.hub.guest(outer) {
+                    guest.residency.put_back();
+                }
+            }
+            None => self.resident_entities.local_player.put_back(),
+        }
+        self.hook.finish_loan();
+        if let Some(vehicle) = released_vehicle {
+            self.release_removed_vehicle(vehicle);
+        }
+        self.bind_current_hook_residency();
         for event in turn_events {
             match event {
                 MotionEvent::Health(horizon_client::health::HealthEvent::DamageBroadcast {
@@ -996,11 +1027,17 @@ impl Game<'_> {
         }
         // The turn's teleports are in the hub now: the mods hear them.
         self.flush_teleport_notes();
+        if let Some(host) = self.lan.as_ref() {
+            refresh_building_player(host, conn);
+        }
         // An inner turn can move, kill, or change the mode of a hub-owned body.
         if let (Some(actor), Some(host)) = (self.lan_acting, self.lan.as_ref()) {
             self.lan_building_boxes =
                 self.lan_building_boxes
                     .for_turn(actor, None, building_players(host));
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
     }
 

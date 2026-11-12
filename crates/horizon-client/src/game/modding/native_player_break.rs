@@ -84,6 +84,40 @@ impl Game<'_> {
     }
 }
 
+impl Game<'_> {
+    /// `ServerPlayerGameMode.destroyBlock`'s `Level.removeBlock`, then `Block.destroy`: the mods'
+    /// `player_destroyed_block` hears the removal once it succeeded, before a creative player's
+    /// return and the drops. It is told the block the removal took out, read here, after
+    /// `playerWillDestroy` and the mods' `break_block` had their say, together with that block's
+    /// block entity data. True when the block was removed.
+    pub(in crate::game) fn remove_block_as_player(
+        &mut self,
+        pos: [i32; 3],
+        creative: bool,
+        correct_tool: bool,
+    ) -> bool {
+        let source = self
+            .lan_acting_uuid
+            .map(horizon_world::level::LevelEventPlayer);
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let block_entity = self.removed_block_entity_data(pos, state);
+        let removed = self.with_level(|b, level, ticks| {
+            b.player_destroy_block(
+                level,
+                ticks,
+                horizon_core::position::BlockPos::new(pos[0], pos[1], pos[2]),
+                creative,
+                correct_tool,
+                source,
+            )
+        });
+        if removed {
+            self.native_player_destroyed_block(pos, state, block_entity);
+        }
+        removed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::native_entity_refs::tests::with_game;
@@ -94,6 +128,11 @@ mod tests {
     /// A server's game with its own player in survival standing at the
     /// origin chunk, holding `held`: their UUID.
     fn with_player(game: &mut Game<'_>, held: ItemStack) -> u128 {
+        // The shared fixture does not open a server or register a ticking chunk.
+        game.options.dedicated = Some(Vec::new());
+        let _ = game
+            .block_ticks
+            .add_empty_chunk(horizon_core::position::ChunkPos::new(0, 0));
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 64.0, 4.5)).unwrap());
         game.set_mode(GameMode::Survival);
         game.inventory[game.selected] = Some(held);

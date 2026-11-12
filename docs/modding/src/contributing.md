@@ -9,7 +9,7 @@ The book follows [Diátaxis](https://diataxis.fr): a page is one of four kinds, 
 | How-to | One task, steps only | How-to, Injections |
 | Reference | Facts, complete and dry | Reference, and the rustdoc of `horizon-mod-api` |
 
-- **A hook, event or `Host` method:** its `///` lines in the declaration under `crates/horizon-mod-api/src/hooks/`.
+- **A hook, event or `Host` method:** its `///` lines in the declaration under `crates/horizon-mod-vocab/src/hooks/`.
   The generator writes it as `///` on the generated item; `cargo doc -p horizon-mod-api` shows it. A hook without
   a `doc` fails the build.
 - **A hook whose game target has many parameters:** a `native_*` target takes at most 7 parameters (receiver included;
@@ -27,6 +27,10 @@ The book follows [Diátaxis](https://diataxis.fr): a page is one of four kinds, 
 - **A guide page:** `docs/modding/src/`. Code in a page is `{{#include}}`d from `docs/modding/examples`, which
   compiles, so a change to the API that breaks an example fails the build.
 - **A mod API change** updates its fragment `doc` and any page it affects in the same PR.
+- **A new concept or how-to page:** add the file directly under `concepts/` or `how-to/`; the book adds it
+  to its part, after the pages `SUMMARY.md` lists, in order of its `#` title. Don't add it to `SUMMARY.md`
+  unless it must come first or sit in another part. Any other new page needs its `SUMMARY.md` line: the
+  build fails on a page the book doesn't render, and on a `SUMMARY.md` link to a missing file.
 - **Trait-mod and native-mod concepts:** edit one source in `concepts/trait-mods/` or
   `how-to/native-mods/`. Sorted filenames set reading order; the leading `<!-- chapter: Title -->`
   supplies the navigation title. New files are discovered automatically, without a shared list edit.
@@ -53,3 +57,18 @@ A reviewer runs your change in game at your head only when a test can't cover on
 If your PR changes or removes something mods already use, the reviewer also runs
 [horizon-machine-sample](https://github.com/arismoko/horizon-machine-sample) against it. A new item's `///` doc is its
 reference.
+
+## A catalog point and the wasm fixture
+
+A new or changed catalog point is proven by the wasm fixture: real wasm mods (`crates/horizon-mod-wasm/tests/fixture`,
+`library-fixture` and `groups`) built with `cargo horizon-mod build --wasm` and loaded by the real loader. The
+`wasm-mods` CI job does all of it on pushes to main and on manual dispatch; it does not run on pull requests. Main
+pushes coalesce: a started run finishes and only the newest waiting push runs next, so the newest finished main run
+proves every commit before it. A red is attributed by reading the error, with a manual dispatch on a suspect commit
+(through a branch pointing at it) when needed. A maintainer dispatches it on a PR branch that changes what it builds. That job is the answer; you don't
+need a local build.
+
+To run it yourself, on Linux or Windows, follow the steps of `.github/workflows/wasm-mods.yml` from the repository
+root; the tool installs its pinned toolchain through rustup. One wasm compile of `horizon-mod-points` takes about
+10 GiB of memory, so set `CARGO_BUILD_JOBS=1` on a 16 GiB machine. To check one change, build only the member that
+uses the point and run its test. The build rewrites files in the fixture folders; don't commit them.

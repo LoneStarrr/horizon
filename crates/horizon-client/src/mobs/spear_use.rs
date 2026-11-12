@@ -80,8 +80,16 @@ pub fn update_using_item(m: &mut Mob, w: &MobWorld, known_speed: Vec3, events: &
     // `ItemStack.onUseTick` gets the ticks left; the use began at 1.
     let ticks_used = m.extra.using_item - 1;
     damage_entities(m, &kinetic, ticks_used, w, known_speed, events);
+    count_use_tick(m);
+}
+
+/// One more tick of a use. Vanilla counts `useItemRemaining` down as a Java
+/// int, which a mod may set to anything; here the ticks used count up, and a
+/// counter a mod pushed to `i32::MAX` stays there rather than wrapping below
+/// 1, which would end the use that vanilla keeps running.
+pub fn count_use_tick(m: &mut Mob) {
     if is_using_item(m) {
-        m.extra.using_item += 1;
+        m.extra.using_item = m.extra.using_item.saturating_add(1);
     }
 }
 
@@ -97,7 +105,7 @@ struct Candidate {
 /// on or the rider it carries.
 fn candidates(m: &Mob, w: &MobWorld) -> Vec<Candidate> {
     let mut out = Vec::new();
-    if let Some(p) = w.player.as_ref().filter(|p| p.alive && !p.spectator) {
+    if let Some(p) = w.selected_player().filter(|p| p.alive && !p.spectator) {
         out.push(Candidate {
             who: Who::Player,
             bounds: p.bounds,
@@ -265,11 +273,11 @@ fn stab_attack(
     let mut affected = deals_knockback;
     if deals_damage {
         match target {
-            Who::Player => events.push(MobEvent::DamagePlayer {
+            Who::Player => events.push(w.route_player_event(MobEvent::DamagePlayer {
                 amount: damage,
                 from,
                 kind: "minecraft:spear",
-            }),
+            })),
             Who::Mob(id) => events.push(MobEvent::AttackMob {
                 target: id,
                 amount: damage,
@@ -280,21 +288,18 @@ fn stab_attack(
         // `EnchantmentHelper.doPostAttackEffects`: Fire Aspect.
         let burn = gear::fire_aspect(m);
         if burn > 0 {
-            events.push(MobEvent::Ignite {
-                target,
-                seconds: burn,
-            });
+            events.push(w.route_player_event(MobEvent::Ignite(target, burn)));
         }
     }
     if deals_knockback {
-        cause_extra_knockback(m, target, 0.4_f32, source, events);
+        cause_extra_knockback(m, target, 0.4_f32, source, w, events);
         // `LivingEntity.getKnockback`: the Knockback enchantment, halved.
         let power = gear::knockback(m) as f32 / 2.0;
-        cause_extra_knockback(m, target, power, source, events);
+        cause_extra_knockback(m, target, power, source, w, events);
     }
     if dismounts && w.target_info(target).is_some_and(|t| t.passenger) {
         affected = true;
-        events.push(MobEvent::StabDismount { target });
+        events.push(w.route_player_event(MobEvent::StabDismount { target }));
     }
     affected
 }
@@ -306,19 +311,21 @@ fn cause_extra_knockback(
     target: Who,
     power: f32,
     source: Damage,
+    w: &MobWorld,
     events: &mut Vec<MobEvent>,
 ) {
     if power <= 0.0 {
         return;
     }
     let to_rad = std::f32::consts::PI / 180.0;
-    events.push(MobEvent::Knockback {
+    events.push(w.route_player_event(MobEvent::Knockback {
         target,
         power: f64::from(power),
         x: f64::from((m.yaw * to_rad).msin()),
         z: f64::from(-(m.yaw * to_rad).mcos()),
         source,
-    });
+        apply_blocking: None,
+    }));
     m.velocity = Vec3::new(m.velocity.x * 0.6, m.velocity.y, m.velocity.z * 0.6);
 }
 
@@ -910,5 +917,41 @@ impl<G: Goal + Clone + 'static> Goal for NoMeleeWithSpear<G> {
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
         self.0.tick(m, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mob, count_use_tick, is_using_item, start_using_item};
+    use horizon_core::geometry::Vec3;
+
+    fn spear_zombie() -> Mob {
+        let mut m = Mob::new(1, crate::mobs::sensor_scan_tests::kind(), Vec3::ZERO, 0.0);
+        m.extra.set_slot_id(
+            horizon_items::equipment::MAINHAND,
+            Some("minecraft:iron_spear".into()),
+        );
+        m
+    }
+
+    /// The counters a mod's `living_set_item_use_remaining` leaves a 72000
+    /// tick use at (remaining `i32::MIN`, `i32::MAX`, 0 and -5): the next
+    /// ticks count on without overflowing, and the use keeps running.
+    #[test]
+    fn a_use_counter_at_any_value_a_mod_sets_survives_the_next_ticks() {
+        for counter in [i32::MAX, 1, 72_001, 72_006, i32::MAX - 1] {
+            let mut m = spear_zombie();
+            assert!(start_using_item(&mut m, false));
+            m.extra.using_item = counter;
+            for tick in 1..=3 {
+                count_use_tick(&mut m);
+                assert!(is_using_item(&m), "{counter} tick {tick}");
+                assert_eq!(
+                    m.extra.using_item,
+                    counter.saturating_add(tick),
+                    "{counter} tick {tick}"
+                );
+            }
+        }
     }
 }

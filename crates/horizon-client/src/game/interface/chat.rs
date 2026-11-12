@@ -34,6 +34,18 @@ pub(super) fn chat_tree(
         None => horizon_client::command::vanilla::game_dispatcher(),
     }
 }
+/// The arguments of a typed `/profiler` the client answers itself: only when the chat tree's `profiler` is Horizon's, else the server or mod that owns the name runs it.
+fn horizon_profiler_args<'a>(
+    message: &'a str,
+    server_tree: Option<&horizon_client::command::Dispatcher>,
+) -> Option<&'a str> {
+    let args = message
+        .strip_prefix('/')
+        .and_then(super::profile_capture::profiler_args)?;
+    server_tree
+        .is_none_or(|tree| tree.has_horizon_profiler())
+        .then_some(args)
+}
 use winit::{
     event::KeyEvent,
     keyboard::{KeyCode, PhysicalKey},
@@ -165,8 +177,12 @@ impl Game<'_> {
             }
             keep
         });
-        let (tree, _, problems) =
-            super::native_server::command_tree(&commands, |name| base.find(name).is_some());
+        let arguments = super::native_server::command_arguments();
+        let (tree, _, problems) = super::native_server::command_tree(
+            &commands,
+            |name| base.find(name).is_some(),
+            &arguments,
+        );
         for problem in problems {
             log::warn!("Horizon: a client command was left out: {problem}");
         }
@@ -175,8 +191,9 @@ impl Game<'_> {
             &mut tree_with_mods,
             &tree,
             horizon_client::command::MOD_COMMAND,
+            &arguments,
         );
-        with_studio_commands(&with_native_commands(&tree_with_mods, &["studio"]))
+        with_studio_commands(&with_native_commands(&tree_with_mods, &["studio"])).with_profiler()
     }
 }
 
@@ -292,8 +309,12 @@ pub struct UiState {
     pub show_hand_when_hidden: bool,
     /// Death message key set by the cause of death (e.g. /kill).
     pub death_cause: Option<String>,
-    /// Path of an F2 screenshot waiting for its frame.
-    pub screenshot_message: Option<std::path::PathBuf>,
+    /// What this frame's HUD shows that Horizon's overlays keep clear of (`Game::hud_room`),
+    /// set by `hud_layers` before anything draws.
+    pub room: horizon_client::hud_kit::room::Room,
+    /// F2 screenshots not written yet: each reports in chat once its PNG is.
+    pub screenshot_messages: Vec<std::path::PathBuf>,
+    pub screenshot_writes: Vec<super::screenshot_writer::ScreenshotWrite>,
     /// The options screens.
     pub options: horizon_client::options_ui::OptionsUi,
     /// The prepared resources before resource packs are layered on.
@@ -563,7 +584,7 @@ static COMMAND_EXPORTS: Mutex<Vec<(PathBuf, Option<Arc<Registries>>)>> = Mutex::
 /// its 1.6 MB again took about 15 ms of every world opening. Only the part
 /// the registries fill from stays, not the parsed export (4.2 MB, against
 /// 2.2 MB). A dedicated server opens its world once and keeps nothing.
-fn command_export(dir: &Path, keep: bool) -> Option<Arc<Registries>> {
+pub(super) fn command_export(dir: &Path, keep: bool) -> Option<Arc<Registries>> {
     let mut cache = COMMAND_EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, export)) = cache.iter().find(|(cached, _)| cached == dir) {
         return export.clone();
@@ -775,7 +796,7 @@ impl Game<'_> {
     }
     /// `ResourceOrIdArgument`'s loot tables are the server's: every table the
     /// world plays with, the game's, the content mods' and its packs'.
-    pub(super) fn sync_loot_table_ids(&mut self) {
+    pub(in crate::game) fn sync_loot_table_ids(&mut self) {
         let mut ids: Vec<String> = self.items().loot_table_ids().map(str::to_owned).collect();
         ids.sort();
         self.ui.registries.loot_tables = ids;
@@ -1101,8 +1122,9 @@ impl Game<'_> {
             self.ui.in_bed_chat = self.screen == Screen::Chat;
         }
     }
-    /// The Leave Bed button of `InBedChatScreen`: its bounds.
-    fn leave_bed_button(width: f32, height: f32) -> (i32, i32, i32, i32) {
+    /// The Leave Bed button of `InBedChatScreen`: its bounds, laid out once
+    /// per build (`ChatLayout`).
+    pub(super) fn leave_bed_button(width: f32, height: f32) -> (i32, i32, i32, i32) {
         (width as i32 / 2 - 100, height as i32 - 40, 200, 20)
     }
     /// The Leave Bed button's draws. It registers as a button
@@ -1111,10 +1133,8 @@ impl Game<'_> {
     fn leave_bed_draws(
         m: &Measure,
         mouse: (i32, i32),
-        width: f32,
-        height: f32,
+        (x, y, w, h): (i32, i32, i32, i32),
     ) -> Vec<horizon_client::screen_draw::Draw> {
-        let (x, y, w, h) = Self::leave_bed_button(width, height);
         let label = Text::literal(horizon_client::lang::get_or(
             "multiplayer.stopSleeping",
             "Leave Bed",
@@ -1152,11 +1172,24 @@ impl Game<'_> {
         // Connected to a server (single player's own included), the chat on
         // screen is the connection's: the game's own messages join it.
         if self.remote.is_some() {
-            self.chat_line(text, ChatSource::Server);
+            self.add_chat_line(text, ChatSource::Server);
             return;
         }
         // The Chat option's Hidden level takes the server's messages too.
         self.local_chat_line(text, Some(SYSTEM_INDICATOR), ChatSource::Server);
+    }
+    /// `ChatComponent.addClientSystemMessage`: a line the client adds itself.
+    /// It joins the connection's chat and its history, with the system
+    /// marker; the Chat option's server-message filter does not hide it
+    /// (`GuiMessageSource.SYSTEM_CLIENT`). Vanilla fires
+    /// `ClientChatReceivedEvent` from `ChatListener` for the lines the server
+    /// sent, so this path does not tell `client_chat_received`.
+    pub(super) fn chat_line(&mut self, text: Text) {
+        if self.remote.is_some() {
+            self.add_chat_line(text, ChatSource::Client);
+        } else {
+            self.local_chat_line(text, Some(SYSTEM_INDICATOR), ChatSource::Client);
+        }
     }
     /// A player's chat line on the window's own chat: a guest's message on
     /// the server's own chat (`HostEvent::Chat`). `ChatListener`
@@ -1216,7 +1249,7 @@ impl Game<'_> {
         let ctrl = self.has_control_down_with_quirk();
         let shift = self.has_shift_down();
         // PvP & HUD's chat search: Ctrl+F starts and stops it, Enter stops it (sends nothing).
-        if self.settings.extras.pvp.chat.search
+        if self.pvp_chat().search
             && match key {
                 KeyCode::KeyF => ctrl,
                 KeyCode::Enter | KeyCode::NumpadEnter => self.pvp.chat_search,
@@ -1341,6 +1374,12 @@ impl Game<'_> {
             return;
         }
         self.ui.chat.add_recent(&message);
+        if let Some(args) =
+            horizon_profiler_args(&message, self.remote.as_ref().map(|r| &r.chat_tree))
+        {
+            self.profiler_chat(args);
+            return;
+        }
         // On a server (single player's own included) the server runs it,
         // unless a client mod owns the command.
         if self.remote.is_some() {
@@ -1360,7 +1399,10 @@ impl Game<'_> {
         } else {
             let line = Text::translate(
                 "chat.type.text",
-                &[self.player_display_name(), Text::literal(message.as_str())],
+                &[
+                    self.player_display_name(),
+                    Text::untrusted(message.as_str()),
+                ],
             );
             let focused = self.screen == Screen::Chat;
             self.ui.chat.add(
@@ -1375,14 +1417,6 @@ impl Game<'_> {
     }
     pub(super) fn chat_scroll(&mut self, amount: f32) {
         let cursor = self.cursor;
-        let height = self.renderer.as_ref().map_or(720.0, |r| {
-            HudBatch::new(
-                [r.config.width, r.config.height],
-                self.settings.gui_scale_inputs(),
-            )
-            .height
-        });
-        let _ = height;
         let mouse = (cursor.0.floor() as i32, cursor.1.floor() as i32);
         if let Some(screen) = self.ui.chat_screen.as_mut()
             && screen.scroll(mouse, amount as f64)
@@ -1416,7 +1450,9 @@ impl Game<'_> {
                 )
                 .width
             });
-            let (x, y, w, h) = Self::leave_bed_button(width, height);
+            let (x, y, w, h) = self
+                .built_chat(width, height)
+                .map_or_else(|| Self::leave_bed_button(width, height), |l| l.leave_bed);
             if horizon_client::screen_draw::inside((cursor.0 as i32, cursor.1 as i32), x, y, w, h) {
                 self.wake_up();
                 return;
@@ -1437,7 +1473,7 @@ impl Game<'_> {
             cursor.1 as f64,
         );
         // PvP & HUD's copy on click: a message where the click has nothing else to do.
-        if self.settings.extras.pvp.chat.copy
+        if self.pvp_chat().copy
             && !self.has_shift_down()
             && style.as_ref().is_none_or(|s| s.click.is_none())
             && let Some(message) =
@@ -1480,6 +1516,14 @@ impl Game<'_> {
                 }
             }
             Some(ClickEvent::RunCommand(command)) => self.click_command(&command),
+            Some(ClickEvent::Profiler(command)) => {
+                if let Some(args) = command
+                    .strip_prefix('/')
+                    .and_then(super::profile_capture::profiler_args)
+                {
+                    self.profiler_chat(args);
+                }
+            }
             // Screen.defaultHandleGameClickEvent: the dialog opens over the
             // screen, and closes back to it.
             Some(ClickEvent::ShowDialog(dialog)) => self.show_dialog_ref(&dialog),
@@ -1617,7 +1661,7 @@ impl Game<'_> {
     /// Chat lines over the HUD (focused while the chat screen is open).
     pub(super) fn draw_chat(&mut self, batch: &mut HudBatch) {
         let focused = self.screen == Screen::Chat;
-        let options = self.settings.extras.pvp.chat;
+        let options = self.pvp_chat();
         self.ui.chat.set_qol(&self.gui.atlas, options.qol());
         // A search ends with its option; a chat closed some other way ends it in keep_chat_draft.
         if self.pvp.chat_search && self.ui.chat_screen.is_none() {
@@ -1704,12 +1748,8 @@ impl Game<'_> {
                 &super::screen_info::tr,
             )
         });
+        // The build made the box at this size (`ChatScreen.resize`).
         let m = Measure(&self.gui.atlas.font);
-        let c = Commands {
-            dispatcher: chat_tree(&self.remote),
-            registries: &self.ui.registries,
-        };
-        screen.resize(&m, &c, batch.width as i32, batch.height as i32);
         // Options.getBackgroundColor(Integer.MIN_VALUE).
         let background = if self.settings.file.bool("backgroundForChatOnly") {
             i32::MIN
@@ -1725,14 +1765,17 @@ impl Game<'_> {
         horizon_client::screen_draw::paint(batch, &self.gui.atlas, &draws);
         self.ui.chat_screen = Some(screen);
         if in_bed {
-            let button = Self::leave_bed_draws(&m, mouse, batch.width, batch.height);
+            let (w, h) = (batch.width, batch.height);
+            let rect = self
+                .built_chat(w, h)
+                .map_or_else(|| Self::leave_bed_button(w, h), |l| l.leave_bed);
+            let button = Self::leave_bed_draws(&m, mouse, rect);
             horizon_client::screen_draw::paint(batch, &self.gui.atlas, &button);
         }
         // The hovered message part's tooltip (`renderComponentHoverEffect`),
         // or the text of the message tag under the cursor.
         let height = batch.height as i32;
         let (cx, cy) = (f64::from(self.cursor.0), f64::from(self.cursor.1));
-        let wrap = (batch.width as i32 / 2).max(200);
         // handleTagIcon: the chat-modified icons over the cursor or its message.
         let (tag_tooltip, tag_icons) =
             self.ui
@@ -1747,30 +1790,74 @@ impl Game<'_> {
                     horizon_client::widgets::Cursor::PointingHand,
                 );
             }
-            if let Some(hover) = style.hover {
-                let lines = self.wrapped_rows(&hover, wrap);
-                self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
-            } else if let Some(stack) = style
-                .hover_item
-                .as_deref()
-                .and_then(horizon_client::item_data::stack_from_hover)
-                .filter(|s| self.items().get(&s.item).is_some())
-            {
-                self.draw_stack_tooltip(batch, &stack, self.cursor.0, self.cursor.1);
-            } else if let Some(entity) = style
-                .hover_entity
-                .as_deref()
-                .filter(|_| self.settings.file.bool("advancedItemTooltips"))
-            {
-                // ChatScreen: a ShowEntity tooltip only with advanced tooltips on.
-                let lines = Self::entity_tooltip_lines(entity);
-                self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
-            }
+            self.component_hover_effect(batch, &style, self.cursor);
         } else if let Some(tag) = &tag_tooltip {
             // The message tag's text, split at 210.
             let lines = self.wrapped_rows(tag, 210);
             self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
         }
+    }
+    /// `GuiGraphicsExtractor.componentHoverEffect`: the hover of the text component under the
+    /// cursor at `at`, as the chat, a book and a dialog draw it. `component_hover` is asked
+    /// first and may cancel it. Then a text hover is split at half the screen's width (at
+    /// least 200), an item hover draws its stack's tooltip, and an entity hover its name, type
+    /// and UUID while advanced tooltips are on.
+    pub(super) fn component_hover_effect(
+        &mut self,
+        batch: &mut HudBatch,
+        style: &horizon_client::text::Style,
+        at: (f32, f32),
+    ) {
+        if self.component_hover_canceled(batch, style, at) {
+            return;
+        }
+        if let Some(hover) = &style.hover {
+            let wrap = (batch.width as i32 / 2).max(200);
+            let lines = self.wrapped_rows(hover, wrap);
+            self.draw_tooltip_lines(batch, &lines, at.0, at.1);
+        } else if let Some(stack) = style
+            .hover_item
+            .as_deref()
+            .and_then(horizon_client::item_data::stack_from_hover)
+            .filter(|s| self.items().get(&s.item).is_some())
+        {
+            self.draw_stack_tooltip(batch, &stack, at.0, at.1);
+        } else if let Some(entity) = style
+            .hover_entity
+            .as_deref()
+            .filter(|_| self.settings.file.bool("advancedItemTooltips"))
+        {
+            // A ShowEntity tooltip only with advanced tooltips on.
+            let lines = Self::entity_tooltip_lines(entity);
+            self.draw_tooltip_lines(batch, &lines, at.0, at.1);
+        }
+    }
+    /// `component_hover`, only while a mod listens: true when a mod cancelled the hover.
+    fn component_hover_canceled(
+        &self,
+        batch: &mut HudBatch,
+        style: &horizon_client::text::Style,
+        at: (f32, f32),
+    ) -> bool {
+        if !mod_api::__private::listened(mod_api::HookId::ComponentHover) {
+            return false;
+        }
+        let Some(hover) = horizon_client_lib::api_text::style_hover(style) else {
+            return false;
+        };
+        let mut cancel = false;
+        let mut draw = super::host::draw::GameDrawContext {
+            game: self,
+            surface: batch,
+        };
+        self.native_component_hover(mod_api::__private::ComponentHoverCall {
+            draw: &mut draw,
+            hover: &hover,
+            x: at.0 as i32,
+            y: at.1 as i32,
+            cancel: &mut cancel,
+        });
+        cancel
     }
     /// `Font.split`: a tooltip text wrapped at `width`, one white row per line.
     pub(super) fn wrapped_rows(&self, text: &Text, width: i32) -> Vec<(Text, u32)> {
@@ -1793,6 +1880,9 @@ impl Game<'_> {
             self.sync_hub_clocks();
             return;
         }
+        // The End's independent clock runs one tick per tick while advance_time
+        // is enabled, regardless of the Overworld clock's pause or rate.
+        self.world.end_clock += 1;
         let mut names: Vec<String> = self.ui.command_clocks.keys().cloned().collect();
         let active = self.active_clock().to_owned();
         for name in [OVERWORLD_CLOCK.to_owned(), active] {
@@ -1974,7 +2064,9 @@ impl Game<'_> {
     }
     /// `ServerClockManager.ServerClockInstance.loadFrom`: restore the existing
     /// Overworld state when a world opens; clear the other command-state cache.
-    pub(super) fn load_world_state(&mut self) {
+    /// The carrier store's open-time state settles here too, before the
+    /// first tick and any player: a refusal fails the open.
+    pub(super) fn load_world_state(&mut self) -> crate::Result<()> {
         self.ui.rules = GameRules::load_with_registry(
             &self.world_root,
             &self.level.enabled_features,
@@ -2031,6 +2123,7 @@ impl Game<'_> {
         // The world opens with its test instances (`Registries.TEST_INSTANCE`).
         self.snapshot_test_defs();
         self.sync_rules();
+        self.carrier_world_opened()
     }
     /// Save the clock beside level.dat (Level.write saves the game rules: a
     /// second writer of game_rules.dat could leave it with the rules loaded
@@ -2099,25 +2192,30 @@ impl Game<'_> {
         self.ui.toggle_hide_gui();
     }
     /// F2: ScreenShot.grab into `screenshots/` with vanilla's file name.
-    pub(super) fn take_screenshot(&mut self) {
+    pub(super) fn take_screenshot(&mut self) -> Option<std::path::PathBuf> {
         if self.screenshot_sequence.is_some() {
-            return;
+            return None;
         }
         let dir = horizon_client::logging::player_dir().join("screenshots");
         if std::fs::create_dir_all(&dir).is_err() {
-            return;
+            return None;
         }
-        let name = screenshot_name(&dir);
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
+        let name = screenshot_name(&dir, &self.ui.screenshot_messages);
+        let renderer = self.renderer.as_mut()?;
         let path = dir.join(name);
+        // A second shortcut before rendering replaces the queued frame. Release
+        // that request's name: no readback will arrive to finish it.
+        if let Some(replaced) = renderer.screenshot.as_ref() {
+            self.ui.screenshot_messages.retain(|p| *p != replaced.path);
+        }
         renderer.screenshot = Some(horizon_client::gfx::ScreenshotRequest {
             path: path.clone(),
             size: None,
             scaled: true,
+            background: true,
         });
-        self.ui.screenshot_message = Some(path);
+        self.ui.screenshot_messages.push(path.clone());
+        Some(path)
     }
     /// `Minecraft.handleGlobalKeyPress`'s screenshot branch: the
     /// `key.screenshot` mapping (F2 by default) takes the picture before a
@@ -2137,7 +2235,7 @@ impl Game<'_> {
         if self.debug_keys.modifier_down {
             return false;
         }
-        self.take_screenshot();
+        let _ = self.take_screenshot();
         true
     }
     /// Readback is complete: fire the client hook, then save the image it left.
@@ -2145,11 +2243,23 @@ impl Game<'_> {
         &mut self,
         mut pending: horizon_client::gfx::PendingScreenshot,
     ) -> Option<std::result::Result<[u32; 2], String>> {
-        if self.ui.screenshot_message.as_ref() != Some(&pending.path) {
-            // Another request replaced F2 before its frame was drawn.
-            self.ui.screenshot_message = None;
-            return Some(pending.save().map_err(|e| e.to_string()));
+        if !self.ui.screenshot_messages.contains(&pending.path) {
+            if !pending.background {
+                return Some(pending.save().map_err(|e| e.to_string()));
+            }
+            self.ui
+                .screenshot_writes
+                .push(super::screenshot_writer::ScreenshotWrite::start(
+                    pending, None, None, false,
+                ));
+            return None;
         }
+        let at = self
+            .ui
+            .screenshot_messages
+            .iter()
+            .position(|p| *p == pending.path)
+            .unwrap();
         let mut file_name = pending
             .path
             .file_name()
@@ -2165,17 +2275,20 @@ impl Game<'_> {
             &mut cancel,
         );
         if cancel {
+            self.ui.screenshot_messages.remove(at);
             self.post_screenshot_chat(screenshot_cancel_line(message));
-            self.ui.screenshot_message = None;
             return None;
         }
         let root = horizon_client::logging::player_dir().join("screenshots");
-        let result = pending
-            .save_in(&root, &file_name)
-            .map_err(|e| e.to_string());
-        self.ui.screenshot_message = Some(pending.path);
-        self.finish_screenshot(&result, message);
-        Some(result)
+        self.ui
+            .screenshot_writes
+            .push(super::screenshot_writer::ScreenshotWrite::start(
+                pending,
+                Some((root, file_name)),
+                message,
+                true,
+            ));
+        None
     }
     /// After a frame: report a finished F2 screenshot in chat.
     pub(super) fn finish_screenshot(
@@ -2183,9 +2296,10 @@ impl Game<'_> {
         result: &std::result::Result<[u32; 2], String>,
         message: Option<Text>,
     ) {
-        let Some(path) = self.ui.screenshot_message.take() else {
+        if self.ui.screenshot_messages.is_empty() {
             return;
-        };
+        }
+        let path = self.ui.screenshot_messages.remove(0);
         let message = match result {
             Ok(_) => {
                 log::info!("Saved screenshot to {}", path.display());
@@ -2228,7 +2342,7 @@ pub(super) fn screenshot_cancel_line(message: Option<Text>) -> Text {
     })
 }
 /// `yyyy-MM-dd_HH.mm.ss[_n].png` (Util.getFilenameFormattedDateTime, in local time).
-pub fn screenshot_name(dir: &std::path::Path) -> String {
+pub fn screenshot_name(dir: &std::path::Path, pending: &[std::path::PathBuf]) -> String {
     // Util.getFilenameFormattedDateTime: the local date and time.
     let base = chrono::Local::now().format("%Y-%m-%d_%H.%M.%S").to_string();
     let mut n = 1;
@@ -2238,7 +2352,8 @@ pub fn screenshot_name(dir: &std::path::Path) -> String {
         } else {
             format!("{base}_{n}.png")
         };
-        if !dir.join(&name).exists() {
+        let path = dir.join(&name);
+        if !path.exists() && !pending.contains(&path) {
             return name;
         }
         n += 1;
@@ -2259,6 +2374,31 @@ const LINK_COPY: usize = 1;
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_typed_profiler_is_the_clients_unless_the_server_owns_the_name() {
+        let vanilla = horizon_client::command::vanilla::game_dispatcher();
+        let ours = vanilla.with_profiler();
+        assert_eq!(
+            super::horizon_profiler_args("/profiler share", Some(&ours)),
+            Some(" share")
+        );
+        assert_eq!(super::horizon_profiler_args("/profiler", None), Some(""));
+        assert_eq!(
+            super::horizon_profiler_args("/profilers", Some(&ours)),
+            None
+        );
+        let mut server = vanilla.clone();
+        let node = server.literal(0, "profiler");
+        server.executes(node, "server:profiler");
+        let theirs = server.with_profiler();
+        assert_eq!(
+            super::horizon_profiler_args("/profiler share", Some(&theirs)),
+            None
+        );
+    }
+
+    /// A mod's text reaches the chat box as typing would leave it: emoji and
+    /// accents stay, control characters, DEL and the section sign go.
     #[test]
     fn canceled_screenshot_keeps_a_custom_line_or_the_default_reason() {
         let custom = Text::literal("kept");
@@ -2331,6 +2471,25 @@ mod tests {
         assert!(should_discard_draft(ChatExit::Intentional, false));
         assert!(!should_discard_draft(ChatExit::Intentional, true));
         assert!(should_discard_draft(ChatExit::Done, true));
+    }
+
+    /// `Screenshot.getFile` picks the first free name of the second; an F2
+    /// screenshot still being written on its thread has no file yet, so a
+    /// second press in the same second takes the next name, not the same one.
+    #[test]
+    fn a_screenshot_being_written_keeps_its_name() {
+        let dir = std::env::temp_dir().join(format!("horizon-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = screenshot_name(&dir, &[]);
+        let second = screenshot_name(&dir, &[dir.join(&first)]);
+        assert_ne!(first, second);
+        // Unless the clock turned to the next second in between.
+        let same_second = second.starts_with(first.trim_end_matches(".png"));
+        assert!(
+            !same_second || second == first.replace(".png", "_2.png"),
+            "{second}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2434,16 +2593,20 @@ mod tests {
     fn a_client_commands_usage_is_parsed_by_the_chat_tree() {
         let reg = Registries::default();
         let vanilla = horizon_client::command::vanilla::game_dispatcher();
-        let commands = [mod_api::NativeCommand::new("xmode <mode:word>")];
-        let (tree, _, problems) = super::super::native_server::command_tree(&commands, |name| {
-            vanilla.find(name).is_some()
-        });
+        let commands = [mod_api::Command::new("xmode <mode:word>")];
+        let arguments = super::super::native_server::command_arguments();
+        let (tree, _, problems) = super::super::native_server::command_tree(
+            &commands,
+            |name| vanilla.find(name).is_some(),
+            &arguments,
+        );
         assert!(problems.is_empty(), "{problems:?}");
         let mut chat = vanilla.clone();
         super::super::native_server::register_dispatcher(
             &mut chat,
             &tree,
             horizon_client::command::MOD_COMMAND,
+            &arguments,
         );
         let parse = chat.parse("xmode fast", &reg);
         assert_eq!(
@@ -2460,8 +2623,9 @@ mod tests {
         );
         // A name the game has is not taken over.
         let (_, _, problems) = super::super::native_server::command_tree(
-            &[mod_api::NativeCommand::new("help <x:word>")],
+            &[mod_api::Command::new("help <x:word>")],
             |name| vanilla.find(name).is_some(),
+            &arguments,
         );
         assert_eq!(problems.len(), 1);
     }
@@ -2745,11 +2909,11 @@ mod tests {
             ChatAbilities::new(ChatVisibility::Full),
         );
         screen.draw(&m, (0, 0), 0, 0);
-        Game::leave_bed_draws(&m, (0, 0), width, height);
+        let (x, y, w, h) = Game::leave_bed_button(width, height);
+        Game::leave_bed_draws(&m, (0, 0), (x, y, w, h));
         horizon_client::widgets::end_frame(u64::MAX);
 
         let targets = key_focus::drawn_targets();
-        let (x, y, w, h) = Game::leave_bed_button(width, height);
         let bed = targets
             .iter()
             .copied()

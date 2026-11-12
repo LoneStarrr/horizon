@@ -10,7 +10,6 @@ use horizon_client::{
     items::ItemStack,
     mobs::Who,
     projectiles::{Projectile, ProjectileKind},
-    random_source,
 };
 use horizon_core::{geometry::Vec3, random::RandomSource};
 
@@ -341,10 +340,12 @@ impl Game<'_> {
             let rocket = &*ammo.item == FIREWORK_ROCKET;
             if rocket {
                 let at = Vec3::new(eye[0], eye[1] - f64::from(0.15f32), eye[2]);
-                let mut shot = Projectile::new(ProjectileKind::Snowball, at, None);
-                shot.shoot(&mut random_source::entity(), dir.to_array(), power, 1.0);
-                self.launch_angled_rocket(at, shot.velocity, ammo, Some(Who::Player));
-                self.player_projectile_shot();
+                // Its first tick posts the shot (Projectile.tick).
+                self.launch_angled_rocket(at, ammo, Some(Who::Player), |own| {
+                    let mut shot = Projectile::new(ProjectileKind::Snowball, at, None);
+                    shot.shoot(own, dir.to_array(), power, 1.0);
+                    shot.velocity
+                });
             }
             if !rocket {
                 let effect = super::dispenser::tipped_effect(ammo).or_else(|| {
@@ -367,10 +368,10 @@ impl Game<'_> {
                     a.fired_from_weapon = Some(weapon.clone());
                     a.pierce = pierce;
                 }
-                // Flame: the arrow is spawned burning (EnchantmentHelper.onProjectileSpawned).
-                self.ignite_spawned_arrow(&weapon, &mut arrow);
-                arrow.shoot(&mut self.world.random, dir.to_array(), power, 1.0);
-                self.add_projectile(arrow);
+                // Flame: `spawn_projectile` runs EnchantmentHelper.onProjectileSpawned
+                // for the weapon the arrow was fired from.
+                arrow.shoot_own(dir.to_array(), power, 1.0);
+                self.spawn_projectile(arrow, ammo);
                 let (player, name, projectile) = (
                     horizon_client::lan::playerdata::ints_uuid(self.acting_player_uuid()),
                     self.acting_player_name().to_owned(),
@@ -408,7 +409,10 @@ mod tests {
     use super::*;
 
     /// A game on the prepared resources with a creative player.
-    fn game_with_player(root: &std::path::Path) -> (Game<'static>, [f64; 3]) {
+    fn game_with_player<'a>(
+        resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>,
+        root: &std::path::Path,
+    ) -> (Game<'a>, [f64; 3]) {
         use crate::game::{Audio, Options, Progress, Settings, load_resources};
         let settings = Settings::default();
         let loaded = load_resources(
@@ -427,7 +431,7 @@ mod tests {
         let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
         options.resources = root.to_path_buf();
         options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
-        let res: &'static _ = Box::leak(Box::new(loaded.resources));
+        let res = resources.insert(loaded.resources);
         let mut game = Game::new(
             res,
             loaded.pack,
@@ -461,7 +465,8 @@ mod tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn bow_and_crossbow_shots_sound_at_the_feet_not_the_eye() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let (mut game, feet) = game_with_player(&root);
+        let mut resources = None;
+        let (mut game, feet) = game_with_player(&mut resources, &root);
         let eye = game.eye_position().unwrap();
         assert_ne!(eye, feet);
 
@@ -489,15 +494,16 @@ mod tests {
         assert_eq!(at, vec![feet]);
     }
 
-    /// `AbstractArrow`'s constructor runs `EnchantmentHelper.onProjectileSpawned`
-    /// for the weapon the arrow is fired from, bow or crossbow, so a Flame
+    /// `Projectile.applyOnProjectileSpawned` runs `EnchantmentHelper.onProjectileSpawned`
+    /// for the weapon an arrow is fired from, bow or crossbow, so a Flame
     /// crossbow shoots burning arrows: Flame's `Ignite(constant(100))` is 100
     /// seconds, 2000 ticks, on every arrow of a Multishot volley (#10482).
     #[test]
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn a_flame_crossbow_shoots_burning_arrows() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let (mut game, _) = game_with_player(&root);
+        let mut resources = None;
+        let (mut game, _) = game_with_player(&mut resources, &root);
         // Shoots a crossbow with `enchantments` and one arrow loaded per shot,
         // and returns how long each new arrow burns for.
         let mut shoot = |enchantments: &[&str], shots: usize| -> Vec<i32> {

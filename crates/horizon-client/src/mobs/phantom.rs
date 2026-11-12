@@ -46,8 +46,7 @@ pub fn set_size(m: &mut Mob, size: i32) {
     }
 }
 fn can_attack(w: &MobWorld) -> bool {
-    w.player
-        .as_ref()
+    w.selected_player()
         .is_some_and(|p| p.alive && !p.creative && !p.spectator)
 }
 /// `Phantom.canAttack(level, player, TargetingConditions.DEFAULT)`: as above,
@@ -72,7 +71,7 @@ impl Goal for AttackPlayerTarget {
             return false;
         }
         self.next_scan = reduced(60);
-        let Some(p) = &cx.w.player else {
+        let Some(p) = cx.w.selected_player() else {
             return false;
         };
         let d = p.position;
@@ -80,7 +79,7 @@ impl Goal for AttackPlayerTarget {
             && (d.y - m.position.y).abs() <= 64.0
             && (d.z - m.position.z).abs() <= 16.0 + f64::from(m.width());
         if near && can_attack_seen(m, cx.w) {
-            m.ai.target = Some(Who::Player);
+            m.set_ai_target(cx.w, Some(Who::Player));
             return true;
         }
         false
@@ -260,8 +259,8 @@ impl Goal for SweepAttack {
         }
         !self.scared
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = None;
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        m.set_ai_target(cx.w, None);
         m.extra.flag = false;
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
@@ -627,5 +626,15 @@ mod anchor_save_tests {
         let stale = saved_phantom(Some([100, 64, -40]));
         let saved = mob_to_nbt(&loose, [0; 4], Some(&stale), None, |_| None);
         assert_eq!(saved.get("anchor_pos"), None, "no anchor, no key");
+    }
+
+    #[test]
+    fn a_phantoms_look_control_keeps_the_flight_pitch() {
+        let types = phantom_types();
+        let mut m = mob_from_nbt(&saved_phantom(None), &types, 3, None).unwrap();
+        // `PhantomLookControl.tick` is empty, unlike `LookControl.tick`.
+        m.head_pitch = -22.0;
+        m.look_control_tick();
+        assert_eq!(m.head_pitch, -22.0);
     }
 }

@@ -5,9 +5,12 @@ use crate::{
     fast_hash::{FxHashMap, FxHashSet},
     section_mask::SectionMask,
 };
-use horizon_core::random::LegacyRandom;
+use horizon_core::random::{LegacyRandom, LevelRandom};
 use horizon_world::registry::BlockStateId;
 use std::sync::Arc;
+
+mod modified;
+pub use modified::ModifiedChunks;
 
 /// Sections (x, section index, z) waiting to be remeshed, kept by column
 /// (a bit per section index), so the mesh scheduler looks at each column once
@@ -20,6 +23,10 @@ impl DirtySections {
     pub fn insert(&mut self, (x, sy, z): (i32, i32, i32)) {
         debug_assert!((0..SectionMask::CAPACITY as i32).contains(&sy));
         self.columns.entry((x, z)).or_default().insert(sy as usize);
+    }
+    /// Mark all sections in `mask` dirty for column `(x, z)`.
+    pub fn insert_column_mask(&mut self, (x, z): (i32, i32), mask: SectionMask) {
+        *self.columns.entry((x, z)).or_default() |= mask;
     }
     pub fn contains(&self, &(x, sy, z): &(i32, i32, i32)) -> bool {
         (0..SectionMask::CAPACITY as i32).contains(&sy)
@@ -57,12 +64,15 @@ pub struct World {
     /// The holders lent to mods since the last flush, whose synced changes
     /// `flush_attachment_sync` sends.
     pub attachment_syncs: FxHashSet<horizon_mod_runtime::attachments::Holder>,
+    /// Block entities a moving piston landed since the last flush, whose
+    /// synced attachments `flush_attachment_sync` sends whole (#3184).
+    pub attachment_landings: FxHashSet<horizon_mod_runtime::attachments::Holder>,
     /// The level's build range and skylight (its dimension type); its
     /// chunks hold `shape.column()`.
     pub shape: LevelShape,
     pub fast_lava: bool,
     pub chunks: crate::chunk_map::ChunkMap,
-    pub random: LegacyRandom,
+    pub random: LevelRandom,
     pub revision: u64,
     pub health_rules: HealthRules,
     pub air: BlockStateId,
@@ -73,6 +83,10 @@ pub struct World {
     /// Edits on lit chunks (position, old state, new state), relit
     /// incrementally by streaming.
     pub light_edits: Vec<((i32, i32, i32), u32, u32)>,
+    /// Where each light check queued since the last ask sits in `light_edits`, so a repeated
+    /// check at the same position queues nothing, as `LevelLightEngine.checkBlock` queues into a
+    /// set. An index that no longer holds its position (drained, rolled back) is ignored.
+    pub light_checks: crate::fast_hash::FxHashMap<(i32, i32, i32), usize>,
     /// Saved entities of chunks that just loaded, spawned by the game.
     pub loaded_entities: Vec<((i32, i32), Vec<horizon_core::nbt::Tag>)>,
     /// Chunks loaded since the level's last pass, their entity sections not
@@ -83,9 +97,19 @@ pub struct World {
     /// was generated rather than read from the save: the game tells native mods.
     pub loaded_chunks: Vec<(i32, i32, bool)>,
     /// Chunks changed since the last save.
-    pub modified: FxHashSet<(i32, i32)>,
+    pub modified: ModifiedChunks,
     /// Block entities, and the order they tick in.
     pub block_entities: crate::block_entities::BlockEntities,
+    /// Carrier transfer fences: the world cells and carriers locked
+    /// while a carrier operation runs between prepared and committed
+    /// (the game's carrier transfers). Empty, one load, when no
+    /// operation is in flight.
+    pub carrier_fences: crate::carrier_fences::Fences,
+    /// Whether the world's `data/` folder already existed when the
+    /// world opened — the carrier store's first-use gate. Captured at
+    /// open, not at transfer time, so a folder created this session
+    /// (by the first save, say) cannot pass for an old one.
+    pub carrier_data_existed_at_open: bool,
     /// Each chest's `ContainerOpenersCounter`: opener count and largest
     /// interaction range.
     pub chest_openers: FxHashMap<(i32, i32, i32), (i32, f64)>,
@@ -101,6 +125,9 @@ pub struct World {
     pub inhabited: FxHashMap<(i32, i32), i64>,
     pub game_time: i64,
     pub day_time: i64,
+    /// The End's world clock (`WorldClocks.THE_END`, the End sky flash's), saved apart from
+    /// the game time and, like every clock, still while `advance_time` is off.
+    pub end_clock: i64,
     pub weather: Weather,
     /// Every block position written since the log was last drained, kept
     /// only while the world is open to the network (see `lan`).
@@ -120,7 +147,7 @@ pub struct World {
     /// (`ChunkHolder.sectionLightChanged`).
     pub light_log: Option<crate::fast_hash::FxHashMap<(i32, i32), SectionMask>>,
     /// The villager POIs of each section (`PoiManager`'s sections).
-    pub pois: crate::poi_sections::PoiSections<horizon_world::poi::PoiType>,
+    pub pois: crate::poi_sections::PoiSections<horizon_world::poi::PoiIdentity>,
     /// Moving-piston states removed during the last tick; retained until the
     /// final block mesh is visible.
     pub moving_piston_fallback: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
@@ -227,7 +254,7 @@ impl World {
         Self {
             shape: LevelShape::OVERWORLD,
             chunks: Default::default(),
-            random: LegacyRandom::new(seed),
+            random: LevelRandom::for_level(LegacyRandom::new(seed)),
             revision: 0,
             health_rules: HealthRules::default(),
             air,
@@ -235,13 +262,17 @@ impl World {
             dirty_sections: Default::default(),
             dirty_light: Default::default(),
             light_edits: Vec::new(),
+            light_checks: Default::default(),
             loaded_entities: Vec::new(),
             entities_pending: FxHashSet::default(),
             loaded_chunks: Vec::new(),
-            modified: FxHashSet::default(),
+            modified: ModifiedChunks::default(),
             attachments: Default::default(),
             attachment_syncs: FxHashSet::default(),
+            attachment_landings: FxHashSet::default(),
             block_entities: Default::default(),
+            carrier_fences: Default::default(),
+            carrier_data_existed_at_open: false,
             chest_openers: FxHashMap::default(),
             block_names: FxHashMap::default(),
             watched: Vec::new(),
@@ -249,6 +280,7 @@ impl World {
             inhabited: FxHashMap::default(),
             game_time: 0,
             day_time: 1000,
+            end_clock: 0,
             weather: Weather::default(),
             block_log: None,
             block_log_held: Vec::new(),
@@ -325,6 +357,12 @@ impl World {
     /// The lowest block Y the level's chunks hold.
     pub fn bottom_y(&self) -> i32 {
         self.layout().min_y()
+    }
+    /// `Entity.checkBelowWorld`'s floor, `Level.getMinY() - 64`: the level's own
+    /// lowest Y (0 in the Nether and the End), not the chunks' widened column.
+    /// An entity below it is out of the world.
+    pub fn below_world_y(&self) -> f64 {
+        f64::from(self.shape.min_y - 64)
     }
     /// One above the highest block Y the level's chunks hold.
     pub fn top_y(&self) -> i32 {
@@ -515,6 +553,30 @@ impl World {
     pub fn is_loaded_at(&self, x: i32, y: i32, z: i32) -> bool {
         self.shape.contains_y(y) && self.loaded(x, z)
     }
+    /// Persisted container capacity override; absence preserves vanilla capacity.
+    pub fn container_stack_limit(&self, key: (i32, i32, i32)) -> Option<u32> {
+        self.chunks
+            .get(&(key.0 >> 4, key.2 >> 4))
+            .and_then(|c| c.container_stack_limits.get(&key).copied())
+    }
+    /// Store with the authoritative saved block entity fields.
+    pub fn set_container_stack_limit(&mut self, key: (i32, i32, i32), limit: u32) {
+        use horizon_core::nbt::{Compound, Tag};
+        self.with_chunk_extras(key, |extras| {
+            if !extras.block_entity_sources.iter().any(|(p, _)| *p == key) {
+                extras
+                    .block_entity_sources
+                    .push((key, Tag::Compound(Compound::new())));
+            }
+            if let Some((_, Tag::Compound(tag))) = extras
+                .block_entity_sources
+                .iter_mut()
+                .find(|(p, _)| *p == key)
+            {
+                tag.insert("horizon:stack_limit".into(), Tag::Int(limit as i32));
+            }
+        });
+    }
     /// `LockCode`: the `lock` a container block entity refuses to open
     /// without, as the tag it was loaded or set with carries it (Horizon's
     /// model holds no field for it).
@@ -618,6 +680,23 @@ impl World {
             .map(Arc::unwrap_or_clone)
             .unwrap_or_default();
         f(&mut extras);
+        let limit = extras
+            .block_entity_sources
+            .iter()
+            .find(|(p, _)| *p == key)
+            .and_then(|(_, tag)| tag.get("horizon:stack_limit"))
+            .and_then(|tag| match tag {
+                horizon_core::nbt::Tag::Int(n) if (1..=99).contains(n) => Some(*n as u32),
+                _ => None,
+            });
+        match limit {
+            Some(limit) => {
+                chunk.container_stack_limits.insert(key, limit);
+            }
+            None => {
+                chunk.container_stack_limits.remove(&key);
+            }
+        }
         chunk.saved = Some(Arc::new(extras));
         self.modified.insert(chunk_key);
     }
@@ -655,6 +734,48 @@ mod tests {
     use crate::chunk::{Chunk, MIN_Y, SECTIONS};
     use horizon_world::registry::BlockStateId;
     use std::sync::Arc;
+
+    #[test]
+    fn block_entity_neighbor_far_read_keeps_chunk_unloaded() {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        let count = world.chunks.len();
+        assert!(world.loaded(15, 0));
+        assert!(!world.loaded(16, 0));
+        assert_eq!(world.block(16, 64, 0), BlockStateId(0));
+        assert_eq!(world.chunks.len(), count);
+        assert!(!world.loaded(16, 0));
+    }
+
+    #[test]
+    fn container_limit_index_tracks_load_rollback_removal_and_replacement() {
+        use crate::chunk::ChunkExtras;
+        use horizon_core::nbt::{Compound, Tag};
+        let key = (3, 70, 4);
+        let mut extras = ChunkExtras::default();
+        for (pos, n) in [(key, 10), ((4, 70, 4), 100), ((5, 70, 4), 0)] {
+            let mut tag = Compound::new();
+            tag.insert("horizon:stack_limit".into(), Tag::Int(n));
+            extras.block_entity_sources.push((pos, Tag::Compound(tag)));
+        }
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.saved = Some(Arc::new(extras));
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(chunk));
+        assert_eq!(world.container_stack_limit(key), Some(10));
+        assert_eq!(world.container_stack_limit((4, 70, 4)), None);
+        assert_eq!(world.container_stack_limit((5, 70, 4)), None);
+        let kept = world.block_entity_extras(key);
+        world.set_container_stack_limit(key, 20);
+        assert_eq!(world.container_stack_limit(key), Some(20));
+        world.set_block_entity_extras(key, kept);
+        assert_eq!(world.container_stack_limit(key), Some(10));
+        world.forget_block_entity_source(key);
+        assert_eq!(world.container_stack_limit(key), None);
+        world.set_container_stack_limit(key, 30);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        assert_eq!(world.container_stack_limit(key), None);
+    }
 
     /// `/weather thunder` then `/weather clear` in a frozen world: the levels sit at their
     /// targets at every partial tick, where a tick of fading would have moved them 0.01.
@@ -747,8 +868,8 @@ mod tests {
 }
 
 /// A block entity's fields kept beside its model ([`World::block_entity_extras`]).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockEntityExtras {
-    source: Option<horizon_core::nbt::Tag>,
-    rolled_loot: Option<crate::chunk::RolledLoot>,
+    pub source: Option<horizon_core::nbt::Tag>,
+    pub rolled_loot: Option<crate::chunk::RolledLoot>,
 }

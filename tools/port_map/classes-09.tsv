@@ -1,10 +1,10 @@
 SetStewEffectFunction.Builder	skip:java		builder for the stew effect list; Horizon keeps the effects in loot.rs Context::run (set_stew_effect)
 SetWritableBookPagesFunction	missing		`horizon-world/src/loot.rs::modify` has no `set_writable_book_pages` arm, and no vanilla loot table asks for one
-SetWrittenBookPagesFunction	missing		no `set_written_book_pages` arm in `loot.rs::modify` (the arms run from `sequence` and `set_count` through `set_potion` to `set_stew_effect`); no vanilla loot table asks for one
+SetWrittenBookPagesFunction	home	crates/horizon-world/src/loot.rs,crates/horizon-items/src/item_data.rs	the set_written_book_pages arm applies the page operation to the written_book_content component; written_book_from_tag reads the content into the book's pages
 SmeltItemFunction.run	port	crates/horizon-world/src/loot.rs::Context::run	furnace_smelt arm: smelting recipe, use_input_count and stack cap
 SmeltItemFunction.smelted	skip:java		static builder factory
-ToggleTooltips	home	crates/horizon-client/src/game/administration/commands/items.rs	the `/item modify` arm of cmd_item_modify writes the tooltip_display component's hide_tooltip and hidden_components as run does; the loot run has no arm, and no vanilla loot table uses it
-ToggleTooltips.run	inline	crates/horizon-client/src/game/administration/commands/items.rs::Game::cmd_item_modify	the `minecraft:toggle_tooltips` arm of the `/item modify` command adds each false toggle to `tooltip_display`'s hidden_components and keeps hide_tooltip; the loot run has no arm, so a loot table's toggle_tooltips is ignored (no vanilla loot table uses one)
+ToggleTooltips	home	crates/horizon-client/src/game/commands/items.rs,crates/horizon-world/src/loot.rs	the /item modify arm and the toggle_tooltips loot arm both update the tooltip_display component's hidden_components as TooltipDisplay.withHidden does
+ToggleTooltips.run	port	crates/horizon-world/src/loot.rs::Context::run	the arm keeps a hide_tooltip an earlier function set, removes a shown component from hidden_components and adds a hidden one
 LootContextParamSets	skip:data		loot parameter set registry and validation; Horizon reads its loot tables
 AllOfCondition.allOf	skip:java		static builder
 AllOfCondition.combine	inline	crates/horizon-items/src/items.rs::LootContext::condition	all_of arm: every term must hold
@@ -133,25 +133,25 @@ Vec2.rotate	port	crates/horizon-client/src/mobs/sulfur_cube.rs::rotate	x cos - y
 Vec2.scale	skip:other		2D vector maths; Horizon has no Vec2 type and keeps 2D maths in its callers
 Vec2.equals	skip:java		Object equality; Rust derives it
 Vec2.hashCode	skip:java		Object hashing; Rust derives it
-ArrayVoxelShape.getCoords	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::coordinates	
+ArrayVoxelShape.getCoords	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::coordinates
 BitSetDiscreteVoxelShape.<init>	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::from_cube	gap: minor: takes the occupancy from the caller; there is no empty-grid constructor
-BitSetDiscreteVoxelShape.clearZStrip	port	crates/horizon-core/src/geometry/shape.rs::clear_strip	
+BitSetDiscreteVoxelShape.clearZStrip	port	crates/horizon-core/src/geometry/shape.rs::clear_strip
 BitSetDiscreteVoxelShape.fillUpdateBounds	inline	crates/horizon-core/src/geometry/shape.rs::VoxelShape::build	bounds computed from the filled grid
-BitSetDiscreteVoxelShape.forAllBoxes	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::decompose	
-BitSetDiscreteVoxelShape.getIndex	port	crates/horizon-core/src/geometry/shape.rs::index	
+BitSetDiscreteVoxelShape.forAllBoxes	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::decompose
+BitSetDiscreteVoxelShape.getIndex	port	crates/horizon-core/src/geometry/shape.rs::index
 BitSetDiscreteVoxelShape.isInterior	skip:other		no vanilla caller outside its own class
 BitSetDiscreteVoxelShape.isXZRectangleFull	inline	crates/horizon-core/src/geometry/shape.rs::VoxelShape::decompose	the greedy x-z merge inside decompose
-BitSetDiscreteVoxelShape.isZStripFull	port	crates/horizon-core/src/geometry/shape.rs::strip_full	
-BitSetDiscreteVoxelShape.join	port	crates/horizon-core/src/geometry/shape/create.rs::VoxelShape::join	
-BitSetDiscreteVoxelShape.withFilledBounds	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::with_discrete_bounds	
-CubeVoxelShape.findIndex	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::find_index	
-DiscreteCubeMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge	
-IdenticalMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge	
+BitSetDiscreteVoxelShape.isZStripFull	port	crates/horizon-core/src/geometry/shape.rs::strip_full
+BitSetDiscreteVoxelShape.join	port	crates/horizon-core/src/geometry/shape/create.rs::VoxelShape::join
+BitSetDiscreteVoxelShape.withFilledBounds	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::with_discrete_bounds
+CubeVoxelShape.findIndex	port	crates/horizon-core/src/geometry/shape.rs::VoxelShape::find_index
+DiscreteCubeMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge
+IdenticalMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge
 IndirectMerger.<init>	skip:java		list wrapper constructor
-IndirectMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge	
+IndirectMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::merge
 IndirectMerger.getList	skip:java		list accessor
 MinecartCollisionContext	missing		`game/entities/minecarts.rs::move_cart` has no exclusion for the block a rail rests on or the slope block of an ascending rail, so a cart's move collides with them as with any other block
-NonOverlappingMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::disjoint	
-NonOverlappingMerger.forNonSwappedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::disjoint	
+NonOverlappingMerger.forMergedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::disjoint
+NonOverlappingMerger.forNonSwappedIndexes	port	crates/horizon-core/src/geometry/shape/join.rs::disjoint
 NonOverlappingMerger.getDouble	skip:java		list accessor
-PositionCollisionContext.isAbove	port	crates/horizon-world/src/collision_context.rs::CollisionContext::is_above	
+PositionCollisionContext.isAbove	port	crates/horizon-world/src/collision_context.rs::CollisionContext::is_above

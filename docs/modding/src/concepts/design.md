@@ -18,7 +18,7 @@ branches. An old mod rebuilds, and the compiler says what moved. Removing a path
 catalog, these docs, the tests and the sample mod in the same change. A hook with no NeoForge counterpart is
 judged on its merits like any other.
 
-Every hook is declared once, in the catalog (`crates/horizon-mod-api/src/hooks/`): its name, side, contract,
+Every hook is declared once, in the catalog (`crates/horizon-mod-vocab/src/hooks/`): its name, side, contract,
 scope and `doc`. The generator writes everything repeated from it: the `Hooks` trait, the part traits, the
 `Host` traits, the dispatch and the [reference](../reference/api.md). A hook is added by declaring it, not by
 editing match arms.
@@ -79,17 +79,21 @@ and [Parts](trait-mods.md#parts).
 | Behaviour | Entry point | Side and collection time | When usable |
 | --- | --- | --- | --- |
 | Block, block entity, item, entity and menu Parts | `Registrar::attach_block_part`, `attach_block_entity_part`, `attach_item_part`, `attach_entity_part`, `attach_menu_part` | Startup on the sides that load the mod | After resolution against the game's registries. Each Part method runs on the side declared for that hook. |
-| Capability providers | `provide_block_entity_capability`, `provide_item_capability`, `provide_entity_capability` on the registrar | Startup registration, server provider calls | After the game resolves the registrations. A capability query supplies the holder and a server host. |
+| Capability providers | `provide_block_entity_capability`, `provide_block_capability`, `provide_item_capability`, `provide_entity_capability` on the registrar | Startup registration, server provider calls | After the game resolves the registrations. A capability query supplies the holder and a server host. |
 | Block entity types, default entity attributes and entity spawn placements | `declare_block_entity_type`, `declare_entity_attributes`, `modify_entity_attributes`, `declare_spawn_placement` | Startup declarations on the sides that load the mod | When the registered types, defaults and spawn rules are resolved against the content tables. |
+| Biome modifiers | `declare_biome_modifier` | Startup declarations on the sides that load the mod | When the world's biome tables build, with the data-file biome modifiers. Not applied by the game yet. |
+| Biome regions | `declare_biome_region` | Startup declarations on the sides that load the mod | Sorted by mod id, then region id. A new world records them; from then on its saved layout, not the mods, decides the Overworld's and Nether's regions ([the design](mod-biome-regions.md)). |
+| New attribute types | `declare_attribute` | Startup declarations on the sides that load the mod | When the attribute catalog grows, before entity attribute rows resolve. The mod attributes append after the vanilla ones, sorted by mod id then attribute id — the network id order on every side running the same mods. |
 | Game rules and categories | `game_rule_bool`, `game_rule_category` | Startup, before the game validates and installs the rule schema | When the game uses the installed schema to load rule values and build the rule UI. |
 | Dimension and chunk generation code, structure types, ticket controllers | `register_dimension`, `register_chunk_generator`, `register_structure_type`, `register_ticket_controller` | Startup declarations, consumed by world setup and generation | When the world resolves its dimension, structure or ticket registrations. |
 | Controls bindings | `Registrar::register_key_mapping` | Startup registration, client consumer | When the client installs the bindings in Controls and restores saved bindings. |
 | Component tooltips | `Registrar::register_tooltip_appender` | Startup registration, client consumer | The item tooltip builder uses the callback for the registered component and placement. |
-| Server commands | `Hooks::register_commands` collects `NativeCommand` usages | Server, when opening a world and on explicit command refresh | After the server rebuilds the command tree. The server owns permission checks and sends the tree to players. |
-| Client commands | `Hooks::register_client_commands` collects `NativeCommand` usages | Client, at connection start and when the server sends its tree | After the client incorporates them into completion and local dispatch. |
+| Server commands | `Hooks::register_commands` collects `Command` usages | Server, when opening a world and on explicit command refresh | After the server rebuilds the command tree. The server owns permission checks and sends the tree to players. |
+| Command argument types | `Registrar::register_command_argument` declares parsing and suggestions | Startup, on the sides that load the mod | Before command trees that use the type are built at world open or refresh; clients that do not know the type complete it from the server. |
+| Client commands | `Hooks::register_client_commands` collects `Command` usages | Client, at connection start and when the server sends its tree | After the client incorporates them into completion and local dispatch. |
 | HUD layers and F3 entries | `register_gui_layers` and `register_debug_entries` | Client startup | When the installed HUD order or debug entry list is used for drawing. |
 | World-space debug renderers | `register_debug_renderers` | Client, each refresh of the renderer list | The next debug draw uses the refreshed list. |
-| Model layers, block and item tints, numeric and categorical item model properties | `layer_definitions`, `register_block_tint_sources`, `register_item_tint_sources`, `register_range_select_item_model_property`, `register_select_item_model_property` | Client startup before resource loading | The client can resolve the declarations when it builds its models and rendering tables. |
+| Model layers, colour resolvers, block and item tints, numeric and categorical item model properties | `register_layer_definitions`, `register_color_resolvers`, `register_block_tint_sources`, `register_item_tint_sources`, `register_range_select_item_model_property`, `register_select_item_model_property` | Client startup before resource loading | The client can resolve the declarations when it builds its models and rendering tables. |
 | Data map types | `data_map_types` | Server, at world data load and each reload | After the server publishes the loaded data maps. |
 | Recipe property additions | `recipe_property_sets` | Server data load and client preload, after recipes resolve, and again on reload | When station slot checks use the published sets. |
 | Mod configs | `register_configs` | Config phase on the owning side, once at startup for Client/Common and per world for Server | After the file is read and the mod receives its config loading callback. |
@@ -110,7 +114,6 @@ reload. Each builder should collect typed declarations and validate keys before 
 
 | Builder | Side and contract | Issue |
 | --- | --- | --- |
-| Command argument types | Register codecs, parsing and suggestions before building command trees that use the types. | [#810](https://github.com/arismoko/horizon/issues/810) |
 | Data pack registries | Declare the entry codec before server data loading and rebuild the registry on reload. | [#811](https://github.com/arismoko/horizon/issues/811) |
 | Attribute types | Declare a namespaced attribute and its value rules before entity defaults resolve. | [#812](https://github.com/arismoko/horizon/issues/812) |
 | World generation features | Bind named feature and placement implementations before server worldgen data resolves them. | [#815](https://github.com/arismoko/horizon/issues/815) |
@@ -146,8 +149,8 @@ them; the design is this:
 
 - **One trait per scope.** `BlockPart`, `BlockEntityPart`, `ItemPart` and `MenuPart` are generated from the
   catalog entries whose `scope` names them, so a part on a plain block has no tick method to write.
-- **A global hook only where NeoForge has a bus event.** Where NeoForge fires an event at the same moment as
-  the override, that event is a hook on `Hooks`, asked first for everything, and its cancel skips the parts.
+- **A global hook only where NeoForge has a bus event.** Where a NeoForge event is the counterpart for
+  the override moment, that event is a hook on `Hooks`, asked first for everything, and its cancel skips the parts.
   Where it has none, the moment is a part method alone and has no global form. A mod reacting to its own blocks
   uses a part; one reacting to every block uses the event.
 - **A part is configuration.** It takes `&self` and is `Send + Sync`, like a vanilla `Block`'s properties. State
@@ -224,16 +227,15 @@ rests on the one before:
 
 1. **The prebuilt game.** The game as a dylib with its metadata, built daily and published as prerelease
    builds, so a native mod compiles against it instead of rebuilding the game.
-2. **Slots.** Injection targets compiled into the prebuilt game, so a mixin does not force a rebuild. The
-   generated slot points exist; filling them from a mod follows.
+2. **Slots.** `[[inject]]` listeners fill compiled points without compiling game code.
+   A missing slot is refused, including on native.
 3. **The internals tier.** A per-mod declared list of game internals the prebuilt game exposes. It is native
    only and logged, and each internal a mod needs is a request for an API.
-4. **The blend.** A wasm mod that also carries slot mixins. An API-typed mixin is filled by the `mod.wasm`
-   itself, with no native code. A mixin that needs internals ships as source, compiles on install, and marks
-   the package as including native code. The native and wasm parts talk only through interfaces the mod
-   declares, with plain data or resources crossing, so raw internals never reach the wasm side.
+4. **Wasm points.** API `[[inject]]` listeners use the same records on native and wasm.
+   Engine internals and listed call sites are native only.
 
-A mod that needs a change to a non-slot part of the game still rebuilds the game.
+A native mod that needs a supported source edit uses [mixins](../mixins.md),
+which compile game code. An inject never falls back to one.
 
 ## No telemetry
 

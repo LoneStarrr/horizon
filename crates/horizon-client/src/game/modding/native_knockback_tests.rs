@@ -67,7 +67,7 @@ fn heard(test: impl FnOnce(&mut super::Game<'_>, &Mutex<Heard>)) -> Heard {
         Box::new(Probe(log.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || with_game(|game| test(game, &log)));
+    mod_platform::testing::with_mods(mods, || with_game(|game| test(game, &log)));
     std::mem::take(&mut *log.lock().unwrap())
 }
 
@@ -283,7 +283,7 @@ fn the_attack_scope_nests_restores_and_a_guest_swap_hides_it() {
         Box::new(Probe(log.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         super::native_guest_turn_tests::with_guests(|game| {
             player_with_sword(game);
             let outer = game.attack_of(7);
@@ -325,7 +325,7 @@ fn next_draw_after_a_directionless_push(cancel: Option<bool>) -> i32 {
         zombie_at(game, 42, Vec3::ZERO);
         let hit = Damage::of(DamageKind::Generic);
         let mut mob = game.mobs.pop().unwrap();
-        mob.knockback(damage_level_of!(game), 0.4, 0.0, 0.0, &hit);
+        mob.knockback(damage_level_of!(game), 0.4, 0.0, 0.0, &hit, 0.0);
         *drawn.lock().unwrap() = mob.random.next_int();
     };
     match cancel {
@@ -335,7 +335,7 @@ fn next_draw_after_a_directionless_push(cancel: Option<bool>) -> i32 {
             log.lock().unwrap().cancel = cancel;
             let mods: mod_api::Mods =
                 vec![mod_api::ModEntry::new("probe", Box::new(Probe(log)))].into();
-            mod_api::testing::with_mods(mods, || with_game(draw));
+            mod_platform::testing::with_mods(mods, || with_game(draw));
         }
     }
     drawn.into_inner().unwrap()
@@ -361,7 +361,7 @@ fn a_guest_blow_on_a_guest_names_the_attacker_and_the_sword() {
         Box::new(Probe(log.clone())),
     )]
     .into();
-    mod_api::testing::with_mods(mods, || {
+    mod_platform::testing::with_mods(mods, || {
         super::native_guest_turn_tests::with_guests(|game| {
             game.lan
                 .as_mut()

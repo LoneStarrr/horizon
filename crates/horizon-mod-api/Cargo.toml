@@ -10,10 +10,9 @@ description = "The mod API: hooks, hosts, handles and parts, for native and WebA
 name = "mod_api"
 
 [dependencies]
+horizon-mod-vocab = { path = "../horizon-mod-vocab" }
 horizon-mod-runtime = { path = "../horizon-mod-runtime" }
 horizon-core = { path = "../horizon-core" }
-horizon-world = { path = "../horizon-world" }
-horizon-mod-package = { path = "../horizon-mod-package", default-features = false }
 horizon-mod-api-macros = { path = "../horizon-mod-api-macros" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
@@ -25,12 +24,11 @@ glam = "0.30"
 horizon-mod-api-gen = { path = "../horizon-mod-api-gen" }
 
 [dev-dependencies]
-# `Items::for_tests` for the fluid ingredient unit tests.
-horizon-items = { path = "../horizon-items", features = ["test-support"] }
+horizon-mod-vocab = { path = "../horizon-mod-vocab", features = ["testing"] }
 
 [features]
 # Scoped mod installation for other crates' tests (`mod_api::testing`).
-testing = []
+testing = ["horizon-mod-vocab/testing"]
 # The mod side of the wasm boundary on a native build, for the boundary's tests.
 wasm-guest = []
 

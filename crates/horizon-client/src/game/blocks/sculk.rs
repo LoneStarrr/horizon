@@ -21,7 +21,7 @@ use horizon_core::{
     random::RandomSource,
 };
 use horizon_world::registry::BlockStateId;
-use mod_api::particles::PositionSource;
+use mod_api::client::particles::PositionSource;
 use std::collections::HashSet;
 
 pub const HELP: &[&str] = &[
@@ -364,12 +364,19 @@ impl Game<'_> {
             self.sculk.tracker = WardenSpawnTracker::from_nbt(tag);
         }
     }
-    /// Write the tracker into the player data being saved.
+    /// The tracker as saved, once it has been loaded.
+    pub(super) fn warden_tracker_tag(&self) -> Option<horizon_core::nbt::Tag> {
+        self.sculk
+            .tracker_loaded
+            .then(|| self.sculk.tracker.to_nbt())
+    }
+    /// Write the tracker into the player data being saved. With a LAN owner,
+    /// `store_owner` rewrites that from the owner's guest, so it puts the
+    /// tracker there as well (`playerdata::with_warden`).
     pub(super) fn save_warden_tracker(&mut self) {
-        if !self.sculk.tracker_loaded {
+        let Some(tag) = self.warden_tracker_tag() else {
             return;
-        }
-        let tag = self.sculk.tracker.to_nbt();
+        };
         let extra = self
             .level
             .player_extra
@@ -479,6 +486,21 @@ impl Game<'_> {
             }
             self.sculk.known = loaded;
         }
+        self.sculk_sync_writes();
+    }
+
+    /// `LevelChunk.setBlockState`: finish sculk placement before a command
+    /// or `BlockItem.updateCustomBlockEntityTag` loads saved entity fields.
+    pub(super) fn sculk_place_entity(&mut self, state: BlockStateId) -> bool {
+        self.sculk_prepare();
+        if self.kind_of_state(state.0) == 0 {
+            return false;
+        }
+        self.sculk_sync_writes();
+        true
+    }
+
+    fn sculk_sync_writes(&mut self) {
         let writes = std::mem::take(&mut self.world.watched_writes);
         for (key, old, new) in writes {
             let (old_kind, new_kind) = (self.kind_of_state(old), self.kind_of_state(new));
@@ -574,6 +596,8 @@ impl Game<'_> {
             source: Some(Who::Player.into()),
             owner: None,
             affected_state: state,
+            source_uuid: None,
+            owner_uuid: None,
             dampening_state: self.state_dampens(state),
             spectator: self.spectator(),
             stepping_carefully: self.keys.held(Action::Sneak),
@@ -605,6 +629,8 @@ impl Game<'_> {
             source: Some(Who::Mob(id).into()),
             owner: None,
             affected_state: state,
+            source_uuid: None,
+            owner_uuid: None,
             dampening_state: self.state_dampens(state),
             spectator: false,
             stepping_carefully: false,
@@ -631,7 +657,11 @@ impl Game<'_> {
     }
 
     /// `GameEvent.Context.of(entity, state)` for a non-living entity.
-    pub(super) fn entity_event_context(&self, id: u32, state: Option<BlockStateId>) -> Context {
+    pub(in crate::game) fn entity_event_context(
+        &self,
+        id: u32,
+        state: Option<BlockStateId>,
+    ) -> Context {
         let dampens = self
             .dropped
             .iter()
@@ -676,7 +706,12 @@ impl Game<'_> {
     // ---- posting ----
 
     /// `Level.gameEvent`: tell the listeners within reach.
-    pub(super) fn post_game_event(&mut self, event: &'static str, pos: [f64; 3], ctx: Context) {
+    pub(in crate::game) fn post_game_event(
+        &mut self,
+        event: &'static str,
+        pos: [f64; 3],
+        ctx: Context,
+    ) {
         #[cfg(test)]
         TEST_POSTED_EVENTS.with(|events| {
             if let Some(events) = events.borrow_mut().as_mut() {
@@ -759,6 +794,7 @@ impl Game<'_> {
             return;
         }
         let ctx = ctx.unwrap_or_else(|| make_ctx(self));
+        let ctx = self.with_vibration_uuids(ctx);
         for key in near {
             self.sculk_listen(key, event, pos, &ctx);
         }
@@ -802,6 +838,27 @@ impl Game<'_> {
         }
         slots
     }
+    /// The context with the saved identities of its source and owner, as
+    /// `VibrationInfo`'s constructor takes them from the entities when the
+    /// event is heard. Only what the context already names is filled.
+    fn with_vibration_uuids(&self, mut ctx: Context) -> Context {
+        if ctx.source_uuid.is_none() {
+            ctx.source_uuid = self.vibration_uuid(ctx.source.and_then(|source| source.actor()));
+        }
+        if ctx.owner_uuid.is_none() {
+            ctx.owner_uuid = self.vibration_uuid(ctx.owner);
+        }
+        ctx
+    }
+    /// The saved UUID of a vibration's mob through the save layer's
+    /// `save_who_uuid`. `Who::Player` stays `None`: on a server it can be the
+    /// acting guest as well as the host, so it names no single entity here.
+    fn vibration_uuid(&self, who: Option<Who>) -> Option<[i32; 4]> {
+        match who {
+            Some(who @ Who::Mob(_)) => self.save_who_uuid(who),
+            _ => None,
+        }
+    }
     /// The mob at `index` hears a game event, if it is a warden or an allay.
     fn mob_listen(&mut self, index: usize, event: &'static str, pos: [f64; 3], ctx: &Context) {
         if self.mobs[index].species() == Species::Warden && self.mobs[index].alive() {
@@ -809,6 +866,19 @@ impl Game<'_> {
         }
         if self.mobs[index].species() == Species::Allay && self.mobs[index].alive() {
             self.allay_listen(index, event, pos, ctx);
+            // Allay.JukeboxListener, its own listener beside the vibrations'.
+            let playing = match event {
+                "minecraft:jukebox_play" => Some(true),
+                "minecraft:jukebox_stop_play" => Some(false),
+                _ => None,
+            };
+            let m = &mut self.mobs[index];
+            if let Some(playing) = playing
+                && allay::hears_jukebox(m, pos)
+            {
+                let at = pos.map(|v| v.floor() as i32);
+                allay::set_jukebox_playing(m, at, playing);
+            }
         }
     }
     /// A game event at a block (`Level.gameEvent(source, event, pos)`).
@@ -947,6 +1017,8 @@ impl Game<'_> {
                     pos,
                     source: ctx.source,
                     owner: ctx.owner,
+                    source_uuid: ctx.source_uuid,
+                    owner_uuid: ctx.owner_uuid,
                 },
                 time,
             );
@@ -1109,6 +1181,23 @@ impl Game<'_> {
                     let source = PositionSource::Block([key.0, key.1, key.2]);
                     self.vibration_particle(source, info.pos, center(key), travel);
                 }
+                if let Some((info, travel)) = tick.resumed {
+                    let source = PositionSource::Block([key.0, key.1, key.2]);
+                    let dest = center(key);
+                    let initial = info.distance.floor() as i32;
+                    // `tryReloadVibrationParticle` works in doubles.
+                    let alpha = if initial > 0 {
+                        1.0 - f64::from(travel) / f64::from(initial)
+                    } else {
+                        0.0
+                    };
+                    let current_pos = [
+                        info.pos[0] + (dest[0] - info.pos[0]) * alpha,
+                        info.pos[1] + (dest[1] - info.pos[1]) * alpha,
+                        info.pos[2] + (dest[2] - info.pos[2]) * alpha,
+                    ];
+                    self.vibration_particle(source, current_pos, dest, travel);
+                }
                 if let Some(info) = tick.received {
                     self.sculk_receive(key, info)?;
                 }
@@ -1260,6 +1349,7 @@ impl Game<'_> {
                     let d = [at[0] - dest[0], at[1] - dest[1], at[2] - dest[2]];
                     let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32;
                     let time = self.world.game_time;
+                    let source_uuid = self.vibration_uuid(Some(who));
                     if let Some(e) = self.sculk_entity(key) {
                         e.vibration.schedule(
                             Info {
@@ -1268,6 +1358,8 @@ impl Game<'_> {
                                 pos: at,
                                 source: Some(who.into()),
                                 owner: None,
+                                source_uuid,
+                                owner_uuid: None,
                             },
                             time,
                         );
@@ -1407,7 +1499,7 @@ impl Game<'_> {
                 f64::from(at.1),
                 f64::from(at.2) + 0.5,
             ];
-            let yaw = mod_api::camera::wrap_degrees(self.world.random.next_float() * 360.0);
+            let yaw = mod_api::client::camera::wrap_degrees(self.world.random.next_float() * 360.0);
             self.next_entity += 1;
             let mut mob = Mob::new(
                 self.next_entity,
@@ -1518,7 +1610,7 @@ impl Game<'_> {
     /// `LightmapRenderStateExtractor`: the night vision effect's intensity
     /// (`GameRenderer.nightVisionScale`), or conduit power's water vision.
     pub(super) fn night_vision_intensity(&self, partial: f32) -> f32 {
-        use mod_api::fog::FogType;
+        use mod_api::client::fog::FogType;
         if let Some(e) = self.potions.effects.get("night_vision") {
             // MobEffectInstance.endsWithin(200); -1 is infinite.
             return if e.duration < 0 || e.duration > 200 {
@@ -1859,7 +1951,12 @@ impl Game<'_> {
     }
     /// Retain the projectile as the landing event source and the
     /// shooter as its owner, even when the projectile is held out for ticking.
-    pub(super) fn projectile_landed_event(&mut self, id: u32, owner: Option<Who>, at: [f64; 3]) {
+    pub(in crate::game) fn projectile_landed_event(
+        &mut self,
+        id: u32,
+        owner: Option<Who>,
+        at: [f64; 3],
+    ) {
         let ctx = Context {
             source: (id != 0).then_some(EventSource::Entity(id)),
             owner,
@@ -1867,6 +1964,50 @@ impl Game<'_> {
             ..Context::default()
         };
         self.post_game_event("minecraft:projectile_land", at, ctx);
+    }
+    /// A projectile's own event (`gameEvent(event)`, `Context.of(this, state)`):
+    /// its owner as the projectile's owner, `state` the affected state. A
+    /// guest's projectile posts as theirs, or with no owner once they have left
+    /// (`Projectile.getOwner`), as its shot does.
+    pub(super) fn projectile_own_event(
+        &mut self,
+        event: &'static str,
+        owner: Option<Who>,
+        guest: Option<u32>,
+        at: [f64; 3],
+        state: Option<BlockStateId>,
+    ) {
+        if let Some(conn) = guest.filter(|conn| owner.is_some() && self.lan_acting != Some(*conn)) {
+            let posted = self
+                .as_guest(conn, |g| {
+                    g.projectile_own_event(event, owner, None, at, state);
+                })
+                .is_some();
+            if !posted {
+                self.projectile_own_event(event, None, None, at, state);
+            }
+            return;
+        }
+        let mut ctx = Context {
+            dampening_state: self.state_dampens(state),
+            ..Context::default()
+        };
+        ctx.owner = owner;
+        ctx.player = owner == Some(Who::Player) || self.rides_player(owner);
+        self.post_game_event(event, at, ctx);
+    }
+    /// The state HIT_GROUND names for an entity of `bounds` landing at
+    /// `position` (`Entity.checkFallDamage`): its supporting block's
+    /// (`mainSupportingBlockPos`), else the block at `getOnPosLegacy`.
+    pub(super) fn landing_state(&self, position: Vec3, bounds: Aabb) -> BlockStateId {
+        let p = self.supporting_block(position, bounds).unwrap_or_else(|| {
+            BlockPos::new(
+                position.x.floor() as i32,
+                (position.y - 0.2).floor() as i32,
+                position.z.floor() as i32,
+            )
+        });
+        self.world.block(p.x, p.y, p.z)
     }
     /// The player shot or threw something.
     pub(super) fn player_projectile_shot(&mut self) {
@@ -1933,20 +2074,17 @@ impl Game<'_> {
     }
 
     /// `Entity.checkFallDamage` emits HIT_GROUND after the block's fallOn.
-    pub(super) fn post_landing_event(&mut self, position: Vec3, bounds: Aabb, living: bool) {
+    pub(in crate::game) fn post_landing_event(
+        &mut self,
+        position: Vec3,
+        bounds: Aabb,
+        living: bool,
+    ) {
         if self.remote.is_some() || self.options.execution_role.is_client() {
             return;
         }
         self.sculk_prepare();
-        // mainSupportingBlockPos, or the block's state at getOnPosLegacy.
-        let state = match self.supporting_block(position, bounds) {
-            Some(support) => self.world.block(support.x, support.y, support.z),
-            None => self.world.block(
-                position.x.floor() as i32,
-                (position.y - 0.2).floor() as i32,
-                position.z.floor() as i32,
-            ),
-        };
+        let state = self.landing_state(position, bounds);
         let mut context = self.who_context(None, Some(state));
         context.living = living;
         self.post_game_event(
@@ -2070,8 +2208,8 @@ impl Game<'_> {
         &mut self,
         pos: [i32; 3],
         held: Option<&horizon_client::items::ItemStack>,
-    ) -> Result<Option<mod_api::NativeInteractionResult>> {
-        use mod_api::NativeInteractionResult as Answer;
+    ) -> Result<Option<mod_api::InteractionResult>> {
+        use mod_api::InteractionResult as Answer;
         if !matches!(
             &*self.block_name(pos),
             "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
@@ -2268,7 +2406,7 @@ impl Game<'_> {
             == horizon_client::blocks::Fluid::Water
     }
     /// `Entity.checkSupportingBlock`: the block under this box closest to the
-    /// entity. Everything but the player works it out when it asks.
+    /// entity. Everything but the player works it out when it asks (Breeze ground dust too).
     pub(in crate::game) fn supporting_block(
         &self,
         position: Vec3,
@@ -2430,12 +2568,53 @@ impl Game<'_> {
     /// `ArmorStand.kill`, `VehicleEntity.destroy`): removed, then
     /// `gameEvent(ENTITY_DIE, attributedTo != null ? attributedTo : this)` at
     /// the entity's position. `by_player`: the player's hit killed it, so the
-    /// player is the source. Otherwise the source is the entity itself (or a
-    /// bolt), which no listener tells apart from none: it is not living,
-    /// sneaking, a spectator or a warden.
+    /// player is the source. Nonliving self sources have no Who handle;
+    /// their listener facts are represented by the default context.
     pub(super) fn entity_killed_event(&mut self, at: [f64; 3], by_player: bool) {
-        let ctx = self.who_context(by_player.then_some(Who::Player), None);
-        self.post_game_event("minecraft:entity_die", at, ctx);
+        self.entity_killed_event_by(at, by_player.then_some(super::commands::Target::Player));
+    }
+    /// `BlockAttachedEntity.kill` / `ArmorStand.kill` with DamageSource.getEntity.
+    pub(super) fn entity_killed_event_by(
+        &mut self,
+        at: [f64; 3],
+        source: Option<super::commands::Target>,
+    ) {
+        self.entity_event_by("minecraft:entity_die", at, source);
+    }
+    /// `Entity.gameEvent(event, attributedTo)` at `at`, attributed to `source`
+    /// (a LAN guest posts as that player), else to the entity itself.
+    pub(super) fn entity_event_by(
+        &mut self,
+        event: &'static str,
+        at: [f64; 3],
+        source: Option<super::commands::Target>,
+    ) {
+        use super::commands::Target;
+        if let Some(Target::Guest(conn)) = source {
+            if self.lan_acting == Some(conn) {
+                let ctx = self.player_context(None);
+                self.post_game_event(event, at, ctx);
+                return;
+            }
+            let posted = self
+                .as_guest(conn, |g| {
+                    let ctx = g.player_context(None);
+                    g.post_game_event(event, at, ctx);
+                })
+                .is_some();
+            if posted {
+                return;
+            }
+        }
+        let who = match source {
+            Some(Target::Player) => Some(Who::Player),
+            Some(Target::Mob(id)) => Some(Who::Mob(id)),
+            _ => None,
+        };
+        let mut ctx = self.who_context(who, None);
+        // A stand is living, but Warden.canTargetEntity explicitly excludes it.
+        ctx.living |= matches!(source, Some(Target::Stand(_)));
+        self.post_game_event(event, at, ctx);
     }
 }
 
@@ -2455,7 +2634,10 @@ fn darkness_target(e: &EffectInstance) -> f32 {
 /// `MobEffectInstance.BlendState.tick` for the darkness effect: from the
 /// (previous, current) factors, the next ones. It fades in and out over 22
 /// ticks; with no darkness it is gone.
-pub(super) fn darkness_blend_tick(effects: &PlayerEffects, (_, current): (f32, f32)) -> (f32, f32) {
+pub(in crate::game) fn darkness_blend_tick(
+    effects: &PlayerEffects,
+    (_, current): (f32, f32),
+) -> (f32, f32) {
     let next = match effects.get("darkness") {
         Some(e) => {
             let step = 1.0 / DARKNESS_BLEND as f32;
@@ -2580,8 +2762,8 @@ mod tests {
     #[ignore = "needs prepared resources"]
     fn vanilla_game_event_carries_the_affected_state() {
         use crate::game::native_entity_refs::tests::with_game;
-        use mod_api::testing::with_mods;
         use mod_api::{Hooks, ModEntry, VanillaGameEventEvent};
+        use mod_platform::testing::with_mods;
         use std::sync::{Arc, Mutex};
 
         struct Heard(Arc<Mutex<Vec<Option<BlockStateId>>>>);
@@ -3062,3 +3244,8 @@ mod shriek_capture_tests {
         }
     }
 }
+
+// Milking and shearing farm animals; lives here for `TEST_POSTED_EVENTS`.
+#[cfg(test)]
+#[path = "tests/farm_animal_interaction_tests.rs"]
+mod farm_animal_interaction_tests;

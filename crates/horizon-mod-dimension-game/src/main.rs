@@ -16,9 +16,9 @@ use mod_api::{
     BlockKey, ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, ConfiguredFeature,
     CustomDensity, DensityFunctionType, DensitySampler, DimensionSettings, FeatureRandom,
     FeatureRegion, FeatureType, Flow, FoliageAttachment, FoliagePlacer, FoliagePlacerType, Hooks,
-    ModEntry, NativeCommand, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text, TreeAxis, TreeContext,
-    TreeDecorator, TreeDecoratorType, TreeRandom, TrunkPlacer, TrunkPlacerType,
+    ModEntry, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
+    ServerHost, ServerTickEvent, ServerTickPhase, Text, TreeAxis, TreeContext, TreeDecorator,
+    TreeDecoratorType, TreeRandom, TrunkPlacer, TrunkPlacerType,
 };
 use std::sync::{Arc, Mutex};
 
@@ -272,8 +272,8 @@ impl Hooks for DimProbe {
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         event.commands.extend([
-            NativeCommand::new("dimprobe enter <level:word>"),
-            NativeCommand::new("dimprobe later <level:word>"),
+            mod_api::Command::new("dimprobe enter <level:word>"),
+            mod_api::Command::new("dimprobe later <level:word>"),
         ]);
     }
 
@@ -316,9 +316,12 @@ impl Hooks for DimProbe {
 }
 
 fn main() {
-    horizon_client::entry::main_with(
+    horizon_mod_host::exit_if_compile_child();
+    let startup = horizon_client::entry::prepare();
+    horizon_mod_host::main_with(
         vec![ModEntry::new("dimprobe", Box::<DimProbe>::default())],
         &[],
         BUILT,
+        startup,
     );
 }

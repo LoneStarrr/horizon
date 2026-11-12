@@ -2,18 +2,55 @@
 use super::{Catalog, Target, free_function_source, host, native_hook_files, sources};
 use quote::ToTokens;
 use std::{fs, path::Path};
+mod vocab_boundary;
+
+fn write_vocab_output(
+    out_dir: &Path,
+    name: &str,
+    code: &str,
+    inventory: &vocab_boundary::Inventory,
+    sources: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> Result<(), String> {
+    vocab_boundary::validate_with_modules(name, code, inventory, sources)
+        .map_err(|e| format!("{name}: {e}"))?;
+    write_if_changed(out_dir.join(name), code).map_err(|e| e.to_string())
+}
+
+/// Preserve output timestamps when generation produces identical bytes.
+pub fn write_if_changed(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let bytes = bytes.as_ref();
+    match fs::read(path) {
+        Ok(previous) if previous == bytes => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::write(path, bytes)
+}
 
 /// Generate only this crate's files, tracking every source read by the generator.
 /// `root` is supplied at run time by the consuming crate's build script.
 pub fn generate(root: &Path, out_dir: &Path, target: Target) -> Result<(), String> {
-    track(root)?;
+    track(root, !matches!(&target, Target::Vocab))?;
+    let inventory = if matches!(target, Target::Vocab) {
+        let path = root.join("tools/layering/mod_vocab_state.json");
+        crate::rerun_if_changed(&path.display());
+        vocab_boundary::inventory(root)?
+    } else {
+        vocab_boundary::Inventory::new()
+    };
+    let vocab_sources = if matches!(target, Target::Vocab) {
+        vocab_boundary::modules::sources(root)?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    if matches!(&target, Target::Client) {
+        crate::rerun_if_staged(root);
+    }
     let generated = sources(root, super::FillMode::Require)?;
     let outputs = match target {
         Target::Client => vec![
-            (
-                "game_modules.rs",
-                super::game_modules::declarations(&root.join("crates/horizon-client/src/game"))?,
-            ),
             ("native_hook_modules.rs", native_hook_modules(root)?),
             (
                 "lan_action_modules.rs",
@@ -27,14 +64,25 @@ pub fn generate(root: &Path, out_dir: &Path, target: Target) -> Result<(), Strin
             // engine's `GoalCx` in `mobs/part_goals.rs`.
             ("mod_api_goal_view_generated.rs", generated.goal_view),
         ],
-        Target::Api => {
-            fs::write(
-                out_dir.join(super::parts::OUTPUT),
-                super::parts::source(root)?,
-            )
-            .map_err(|e| e.to_string())?;
-            for (name, code) in super::exports::sources(root)? {
-                fs::write(out_dir.join(name), code).map_err(|e| e.to_string())?;
+        Target::Api | Target::Vocab => {
+            if matches!(target, Target::Api) {
+                write_if_changed(
+                    out_dir.join("parts_registration_modules.rs"),
+                    super::parts::registration_source(root)?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if matches!(target, Target::Vocab) {
+                write_vocab_output(
+                    out_dir,
+                    super::parts::OUTPUT,
+                    &super::parts::source(root)?,
+                    &inventory,
+                    &vocab_sources,
+                )?;
+                for (name, code) in super::exports::sources(root)? {
+                    write_vocab_output(out_dir, &name, &code, &inventory, &vocab_sources)?;
+                }
             }
             let hooks = generated.hooks;
             let included = [
@@ -53,23 +101,92 @@ pub fn generate(root: &Path, out_dir: &Path, target: Target) -> Result<(), Strin
                     .map_err(|_| "generating the wire impls panicked".to_string())?
             })?;
             for path in sources.iter().chain(&generated_wire.sources) {
-                println!("cargo:rerun-if-changed={}", path.display());
+                crate::rerun_if_changed(&path.display());
             }
-            vec![
+            let outputs = vec![
                 (host::AREAS_OUTPUT, generated.areas),
                 ("mod_api_generated.rs", hooks),
                 ("mod_api_generated_host.rs", generated.host),
                 ("capability_providers_generated.rs", providers),
                 ("wire_generated.rs", generated_wire.wire),
                 ("wire_guest_generated.rs", generated_wire.guest),
-            ]
+            ];
+            outputs
+                .into_iter()
+                .filter(|(name, _)| match target {
+                    Target::Api => *name == "wire_guest_generated.rs",
+                    Target::Vocab => *name != "wire_guest_generated.rs",
+                    Target::Client => unreachable!(),
+                })
+                .collect()
         }
     };
     for (name, code) in outputs {
-        fs::write(out_dir.join(name), &code).map_err(|e| e.to_string())?;
+        let code = generated_source(root, &target, name, code)?;
+        if matches!(target, Target::Vocab) {
+            write_vocab_output(out_dir, name, &code, &inventory, &vocab_sources)?;
+        } else {
+            write_if_changed(out_dir.join(name), &code).map_err(|e| e.to_string())?;
+        }
         syn::parse_file(&code).map_err(|e| format!("generated Rust: {name}: {e}"))?;
     }
     Ok(())
+}
+
+fn generated_source(
+    root: &Path,
+    target: &Target,
+    name: &str,
+    code: String,
+) -> Result<String, String> {
+    if matches!(target, Target::Client)
+        && matches!(
+            name,
+            "mod_api_fire_generated.rs" | "mod_api_goal_view_generated.rs"
+        )
+        && root.join(".horizon-source-staged").is_file()
+    {
+        super::internals::widen_generated(Path::new(name), code)
+    } else {
+        Ok(code)
+    }
+}
+
+#[cfg(test)]
+mod generated_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn staged_game_helpers_are_widened_but_source_helpers_are_unchanged() {
+        let root =
+            std::env::temp_dir().join(format!("fnr-generated-visibility-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let input = "impl Game<'_> { pub(super) fn fire(&mut self) {} }";
+        for name in [
+            "mod_api_fire_generated.rs",
+            "mod_api_goal_view_generated.rs",
+        ] {
+            assert_eq!(
+                generated_source(&root, &Target::Client, name, input.into()).unwrap(),
+                input
+            );
+        }
+        fs::write(root.join(".horizon-source-staged"), "").unwrap();
+        for name in [
+            "mod_api_fire_generated.rs",
+            "mod_api_goal_view_generated.rs",
+        ] {
+            assert_eq!(
+                generated_source(&root, &Target::Client, name, input.into()).unwrap(),
+                "impl Game<'_> { pub fn fire(&mut self) {} }"
+            );
+            assert_eq!(
+                generated_source(&root, &Target::Vocab, name, input.into()).unwrap(),
+                input
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub(crate) fn native_hook_modules(root: &Path) -> Result<String, String> {
@@ -107,19 +224,16 @@ pub(crate) fn game_host_modules(root: &Path) -> Result<String, String> {
 /// Generate the native-only raw render records, without trait dispatch or subscriptions.
 pub fn generate_render(root: &Path, out_dir: &Path) -> Result<(), String> {
     let declarations = root.join(super::catalog::DECLARATIONS);
-    println!("cargo:rerun-if-changed={}", declarations.display());
+    crate::rerun_if_changed(&declarations.display());
     for module in Catalog::modules(&declarations)? {
-        println!(
-            "cargo:rerun-if-changed={}",
-            declarations.join(format!("{module}.rs")).display()
-        );
+        crate::rerun_if_changed(&declarations.join(format!("{module}.rs")).display());
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("crates/horizon-mod-render/src/render.rs")
-            .display()
+    crate::rerun_if_changed(
+        &root
+            .join("crates/horizon-mod-render/src/render.rs")
+            .display(),
     );
-    let source = super::dispatch::render(root, &Catalog::load(root)?)?.render_dispatch;
+    let source = super::dispatch::render(root, &Catalog::load_declarations(root)?)?.render_dispatch;
     use syn::spanned::Spanned;
     let file = syn::parse_file(&source).map_err(|error| error.to_string())?;
     let lines: Vec<_> = std::iter::once(0)
@@ -140,7 +254,7 @@ pub fn generate_render(root: &Path, out_dir: &Path) -> Result<(), String> {
         records.push('\n');
     }
     syn::parse_file(&records).map_err(|error| error.to_string())?;
-    fs::write(out_dir.join("native_render_generated.rs"), records)
+    write_if_changed(out_dir.join("native_render_generated.rs"), records)
         .map_err(|error| error.to_string())
 }
 
@@ -168,7 +282,7 @@ fn render_records_need_no_game_sources() {
             .iter()
             .filter(|item| matches!(item, syn::Item::Struct(_)))
             .count(),
-        3
+        5
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -179,19 +293,60 @@ fn listed_render_slots_have_eligible_points() {
     super::points::game_points(&root).unwrap();
 }
 
+/// The `mod_api` types with a `Wire` layout ([`super::wire`]), for point records.
+/// A source tree without the mod API (a generator fixture's) has none.
+pub(crate) fn wire_types(root: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    if !root.join("crates/horizon-mod-vocab/src/hooks").is_dir() {
+        return Ok(Default::default());
+    }
+    let generated = sources(root, super::FillMode::Require)?;
+    wire_types_from_sources(root, &generated)
+}
+
+/// Resolve Wire layouts from already validated, immutable API sources.
+/// The caller has established that the mod API directory exists.
+pub(super) fn wire_types_from_sources(
+    root: &Path,
+    generated: &super::Sources,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let included = [
+        (host::AREAS_OUTPUT, generated.areas.as_str()),
+        ("mod_api_generated.rs", generated.hooks.as_str()),
+        ("mod_api_generated_host.rs", generated.host.as_str()),
+    ];
+    // The resolver recurses through the API's types: give it a deep stack.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn_scoped(scope, || super::wire::owned_types(root, &included))
+            .map_err(|e| e.to_string())?
+            .join()
+            .map_err(|_| "reading the wire types panicked".to_string())?
+    })
+}
+
 /// `horizon-mod-points`' generated file: each point's record, `PointId` and typed function constructors,
 /// from the game's source, tracking the game module's files.
 pub fn generate_points(root: &Path, out_dir: &Path) -> Result<(), String> {
+    crate::interface_cache::with_cache(out_dir, || {
+        crate::source::with_walk_cache(|| generate_points_inner(root, out_dir))
+    })
+}
+
+pub(super) fn generate_points_inner(root: &Path, out_dir: &Path) -> Result<(), String> {
+    // Phase durations for CI's build report (points-timing.txt beside the output); never read back.
+    let started = std::time::Instant::now();
+    let mut timing = String::new();
+    let mut phase = |name: &str| {
+        timing.push_str(&format!("{name} {:.2}s\n", started.elapsed().as_secs_f64()));
+    };
     let src = root.join("crates/horizon-client/src");
-    println!("cargo:rerun-if-changed={}", src.join("game.rs").display());
-    println!("cargo:rerun-if-changed={}", src.join("game").display());
-    for path in super::points::tracked(root)?
-        .into_iter()
-        .chain(super::sites::tracked(root).map_err(|e| e.to_string())?)
-    {
-        println!("cargo:rerun-if-changed={}", path.display());
+    crate::rerun_if_changed(&src.join("game.rs").display());
+    crate::rerun_if_changed(&src.join("game").display());
+    for path in super::points::tracked(root)? {
+        crate::rerun_if_changed(&path.display());
     }
-    let private = super::points::source::build_input(root)?;
+    phase("tracked");
     println!("cargo:rerun-if-env-changed=HORIZON_POINT_NAMES");
     let selected = std::env::var("HORIZON_POINT_NAMES")
         .ok()
@@ -200,11 +355,18 @@ pub fn generate_points(root: &Path, out_dir: &Path) -> Result<(), String> {
                 .map_err(|error| format!("HORIZON_POINT_NAMES: {error}"))
         })
         .transpose()?;
-    let code = super::points::records_selected(
-        &super::points::game_points(root)?,
-        &private,
-        selected.as_ref(),
-    ) + &super::sites::ids(root).map_err(|e| e.to_string())?;
+    // Only a staged copy compiles the points' sites into the game; the wasm host's listener
+    // fixture brings its own.
+    crate::rerun_if_staged(root);
+    let staged =
+        root.join(".horizon-source-staged").is_file() || cfg!(feature = "listener-fixture");
+    let points = super::points::game_points(root)?;
+    phase("game_points");
+    let code = super::points::records_selected(&points, selected.as_ref())
+        + &format!(
+            "/// Whether this build compiled the points' sites into the game: only the prebuilt game, built from a staged copy of the source, has them. A build without them refuses every listener at load.\npub const STAGED: bool = {staged};\n"
+        );
+    phase("records");
     let generated = syn::parse_file(&code).map_err(|e| format!("generated Rust: points: {e}"))?;
     // A single multi-megabyte line makes Clippy's source lookups prohibitively slow.
     let mut code = String::new();
@@ -212,43 +374,52 @@ pub fn generate_points(root: &Path, out_dir: &Path) -> Result<(), String> {
         code.push_str(&item.to_token_stream().to_string());
         code.push('\n');
     }
-    fs::write(out_dir.join("points_generated.rs"), code).map_err(|e| e.to_string())
+    phase("format");
+    write_if_changed(out_dir.join("points_generated.rs"), code).map_err(|e| e.to_string())?;
+    phase("written");
+    fs::write(out_dir.join("points-timing.txt"), timing).map_err(|e| e.to_string())
 }
 
-pub(super) fn track(root: &Path) -> Result<(), String> {
+pub(super) fn track(root: &Path, all_game: bool) -> Result<(), String> {
     fn directory(path: &Path, extension: &str, recursive: bool) -> Result<(), String> {
         // Track the directory as well: adding a helper source or fragment changes the inputs.
-        println!("cargo:rerun-if-changed={}", path.display());
+        crate::rerun_if_changed(&path.display());
         for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
             let path = entry.map_err(|e| e.to_string())?.path();
             if path.is_dir() && recursive {
                 directory(&path, extension, recursive)?;
             } else if path.extension().is_some_and(|ext| ext == extension) {
-                println!("cargo:rerun-if-changed={}", path.display());
+                crate::rerun_if_changed(&path.display());
             }
         }
         Ok(())
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("crates/horizon-mod-api/src/lib.rs").display()
-    );
+    crate::rerun_if_changed(&root.join("crates/horizon-mod-vocab/src").display());
     for retired in super::catalog::RETIRED {
         // Only while present: Cargo reruns a build script on every build for a path that doesn't
         // exist. One that appears fails the next generation, and every fresh build, such as CI's.
         let path = root.join(retired);
         if path.exists() {
-            println!("cargo:rerun-if-changed={}", path.display());
+            crate::rerun_if_changed(&path.display());
         }
     }
     directory(&root.join(super::catalog::DECLARATIONS), "rs", false)?;
     directory(&root.join(super::exports::DIRECTORY), "rs", false)?;
-    directory(&root.join("crates/horizon-mod-api/src/parts"), "rs", false)?;
-    directory(&root.join("crates/horizon-client/src/game"), "rs", true)?;
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("crates/horizon-client/src/game.rs").display()
-    );
+    directory(
+        &root.join("crates/horizon-mod-vocab/src/parts"),
+        "rs",
+        false,
+    )?;
+    if all_game {
+        directory(&root.join("crates/horizon-client/src/game"), "rs", true)?;
+        crate::rerun_if_changed(&root.join("crates/horizon-client/src/game.rs").display());
+    } else {
+        directory(
+            &root.join("crates/horizon-client/src/game/native_hooks"),
+            "rs",
+            false,
+        )?;
+    }
     for hook in Catalog::load(root)?.hooks {
         if let Some((krate, path)) = free_function_source(&hook.target) {
             let (module, _) = path.rsplit_once("::").ok_or("target missing module")?;
@@ -257,7 +428,7 @@ pub(super) fn track(root: &Path) -> Result<(), String> {
                 .join(krate)
                 .join("src")
                 .join(format!("{}.rs", module.replace("::", "/")));
-            println!("cargo:rerun-if-changed={}", path.display());
+            crate::rerun_if_changed(&path.display());
         }
     }
     Ok(())

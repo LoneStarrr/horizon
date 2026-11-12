@@ -161,7 +161,7 @@ mod tests {
         use horizon_client::gamerules::Value as RuleValue;
         use horizon_client::items::ItemStack;
         use horizon_core::random::RandomSource;
-        use mod_api::{LevelRef, NativeAuthority, NativeWorldEpoch};
+        use mod_api::{Authority, LevelRef, WorldEpoch};
 
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -194,7 +194,7 @@ mod tests {
         )
         .unwrap();
         game.native_lifecycle
-            .begin_open(NativeAuthority::IntegratedServer);
+            .begin_open(Authority::IntegratedServer);
         let level = game.level(game.dim.id()).unwrap();
         let stone = || ItemStack::new("minecraft:stone", 3);
 
@@ -274,11 +274,11 @@ mod tests {
 
         // ExperienceOrb.award: 100 is 73, 17, 7 and 3, far apart from other orbs.
         assert!(game.level_award_experience(level, 100.5, 70.0, 0.5, 100));
-        let values: Vec<u32> = game.orbs.iter().map(|o| o.value).collect();
+        let values: Vec<u32> = game.orbs.iter().map(|o| o.points()).collect();
         assert_eq!(values, [73, 17, 7, 3]);
         assert!(!game.level_award_experience(level, 100.5, 70.0, 0.5, 0));
 
-        let stale = LevelRef::new(NativeWorldEpoch::new(0), game.dim.key());
+        let stale = LevelRef::new(WorldEpoch::new(0), game.dim.key());
         assert!(
             game.level_spawn_item(stale, 0.0, 0.0, 0.0, stone(), 0)
                 .is_none()
@@ -313,12 +313,13 @@ mod tests {
         }
         let mods: mod_api::Mods =
             vec![mod_api::ModEntry::new("level-item-awards", Box::new(Award))].into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 let orb = |id, x, value, ticks| {
                     let p = Vec3::new(x, 70.0, 0.5);
                     ExperienceOrb {
                         attachment_lifetime: Default::default(),
+                        fall_distance: 0.0,
                         rotation: [0.0, 0.0],
                         join: Default::default(),
                         id,
@@ -331,6 +332,7 @@ mod tests {
                         count: 1,
                         ticks,
                         health: 5,
+                        air: 300,
                         no_gravity: true,
                         following: None,
                     }

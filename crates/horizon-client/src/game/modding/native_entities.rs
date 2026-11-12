@@ -53,7 +53,9 @@ pub(super) fn target_id(t: Target) -> Option<u32> {
         | Target::Trident(id)
         | Target::Spawner(id)
         | Target::Cloud(id)
-        | Target::Hook(id) => Some(id),
+        | Target::Hook(id)
+        | Target::Knot(id)
+        | Target::General(id) => Some(id),
         Target::Player | Target::Guest(_) => None,
     }
 }
@@ -96,25 +98,36 @@ impl Game<'_> {
         let target = self.spawn_entity_from_nbt(tag);
         // These roots take their id as they load, and a rocket has no command
         // Target variant. Select the newly appended root, never an older waiting entity.
-        let root =
-            match kind {
-                "minecraft:tnt" => self.tnts.get_mut(deferred.0).map(|e| {
-                    super::entity::assign_stored_id(&mut self.next_entity, &mut e.id, None)
-                }),
-                "minecraft:falling_block" if deferred.1 < self.falling.len() => {
-                    Some(self.falling.update(deferred.1, |f| {
-                        super::entity::assign_stored_id(
-                            &mut self.next_entity,
-                            &mut f.id,
-                            Some(&f.attachment_lifetime),
-                        )
-                    }))
-                }
-                "minecraft:firework_rocket" => self.rockets.get_mut(deferred.2).map(|e| {
-                    super::entity::assign_stored_id(&mut self.next_entity, &mut e.id, None)
-                }),
-                _ => None,
-            };
+        let root = match kind {
+            "minecraft:tnt" if deferred.0 < self.tnts.len() => {
+                Some(super::entity_residency::assign_resident_id!(
+                    self.tnts,
+                    deferred.0,
+                    e,
+                    &mut self.next_entity,
+                    None
+                ))
+            }
+            "minecraft:falling_block" if deferred.1 < self.falling.len() => {
+                Some(super::entity_residency::assign_resident_id!(
+                    self.falling,
+                    deferred.1,
+                    f,
+                    &mut self.next_entity,
+                    Some(&f.attachment_lifetime)
+                ))
+            }
+            "minecraft:firework_rocket" if deferred.2 < self.rockets.len() => {
+                Some(super::entity_residency::assign_resident_id!(
+                    self.rockets,
+                    deferred.2,
+                    e,
+                    &mut self.next_entity,
+                    None
+                ))
+            }
+            _ => None,
+        };
         self.native_mobs_joined(from, false);
         // Otherwise the root is the first entity spawned, also for kinds no
         // command target stands for (experience orbs, end crystals, cushions). An id handed out to an
@@ -180,6 +193,16 @@ impl Game<'_> {
             // `Entity.<init>` comes before `addFreshEntity`: an entity that started on a
             // path that doesn't tell it (`entity_initialization.rs`) is told here.
             self.initialize_entity(mod_api::Holder::Entity(id), &kind);
+            // Constructor writes were canonical but unbound before insertion.
+            // The real lifetime is now resident, before join listeners query it.
+            if self
+                .entity_attachments
+                .get(&id)
+                .is_some_and(|map| map.has_index_entries())
+                && let Err(error) = self.bind_resident_entity_attachments(id)
+            {
+                log::warn!("constructor attachment binding failed for entity {id}: {error:?}");
+            }
             self.native_entity_join_level(
                 dimension,
                 id,
@@ -197,6 +220,8 @@ impl Game<'_> {
                 kept &= id != watch;
             } else {
                 self.remember_join(id, kind.into_owned());
+                // `addEntity` files it under its section, untold.
+                self.entity_section_joined(id, [at.x, at.y, at.z]);
             }
         }
         self.persist.joined_seq = self.persist.joined_seq.max(observed);
@@ -205,29 +230,22 @@ impl Game<'_> {
 
     fn assign_pending_join_ids(&mut self) {
         self.assign_dragon_and_crystal_ids();
-        for t in &mut self.tnts {
-            super::entity::assign_stored_id(&mut self.next_entity, &mut t.id, None);
-        }
-        self.falling.for_each_mut(|f| {
-            super::entity::assign_stored_id(
-                &mut self.next_entity,
-                &mut f.id,
-                Some(&f.attachment_lifetime),
-            );
-        });
-        self.creatures.projectiles.for_each_mut(|p| {
-            super::entity::assign_stored_id(
-                &mut self.next_entity,
-                &mut p.id,
-                Some(&p.attachment_lifetime),
-            );
-        });
-        for t in &mut self.tridents {
-            super::entity::assign_stored_id(&mut self.next_entity, &mut t.id, None);
-        }
-        for r in &mut self.rockets {
-            super::entity::assign_stored_id(&mut self.next_entity, &mut r.id, None);
-        }
+        use super::entity_residency::assign_resident_ids;
+        assign_resident_ids!(self.tnts, t, &mut self.next_entity, None);
+        assign_resident_ids!(
+            self.falling,
+            f,
+            &mut self.next_entity,
+            Some(&f.attachment_lifetime)
+        );
+        assign_resident_ids!(
+            self.creatures.projectiles,
+            p,
+            &mut self.next_entity,
+            Some(&p.attachment_lifetime)
+        );
+        assign_resident_ids!(self.tridents, t, &mut self.next_entity, None);
+        assign_resident_ids!(self.rockets, r, &mut self.next_entity, None);
     }
     /// The entity inserted earliest after the last one announced.
     fn next_unannounced(&self) -> Option<(Slot, u32, horizon_client::join_seq::JoinSeq)> {
@@ -236,6 +254,11 @@ impl Game<'_> {
         let mark = self.persist.joined_seq;
         let mut best: Option<(Slot, u32, JoinSeq)> = None;
         let mut offer = |slot: Slot, id: u32, seq: JoinSeq| {
+            if self.persist.removals.iter().chain(self.persist.destroying_vehicles.iter()).any(|target| {
+                matches!(*target, super::commands::Target::Boat(n) | super::commands::Target::Cart(n) if n == id)
+            }) {
+                return;
+            }
             if seq > mark && best.is_none_or(|(_, _, previous)| seq < previous) {
                 best = Some((slot, id, seq));
             }
@@ -316,7 +339,7 @@ impl Game<'_> {
             Slot::Apart(Apart::Cushion(i)) => drop(self.cushions.remove(i)),
             Slot::Apart(Apart::Painting(i)) => drop(self.paintings.remove(i)),
             Slot::Apart(Apart::Frame(i)) => drop(self.item_frames.remove(i)),
-            Slot::Apart(Apart::Dragon) => self.dragon.discard(),
+            Slot::Apart(Apart::Dragon) => self.discard_resident_dragon(),
         }
     }
     /// Entities that were moved, not added (a portal's arrival keeps being
@@ -337,6 +360,7 @@ impl Game<'_> {
     /// An entity taken out of the level without leaving it (an item through
     /// an End gateway): forgotten, not told of.
     pub(super) fn native_leave_skip(&mut self, id: u32) {
+        self.entity_section_forget(id);
         if let Ok(i) = self.persist.live.binary_search_by_key(&id, |l| l.0) {
             self.persist.live.remove(i);
         }
@@ -346,6 +370,7 @@ impl Game<'_> {
         if self.remote.is_some() {
             return;
         }
+        self.entity_section_forget(id);
         if let Ok(i) = self.persist.live.binary_search_by_key(&id, |l| l.0) {
             let (id, kind, _) = self.persist.live.remove(i);
             let dimension = self.dim.id();
@@ -384,6 +409,7 @@ impl Game<'_> {
         }
         while let Some(i) = self.persist.live.iter().position(|l| !l.2) {
             let (id, kind, _) = self.persist.live.remove(i);
+            self.entity_section_forget(id);
             let dimension = self.dim.id();
             self.native_entity_leave_level(dimension, id, &kind);
         }
@@ -505,18 +531,29 @@ mod tests {
                 };
                 assert_eq!(waiting, 0);
                 if kind == "minecraft:falling_block" {
-                    let (Tag::Compound(invalid), _) = horizon_core::nbt::parse_snbt(
+                    let (Tag::Compound(unknown_state), _) = horizon_core::nbt::parse_snbt(
                         "{BlockState:{Name:\"test:missing\"},Time:1}",
                     )
                     .unwrap() else {
                         unreachable!()
                     };
-                    assert!(
-                        game.summon(game.dim.id(), kind, [1.0, 70.0, 1.0], invalid)
-                            .is_none()
+                    let fallback = game
+                        .summon(game.dim.id(), kind, [1.0, 70.0, 1.0], unknown_state)
+                        .unwrap();
+                    assert_eq!(fallback, base + 2);
+                    assert_eq!(game.next_entity, base + 2);
+                    assert_eq!(game.falling.len(), 3);
+                    assert_eq!(game.falling[0].id, 0);
+                    assert_eq!(game.falling[1].id, id);
+                    assert_eq!(game.falling[2].id, fallback);
+                    assert_eq!(
+                        game.falling[2].state,
+                        game.pack
+                            .assets
+                            .registry
+                            .default_state("minecraft:sand")
+                            .unwrap()
                     );
-                    assert_eq!(game.next_entity, base + 1);
-                    assert_eq!(game.falling.len(), 2);
                 }
             });
         }
@@ -669,7 +706,7 @@ mod tests {
             }),
         )]
         .into();
-        mod_api::testing::with_mods(mods, || {
+        mod_platform::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_game(|game| {
                 game.native_joins_skip();
                 let base = game.next_entity;
@@ -701,6 +738,7 @@ mod tests {
                 );
 
                 game.crystals.push(super::super::dragon::Crystal {
+                    attachment_lifetime: Default::default(),
                     join: Default::default(),
                     id: base + 4,
                     position: Vec3::ZERO,
@@ -744,6 +782,7 @@ mod tests {
                     fixed: false,
                     invisible: false,
                     custom_name: None,
+                    random: horizon_core::random::LegacyRandom::new(0),
                     check_interval: 0,
                 });
                 let mut dragon = super::super::dragon::Dragon::new(Vec3::ZERO, 0.0, 0);
@@ -766,6 +805,7 @@ mod tests {
                 );
                 drop(seen);
                 game.tnts.push(super::super::tnt::PrimedTnt {
+                    attachment_lifetime: Default::default(),
                     rotation: [0.0, 0.0],
                     join: Default::default(),
                     id: 0,

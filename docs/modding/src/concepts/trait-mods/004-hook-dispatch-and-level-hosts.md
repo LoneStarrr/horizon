@@ -1,10 +1,56 @@
 <!-- chapter: Hook dispatch and level hosts -->
 <!-- separator: 1 -->
 
-A linked trait mod implements `mod_api::Hooks`. Helper injections run first.
-An injection that returns early skips trait mods. A claimed cancellation also skips trait mods.
-Otherwise, trait mods run in their supplied order. The first `Cancel` stops dispatch.
-For replacement hooks, the first `Some` wins. Collection hooks call every mod. Receiverless hooks have no `Host`.
+A linked trait mod implements `mod_api::Hooks`. A hook function is not an injection point, so
+`[[inject]]` never runs inside a hook's dispatch; a `head` injection that cancels the game function
+calling a hook keeps the hook from firing at all. A claimed cancellation reaches only trait listeners that receive cancelled events.
+Otherwise, trait mods run by priority, then in dependency order. Once a mod cancels, later mods are skipped unless
+they receive cancelled events. For replacement hooks, the first `Some` wins. Collection hooks call every mod.
+Receiverless hooks have no `Host`.
+
+To save from inside a hook, use `level.request_save(host)` so the save runs at the next settled
+start-of-tick boundary. A synchronous `save-all` while an entity pass or held-out row is borrowed
+fails with vanilla's `commands.save.failed` feedback and a failed command result, without saving.
+
+To emit a vibration-producing game event, use `level.game_event(host, event, at, context)`.
+`GameEventContext` carries an optional source entity and affected block state; see
+[game events with context](../../how-to/game-events.md) for listener semantics and refusals.
+
+`#[listener]` on a hook method sets both, as NeoForge's `EventPriority` and `receiveCanceled` do. Two mods, each
+its own crate:
+
+```rust
+#[mod_api::horizon_mod]
+impl Hooks for Protection {
+    // Runs before mods at the default priority, 0; higher runs first.
+    #[listener(priority = 100)]
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+        if self.protected(host, event.pos) { Flow::Cancel } else { Flow::Continue }
+    }
+}
+
+#[mod_api::horizon_mod]
+impl Hooks for Override {
+    // Still told after a cancel, and may undo it.
+    #[listener(priority = -100, receive_cancelled)]
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+        if event.cancelled && self.allowed(host, event.pos) {
+            event.cancelled = false;
+        }
+        Flow::Continue
+    }
+}
+```
+
+`priority` is an `i32`, 0 when omitted; mods of equal priority keep dependency order, as `[[inject]]`
+priorities do ([Injections](../../injections.md#ordering)). Each hook's order is fixed once, when the mods are
+installed. Every cancellable hook's event has a `cancelled` field: a mod without `receive_cancelled` always sees
+`false`, since it is not called once the event is cancelled. A mod that receives cancelled events and sets it back to
+`false` lets the game's behaviour run, and the mods after it are told again. An event the game hands over already
+cancelled reaches only mods that receive cancelled events. `receive_cancelled` on a hook without a cancel does not
+compile, and `#[listener]` is for a trait mod's hooks only: a part is called for its own thing, in no order.
+
+Native and wasm trait mods use the same listener ordering and cancellation rules. Wasm subscription records carry the hook name, signed priority, and receive-cancelled flag through the shared-memory Wire boundary at load time. The event's `cancelled` field crosses with its other writable fields. No component-model adapter is involved.
 
 Each hook method takes its host, where it has one, and one event:
 
@@ -37,7 +83,7 @@ the same mod: for example, `LevelRef::set_block` fires `block_changed`. Mods kee
 state with interior mutability so these calls can share the instance safely. Data-load
 hooks can run on any loading thread; item default changes must be identical on every side.
 
-The trait has every hook declared under `crates/horizon-mod-api/src/hooks/` ([Adding a hook](027-adding-a-hook.md#adding-a-hook)).
+The trait has every hook declared under `crates/horizon-mod-vocab/src/hooks/` ([Adding a hook](027-adding-a-hook.md#adding-a-hook)).
 Level hooks use access-specific hosts rather than `Host`. `LevelHost` provides
 `block_state` through `LevelAccess::block_state`, client-side detection and
 `state_with_property`. `state_string(state)` serializes the full name and properties, or returns `None`
@@ -70,13 +116,7 @@ an invalid state, or the state the block already has. It never loads a chunk. Th
 the tick queue; mods do not pass it back to these helpers.
 Frame drawing through `DrawContext`, `BlockEntityDrawContext` and `WorldDrawContext` stays
 in `mod_api`. Raw GPU access is native-only, unstable and outside that API, in
-`mod_render::render` (`horizon-mod-render`). Register its listed frame functions through
-`[[inject]]` with `access = "internals"` and `kind = "head"`; the ordinary listener registry
-owns ordering and disabling. `render_needs` collects requests; `world_drawn` runs before
-the hand and HUD, and `hand_drawn` runs after the hand, on the render thread.
-
-| Removed path or registration | Current route |
-| --- | --- |
-| `mod_api::render` raw GPU types | `mod_render::render` (native escape hatch) |
-| `RenderHooks` / `Hooks::render` | `[[inject]]` internals listeners on the three listed frame functions |
-| API draw contexts | Unchanged; use these for API-typed drawing |
+`mod_render::render` (`horizon-mod-render`). Replace its frame functions with native HEAD mixins compiled against the prebuilt game.
+`render_needs` collects requests; `world_drawn` runs before the hand and HUD, and
+`hand_drawn` runs after the hand, on the render thread. API draw contexts remain
+unchanged; use them for API-typed drawing.
