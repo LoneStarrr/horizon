@@ -1,7 +1,6 @@
 use super::*;
 use mod_api::{Hooks, ModEntry, Registrar};
 
-
 struct Wave;
 #[derive(Debug)]
 struct WaveFunction(f32);
@@ -30,8 +29,6 @@ impl mod_api::DensityFunctionType for Wave {
     }
 }
 
-
-
 /// What the engine decodes is the mod's own code, under its namespaced id.
 #[test]
 fn a_registered_density_function_reaches_the_engine() {
@@ -42,7 +39,10 @@ fn a_registered_density_function_reaches_the_engine() {
             r.register_density_function("wave", Wave);
         }
     }
-    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new("test", Box::new(Registers))])
+    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new(
+        "test",
+        Box::new(Registers),
+    )])
     .unwrap();
     let types = installed_density_functions();
     let function = types["test:wave"]

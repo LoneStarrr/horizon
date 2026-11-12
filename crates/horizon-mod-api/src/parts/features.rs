@@ -66,8 +66,14 @@ pub mod tests {
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors[0].contains("test registered feature type test:spikes twice"));
         assert!(errors[1].contains("namespace"), "{errors:?}");
-        assert!(errors[2].contains("invalid identifier \"test:\""), "{errors:?}");
-        assert!(errors[3].contains("invalid identifier \"test:Bad Name\""), "{errors:?}");
+        assert!(
+            errors[2].contains("invalid identifier \"test:\""),
+            "{errors:?}"
+        );
+        assert!(
+            errors[3].contains("invalid identifier \"test:Bad Name\""),
+            "{errors:?}"
+        );
     }
 
     /// A valid registration is handed over under its namespaced id.

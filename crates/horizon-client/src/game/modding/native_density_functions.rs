@@ -50,4 +50,5 @@ pub(in crate::game) fn installed_density_functions() -> ModDensityTypes {
 }
 
 #[cfg(test)]
+#[path = "native_density_functions/tests.rs"]
 mod tests;

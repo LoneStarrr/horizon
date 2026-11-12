@@ -21,7 +21,6 @@ use horizon_core::{
     random::{LegacyRandom, RandomSource},
 };
 
-use horizon_protocol::registry::Skybox;
 use std::{collections::HashMap, sync::Arc};
 
 /// `TicketType.PORTAL`'s timeout, in ticks.
@@ -390,19 +389,6 @@ impl Game<'_> {
             return own;
         }
         self.res.environment_of(&self.dimension_type().id)
-    }
-
-    /// What the level draws as its sky, from its dimension type's `skybox`
-    /// (`DimensionType.skybox`: the Overworld's sky, the End's, or none).
-    pub(super) fn level_skybox(&self) -> Skybox {
-        match self.dim {
-            Dim::Nether => Skybox::None,
-            Dim::End => Skybox::End,
-            Dim::Overworld | Dim::Extra(_) => self
-                .remote
-                .as_ref()
-                .map_or(Skybox::Overworld, |r| r.dimension.skybox),
-        }
     }
 
     /// SkyRenderer.renderEndFlash, drawn after the renderer's resident sky mesh.

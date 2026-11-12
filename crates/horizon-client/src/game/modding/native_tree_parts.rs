@@ -203,15 +203,26 @@ pub(in crate::game) fn installed_tree_parts() -> ModTreeParts {
         foliage_placers: declared
             .foliage_placers
             .into_iter()
-            .map(|(id, ty)| (id, Arc::new(FoliageType(ty)) as Arc<dyn ModFoliagePlacerType>))
+            .map(|(id, ty)| {
+                (
+                    id,
+                    Arc::new(FoliageType(ty)) as Arc<dyn ModFoliagePlacerType>,
+                )
+            })
             .collect(),
         decorators: declared
             .decorators
             .into_iter()
-            .map(|(id, ty)| (id, Arc::new(DecoratorType(ty)) as Arc<dyn ModTreeDecoratorType>))
+            .map(|(id, ty)| {
+                (
+                    id,
+                    Arc::new(DecoratorType(ty)) as Arc<dyn ModTreeDecoratorType>,
+                )
+            })
             .collect(),
     }
 }
 
 #[cfg(test)]
+#[path = "native_tree_parts/tests.rs"]
 mod tests;

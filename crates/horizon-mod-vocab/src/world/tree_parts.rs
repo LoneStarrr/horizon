@@ -204,7 +204,7 @@ pub fn tree_part_declarations() -> TreePartDeclarations {
     let Some(table) = crate::parts::installed_tree_part_table() else {
         return TreePartDeclarations::default();
     };
-    let named = |id: &Box<str>| id.to_string();
+    let named = |id: &str| id.to_string();
     TreePartDeclarations {
         trunk_placers: table
             .trunk_placers

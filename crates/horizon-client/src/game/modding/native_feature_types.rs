@@ -58,11 +58,14 @@ impl FeatureRegion for Converting<'_> {
             FeatureHeightmap::OceanFloor => EngineHeightmap::OceanFloor,
             FeatureHeightmap::MotionBlocking => EngineHeightmap::MotionBlocking,
             FeatureHeightmap::MotionBlockingNoLeaves => EngineHeightmap::MotionBlockingNoLeaves,
+            _ => return None,
         };
         self.0.height(kind, x, z)
     }
     fn state(&mut self, name: &str, properties: &[(&str, &str)]) -> Option<FeatureState> {
-        self.0.state(name, properties).map(|s| FeatureState::from_raw(s.0))
+        self.0
+            .state(name, properties)
+            .map(|s| FeatureState::from_raw(s.0))
     }
     fn is_air(&mut self, state: FeatureState) -> bool {
         self.0.is_air(BlockStateId(state.raw()))
@@ -106,4 +109,5 @@ pub(in crate::game) fn installed_feature_types() -> ModFeatureTypes {
 }
 
 #[cfg(test)]
+#[path = "native_feature_types/tests.rs"]
 mod tests;

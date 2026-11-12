@@ -1,7 +1,6 @@
 use super::*;
 use mod_api::{Hooks, ModEntry, Registrar};
 
-
 /// A column of `height` gold blocks at an x the random picks.
 struct Column;
 #[derive(Debug)]
@@ -33,8 +32,6 @@ impl mod_api::FeatureType for Column {
         Ok(Arc::new(ColumnFeature(height as i32)))
     }
 }
-
-
 
 /// The engine's region and random reach the mod's code through the API's
 /// own handles, and what the mod writes reaches the engine's region.
@@ -103,7 +100,10 @@ fn a_registered_feature_type_places_through_the_engines_region() {
             false
         }
     }
-    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new("test", Box::new(Registers))])
+    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new(
+        "test",
+        Box::new(Registers),
+    )])
     .unwrap();
     let types = installed_feature_types();
     let feature = types["test:column"]

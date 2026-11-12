@@ -2,9 +2,7 @@ use super::*;
 use mod_api::{Hooks, ModEntry, Registrar};
 
 use horizon_world::registry::BlockStateId as Engine;
-use horizon_world::worldgen::mod_tree_parts::{
-    ModTreeContext, ModTreeRandom, TreeAxis as Axis,
-};
+use horizon_world::worldgen::mod_tree_parts::{ModTreeContext, ModTreeRandom, TreeAxis as Axis};
 use std::collections::{BTreeMap, VecDeque};
 
 const AIR: Engine = Engine(0);
@@ -118,10 +116,7 @@ struct SpiralTrunk {
     leaf_reach: i32,
 }
 impl mod_api::TrunkPlacerType for Spiral {
-    fn decode(
-        &self,
-        config: &serde_json::Value,
-    ) -> Result<Arc<dyn mod_api::TrunkPlacer>, String> {
+    fn decode(&self, config: &serde_json::Value) -> Result<Arc<dyn mod_api::TrunkPlacer>, String> {
         Ok(Arc::new(SpiralTrunk {
             width: config["width"].as_i64().ok_or("missing width")? as i32,
             leaf_reach: config["leaf_reach"].as_i64().unwrap_or(0) as i32,
@@ -248,7 +243,10 @@ impl Hooks for All {
 /// and leaves.
 #[test]
 fn registered_tree_parts_place_a_tree_on_a_small_region() {
-    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new("mymod", Box::new(All))])
+    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new(
+        "mymod",
+        Box::new(All),
+    )])
     .unwrap();
     let parts = installed_tree_parts();
     let trunk = parts.trunk_placers["mymod:spiral_trunk_placer"]
@@ -319,7 +317,10 @@ fn registered_tree_parts_place_a_tree_on_a_small_region() {
 /// A part's own decode error reaches the tree's load error, and an unknown config is refused.
 #[test]
 fn registered_tree_parts_refuse_their_invalid_configs() {
-    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new("mymod", Box::new(All))])
+    mod_platform::__private::part_tests::install_parts_fixture(&[ModEntry::new(
+        "mymod",
+        Box::new(All),
+    )])
     .unwrap();
     let parts = installed_tree_parts();
     assert_eq!(
@@ -349,5 +350,3 @@ fn registered_tree_parts_refuse_their_invalid_configs() {
             .contains_key("minecraft:straight_trunk_placer")
     );
 }
-
-

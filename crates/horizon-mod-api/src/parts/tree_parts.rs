@@ -28,25 +28,19 @@ impl PartRegistrar {
 
 impl TreePartsRegistrar for PartRegistrar {
     fn add_trunk_placer(&mut self, name: &str, ty: Arc<dyn crate::TrunkPlacerType>) {
-        let taken = |t: &TreePartTable, id: &str| {
-            t.trunk_placers.iter().any(|(i, _)| **i == *id)
-        };
+        let taken = |t: &TreePartTable, id: &str| t.trunk_placers.iter().any(|(i, _)| **i == *id);
         if let Some(id) = self.tree_part_id("trunk placer", name, taken) {
             self.tree_parts.trunk_placers.push((id, ty));
         }
     }
     fn add_foliage_placer(&mut self, name: &str, ty: Arc<dyn crate::FoliagePlacerType>) {
-        let taken = |t: &TreePartTable, id: &str| {
-            t.foliage_placers.iter().any(|(i, _)| **i == *id)
-        };
+        let taken = |t: &TreePartTable, id: &str| t.foliage_placers.iter().any(|(i, _)| **i == *id);
         if let Some(id) = self.tree_part_id("foliage placer", name, taken) {
             self.tree_parts.foliage_placers.push((id, ty));
         }
     }
     fn add_tree_decorator(&mut self, name: &str, ty: Arc<dyn crate::TreeDecoratorType>) {
-        let taken = |t: &TreePartTable, id: &str| {
-            t.decorators.iter().any(|(i, _)| **i == *id)
-        };
+        let taken = |t: &TreePartTable, id: &str| t.decorators.iter().any(|(i, _)| **i == *id);
         if let Some(id) = self.tree_part_id("tree decorator", name, taken) {
             self.tree_parts.decorators.push((id, ty));
         }
@@ -73,10 +67,7 @@ pub mod tests {
     struct Cross;
     #[cfg(test)]
     impl mod_api::FoliagePlacerType for Cross {
-        fn decode(
-            &self,
-            _: &serde_json::Value,
-        ) -> Result<Arc<dyn mod_api::FoliagePlacer>, String> {
+        fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn mod_api::FoliagePlacer>, String> {
             Err("fixture decodes nothing".into())
         }
     }
@@ -84,10 +75,7 @@ pub mod tests {
     struct Lantern;
     #[cfg(test)]
     impl mod_api::TreeDecoratorType for Lantern {
-        fn decode(
-            &self,
-            _: &serde_json::Value,
-        ) -> Result<Arc<dyn mod_api::TreeDecorator>, String> {
+        fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn mod_api::TreeDecorator>, String> {
             Err("fixture decodes nothing".into())
         }
     }
@@ -119,8 +107,14 @@ pub mod tests {
         assert_eq!(errors.len(), 5, "{errors:?}");
         assert!(errors[0].contains("test registered trunk placer test:spiral twice"));
         assert!(errors[1].contains("namespace"), "{errors:?}");
-        assert!(errors[2].contains("invalid identifier \"test:\""), "{errors:?}");
-        assert!(errors[3].contains("invalid identifier \"test:Bad Name\""), "{errors:?}");
+        assert!(
+            errors[2].contains("invalid identifier \"test:\""),
+            "{errors:?}"
+        );
+        assert!(
+            errors[3].contains("invalid identifier \"test:Bad Name\""),
+            "{errors:?}"
+        );
         assert!(errors[4].contains("test registered tree decorator test:lantern twice"));
     }
 

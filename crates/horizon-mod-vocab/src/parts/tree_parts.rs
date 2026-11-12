@@ -1,6 +1,7 @@
 use super::*;
 /// The tree parts registered at startup, for the executable to hand to the engine.
-pub(crate) fn installed_tree_part_table() -> Option<&'static crate::world::tree_parts::TreePartTable> {
+pub(crate) fn installed_tree_part_table() -> Option<&'static crate::world::tree_parts::TreePartTable>
+{
     installed().map(|installed| &installed.tree_parts)
 }
 

@@ -34,10 +34,7 @@ pub mod tests {
     struct Wave;
     #[cfg(test)]
     impl mod_api::DensityFunctionType for Wave {
-        fn decode(
-            &self,
-            _: &serde_json::Value,
-        ) -> Result<Arc<dyn mod_api::CustomDensity>, String> {
+        fn decode(&self, _: &serde_json::Value) -> Result<Arc<dyn mod_api::CustomDensity>, String> {
             Err("fixture decodes nothing".into())
         }
     }
@@ -66,8 +63,14 @@ pub mod tests {
         assert_eq!(errors.len(), 4, "{errors:?}");
         assert!(errors[0].contains("test registered density function test:wave twice"));
         assert!(errors[1].contains("namespace"), "{errors:?}");
-        assert!(errors[2].contains("invalid identifier \"test:\""), "{errors:?}");
-        assert!(errors[3].contains("invalid identifier \"test:Bad Name\""), "{errors:?}");
+        assert!(
+            errors[2].contains("invalid identifier \"test:\""),
+            "{errors:?}"
+        );
+        assert!(
+            errors[3].contains("invalid identifier \"test:Bad Name\""),
+            "{errors:?}"
+        );
     }
 
     /// A valid registration is handed over under its namespaced id.

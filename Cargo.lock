@@ -2267,6 +2267,7 @@ dependencies = [
  "horizon-mod-package",
  "horizon-mod-wasm",
  "log",
+ "serde_json",
  "tempfile",
  "wat",
 ]

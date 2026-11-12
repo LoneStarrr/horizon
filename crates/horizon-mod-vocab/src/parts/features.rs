@@ -1,6 +1,7 @@
 use super::*;
 /// The feature types registered at startup, for the executable to hand to the engine.
-pub(crate) fn installed_feature_type_list() -> &'static [crate::world::feature_type::FeatureTypeInfo] {
+pub(crate) fn installed_feature_type_list() -> &'static [crate::world::feature_type::FeatureTypeInfo]
+{
     installed().map_or(&[], |installed| installed.feature_types.as_slice())
 }
 
