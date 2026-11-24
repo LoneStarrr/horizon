@@ -5,7 +5,7 @@ use super::{
     Mob, MobEvent, MobWorld,
     anim::{Poses, State as AnimState},
     control::MoveKind,
-    goals::{Cx, Goal, LookAtPlayer, MOVE, Panic, RandomLookAround, Stroll, goal_clone},
+    goals::{AnimalPanic, Cx, Goal, LookAtPlayer, MOVE, RandomLookAround, Stroll, goal_clone},
     nav::NavKind,
 };
 use crate::health::DamageLevel;
@@ -18,6 +18,9 @@ use horizon_protocol::entity_data::PositionSource;
 #[cfg(test)]
 #[path = "allay_liked_player_tests.rs"]
 mod allay_liked_player_tests;
+#[cfg(test)]
+#[path = "allay_stroll_tests.rs"]
+mod allay_stroll_tests;
 pub mod interaction;
 
 // Allay state: `main_hand` the held filter; `State::inventory` the fetched stack,
@@ -238,11 +241,12 @@ pub fn register(m: &mut Mob) {
     // FlyingPathNavigation.setRequiredPathLength(48).
     m.set_required_path_length(48.0);
     let g = &mut m.ai.goals;
-    g.add(0, Panic::new(2.5));
+    g.add(0, AnimalPanic::new(2.5));
     g.add(1, Fetch);
     g.add(2, Deliver);
     g.add(3, StayClose);
-    g.add(4, Stroll::flying(1.0));
+    // AllayAi's RandomStroll.fly(1.0F): getTargetFlyPos, 10 by 7.
+    g.add(4, Stroll::fly(1.0));
     g.add(5, LookAtPlayer::new(6.0));
     g.add(6, RandomLookAround::default());
 }

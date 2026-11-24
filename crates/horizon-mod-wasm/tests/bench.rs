@@ -5,7 +5,7 @@
 //! and wasm32-unknown-unknown installed:
 //! ```sh
 //! cargo build -p cargo-horizon-mod
-//! (cd crates/horizon-mod-wasm/tests/fixture && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod build --wasm --catalog points.json && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod wasm-std "$OLDPWD/target/horizon-wasm-std.wasm" --catalog points.json)
+//! (cd crates/horizon-mod-wasm/tests/fixture && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod build --wasm && "$OLDPWD/target/debug/cargo-horizon-mod" horizon-mod wasm-std "$OLDPWD/target/horizon-wasm-std.wasm")
 //! HORIZON_WASM_STD="$PWD/target/horizon-wasm-std.wasm" HORIZON_WASM_FIXTURE="$PWD/crates/horizon-mod-wasm/tests/fixture/target/horizon-mod/wasm_fixture.hmod" cargo test --release -p horizon-mod-wasm --features listener-fixture --test bench empty_subscribed_listener -- --ignored --exact --nocapture
 //! ```
 //! Building the fixture rewrites its `horizon-mod.toml` with the generated wasm
@@ -16,7 +16,7 @@
 //! times 100,000 real dispatches; 20 warm-up samples precede 100 reported samples.
 //! Loading, initialization, subscription installation and the host are outside timing.
 //! These are in-memory dispatches, not server teardown or world ticks.
-// Generated fixtures exercise every shape; TODO(#2273): make the generator emit clippy-clean code.
+// Generated fixtures exercise every shape; TODO(arismoko/horizon#2273): make the generator emit clippy-clean code.
 #![allow(clippy::all, unused_comparisons, unreachable_patterns, dead_code)]
 #[path = "support/no_hooks.rs"]
 mod no_hooks;
@@ -84,7 +84,12 @@ fn measure(label: &str, mods: Vec<ModEntry>) {
             let mut entities: Vec<_> = (0..1000)
                 .map(|_| ModBlockEntity::new(format!("wasm_fixture:{kind}"), Default::default()))
                 .collect();
-            mod_api::dispatch_block_entity_tick(&mut World, [0, 64, 0], &mut entities[0]);
+            mod_api::dispatch_block_entity_tick(
+                &mut World,
+                &mut mod_api::BlockEntityTickReply::Changed,
+                [0, 64, 0],
+                &mut entities[0],
+            );
             assert_eq!(
                 entities[0].data,
                 [expected],
@@ -99,7 +104,12 @@ fn measure(label: &str, mods: Vec<ModEntry>) {
             for round in 0..120 {
                 let now = Instant::now();
                 for entity in &mut entities {
-                    mod_api::dispatch_block_entity_tick(&mut World, [0, 64, 0], entity);
+                    mod_api::dispatch_block_entity_tick(
+                        &mut World,
+                        &mut mod_api::BlockEntityTickReply::Changed,
+                        [0, 64, 0],
+                        entity,
+                    );
                 }
                 let elapsed = now.elapsed().as_nanos();
                 if round >= 20 {
@@ -126,16 +136,14 @@ fn block_entity_ticks() {
         let path = std::env::var("HORIZON_WASM_FIXTURE").unwrap();
         let path = std::path::Path::new(&path);
         let std = std::fs::read(std::env::var("HORIZON_WASM_STD").unwrap()).unwrap();
-        let mut manifest = Package::read(path).unwrap().manifest;
-        // This fixture variant exercises ordinary hooks and Parts, not game points.
-        manifest.inject.clear();
+        let manifest = Package::read(path).unwrap().manifest;
         let info = mod_api::PackageInfo::new(
             manifest.id.clone(),
             manifest.version.clone(),
             mod_api::PackageKind::Code,
             mod_api::Side::Both,
             vec![manifest.id.clone()],
-            manifest.dependencies.keys().cloned().collect(),
+            Vec::new(),
         );
         let package = WasmPackage {
             manifest,
@@ -201,16 +209,14 @@ fn empty_subscribed_listener() {
         let path = std::env::var("HORIZON_WASM_FIXTURE").unwrap();
         let path = std::path::Path::new(&path);
         let std = std::fs::read(std::env::var("HORIZON_WASM_STD").unwrap()).unwrap();
-        let mut manifest = Package::read(path).unwrap().manifest;
-        // This fixture variant exercises ordinary hooks and Parts, not game points.
-        manifest.inject.clear();
+        let manifest = Package::read(path).unwrap().manifest;
         let info = mod_api::PackageInfo::new(
             manifest.id.clone(),
             manifest.version.clone(),
             mod_api::PackageKind::Code,
             mod_api::Side::Both,
             vec![manifest.id.clone()],
-            manifest.dependencies.keys().cloned().collect(),
+            Vec::new(),
         );
         let package = WasmPackage {
             manifest,

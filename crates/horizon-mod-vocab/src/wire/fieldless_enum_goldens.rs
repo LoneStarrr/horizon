@@ -155,7 +155,7 @@ fn existing_fieldless_enum_layouts_match_baseline() {
     );
     assert_eq!(
         <crate::world::data_maps::DataMapError as Wire>::layout(&mut vec![]),
-        0x38e6144ff0918aa9,
+        0x3c338ccd2a00316e,
         "DataMapError"
     );
     assert_eq!(
@@ -247,7 +247,7 @@ fn existing_fieldless_enum_layouts_match_baseline() {
     );
     assert_eq!(
         <crate::world::types::ExplosionInteraction as Wire>::layout(&mut vec![]),
-        0x649673fec35bab1f,
+        0x1ede2797636bb977,
         "ExplosionInteraction"
     );
     assert_eq!(
@@ -282,7 +282,7 @@ fn existing_fieldless_enum_layouts_match_baseline() {
     );
     assert_eq!(
         <crate::world::types::GameRuleError as Wire>::layout(&mut vec![]),
-        0xe76f57d2c9f945cb,
+        0xb0678faa207c25fa,
         "GameRuleError"
     );
     assert_eq!(
@@ -399,6 +399,11 @@ fn existing_fieldless_enum_layouts_match_baseline() {
         <crate::entity::types::MinecartKind as Wire>::layout(&mut vec![]),
         0x3ee6a888c41a4aa0,
         "MinecartKind"
+    );
+    assert_eq!(
+        <crate::entity::types::MoveCause as Wire>::layout(&mut vec![]),
+        0x00bec45d5d6aef41,
+        "MoveCause"
     );
     assert_eq!(
         <crate::world::types::MobCategory as Wire>::layout(&mut vec![]),
@@ -526,6 +531,11 @@ fn existing_fieldless_enum_layouts_match_baseline() {
         "RaidStatus"
     );
     assert_eq!(
+        <crate::block::rail_shape::RailShape as Wire>::layout(&mut vec![]),
+        0xd5b1c18674ac3799,
+        "RailShape"
+    );
+    assert_eq!(
         <crate::content::content_declarations::Rarity as Wire>::layout(&mut vec![]),
         0x52de7b6c1b10c3e0,
         "Rarity"
@@ -577,7 +587,7 @@ fn existing_fieldless_enum_layouts_match_baseline() {
     );
     assert_eq!(
         <crate::item::crafting::Shape as Wire>::layout(&mut vec![]),
-        0xa157d010a4183033,
+        0x004a43af941b0c62,
         "Shape"
     );
     assert_eq!(
@@ -587,7 +597,7 @@ fn existing_fieldless_enum_layouts_match_baseline() {
     );
     assert_eq!(
         <crate::content::package_side::Side as Wire>::layout(&mut vec![]),
-        0xdd28eeec22f3e455,
+        0xa58ce85f7e9e9c30,
         "Side"
     );
     assert_eq!(

@@ -18,6 +18,7 @@ impl Game<'_> {
             next_entity: &mut self.next_entity,
             spawn,
             spawn_angle: self.level.world_spawn_angle,
+            spawn_dimension: self.level.spawn_dimension(),
             difficulty: i32::from(self.ui.difficulty),
             difficulty_locked: self.level.difficulty_locked,
             clock_rate,
@@ -49,6 +50,24 @@ impl Game<'_> {
                 return Some(host);
             }
             events = self.resume_raw_inbox(&mut host.hub, entities, spawn);
+        }
+    }
+}
+
+impl Game<'_> {
+    pub(super) fn receive_raw_delivery(
+        &mut self,
+        mut delivery: Box<horizon_client::raw_payloads::Delivery>,
+    ) {
+        let finished =
+            self.receive_server_payload(delivery.endpoint.clone(), &mut delivery.incoming);
+        let Some(host) = self.lan.as_mut() else {
+            return;
+        };
+        if !finished {
+            host.hub.defer_raw_payload(delivery);
+        } else {
+            host.hub.finish_raw_payload(delivery.conn);
         }
     }
 }

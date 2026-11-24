@@ -19,9 +19,9 @@ use horizon_core::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicI64, AtomicU8, Ordering},
     },
 };
@@ -84,26 +84,62 @@ fn fill_behind<T: Send + Sync + 'static>(
     }
 }
 
+/// What a finalizer reads [`Data`] into, shared with the thread `load_behind` starts.
+type DataCell = Arc<OnceLock<Option<Data>>>;
+
+/// The cell for a finalizer of `root` and `item_data`: the one a live finalizer of the same
+/// root and item defaults holds, else a new one. `load` takes no dimension, so the overworld
+/// and the Nether of one world read the same files: one read serves both instead of a copy
+/// each (#19996). The cell goes with the world's last finalizer.
+fn shared_cell(root: &Path, item_data: &Arc<ItemData>) -> DataCell {
+    static CELLS: Mutex<Vec<(PathBuf, Weak<ItemData>, Weak<OnceLock<Option<Data>>>)>> =
+        Mutex::new(Vec::new());
+    let mut cells = CELLS.lock().unwrap_or_else(PoisonError::into_inner);
+    cells.retain(|(_, _, cell)| cell.strong_count() > 0);
+    let live = cells.iter().find_map(|(path, data, cell)| {
+        // A held `Weak` keeps its allocation, so no other `ItemData` can take its address.
+        (path == root && std::ptr::eq(data.as_ptr(), Arc::as_ptr(item_data)))
+            .then(|| cell.upgrade())
+            .flatten()
+    });
+    live.unwrap_or_else(|| {
+        let cell = Arc::new(OnceLock::new());
+        cells.push((
+            root.to_owned(),
+            Arc::downgrade(item_data),
+            Arc::downgrade(&cell),
+        ));
+        cell
+    })
+}
+
 pub struct StructureMobFinalizer {
     root: PathBuf,
     item_data: Arc<ItemData>,
     dimension: String,
-    /// Shared with the thread `load_behind` starts.
-    data: Arc<OnceLock<Option<Data>>>,
+    /// Shared with the thread `load_behind` starts and the world's other finalizers.
+    data: DataCell,
     /// The level's difficulty (0 peaceful to 3 hard) and overworld clock.
     difficulty: AtomicU8,
     day_time: AtomicI64,
+    mob_maps: std::sync::RwLock<Arc<crate::neoforge_mob_maps::NeoForgeMobMaps>>,
 }
 impl StructureMobFinalizer {
     pub fn new(root: PathBuf, dimension: &str, item_data: Arc<ItemData>) -> Self {
         Self {
+            data: shared_cell(&root, &item_data),
             root,
             item_data,
             dimension: dimension.to_owned(),
-            data: Arc::new(OnceLock::new()),
             difficulty: AtomicU8::new(2),
             day_time: AtomicI64::new(0),
+            mob_maps: std::sync::RwLock::new(Arc::clone(
+                crate::neoforge_mob_maps::NeoForgeMobMaps::vanilla(),
+            )),
         }
+    }
+    pub fn set_mob_maps(&self, snapshot: &Arc<crate::neoforge_mob_maps::NeoForgeMobMaps>) {
+        *self.mob_maps.write().unwrap() = Arc::clone(snapshot);
     }
     pub fn set_conditions(&self, difficulty: u8, day_time: i64) {
         self.difficulty.store(difficulty, Ordering::Relaxed);
@@ -113,6 +149,7 @@ impl StructureMobFinalizer {
 
 struct Level<'a> {
     data: &'a Data,
+    mob_maps: &'a crate::neoforge_mob_maps::NeoForgeMobMaps,
     biome: &'a str,
     structures: &'a [String],
     difficulty: u8,
@@ -120,6 +157,9 @@ struct Level<'a> {
     next_id: u32,
 }
 impl FinalizeLevel for Level<'_> {
+    fn mob_maps(&self) -> &crate::neoforge_mob_maps::NeoForgeMobMaps {
+        self.mob_maps
+    }
     fn biome(&self, _: [i32; 3]) -> String {
         self.biome.to_owned()
     }
@@ -315,8 +355,11 @@ impl StructureMobFinalizer {
     ) -> Option<Compound> {
         let base = self.difficulty.load(Ordering::Relaxed);
         let day_time = self.day_time.load(Ordering::Relaxed);
+        // Release the publication lock before any finalize body runs.
+        let mob_maps = Arc::clone(&self.mob_maps.read().unwrap());
         let mut level = Level {
             data,
+            mob_maps: &mob_maps,
             biome,
             structures,
             difficulty: base,
@@ -349,6 +392,90 @@ impl StructureMobFinalizer {
 mod tests {
     use super::*;
     use horizon_world::native_load_context::DataLoadOrigin;
+
+    /// The dimensions of one world read their data once (#19996); another load's item
+    /// defaults read their own, and the read goes when the world's finalizers do.
+    #[test]
+    fn a_worlds_dimensions_share_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("items.json"), "{}").unwrap();
+        let root = dir.path().to_owned();
+        let load = || crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad);
+        let item_data = load().unwrap();
+        let overworld =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", item_data.clone());
+        let nether = StructureMobFinalizer::new(root.clone(), "minecraft:the_nether", item_data);
+        assert!(Arc::ptr_eq(&overworld.data, &nether.data));
+        let other =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", load().unwrap());
+        assert!(!Arc::ptr_eq(&overworld.data, &other.data));
+        let read = Arc::downgrade(&overworld.data);
+        drop((overworld, nether));
+        assert!(read.upgrade().is_none());
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn structure_maps_reload_without_cross_world_bleed() {
+        use crate::neoforge_mob_maps::NeoForgeMobMaps;
+        use std::collections::BTreeMap;
+        let root = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("explicit fixture resources"),
+        );
+        let item_data =
+            crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad).unwrap();
+        let first =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", item_data.clone());
+        let mut second = StructureMobFinalizer::new(root, "minecraft:overworld", item_data);
+        // Resource decoding can be shared; the two worlds' published snapshots cannot.
+        second.data = first.data.clone();
+        let mut desert = NeoForgeMobMaps::default();
+        desert.set_villager_types(BTreeMap::from([("minecraft:plains".into(), 1)]));
+        let desert = Arc::new(desert);
+        let mut snow = NeoForgeMobMaps::default();
+        snow.set_villager_types(BTreeMap::from([("minecraft:plains".into(), 4)]));
+        let snow = Arc::new(snow);
+        let mut removed = NeoForgeMobMaps::default();
+        removed.set_villager_types(BTreeMap::new());
+        let removed = Arc::new(removed);
+        first.set_mob_maps(&desert);
+        second.set_mob_maps(&snow);
+        for (world, snapshot, expected) in [
+            (&first, None, "minecraft:desert"),
+            (&second, None, "minecraft:snow"),
+            (&first, Some(&removed), "minecraft:plains"),
+            (&second, None, "minecraft:snow"),
+            (&first, Some(&desert), "minecraft:desert"),
+        ] {
+            if let Some(snapshot) = snapshot {
+                world.set_mob_maps(snapshot);
+            }
+            let Tag::Compound(mut nbt) = Tag::compound([
+                ("id", Tag::String("minecraft:villager".into())),
+                (
+                    "Pos",
+                    Tag::List(vec![
+                        Tag::Double(0.0f64.to_bits()),
+                        Tag::Double(64.0f64.to_bits()),
+                        Tag::Double(0.0f64.to_bits()),
+                    ]),
+                ),
+            ]) else {
+                unreachable!()
+            };
+            assert!(world.finalize(
+                &mut nbt,
+                "minecraft:plains",
+                &[],
+                &mut LegacyRandom::new(12345)
+            ));
+            let result = Tag::Compound(nbt);
+            assert!(
+                matches!(result.get("VillagerData").and_then(|value| value.get("type")), Some(Tag::String(value)) if value.to_string_lossy() == expected),
+                "{result:?}"
+            );
+        }
+    }
 
     #[test]
     fn structure_zombie_preserves_unknown_profession() {

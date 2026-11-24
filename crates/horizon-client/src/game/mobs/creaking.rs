@@ -15,7 +15,7 @@ use horizon_client::{
 use horizon_core::{
     geometry::Vec3,
     position::BlockPos,
-    random::{LegacyRandom, RandomSource},
+    random::{LevelRandom, RandomSource},
 };
 use horizon_world::registry::BlockStateId;
 use std::sync::Arc;
@@ -116,7 +116,7 @@ impl Game<'_> {
         f: impl FnOnce(
             &mut CreakingHeart,
             Option<&horizon_client::mobs::MobWorld>,
-            &mut LegacyRandom,
+            &mut LevelRandom,
             &mut Host,
             &mut Vec<HeartEvent>,
         ),
@@ -131,7 +131,9 @@ impl Game<'_> {
         let creaking = self.res.mob_types().get("minecraft:creaking").cloned();
         let player_uuid = self.level.player_uuid;
         let snapshot: Vec<_> = if others {
-            mobs.iter().map(|m| seen(m, player_uuid)).collect()
+            mobs.iter()
+                .map(|m| seen(m, player_uuid, world_items!(self)))
+                .collect()
         } else {
             Vec::new()
         };
@@ -178,6 +180,9 @@ impl Game<'_> {
                     [0.0; 3],
                 ),
                 HeartEvent::OutputChanged(at) => self.container_changed((at[0], at[1], at[2])),
+                HeartEvent::BlockGameEvent(event, at, state) => {
+                    self.post_block_game_event(event, at, None, Some(state))
+                }
                 HeartEvent::Mob(event) => mob_events.push(event),
             }
         }
@@ -485,6 +490,10 @@ impl CreakingState {
 }
 
 #[cfg(test)]
+#[path = "tests/creaking_heart_events_tests.rs"]
+mod creaking_heart_events_tests;
+
+#[cfg(test)]
 mod tests {
     use super::CreakingState;
     use horizon_client::{chunk::Chunk, chunk_map::ChunkMap};
@@ -541,7 +550,7 @@ mod tests {
 mod nested_spawn_tests {
     use super::*;
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn lifted_heart_callback_keeps_nested_spawns_until_the_next_pass() {
         crate::game::entity::taken_pass_tests::in_both_dimensions(|game, balance| {
             let mut heart = CreakingHeart::default();

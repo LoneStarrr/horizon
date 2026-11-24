@@ -7,6 +7,7 @@
 //! connection stays on one thread, so its bytes keep their order. The
 //! integrated server's own player, over an in-memory pipe, is served the same
 //! way: the pipe tells the thread when bytes arrive.
+use super::Body;
 use horizon_protocol::connection::{ConnReader, ConnWriter, Pipe, Socket};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use std::{
@@ -36,6 +37,10 @@ const WAKER: Token = Token(usize::MAX);
 pub(super) trait Session: Send {
     /// A packet arrived.
     fn packet(&mut self, id: i32, payload: Vec<u8>) -> Verdict;
+    /// Retry an already-decoded packet deferred by ingress backpressure.
+    fn flush_deferred(&mut self) -> Verdict {
+        Verdict::Go
+    }
     /// A packet to send of its own accord now (a keep-alive).
     fn tick(&mut self, now: Instant) -> Option<Vec<u8>>;
     /// The connection is ending, for this reason: no packet arrives after it.
@@ -47,6 +52,8 @@ pub(super) trait Session: Send {
 /// What becomes of a connection after one of its packets.
 pub(super) enum Verdict {
     Go,
+    /// Backpressure: pause reads until the deferred packet fits in the ingress budget.
+    Defer,
     /// Close it now, for this reason.
     Close(String),
     /// Send this body (a disconnect) after what is queued, then close, for this reason.
@@ -82,13 +89,12 @@ struct Queue {
 }
 
 // Include allocation capacity and geometric queue growth, even for empty bodies.
-pub(super) fn charge(body: &Vec<u8>) -> usize {
-    body.capacity()
-        .saturating_add(std::mem::size_of::<Queued>() * 2)
+pub(super) fn charge(retained: usize) -> usize {
+    retained.saturating_add(std::mem::size_of::<Queued>() * 2)
 }
 
 pub(super) struct Queued {
-    body: Vec<u8>,
+    body: Body,
     prepared: bool,
     pending: Arc<AtomicUsize>,
     cost: usize,
@@ -166,27 +172,30 @@ impl Outbox {
     /// follows an end, but a close overrides a disconnect still writing.
     /// Past [`MAX_PENDING`] a capped connection closes. The thread to wake, if
     /// this is the first news it has since it last looked.
-    pub(super) fn push(&self, bodies: Vec<Vec<u8>>, end: Option<End>) -> Option<&Arc<Worker>> {
-        let bodies = bodies
-            .into_iter()
-            .map(|body| Queued {
-                cost: charge(&body),
-                body,
-                prepared: false,
-                pending: self.pending.clone(),
-            })
-            .collect();
-        self.push_queued(bodies, end)
+    pub(super) fn push(&self, mut bodies: Vec<Body>, end: Option<End>) -> Option<&Arc<Worker>> {
+        self.push_from(&mut bodies, end)
     }
-    fn push_queued(&self, bodies: Vec<Queued>, end: Option<End>) -> Option<&Arc<Worker>> {
+    /// Drain `bodies` into the outbox queue while preserving the caller's vector capacity.
+    pub(super) fn push_from(
+        &self,
+        bodies: &mut Vec<Body>,
+        end: Option<End>,
+    ) -> Option<&Arc<Worker>> {
         let mut q = self.queue();
         match (q.at, q.end) {
-            (At::Closed, _) => return None,
+            (At::Closed, _) => {
+                bodies.clear();
+                return None;
+            }
             (_, None) => {
-                if q.bodies.is_empty() {
-                    q.bodies = bodies;
-                } else {
-                    q.bodies.extend(bodies);
+                q.bodies.reserve(bodies.len());
+                for body in bodies.drain(..) {
+                    q.bodies.push(Queued {
+                        cost: charge(body.retained()),
+                        body,
+                        prepared: false,
+                        pending: self.pending.clone(),
+                    });
                 }
                 q.end = if self.capped && self.pending.load(Ordering::Relaxed) > MAX_PENDING {
                     Some(End::Close)
@@ -194,8 +203,14 @@ impl Outbox {
                     end
                 };
             }
-            (_, Some(End::Disconnect)) if end == Some(End::Close) => q.end = end,
-            (_, Some(_)) => return None,
+            (_, Some(End::Disconnect)) if end == Some(End::Close) => {
+                bodies.clear();
+                q.end = end;
+            }
+            (_, Some(_)) => {
+                bodies.clear();
+                return None;
+            }
         }
         let At::Slot(slot) = q.at else {
             return None;
@@ -209,14 +224,24 @@ impl Outbox {
             .then_some(&self.worker)
     }
     /// [`Self::push`], waking the thread at once.
-    pub(super) fn send(&self, bodies: Vec<Vec<u8>>, end: Option<End>) {
+    pub(super) fn send(&self, bodies: Vec<Body>, end: Option<End>) {
         if let Some(worker) = self.push(bodies, end) {
+            worker.wake();
+        }
+    }
+    /// [`Self::push_from`], waking the thread at once.
+    pub(super) fn send_from(&self, bodies: &mut Vec<Body>, end: Option<End>) {
+        if let Some(worker) = self.push_from(bodies, end) {
             worker.wake();
         }
     }
     #[cfg(test)]
     pub(super) fn queued_contents(&self) -> Vec<Vec<u8>> {
-        self.queue().bodies.iter().map(|b| b.body.clone()).collect()
+        self.queue()
+            .bodies
+            .iter()
+            .map(|b| b.body.to_vec())
+            .collect()
     }
     pub(super) fn alive(&self) -> bool {
         let q = self.queue();
@@ -224,7 +249,7 @@ impl Outbox {
     }
     pub(super) fn publish(&self, body: Vec<u8>, cost: usize) -> bool {
         let packet = Queued {
-            body,
+            body: body.into(),
             cost,
             prepared: true,
             pending: self.pending.clone(),
@@ -251,11 +276,19 @@ impl Outbox {
     /// `room` for them, else only a close. An end stays, so that nothing is
     /// queued after it.
     fn take(&self, room: bool) -> (Vec<Queued>, Option<End>) {
+        let mut bodies = Vec::new();
+        let end = self.take_into(room, &mut bodies);
+        (bodies, end)
+    }
+    fn take_into(&self, room: bool, out: &mut Vec<Queued>) -> Option<End> {
+        out.clear();
         let mut q = self.queue();
         q.listed = false;
-        match room {
-            true => (std::mem::take(&mut q.bodies), q.end),
-            false => (Vec::new(), q.end.filter(|e| *e == End::Close)),
+        if room {
+            std::mem::swap(&mut q.bodies, out);
+            q.end
+        } else {
+            q.end.filter(|e| *e == End::Close)
         }
     }
     fn attach(&self, slot: usize) {
@@ -307,10 +340,13 @@ struct Pool {
     workers: Vec<Arc<Worker>>,
 }
 
-/// The pool, started the first time: one thread per two cores.
+/// The pool, started the first time: one thread per two cores, the automatic
+/// size Battery Mode halves. It used to count `available_parallelism` itself;
+/// through `horizon_threads` now, `HORIZON_WORKER_THREADS` caps it too, as
+/// [`horizon_threads::worker_count`] says it caps every pool.
 fn pool() -> Result<&'static Pool, String> {
     static POOL: OnceLock<Result<Pool, String>> = OnceLock::new();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
+    let threads = horizon_threads::sizing::for_pool(horizon_threads::sizing::Pool::Net);
     POOL.get_or_init(|| start(threads).map_err(|e| format!("network threads: {e}")))
         .as_ref()
         .map_err(Clone::clone)
@@ -373,6 +409,7 @@ fn run(mut poll: Poll, worker: &Arc<Worker>) {
     let mut free: Vec<usize> = Vec::new();
     let mut touched: Vec<usize> = Vec::new();
     let mut sweep_at = Instant::now() + SWEEP;
+    let mut release_seen = horizon_threads::release_seen();
     loop {
         let wait = sweep_at.saturating_duration_since(Instant::now());
         if let Err(e) = poll.poll(&mut events, Some(wait))
@@ -427,6 +464,15 @@ fn run(mut poll: Poll, worker: &Arc<Worker>) {
         }
         if now >= sweep_at {
             sweep_at = now + SWEEP;
+            // Give back what was freed into this thread's heap (the packets it
+            // read, the buffers of connections gone) when the server asks.
+            if horizon_threads::release_asked(&mut release_seen) {
+                if conns.iter().all(Option::is_none) {
+                    conns = Vec::new();
+                    free = Vec::new();
+                }
+                horizon_threads::release_free_memory();
+            }
             touched.clear();
             for (i, slot) in conns.iter_mut().enumerate() {
                 if let Some(c) = slot {
@@ -495,9 +541,13 @@ struct Conn {
     stalled: Option<Instant>,
     /// [`Session::left`] was called: what arrives now is dropped.
     left: bool,
+    /// Session holds an already-decoded packet deferred by ingress backpressure.
+    deferred: bool,
     /// A disconnect is in `out`: nothing more is taken from the outbox.
     draining: bool,
     close_at: Option<Instant>,
+    /// Reusable scratch buffer swapped in `serve` so high-rate ticks avoid `Vec` allocs.
+    serve_buf: Vec<Queued>,
 }
 impl Conn {
     /// Pipe readiness covers incoming data and capacity returned by peer reads.
@@ -556,8 +606,10 @@ impl Conn {
             last_read: now,
             stalled: None,
             left: false,
+            deferred: false,
             draining: false,
             close_at: None,
+            serve_buf: Vec::new(),
         })
     }
 
@@ -578,11 +630,35 @@ impl Conn {
     /// Read and hand over every packet that arrived.
     fn read(&mut self, now: Instant) {
         loop {
+            if self.deferred {
+                if !self.left {
+                    match self.session.flush_deferred() {
+                        Verdict::Go => self.deferred = false,
+                        Verdict::Defer => {
+                            self.last_read = now;
+                            return;
+                        }
+                        Verdict::Close(reason) => return self.end(now, reason),
+                        Verdict::Kick(reason, body) => {
+                            self.deferred = false;
+                            self.kick(now, reason, &body);
+                        }
+                    }
+                } else {
+                    self.deferred = false;
+                }
+                continue;
+            }
             match self.reader.buffered() {
                 Ok(Some((id, payload))) => {
                     if !self.left {
                         match self.session.packet(id, payload) {
                             Verdict::Go => {}
+                            Verdict::Defer => {
+                                self.deferred = true;
+                                self.last_read = now;
+                                return;
+                            }
                             Verdict::Close(reason) => return self.end(now, reason),
                             Verdict::Kick(reason, body) => self.kick(now, reason, &body),
                         }
@@ -607,15 +683,27 @@ impl Conn {
 
     /// Frame `bodies` into `out`, `queued` ones counted off `pending`: false
     /// if one could not be.
-    fn frame(&mut self, now: Instant, bodies: Vec<Queued>, _queued: bool) -> bool {
-        for body in &bodies {
+    fn frame(&mut self, now: Instant, mut bodies: Vec<Queued>, _queued: bool) -> bool {
+        self.frame_drain(now, &mut bodies)
+    }
+
+    fn frame_drain(&mut self, now: Instant, bodies: &mut Vec<Queued>) -> bool {
+        let mut tally = (0, 0);
+        // Drain by value so each body is freed once it is framed (#18313), while keeping buffer capacity.
+        for body in bodies.drain(..) {
             let result = if body.prepared {
                 self.writer.frame_into(&body.body, &mut self.out);
                 Ok(())
             } else {
-                super::conn::frame_body(&mut self.writer, &body.body, &mut self.out)
+                super::conn::frame_body_tallied(
+                    &mut self.writer,
+                    &body.body,
+                    &mut self.out,
+                    &mut tally,
+                )
             };
             if let Err(e) = result {
+                self.writer.count_frames(tally.0, tally.1);
                 self.end(now, e.to_string());
                 return false;
             }
@@ -626,6 +714,7 @@ impl Conn {
                 self.outbox.probe[5].store(self.out.len() - self.written, Ordering::Relaxed);
             }
         }
+        self.writer.count_frames(tally.0, tally.1);
         true
     }
 
@@ -638,7 +727,7 @@ impl Conn {
                 return self.end(now, "Disconnected");
             }
             // The hub's own disconnect, if it was the last queued, does for this one.
-            let ours = (end.is_none()).then(|| disconnect.to_vec());
+            let ours = (end.is_none()).then(|| Body::from(disconnect.to_vec()));
             if !self.frame(now, bodies, true)
                 || !self.frame(
                     now,
@@ -663,25 +752,34 @@ impl Conn {
     /// Write what is framed, and frame what the outbox holds, while the
     /// client takes it.
     fn serve(&mut self, now: Instant) {
+        let mut bodies = std::mem::take(&mut self.serve_buf);
+        let mut finished = false;
         loop {
             if !self.flush(now) || self.close_at.is_some() {
-                return;
+                break;
             }
             // A close is seen even while the client takes nothing.
             let room = !self.draining && self.out.len() - self.written <= AHEAD;
-            let (bodies, end) = self.outbox.take(room);
+            let end = self.outbox.take_into(room, &mut bodies);
             if end == Some(End::Close) {
-                return self.end(now, "Disconnected");
-            }
-            if bodies.is_empty() {
+                self.end(now, "Disconnected");
                 break;
             }
-            if !self.frame(now, bodies, true) {
-                return;
+            if bodies.is_empty() {
+                finished = true;
+                break;
+            }
+            if !self.frame_drain(now, &mut bodies) {
+                break;
             }
             self.draining = end == Some(End::Disconnect);
         }
-        if self.draining && self.written == self.out.len() && self.close_at.is_none() {
+        bodies.clear();
+        if bodies.capacity() > 512 {
+            bodies.shrink_to(64);
+        }
+        self.serve_buf = bodies;
+        if finished && self.draining && self.written == self.out.len() && self.close_at.is_none() {
             self.close_at = Some(now + LINGER);
         }
     }
@@ -748,6 +846,12 @@ impl Conn {
         if self.close_at.is_some() {
             return;
         }
+        if !self.left && self.deferred {
+            self.read(now);
+            if self.close_at.is_some() {
+                return;
+            }
+        }
         if self
             .stalled
             .is_some_and(|t| now.duration_since(t) > self.timeout)
@@ -762,7 +866,7 @@ impl Conn {
             && self.frame(
                 now,
                 vec![Queued {
-                    body,
+                    body: body.into(),
                     prepared: false,
                     pending: self.outbox.pending.clone(),
                     cost: 0,
@@ -848,7 +952,8 @@ mod tests {
     }
     impl Served {
         fn send(&self, bodies: Vec<Vec<u8>>, end: Option<End>) {
-            let len: usize = bodies.iter().map(charge).sum();
+            let bodies: Vec<Body> = bodies.into_iter().map(Body::from).collect();
+            let len: usize = bodies.iter().map(|b| charge(b.retained())).sum();
             self.pending.fetch_add(len, Ordering::Relaxed);
             self.outbox.send(bodies, end);
         }
@@ -895,6 +1000,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_socket_carries_packets_both_ways_in_order_then_disconnects() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -966,7 +1072,7 @@ mod tests {
         assert_eq!(served.next(), Seen::Closed);
         // Nothing after the kick, and nothing queued once closed.
         assert!(served.seen.try_recv().is_err());
-        assert!(served.outbox.push(vec![body(4, 1)], None).is_none());
+        assert!(served.outbox.push(vec![body(4, 1).into()], None).is_none());
     }
 
     #[test]
@@ -982,6 +1088,7 @@ mod tests {
     /// A client that reads nothing holds its disconnect unwritten; a close
     /// then ends the connection at once.
     #[test]
+    #[ignore = "daily"]
     fn a_close_ends_a_disconnect_the_client_does_not_take() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

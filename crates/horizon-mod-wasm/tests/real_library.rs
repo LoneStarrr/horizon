@@ -1,6 +1,6 @@
 //! Independently built library, observer and dependent packages load through the production loader.
 //! Its own test binary: the game's points registry is process-global and sealed once.
-// Generated fixtures exercise every shape; TODO(#2273): make the generator emit clippy-clean code.
+// Generated fixtures exercise every shape; TODO(arismoko/horizon#2273): make the generator emit clippy-clean code.
 #![allow(clippy::all, unused_comparisons, unreachable_patterns, dead_code)]
 #[path = "support/no_hooks.rs"]
 mod no_hooks;
@@ -36,7 +36,7 @@ fn real_library_dependency() {
                 mod_api::PackageKind::Code,
                 mod_api::Side::Both,
                 vec![manifest.id.clone()],
-                manifest.dependencies.keys().cloned().collect(),
+                Vec::new(),
             ));
             packages.push(WasmPackage {
                 manifest,
@@ -58,12 +58,6 @@ fn real_library_dependency() {
         replaced[0].manifest.wasm = Some(serde_json::from_value(manifest).unwrap());
         let refused = load(&std::fs::read(&std).unwrap(), replaced);
         assert!(refused.refused.iter().any(|(_, r)| matches!(r, horizon_mod_wasm::Refusal::LinkedAgainst { dependency } if dependency == "wasm_test_library")));
-        if !mod_points::STAGED {
-            // Fresh no-points variants retain the same library links, statics and Parts.
-            for package in &mut packages {
-                package.manifest.inject.clear();
-            }
-        }
         let loaded = load(&std::fs::read(std).unwrap(), packages);
         assert!(loaded.refused.is_empty(), "{:?}", loaded.refused);
         assert_eq!(loaded.mods.len(), 3);
@@ -81,31 +75,30 @@ fn real_library_dependency() {
                 "wasm_test_dependent:dependent".into(),
                 Default::default(),
             );
-            mod_api::dispatch_block_entity_tick(&mut Quiet, [0, 64, 0], &mut entity);
+            mod_api::dispatch_block_entity_tick(
+                &mut Quiet,
+                &mut mod_api::BlockEntityTickReply::Changed,
+                [0, 64, 0],
+                &mut entity,
+            );
             assert_eq!(&entity.data[..2], [37, 1], "library call and owned Drop");
             let address = entity.data[2];
             let mut observer = mod_api::ModBlockEntity::new(
                 "wasm_test_observer:observer".into(),
                 Default::default(),
             );
-            mod_api::dispatch_block_entity_tick(&mut Quiet, [0, 64, 0], &mut observer);
+            mod_api::dispatch_block_entity_tick(
+                &mut Quiet,
+                &mut mod_api::BlockEntityTickReply::Changed,
+                [0, 64, 0],
+                &mut observer,
+            );
             assert_eq!(
                 observer.data,
                 [73, address],
                 "one static, including its address"
             );
         });
-        if !mod_points::STAGED {
-            return;
-        }
-        mod_points::__private::seal();
-        let _phase = mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
-        let mut args = mod_points::TickArgs::__new();
-        mod_points::dispatch::tick(mod_api::HostSide::Server(&mut Quiet), &mut args);
-        assert!(
-            args.cancel,
-            "only the dependent package owns the tick registration"
-        );
     })
 }
 

@@ -125,7 +125,10 @@ impl FurnaceKind {
         self != Self::Furnace
     }
     pub fn from_block(name: &str) -> Option<Self> {
-        match crate::block_entity_types::factory_block(name) {
+        Self::from_factory(crate::block_entity_types::factory_block(name))
+    }
+    fn from_factory(name: &str) -> Option<Self> {
+        match name {
             "minecraft:furnace" => Some(Self::Furnace),
             "minecraft:blast_furnace" => Some(Self::BlastFurnace),
             "minecraft:smoker" => Some(Self::Smoker),
@@ -334,6 +337,75 @@ fn container_size(name: &str) -> Option<usize> {
 fn is_skull(name: &str) -> bool {
     name.ends_with("_skull") || (name.ends_with("_head") && name != "minecraft:piston_head")
 }
+/// The stock item-bearing factories. Construction and type-only capability coverage
+/// share this owner; neither needs to construct a block entity to discover its slots.
+enum StockItemContainer {
+    Furnace(FurnaceKind),
+    Crafter,
+    Brewing,
+    Jukebox,
+    Shelf,
+    Bookshelf,
+    Chest(usize),
+}
+
+impl StockItemContainer {
+    fn for_factory(name: &str) -> Option<Self> {
+        if let Some(kind) = FurnaceKind::from_factory(name) {
+            return Some(Self::Furnace(kind));
+        }
+        Some(match name {
+            "minecraft:crafter" => Self::Crafter,
+            "minecraft:brewing_stand" => Self::Brewing,
+            "minecraft:jukebox" => Self::Jukebox,
+            "minecraft:chiseled_bookshelf" => Self::Bookshelf,
+            n if n == "minecraft:shelf" || n.ends_with("_shelf") => Self::Shelf,
+            _ => Self::Chest(container_size(name)?),
+        })
+    }
+
+    fn type_id(&self) -> &'static str {
+        match self {
+            Self::Chest(HOPPER_SLOTS) => "minecraft:hopper",
+            Self::Chest(9) => "minecraft:dispenser",
+            Self::Chest(_) => "minecraft:chest",
+            Self::Furnace(FurnaceKind::Furnace) => "minecraft:furnace",
+            Self::Furnace(FurnaceKind::BlastFurnace) => "minecraft:blast_furnace",
+            Self::Furnace(FurnaceKind::Smoker) => "minecraft:smoker",
+            Self::Brewing => "minecraft:brewing_stand",
+            Self::Jukebox => "minecraft:jukebox",
+            Self::Crafter => "minecraft:crafter",
+            Self::Bookshelf => "minecraft:chiseled_bookshelf",
+            Self::Shelf => "minecraft:shelf",
+        }
+    }
+
+    fn build(self) -> BlockEntity {
+        match self {
+            Self::Furnace(kind) => BlockEntity::Furnace(Furnace {
+                kind,
+                items: [None, None, None],
+                lit_remaining: 0,
+                lit_total: 0,
+                cooking_timer: 0,
+                cooking_total: 0,
+                speed: 1.0,
+                recipes_used: HashMap::new(),
+            }),
+            // CrafterBlock.newBlockEntity copies the placed state's flag.
+            Self::Crafter => BlockEntity::Crafter(Crafter {
+                state_triggered: Some(false),
+                ..Crafter::default()
+            }),
+            Self::Brewing => BlockEntity::Brewing(Box::new(crate::brewing::BrewingStand::new())),
+            Self::Jukebox => BlockEntity::Jukebox(Jukebox::default()),
+            Self::Shelf => BlockEntity::Shelf(Box::default()),
+            Self::Bookshelf => BlockEntity::ChiseledBookshelf(Box::default()),
+            Self::Chest(slots) => BlockEntity::Chest(vec![None; slots]),
+        }
+    }
+}
+
 impl Crafter {
     /// `slotCanBeDisabled`: only empty slots.
     pub fn slot_can_be_disabled(&self, slot: usize) -> bool {
@@ -374,12 +446,76 @@ impl Crafter {
     }
 }
 impl BlockEntity {
+    /// Its saved stacks as the game that owns `prototypes` takes them in
+    /// (`ItemStack.CODEC`, `applyPatch`): each slot, record, book, brushed item and a
+    /// vault's key, display and ejections, through `item_data::clean_stack`. A mod's
+    /// slots are written only when one changes, so an unchanged entity keeps its
+    /// revision. True when a stack changed.
+    pub fn clean_stacks(&mut self, prototypes: &horizon_items::item_data::ItemPrototypes) -> bool {
+        fn clean<'a>(
+            stacks: impl IntoIterator<Item = &'a mut Option<ItemStack>>,
+            prototypes: &horizon_items::item_data::ItemPrototypes,
+        ) -> bool {
+            horizon_items::item_data::clean_stacks(stacks.into_iter().flatten(), prototypes)
+        }
+        match self {
+            BlockEntity::Chest(items) => clean(items, prototypes),
+            BlockEntity::Furnace(f) => clean(&mut f.items, prototypes),
+            BlockEntity::Brewing(b) => clean(&mut b.items, prototypes),
+            BlockEntity::Jukebox(j) => clean(&mut j.items, prototypes),
+            BlockEntity::Lectern(l) => clean([&mut l.book], prototypes),
+            BlockEntity::Crafter(c) => clean(&mut c.items, prototypes),
+            BlockEntity::Campfire(c) => clean(&mut c.items, prototypes),
+            BlockEntity::Brushable(b) => clean([&mut b.item], prototypes),
+            BlockEntity::Shelf(s) => clean(&mut s.items, prototypes),
+            BlockEntity::ChiseledBookshelf(b) => clean(&mut b.items, prototypes),
+            BlockEntity::Vault(v) => {
+                let ejected =
+                    horizon_items::item_data::clean_stacks(&mut v.items_to_eject, prototypes);
+                clean([&mut v.config.key_item, &mut v.display_item], prototypes) | ejected
+            }
+            BlockEntity::Mod(m) => {
+                let mut items = m.items.clone();
+                let changed = clean(&mut items, prototypes);
+                if changed {
+                    m.items = items;
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the stock factory gives this block item slots. Shares the factory's
+    /// classifier without constructing an entity or consulting a world instance.
+    pub fn has_builtin_item_container(name: &str) -> bool {
+        StockItemContainer::for_factory(name).is_some()
+    }
+
+    /// The item-bearing stock factory's entity identity, before the block-specific
+    /// save identity overrides (a trapped chest, barrel, dropper or shulker box).
+    pub fn builtin_item_container_type(name: &str) -> Option<&'static str> {
+        StockItemContainer::for_factory(name).map(|container| container.type_id())
+    }
+
     pub fn for_block(name: &str) -> Option<Self> {
         let factory = crate::block_entity_types::factory_block(name);
         if crate::block_entity_types::factory_valid(name) == Some(false) {
             return None;
         }
         Self::for_factory(factory)
+    }
+
+    /// `BlockEntity.<init>(pos, state)`: applies a block-state `mode` property
+    /// that a block entity's constructor reads from the placed `BlockState`
+    /// (`StructureBlock.MODE`).
+    pub fn apply_state_mode(&mut self, mode: Option<&str>) {
+        if let Self::StructureBlock(b) = self
+            && let Some(mode) =
+                mode.and_then(crate::structure_block::StructureMode::of_serialized_name)
+        {
+            b.mode = mode;
+        }
     }
 
     fn for_factory(name: &str) -> Option<Self> {
@@ -389,17 +525,8 @@ impl BlockEntity {
                 ..Default::default()
             }));
         }
-        if let Some(kind) = FurnaceKind::from_block(name) {
-            return Some(Self::Furnace(Furnace {
-                kind,
-                items: [None, None, None],
-                lit_remaining: 0,
-                lit_total: 0,
-                cooking_timer: 0,
-                cooking_total: 0,
-                speed: 1.0,
-                recipes_used: HashMap::new(),
-            }));
+        if let Some(container) = StockItemContainer::for_factory(name) {
+            return Some(container.build());
         }
         if matches!(
             name,
@@ -439,14 +566,6 @@ impl BlockEntity {
         if let Some(sculk) = crate::sculk::SculkEntity::for_block(name) {
             return Some(Self::Sculk(Box::new(sculk)));
         }
-        if name == "minecraft:crafter" {
-            // CrafterBlock.newBlockEntity copies the placed state's flag: the
-            // first tick sees it as a change from untriggered.
-            return Some(Self::Crafter(Crafter {
-                state_triggered: Some(false),
-                ..Crafter::default()
-            }));
-        }
         if name.ends_with("_banner") {
             return Some(Self::Banner(Banner::default()));
         }
@@ -468,10 +587,6 @@ impl BlockEntity {
         if name == "minecraft:daylight_detector" {
             return Some(Self::DaylightDetector);
         }
-        if name == "minecraft:ender_chest" {
-            // EnderChestBlock.newBlockEntity: 27 slots, player-specific inventory.
-            return Some(Self::Chest(vec![None; 27]));
-        }
         if name == "minecraft:end_portal" {
             // EndPortalBlock.newBlockEntity: no data, only identity.
             return Some(Self::EndPortal);
@@ -485,27 +600,16 @@ impl BlockEntity {
                 ..Default::default()
             })));
         }
-        if name == "minecraft:brewing_stand" {
-            return Some(Self::Brewing(Box::new(crate::brewing::BrewingStand::new())));
-        }
         if name == "minecraft:campfire" || name == "minecraft:soul_campfire" {
             return Some(Self::Campfire(Box::default()));
         }
-        if name == "minecraft:jukebox" {
-            return Some(Self::Jukebox(Jukebox::default()));
-        }
-        if name == "minecraft:shelf" || name.ends_with("_shelf") {
-            return Some(Self::Shelf(Box::default()));
-        }
-        if name == "minecraft:chiseled_bookshelf" {
-            return Some(Self::ChiseledBookshelf(Box::default()));
-        }
         if name == "minecraft:structure_block" {
             // The entity's mode is the state's (`StructureBlock.MODE`); the block's
-            // state is not known here, so a new one starts in its default, SAVE.
+            // state is not known here, so a new one starts in its default, LOAD
+            // (`StructureBlock.<init>`).
             return Some(Self::StructureBlock(Box::new(
                 crate::structure_block::StructureBlock::new(
-                    crate::structure_block::StructureMode::Save,
+                    crate::structure_block::StructureMode::Load,
                 ),
             )));
         }
@@ -524,7 +628,7 @@ impl BlockEntity {
         if name == "minecraft:potent_sulfur" {
             return Some(Self::PotentSulfur(PotentSulfur::default()));
         }
-        Some(Self::Chest(vec![None; container_size(name)?]))
+        None
     }
     /// `BlockEntity.isValidBlockState`: whether this kind of entity belongs
     /// under `name`'s block — vanilla keeps a set block's existing entity
@@ -592,25 +696,17 @@ impl BlockEntity {
     }
     pub fn id(&self) -> &str {
         match self {
-            Self::Chest(items) => match items.len() {
-                HOPPER_SLOTS => "minecraft:hopper",
-                9 => "minecraft:dispenser",
-                _ => "minecraft:chest",
-            },
-            Self::Furnace(f) => match f.kind {
-                FurnaceKind::Furnace => "minecraft:furnace",
-                FurnaceKind::BlastFurnace => "minecraft:blast_furnace",
-                FurnaceKind::Smoker => "minecraft:smoker",
-            },
-            Self::Brewing(_) => "minecraft:brewing_stand",
+            Self::Chest(items) => StockItemContainer::Chest(items.len()).type_id(),
+            Self::Furnace(f) => StockItemContainer::Furnace(f.kind).type_id(),
+            Self::Brewing(_) => StockItemContainer::Brewing.type_id(),
             Self::Sign(s) => s.id(),
-            Self::Jukebox(_) => "minecraft:jukebox",
+            Self::Jukebox(_) => StockItemContainer::Jukebox.type_id(),
             Self::Beacon(_) => "minecraft:beacon",
             Self::Lectern(_) => "minecraft:lectern",
             Self::Sculk(s) => s.id(),
             Self::Banner(_) => "minecraft:banner",
             Self::CopperGolemStatue(_) => "minecraft:copper_golem_statue",
-            Self::Crafter(_) => "minecraft:crafter",
+            Self::Crafter(_) => StockItemContainer::Crafter.type_id(),
             Self::CreakingHeart(_) => "minecraft:creaking_heart",
             Self::Spawner(_) => "minecraft:mob_spawner",
             Self::TrialSpawner(_) => "minecraft:trial_spawner",
@@ -626,8 +722,8 @@ impl BlockEntity {
             Self::EnchantingTable => "minecraft:enchanting_table",
             Self::Brushable(_) => "minecraft:brushable_block",
             Self::Campfire(_) => "minecraft:campfire",
-            Self::ChiseledBookshelf(_) => "minecraft:chiseled_bookshelf",
-            Self::Shelf(_) => "minecraft:shelf",
+            Self::ChiseledBookshelf(_) => StockItemContainer::Bookshelf.type_id(),
+            Self::Shelf(_) => StockItemContainer::Shelf.type_id(),
             Self::Mod(m) => m.id(),
             Self::PotentSulfur(_) => "minecraft:potent_sulfur",
             Self::StructureBlock(_) => "minecraft:structure_block",
@@ -845,6 +941,52 @@ mod tests {
     use super::*;
     use horizon_core::random::{LegacyRandom, RandomSource};
 
+    #[test]
+    fn stock_item_factories_construct_the_slots_their_type_coverage_promises() {
+        for (block, slots) in [
+            ("minecraft:chest", 27),
+            ("minecraft:trapped_chest", 27),
+            ("minecraft:oxidized_copper_chest", 27),
+            ("minecraft:barrel", 27),
+            ("minecraft:ender_chest", 27),
+            ("minecraft:red_shulker_box", 27),
+            ("minecraft:dispenser", 9),
+            ("minecraft:dropper", 9),
+            ("minecraft:hopper", 5),
+            ("minecraft:furnace", 3),
+            ("minecraft:blast_furnace", 3),
+            ("minecraft:smoker", 3),
+            ("minecraft:crafter", 9),
+            ("minecraft:brewing_stand", 5),
+            ("minecraft:jukebox", 1),
+            ("minecraft:chiseled_bookshelf", 6),
+            ("minecraft:oak_shelf", 3),
+        ] {
+            let factory = StockItemContainer::for_factory(block).unwrap();
+            assert_eq!(factory.build().slots().len(), slots, "{block}");
+            assert_eq!(
+                BlockEntity::for_factory(block).unwrap().slots().len(),
+                slots,
+                "{block}"
+            );
+        }
+        for block in [
+            "minecraft:stone",
+            "minecraft:composter",
+            "minecraft:campfire",
+            "minecraft:decorated_pot",
+            "minecraft:lectern",
+            "minecraft:beehive",
+            "minecraft:suspicious_sand",
+        ] {
+            assert!(StockItemContainer::for_factory(block).is_none(), "{block}");
+            assert!(
+                BlockEntity::for_factory(block).is_none_or(|entity| entity.slots().is_empty()),
+                "{block}"
+            );
+        }
+    }
+
     /// a client that isn't Horizon's is sent vanilla's menu types only.
     #[test]
     fn a_mod_menu_type_reaches_horizon_clients_only() {
@@ -1016,6 +1158,31 @@ mod tests {
         assert!(entity.fits("minecraft:end_portal"));
         // A stone block is not an end portal.
         assert!(BlockEntity::for_block("minecraft:stone").is_none());
+    }
+
+    /// `StructureBlock.<init>` defaults `MODE` to `StructureMode.LOAD`, which
+    /// `StructureBlockEntity.<init>` copies into the block entity; explicit
+    /// block-state modes (`mode=save`, `mode=corner`) propagate as well.
+    #[test]
+    fn bare_structure_block_starts_in_load_mode() {
+        let mut entity =
+            BlockEntity::for_block("minecraft:structure_block").expect("structure block entity");
+        let BlockEntity::StructureBlock(block) = &entity else {
+            panic!("expected structure block entity");
+        };
+        assert_eq!(block.mode, crate::structure_block::StructureMode::Load);
+        let saved = block.save();
+        let mode = saved.iter().find(|(k, _)| *k == "mode").map(|(_, v)| v);
+        assert_eq!(mode, Some(&horizon_core::nbt::Tag::String("LOAD".into())));
+
+        entity.apply_state_mode(Some("save"));
+        let BlockEntity::StructureBlock(block) = &entity else {
+            panic!("expected structure block entity");
+        };
+        assert_eq!(block.mode, crate::structure_block::StructureMode::Save);
+        let saved = block.save();
+        let mode = saved.iter().find(|(k, _)| *k == "mode").map(|(_, v)| v);
+        assert_eq!(mode, Some(&horizon_core::nbt::Tag::String("SAVE".into())));
     }
 }
 

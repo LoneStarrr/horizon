@@ -31,7 +31,7 @@ impl Hooks for SaveOnLoadedJoin {
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated homes"]
+#[ignore = "daily"]
 fn loaded_queue_join_save_refuses_without_losing_remaining_rows() {
     let root = PathBuf::from(std::env::var_os("HORIZON_HOME").unwrap()).join("save-load-pass");
     std::fs::create_dir_all(&root).unwrap();
@@ -61,7 +61,7 @@ fn loaded_queue_join_save_refuses_without_losing_remaining_rows() {
                 ])
             })
             .collect();
-        game.world.loaded_entities.push(((0, 0), tags));
+        game.world.queue_entity_nbt((0, 0), tags);
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
             "save-loaded-join",
             Box::new(SaveOnLoadedJoin {

@@ -5,6 +5,10 @@ mod interaction_event_wasm_tests;
 mod item_fallthrough_tests;
 #[path = "item_used_on_block_tests.rs"]
 mod item_used_on_block_tests;
+#[path = "predicted_use_tests.rs"]
+mod predicted_use_tests;
+#[path = "primed_tnt_crosshair_tests.rs"]
+mod primed_tnt_crosshair_tests;
 #[path = "use_item_hand_tests.rs"]
 mod use_item_hand_tests;
 #[path = "use_item_result_tests.rs"]
@@ -57,7 +61,7 @@ struct Controls {
     air_answer: Option<Answer>,
     air_main_only: bool,
     consume_item: bool,
-    /// The block phase takes one item from the hand before its answer.
+    /// The block phase takes one item from the hand, before its answer if it gives one.
     take_in_block: bool,
     expected_hand: Option<Hand>,
     part_answer: Option<Answer>,
@@ -77,6 +81,10 @@ struct Controls {
     clicks: usize,
     click_hands: Vec<Hand>,
     use_item_packets: usize,
+    /// The click is the host's own, not the fixture guest's: skip the guest identity asserts.
+    host_click: bool,
+    /// Each `use_item` event: side, hand, `player` and `player_entity_id`.
+    item_users: Vec<(LogicalSide, Hand, u128, i32)>,
     /// How many `set_creative_mode_slot` packets the client sent.
     creative_slot_packets: usize,
     expect_empty_item_phase: bool,
@@ -156,7 +164,7 @@ impl Hooks for Observer {
         assert_eq!(side(&host), event.click.side);
         assert_eq!(event.click.pos, [0, 64, 0]);
         assert_eq!(event.click.hit.face, [0, 1, 0]);
-        if event.click.side == LogicalSide::Server {
+        if event.click.side == LogicalSide::Server && !self.0.lock().unwrap().host_click {
             assert_eq!(event.click.player, 12);
             assert_eq!(event.click.player_entity_id, 12);
         }
@@ -179,21 +187,21 @@ impl Hooks for Observer {
             UsePhase::ItemBeforeBlock => state.first_answer,
             _ => unreachable!("UsePhase: unhandled variant"),
         };
+        if ((state.consume_item && answer.is_some() && event.phase == UsePhase::ItemAfterBlock)
+            || (state.take_in_block && event.phase == UsePhase::Block))
+            && let HostSide::Server(host) = host
+        {
+            let player = host.player(event.click.player).unwrap();
+            let items = player.entity().capability(host, &ENTITY_ITEMS, ()).unwrap();
+            let slot = player.selected_slot(host).unwrap();
+            let resource = ItemResource::of(event.click.stack.unwrap());
+            host.transaction(|host, tx| {
+                assert_eq!(items.extract(host, tx, slot, &resource, 1), 1);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
         if let Some(answer) = answer {
-            if ((state.consume_item && event.phase == UsePhase::ItemAfterBlock)
-                || (state.take_in_block && event.phase == UsePhase::Block))
-                && let HostSide::Server(host) = host
-            {
-                let player = host.player(event.click.player).unwrap();
-                let items = player.entity().capability(host, &ENTITY_ITEMS, ()).unwrap();
-                let slot = player.selected_slot(host).unwrap();
-                let resource = ItemResource::of(event.click.stack.unwrap());
-                host.transaction(|host, tx| {
-                    assert_eq!(items.extract(host, tx, slot, &resource, 1), 1);
-                    Ok::<_, ()>(())
-                })
-                .unwrap();
-            }
             *event.cancellation_result = answer;
             Flow::Cancel
         } else {
@@ -203,7 +211,7 @@ impl Hooks for Observer {
     fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
         assert_eq!(side(&host), event.click.side);
         assert_eq!(event.click.pos, [0, 64, 3]);
-        if event.click.side == LogicalSide::Server {
+        if event.click.side == LogicalSide::Server && !self.0.lock().unwrap().host_click {
             assert_eq!(event.click.player, 12);
             assert_eq!(event.click.player_entity_id, 12);
         }
@@ -243,15 +251,24 @@ impl ItemPart for Observer {
         }
         state.first_part_answer
     }
-    fn use_on(&self, _: &mut dyn ServerHost, _: &mut UseOnEvent<'_>) -> Flow {
+    fn use_on(&self, host: HostSide<'_>, _: &mut UseOnEvent<'_>) -> Option<Answer> {
+        let HostSide::Server(_) = host else {
+            return None;
+        };
         self.0.lock().unwrap().steps.push(Step::UseOnPart);
-        Flow::Cancel
+        Some(Answer::SuccessServer)
     }
-    fn use_item(&self, _: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<Answer> {
+    fn use_item(&self, host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<Answer> {
         if let Some(hand) = self.0.lock().unwrap().expected_hand {
             assert_eq!(event.hand, hand);
         }
         let mut state = self.0.lock().unwrap();
+        state.item_users.push((
+            side(&host),
+            event.hand,
+            event.player,
+            event.player_entity_id,
+        ));
         state.steps.push(Step::ItemPart);
         if state.part_pass {
             None
@@ -264,7 +281,16 @@ impl ItemPart for Observer {
 // The same real Game runs either its server path or its normal local-client
 // connection/prediction path, as the existing remote menu fixture does.
 fn with_interaction_game(client: bool, test: impl FnOnce(&mut Game<'_>)) {
-    with_game(|game| {
+    let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+    with_interaction_game_at(client, root, test);
+}
+
+fn with_interaction_game_at(
+    client: bool,
+    root: std::path::PathBuf,
+    test: impl FnOnce(&mut Game<'_>),
+) {
+    super::super::native_entity_refs::tests::with_game_at(root, |game| {
         let _peer = if client {
             game.options.execution_role = ExecutionRole::Client;
             let (client, server) = Pipe::pair();
@@ -312,7 +338,7 @@ fn use_block(game: &mut Game<'_>, client: bool) -> bool {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn right_click_block_forced_item_use_reaches_empty_hand_on_both_sides() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -384,7 +410,7 @@ fn right_click_block_forced_item_use_reaches_empty_hand_on_both_sides() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn right_click_block_explicit_allow_overrides_sneak_skip_on_both_sides() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -451,7 +477,7 @@ fn right_click_block_explicit_allow_overrides_sneak_skip_on_both_sides() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn phase_events_replace_the_behaviour_before_its_part_on_both_sides() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -674,7 +700,7 @@ fn phase_events_replace_the_behaviour_before_its_part_on_both_sides() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn canceled_item_results_keep_the_stack_wrappers_side_effects() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -786,7 +812,7 @@ fn canceled_item_results_keep_the_stack_wrappers_side_effects() {
 /// answers in place of the server's menu turn: SUCCESS swings and ends the click, FAIL ends it,
 /// PASS goes on to the other hand.
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn a_spectator_fires_right_click_block_on_the_client_and_its_cancel_answers() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -834,7 +860,7 @@ fn a_spectator_fires_right_click_block_on_the_client_and_its_cancel_answers() {
 
 /// A cancelled block PASS tries both hands, but neither may send or predict item use.
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn a_spectators_passing_block_click_skips_item_use_for_both_hands() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -901,7 +927,7 @@ fn a_spectators_passing_block_click_skips_item_use_for_both_hands() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn air_event_skips_the_item_and_consuming_results_end_the_click() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1032,7 +1058,7 @@ fn air_event_skips_the_item_and_consuming_results_end_the_click() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn before_block_cancellation_pass_continues_but_fail_and_consuming_results_stop() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1121,7 +1147,7 @@ fn before_block_cancellation_pass_continues_but_fail_and_consuming_results_stop(
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn on_item_use_first_runs_before_the_block_and_ends_the_click() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1201,7 +1227,7 @@ fn on_item_use_first_runs_before_the_block_and_ends_the_click() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn an_item_used_from_the_off_hand_reaches_the_use_hooks_on_the_server() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1306,6 +1332,7 @@ fn setup_interaction_guest(
             max_players: 2,
             integrated: true,
             levels: game.level_shapes,
+            level_seeds: game.levels.runtime.seeds(),
         },
     )
     .unwrap();
@@ -1334,7 +1361,7 @@ fn setup_interaction_guest(
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn a_server_client_fires_use_item_finish_when_the_server_completes_the_use() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1512,7 +1539,7 @@ fn a_server_client_fires_use_item_finish_when_the_server_completes_the_use() {
 /// drops send their own packets; they are not this path.) So a hand a finish listener replaced
 /// in creative mode is not sent as `SetCreativeModeSlot` by either of this client's senders.
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn a_creative_hand_replaced_by_a_finish_listener_is_not_sent_as_a_creative_slot() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1578,9 +1605,11 @@ fn a_creative_hand_replaced_by_a_finish_listener_is_not_sent_as_a_creative_slot(
 
 #[path = "interaction_key_tests.rs"]
 mod interaction_key_tests;
+#[path = "mapping_press_tests.rs"]
+mod mapping_press_tests;
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn item_use_overlap_matrix_on_the_server() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1694,7 +1723,7 @@ fn item_use_overlap_matrix_on_the_server() {
 /// MultiPlayerGameMode.performUseItemOn returns it without a swing. An unknown
 /// item must keep that inert fallback even when RightClickBlock forces use.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn resource_gated_unknown_held_item_forced_use_predicts_pass_without_a_swing() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1756,7 +1785,7 @@ fn resource_gated_unknown_held_item_forced_use_predicts_pass_without_a_swing() {
 }
 
 #[test]
-#[ignore = "requires prepared game resources"]
+#[ignore = "daily"]
 fn a_server_client_keeps_a_bundle_use_until_the_server_completes_it() {
     let observer = Observer::default();
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(

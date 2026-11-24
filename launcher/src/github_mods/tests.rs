@@ -130,6 +130,30 @@ fn an_asset_from_another_host_is_ignored() {
     );
 }
 
+/// GitHub answers a link whatever its letter case, and spells a release's files its own way
+/// (#18167).
+#[test]
+fn a_link_in_another_letter_case_still_takes_the_releases_hmod() {
+    let other = json!({
+        "name": "other.hmod",
+        "browser_download_url": "https://github.com/acme/zoom-fork/releases/download/v1/other.hmod",
+    });
+    let api = recorded(vec![
+        (
+            "repos/Acme/Zoom/releases/latest",
+            release("v1", json!([other, asset("zoom-1.hmod", None)])),
+        ),
+        ("repos/Acme/Zoom/commits/v1", json!({ "sha": SHA })),
+    ]);
+    let found = resolve(&link("https://github.com/Acme/Zoom"), &api).unwrap();
+    assert_eq!(found.tag.as_deref(), Some("v1"));
+    // Another repository's file is still not this one's.
+    assert_eq!(
+        found.asset.map(|file| file.name).as_deref(),
+        Some("zoom-1.hmod")
+    );
+}
+
 #[test]
 fn no_release_resolves_the_default_branch_to_a_commit() {
     let api = recorded(vec![
@@ -247,7 +271,7 @@ fn a_mod_folder_packs_into_a_bundle_the_registry_checks_accept() {
         ("zoom", "0.1.0")
     );
     assert_eq!(packed.sha256, sha256(&bytes));
-    let read = horizon_mod_package::index::native::Bundle::read(&packed.file).unwrap();
+    let read = horizon_platform::mod_package::index::native::Bundle::read(&packed.file).unwrap();
     for shipped in [
         "src/zoom.rs",
         "data/zoom/a.json",
@@ -278,7 +302,7 @@ fn a_flat_hmod_keeps_its_pins_and_ships_only_selected_files() {
     let bundle = &find_mods(&root).unwrap()[0];
     assert_eq!(bundle.manifest.native.as_ref().unwrap().mixins, SHA2);
     let packed = checked(&pack(bundle).unwrap(), &tree("unpacked-out")).unwrap();
-    let read = horizon_mod_package::index::native::Bundle::read(&packed.file).unwrap();
+    let read = horizon_platform::mod_package::index::native::Bundle::read(&packed.file).unwrap();
     assert_eq!(read.manifest.id, "zoom");
     assert!(read.files.contains_key("assets/zoom/lang/en_us.json"));
     let native = read.manifest.native.unwrap();

@@ -10,7 +10,7 @@ use horizon_client::{
 };
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{EntityRandom, LegacyRandom, RandomSource},
 };
 use mod_api::Identifier;
 use serde_json::{Value, json};
@@ -59,7 +59,7 @@ fn with_enchantments(defs: &[(&str, Value)], test: impl FnOnce(&mut super::Game<
         let stack = game.reload_datapacks(false, &[]).unwrap();
         let resources = game.options.resources.clone();
         game.world_tables = game
-            .build_world_tables(&stack, false, &resources, game.mods.data_switched)
+            .stage_world_tables(&stack, false, &resources)
             .unwrap()
             .0;
         for (name, _) in defs {
@@ -114,7 +114,7 @@ fn played(game: &mut super::Game<'_>) -> Vec<(String, f32, f32)> {
 /// a coin-flip sound draws twice when it plays and not at all when it
 /// doesn't, and the next effect's draws follow on.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn requirements_draw_the_level_random_before_each_effect() {
     let coin = json!({"condition": "minecraft:random_chance", "chance": 0.5});
     let effects = json!([
@@ -145,7 +145,7 @@ fn requirements_draw_the_level_random_before_each_effect() {
             let after = own.next_long();
             game.audio.capture = Some(Vec::new());
             let shot = Projectile::new(ProjectileKind::Snowball, Vec3::new(0.5, 70.0, 0.5), None)
-                .with_entity_random(LegacyRandom::new(seed));
+                .with_entity_random(EntityRandom::own(LegacyRandom::new(seed)));
             let id = game.spawn_projectile(shot, &stack);
             assert_eq!(played(game), expected, "seed {seed}");
             let p = game
@@ -168,7 +168,7 @@ fn requirements_draw_the_level_random_before_each_effect() {
 /// order and each enchantment's effect order; an arrow fired from its own
 /// item runs that item's effects once.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn stack_then_weapon_in_component_order() {
     let defs = [
         (
@@ -210,7 +210,7 @@ fn stack_then_weapon_in_component_order() {
                 Vec3::new(0.5, 70.0, 0.5),
                 Some(Who::Player),
             )
-            .with_entity_random(LegacyRandom::new(7));
+            .with_entity_random(EntityRandom::own(LegacyRandom::new(7)));
             let a = p.arrow.as_mut().unwrap();
             a.set_item(&ammo);
             a.fired_from_weapon = Some(weapon.clone());
@@ -257,7 +257,7 @@ fn stack_then_weapon_in_component_order() {
 /// whatever its count, leaves the stack alone, and refuses a stack with an
 /// effect the engine does not apply yet before drawing anything.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn owner_launch_applies_the_supplied_stacks_effects() {
     let defs = [
         ("hot", json!([{"effect": ignite(4.0)}])),

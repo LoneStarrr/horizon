@@ -58,14 +58,10 @@ impl Game<'_> {
         });
         // A canceled `BonemealEvent` that succeeded uses none of the meal.
         let consumed = used && ask.crop != Some(true);
-        // ItemStack.causeUseVibration at the player, after the meal is used
-        // up (shrunk even in creative): an emptied stack has no use effects.
-        if used
-            && held.count > u32::from(consumed)
-            && let Some(p) = self.player.as_ref().map(|p| p.position)
-        {
-            let ctx = self.player_context(None);
-            self.post_game_event("minecraft:item_interact_finish", [p.x, p.y, p.z], ctx);
+        // BoneMealItem.useOn checks use effects after shrinking, even in
+        // creative: an emptied stack exposes no components.
+        if used && held.count > u32::from(consumed) {
+            self.use_vibration(&held, "minecraft:item_interact_finish");
         }
         self.process_level_events()?;
         if used {
@@ -291,7 +287,7 @@ mod tests {
     /// one fails; an untouched use grows the stack the mod edited. One test,
     /// run in order in a fresh process, since every case reads `HEARD`.
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn a_dispensers_bonemeal_follows_the_cancel_and_the_edited_stack() {
         if super::super::native_entity_refs::tests::run_fresh_cases(
             "game::growth::tests::a_dispensers_bonemeal_follows_the_cancel_and_the_edited_stack",
@@ -343,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn the_hand_keeps_the_mods_stack_and_a_creative_count() {
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
             "meal",
@@ -372,7 +368,7 @@ mod tests {
     /// registry when the world's worldgen entries are given, and a vanilla one
     /// stays; without them the pack's feature is unknown and its growth dropped.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_data_packs_feature_is_in_the_live_registry() {
         use horizon_world::worldgen::overrides::WorldgenOverrides;
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -405,7 +401,7 @@ mod tests {
     /// keep the first world's registry for the whole process), and re-opening
     /// the same packs reuses the registry built for them.
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn the_live_features_follow_the_world_being_opened() {
         // Other feature fixtures can evict the process-wide last-built cache.
         if super::super::native_entity_refs::tests::run_fresh_cases(

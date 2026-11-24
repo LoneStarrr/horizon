@@ -43,14 +43,21 @@ pub struct PartRegistrar {
     pub(crate) datapack_registries: Vec<crate::DatapackRegistryDeclaration>,
     pub(crate) menu_recipe_books: HashMap<String, MenuBookDeclaration>,
     pub(crate) self_refusal: Option<String>,
+    /// Loading warnings, by owning mod id, in registration order.
+    pub(crate) warnings: Vec<(String, crate::LoadingMessage)>,
     pub(crate) recipe_book_types: HashMap<String, String>,
     pub(crate) game_rule_categories: Vec<String>,
     pub(crate) game_rules: Vec<crate::GameRuleDecl>,
+    pub(crate) custom_stats: Vec<String>,
     pub(crate) mod_id: &'static str,
     pub(crate) mod_index: usize,
+    /// Whether the registering mod was loaded as a wasm module.
+    pub(crate) mod_wasm: bool,
     /// Parts registered so far, by every mod: the next part's `order`.
     pub(crate) registered: usize,
     pub(crate) parts: Parts,
+    /// Aggregate selector metadata bytes during this registration pass.
+    pub(crate) entity_selector_bytes: usize,
     pub(crate) tags: TagParts,
     pub(crate) block_entity_types: Vec<BlockEntityTypeDecl>,
     pub(crate) block_entity_transforms: HashMap<String, Arc<dyn crate::BlockEntityTransform>>,
@@ -58,8 +65,11 @@ pub struct PartRegistrar {
     pub(crate) world_fluids: Vec<(String, crate::WorldFluid)>,
     pub(crate) entity_attribute_modifications: Vec<EntityAttributeModification>,
     pub(crate) attributes: Vec<AttributeDeclaration>,
+    pub(crate) attribute_widenings: Vec<AttributeBoundsWidening>,
     pub(crate) general_entity_types: Vec<GeneralEntityTypeDeclaration>,
     pub(crate) spawn_placements: Vec<SpawnPlacementDeclaration>,
+    /// The entity Part state declarations, for the game to check their entity types.
+    pub(crate) entity_part_states: Vec<mod_vocab::__private::EntityPartStateDeclaration>,
     pub(crate) registry_keys: Rc<RefCell<horizon_mod_runtime::registry_keys::Requests>>,
     pub(crate) effects: OnceLock<horizon_mod_runtime::registry_keys::Effects>,
     pub(crate) controllers: Vec<ControllerInfo>,
@@ -68,10 +78,13 @@ pub struct PartRegistrar {
     pub(crate) dimensions: Vec<DimensionInfo>,
     pub(crate) dimension_shape: fn(&crate::DimensionSettings) -> bool,
     pub(crate) chunk_generators: Vec<ChunkGeneratorInfo>,
+    pub(crate) biome_sources: Vec<BiomeSourceInfo>,
+    pub(crate) density_function_types: Vec<DensityFunctionTypeInfo>,
     pub(crate) tree_parts: TreePartTable,
-    pub(crate) density_functions: Vec<DensityFunctionInfo>,
     pub(crate) feature_types: Vec<FeatureTypeInfo>,
     pub(crate) refused: Vec<String>,
+    /// The Part state keys this mod declared, with their types' Wire layouts and names.
+    pub(crate) part_states: HashMap<(&'static str, &'static str), (u64, &'static str)>,
 }
 
 impl PartRegistrar {
@@ -80,16 +93,20 @@ impl PartRegistrar {
         Self {
             menu_recipe_books: HashMap::new(),
             self_refusal: None,
+            warnings: Vec::new(),
             biome_modifiers: Vec::new(),
             biome_regions: Vec::new(),
             datapack_registries: Vec::new(),
             recipe_book_types: HashMap::new(),
             game_rule_categories: Vec::new(),
             game_rules: Vec::new(),
+            custom_stats: Vec::new(),
             mod_id,
             mod_index: 0,
+            mod_wasm: false,
             registered: 0,
-            parts: Parts::default(),
+            parts: Self::capability_parts(),
+            entity_selector_bytes: 0,
             tags: TagParts::default(),
             block_entity_types: Vec::new(),
             block_entity_transforms: HashMap::new(),
@@ -97,8 +114,10 @@ impl PartRegistrar {
             world_fluids: Vec::new(),
             entity_attribute_modifications: Vec::new(),
             attributes: Vec::new(),
+            attribute_widenings: Vec::new(),
             general_entity_types: Vec::new(),
             spawn_placements: Vec::new(),
+            entity_part_states: Vec::new(),
             registry_keys: Default::default(),
             effects: OnceLock::new(),
             controllers: Vec::new(),
@@ -108,9 +127,11 @@ impl PartRegistrar {
             dimensions: Vec::new(),
             dimension_shape: |_| false,
             chunk_generators: Vec::new(),
-            density_functions: Vec::new(),
+            biome_sources: Vec::new(),
+            density_function_types: Vec::new(),
             feature_types: Vec::new(),
             refused: Vec::new(),
+            part_states: HashMap::new(),
         }
     }
     /// `part`, of kind `kind`, for tag `tag`; none if it is refused.
@@ -205,9 +226,13 @@ pub(crate) fn register_all(
     for (index, hooks) in mod_vocab::__private::entered_registration(mods, "register").enumerate() {
         registrar.mod_id = mod_vocab::__private::parts_installation::mod_entry_id(&mods[index]);
         registrar.mod_index = index;
+        registrar.mod_wasm = mod_vocab::__private::parts_installation::mod_entry_wasm(&mods[index]);
         let context = crate::RegistrationContext::new();
         let rollback = registrar.registration_checkpoint();
         hooks.register(&mut registrar, &context);
+        for warning in mod_vocab::__private::take_registration_warnings(&context) {
+            RegistrationRefusalRegistrar::registration_warning(&mut registrar, warning);
+        }
         let reason = mod_vocab::__private::take_registration_refusal(&context)
             .or_else(|| registrar.self_refusal.take());
         if let Some(reason) = reason {
@@ -219,7 +244,7 @@ pub(crate) fn register_all(
         }
     }
     registrar.expand_block_entity_parts();
-    registrar.refuse_unknown_dimension_generators();
+    registrar.refuse_unknown_generators_and_biome_sources();
     registrar
 }
 
@@ -241,6 +266,14 @@ pub(crate) fn install_registrar(
     if let Err(errors) = &slots {
         registrar.refused.extend(errors.iter().cloned());
     }
+    for (id, warning) in &registrar.warnings {
+        log::warn!(
+            "mod {id} loading warning: {} {:?}",
+            warning.key(),
+            warning.args()
+        );
+    }
+    registrar.validate_recipe_types();
     if !registrar.refused.is_empty() {
         return Err(registrar.refused);
     }
@@ -258,6 +291,7 @@ pub(crate) fn install_registrar(
         game_rule_slots,
         game_rules: registrar.game_rules,
         game_rule_categories: registrar.game_rule_categories,
+        custom_stats: registrar.custom_stats,
         keys: registrar.parts,
         tags: registrar.tags,
         block_entity_types: registrar.block_entity_types,
@@ -265,9 +299,11 @@ pub(crate) fn install_registrar(
         entity_attributes: registrar.entity_attributes,
         world_fluids: registrar.world_fluids,
         attributes: registrar.attributes,
+        attribute_widenings: registrar.attribute_widenings,
         general_entity_types: registrar.general_entity_types,
         entity_attribute_modifications: registrar.entity_attribute_modifications,
         spawn_placements: registrar.spawn_placements,
+        entity_part_states: registrar.entity_part_states,
         resolved_block_entity_types: OnceLock::new(),
         registry_keys: Rc::try_unwrap(registrar.registry_keys)
             .unwrap_or_else(|_| unreachable!("registration scope has ended"))
@@ -275,6 +311,8 @@ pub(crate) fn install_registrar(
         effects: registrar.effects,
         fluids: OnceLock::new(),
         resolved_items: OnceLock::new(),
+        resolved_entity_types: OnceLock::new(),
+        resolved_game_events: OnceLock::new(),
         resolved_blocks: OnceLock::new(),
         particles: OnceLock::new(),
         controllers: registrar.controllers,
@@ -282,8 +320,10 @@ pub(crate) fn install_registrar(
         structure_types: registrar.structure_types,
         dimensions: registrar.dimensions,
         chunk_generators: registrar.chunk_generators,
+        biome_sources: registrar.biome_sources,
+        density_function_types: registrar.density_function_types,
+        warnings: registrar.warnings,
         tree_parts: registrar.tree_parts,
-        density_functions: registrar.density_functions,
         feature_types: registrar.feature_types,
     };
     mod_vocab::__private::parts_installation::install(installed);

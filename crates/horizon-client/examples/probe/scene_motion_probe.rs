@@ -11,6 +11,7 @@ use horizon_core::geometry::Aabb;
 use horizon_core::geometry::Vec3;
 use horizon_core::{position::BlockPos, random::RandomSource};
 use horizon_world::attributes::{Modifier, Operation};
+use horizon_world::move_gate::MoveGate;
 use horizon_world::movement_statistics::{self, MovementStat, MovementStatisticsWorld};
 use serde_json::Value;
 use std::{
@@ -223,7 +224,7 @@ fn snapshot(out: &mut impl Write, player: &PlayerMotion) -> Result<()> {
                 0f64.to_bits(),
                 if *bubble { 0.2f64 } else { 1.0 }.to_bits()
             )),
-            MotionEvent::Drown => Some("broadcast 67".into()),
+            MotionEvent::Drown(_) => Some("broadcast 67".into()),
             // The oracle marks every getAdvancements call (ENTER_BLOCK.trigger) so.
             MotionEvent::EnterBlock { .. } => Some("hurt-criterion".into()),
             MotionEvent::Waypoint { receiver, enabled } => Some(format!(
@@ -285,14 +286,14 @@ pub fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .into_iter();
         let count = instances.len();
-        let used = std::rc::Rc::new(std::cell::Cell::new(0));
+        let used = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = used.clone();
         let mut player = PlayerMotion::with_attribute_identities(
             &resources,
             vector(&f["position"]),
             &hashes,
             Box::new(move || {
-                counter.set(counter.get() + 1);
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 instances.next().expect("unexpected instance allocation")
             }),
         )?;
@@ -353,7 +354,7 @@ pub fn main() -> Result<()> {
                         jump: mask & 16 != 0,
                         shift: mask & 32 != 0,
                         sprint: mask & 64 != 0,
-                        analog: None,
+                        ..Default::default()
                     })?;
                 }
                 "movement_statistics" => world.check_movement_statistics(vector(&op["value"]))?,
@@ -519,7 +520,7 @@ pub fn main() -> Result<()> {
                         other => return Err(format!("unknown fixture effect {other}").into()),
                     }
                 }
-                "travel" => world.travel_in_air(vector(&op["value"]))?,
+                "travel" => world.travel_in_air(&mut MoveGate::new(), vector(&op["value"]))?,
                 "tick" => {
                     let v = vector(&op["value"]);
                     world.movement_tick([v.x as f32, v.y as f32, v.z as f32])?;
@@ -570,7 +571,7 @@ pub fn main() -> Result<()> {
                 }
                 "trigger" => world.player.jump_trigger_time = op["value"].as_i64().unwrap() as i32,
                 "delay" => world.player.no_jump_delay = op["value"].as_i64().unwrap() as i32,
-                "move" => world.move_self(vector(&op["value"]))?,
+                "move" => world.move_self(&mut MoveGate::new(), vector(&op["value"]))?,
                 "jump" => world.jump_from_ground()?,
                 "sprint" => world.player.set_sprinting(op["value"].as_bool().unwrap())?,
                 "speed" => world.player.speed = single(&op["value"]),
@@ -743,7 +744,7 @@ pub fn main() -> Result<()> {
             )?;
         }
         writeln!(out, "end")?;
-        if used.get() != count {
+        if used.load(std::sync::atomic::Ordering::Relaxed) != count {
             return Err("reference instance allocation count differs".into());
         }
     }

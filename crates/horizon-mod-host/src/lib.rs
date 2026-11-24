@@ -1,6 +1,10 @@
-//! Installed mod code loading above the engine (docs/layers.md, #2534).
+//! Installed mod code loading above the engine (docs/layers.md, arismoko/horizon#2534).
 //! The platform prepares the engine, loads mods here, then makes one engine start call.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[allow(unsafe_code)]
+mod native_libraries;
+pub use native_libraries::{GAME_BUILD_ID, RUSTC_VERSION, main};
 
 mod loading;
 pub use loading::main_with;
@@ -17,5 +21,13 @@ pub fn exit_if_compile_child() {
     }
 }
 
-/// A typed API-point listener supplied by generated native startup.
-pub use mod_points::__private::SlotListener;
+// Keeps the empty `mod_points` in the SDK build (Cargo.toml says why).
+use mod_points as _;
+
+/// A point listener of generated native startup; none exists since #19576.
+pub use mod_api::__private::native::SlotListener;
+
+#[cfg(test)]
+#[path = "../build_identity.rs"]
+#[allow(dead_code)] // `resolve` runs `git`; only build.rs calls it, the tests stay off processes
+mod build_identity;

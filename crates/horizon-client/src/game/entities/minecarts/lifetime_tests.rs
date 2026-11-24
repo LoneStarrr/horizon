@@ -6,7 +6,7 @@ use horizon_mod_runtime::attachments::{
 use std::sync::Mutex;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn lifecycle_carts_keep_registrations_through_commands_unload_park_and_remote() {
     use crate::game::entity::taken_pass_tests::{
         LifecycleFixture, RemoteLifecycle, SlotIdentities,
@@ -59,7 +59,7 @@ fn lifecycle_carts_keep_registrations_through_commands_unload_park_and_remote() 
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn connecting_to_a_remote_level_clears_the_existing_cart_list() {
     use horizon_protocol::connection::Pipe;
     super::super::native_entity_refs::tests::with_game(|game| {
@@ -77,7 +77,7 @@ fn connecting_to_a_remote_level_clears_the_existing_cart_list() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn exploding_a_cart_removes_only_its_owner_and_keeps_a_bound_survivor() {
     bound_cart_case(CartKind::Rideable, |game| {
         game.carts
@@ -165,7 +165,7 @@ impl mod_api::Hooks for TeleportPlayerOnCartDismount {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn exploding_driven_cart_does_not_reseat_a_player_moved_by_its_dismount_hook() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -221,7 +221,7 @@ impl mod_api::Hooks for ToggleActivatorDismount {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn activator_respects_canceled_player_dismount() {
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -254,7 +254,7 @@ fn activator_respects_canceled_player_dismount() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn disabled_tnt_rule_discards_primed_carts_but_keeps_unprimed_ticks() {
     for ridden in [false, true] {
         for primed in [false, true] {
@@ -309,7 +309,7 @@ fn disabled_tnt_rule_discards_primed_carts_but_keeps_unprimed_ticks() {
                     // A burning arrow cannot explode this unprimed cart, but
                     // MinecartTNT.hurtServer still forwards its ordinary damage.
                     let before = game.carts[0].damage;
-                    game.arrow_hits_cart(0, 1.0, Vec3::ZERO, true, false);
+                    game.arrow_hits_cart(0, 1.0, Vec3::ZERO, true, false, None, None);
                     assert_eq!(game.carts[0].damage, before + 10.0);
                 }
             });
@@ -318,7 +318,7 @@ fn disabled_tnt_rule_discards_primed_carts_but_keeps_unprimed_ticks() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
     // Tick explosion, burning-arrow explosion, and ordinary vehicle damage.
     for mode in 0..3 {
@@ -385,8 +385,14 @@ fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
 
                 match mode {
                     0 => game.tick_carts(),
-                    1 => game.arrow_hits_cart(0, 1.0, Vec3::ZERO, true, false),
-                    _ => game.hurt_cart(0, 5.0, true, false),
+                    1 => game.arrow_hits_cart(0, 1.0, Vec3::ZERO, true, false, None, None),
+                    _ => game.hurt_cart(
+                        0,
+                        5.0,
+                        true,
+                        false,
+                        crate::game::minecarts::CartHit::default(),
+                    ),
                 }
                 assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
                 assert!(game.entity(71).is_none());
@@ -437,7 +443,7 @@ fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_cart_commits_the_normal_server_tick() {
     bound_cart_case(CartKind::Furnace, |game| {
         game.carts.update(0, |cart| cart.fuel = 6);
@@ -448,7 +454,7 @@ fn a_bound_cart_commits_the_normal_server_tick() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_cart_commits_the_ridden_tick() {
     bound_cart_case(CartKind::Rideable, |game| {
         game.carts.update(0, |cart| cart.in_water = true);
@@ -467,7 +473,7 @@ fn a_bound_cart_commits_the_ridden_tick() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_ticked_cart_publishes_its_moved_position_before_pushing() {
     bound_cart_case(CartKind::Rideable, |game| {
         game.carts.update(0, |cart| cart.velocity.x = 0.4);
@@ -485,20 +491,25 @@ fn a_bound_ticked_cart_publishes_its_moved_position_before_pushing() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-fn a_bound_cart_commits_the_tnt_interaction() {
+#[ignore = "daily"]
+fn a_bound_tnt_cart_passes_interaction_without_priming() {
     bound_cart_case(CartKind::Tnt, |game| {
         game.inventory[game.selected] = Some(ItemStack::new("minecraft:fire_charge", 1));
-        assert!(game.interact_cart(Some(InteractTarget {
+        // MinecartTNT inherits Entity.interact (PASS), even with a fire charge.
+        assert!(!game.interact_cart(Some(InteractTarget {
             id: 71,
             location: [0.5, 70.0, 0.5],
         })));
-        assert_eq!(game.carts[0].fuse, 80);
+        assert_eq!(game.carts[0].fuse, -1);
+        assert_eq!(
+            game.inventory[game.selected],
+            Some(ItemStack::new("minecraft:fire_charge", 1))
+        );
     });
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_cart_commits_valid_nbt_and_refuses_an_invalid_load() {
     bound_cart_case(CartKind::Furnace, |game| {
         let target = super::super::commands::Target::Cart(71);
@@ -520,7 +531,7 @@ fn a_bound_cart_commits_valid_nbt_and_refuses_an_invalid_load() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_cart_survives_the_parked_level_swap() {
     bound_cart_case(CartKind::Rideable, |game| {
         game.enter_level(super::super::Dim::Nether).unwrap();
@@ -646,7 +657,7 @@ fn bound_cart_case(kind: CartKind, action: impl FnOnce(&mut Game<'_>)) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_bound_tnt_cart_keeps_its_join_when_damage_primes_it() {
     bound_cart_case(CartKind::Tnt, |game| {
         game.carts.push(Minecart::new(
@@ -656,7 +667,13 @@ fn a_bound_tnt_cart_keeps_its_join_when_damage_primes_it() {
         ));
         let expected: Vec<_> = game.carts.iter().map(|c| (c.id, c.join)).collect();
         let join = game.carts[0].join;
-        game.hurt_cart(0, 5.0, false, true);
+        game.hurt_cart(
+            0,
+            5.0,
+            false,
+            true,
+            crate::game::minecarts::CartHit::default(),
+        );
         assert_eq!(
             game.carts
                 .iter()
@@ -673,7 +690,7 @@ fn a_bound_tnt_cart_keeps_its_join_when_damage_primes_it() {
 
 // A public entity lookup also hides a temporarily extracted row. Check the
 // residency journal itself so a terminal path cannot leave a permanent Taken
-// record that poisons later level queries (#2855).
+// record that poisons later level queries (arismoko/horizon#2855).
 fn assert_vehicle_residency_retired(game: &mut Game<'_>, id: u32) {
     use crate::game::entity_residency::SlotAccess;
     assert_eq!(
@@ -688,7 +705,7 @@ fn assert_vehicle_residency_retired(game: &mut Game<'_>, id: u32) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn terminal_vehicle_damage_and_native_removal_retire_residency() {
     for cart in [false, true] {
         for mode in 0..3 {
@@ -720,7 +737,13 @@ fn terminal_vehicle_damage_and_native_removal_retire_residency() {
                 ));
                 if mode == 0 {
                     if cart {
-                        game.hurt_cart(0, 5.0, true, false);
+                        game.hurt_cart(
+                            0,
+                            5.0,
+                            true,
+                            false,
+                            crate::game::minecarts::CartHit::default(),
+                        );
                     } else {
                         assert!(game.hurt_boat(0, 5.0, true));
                     }

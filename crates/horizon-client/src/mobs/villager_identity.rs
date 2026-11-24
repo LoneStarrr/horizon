@@ -8,8 +8,8 @@ pub fn profession_id(index: u8) -> &'static str {
 }
 
 pub fn command_name(mob: &Mob) -> crate::text::Text {
-    if let Some(name) = &mob.custom_name {
-        return crate::text::Text::literal(name);
+    if let Some(name) = mob.display_custom_name() {
+        return name;
     }
     // Villager.getTypeName returns its registered profession's name.
     if mob.species() == Species::Villager {

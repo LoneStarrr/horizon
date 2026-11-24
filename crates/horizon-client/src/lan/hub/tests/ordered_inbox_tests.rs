@@ -12,6 +12,7 @@ fn with_input_context<T>(run: impl FnOnce(&mut TickCtx<'_>) -> T) -> T {
         next_entity: &mut next_entity,
         spawn: [0.5, 64.0, 0.5],
         spawn_angle: [0.0; 2],
+        spawn_dimension: "minecraft:overworld",
         difficulty: 2,
         difficulty_locked: false,
         clock_rate: 1.0,
@@ -62,12 +63,14 @@ fn leaving_physical_guest_keeps_then_discards_its_queued_input_credit() {
     let provider = hub.lan.shared.events.clone();
     publish_packet(&hub, S::Punch(horizon_protocol::packets::Empty));
     let conn = hub.guests[0].conn;
+    let uuid = hub.guests[0].uuid;
     provider
         .send(NetEvent::Left(conn, "test departure".into()))
         .unwrap();
     with_input_context(|ctx| {
         let events = hub.poll(ctx);
         assert!(hub.guests.is_empty());
+        assert!(hub.player_logout_pending(uuid));
         assert!(provider.stats().reserved_bytes > 0);
         assert!(
             events
@@ -75,6 +78,7 @@ fn leaving_physical_guest_keeps_then_discards_its_queued_input_credit() {
                 .any(|e| matches!(e, HostEvent::Left(g) if g.conn == conn && g.inbox.len() == 1))
         );
         drop(events);
+        assert!(!hub.player_logout_pending(uuid));
         assert_eq!(provider.stats().reserved_bytes, 0);
     });
 }
@@ -452,4 +456,120 @@ fn raw_never_overtakes_deferred_movement_and_cannot_reset_its_next_tick_deferral
             });
         });
     }
+}
+
+#[test]
+fn busy_raw_root_does_not_block_another_connections_same_pass() {
+    crate::raw_payloads::test_support::with_peer(|transport| {
+        let (mut hub, _out) = raw_hub(transport);
+        let (mut other, _other_out) = hub_with_a_guest();
+        let mut guest = other.guests.remove(0);
+        guest.conn = 99;
+        guest.uuid = 99;
+        guest.loaded = true;
+        guest.load_timeout = 0;
+        hub.guests.push(guest);
+        publish_raw(&hub, vec![1]);
+        publish_packet(&hub, rotation(30.0));
+        assert!(hub.guests[1].sender.undrained.handed(0));
+        hub.lan
+            .shared
+            .events
+            .send(NetEvent::Packet(99, Box::new(rotation(60.0)), 0))
+            .unwrap();
+        with_input_context(|ctx| {
+            drop(hub.poll(ctx));
+            for event in hub.drain_packets(ctx) {
+                if let HostEvent::RawPayload(delivery) = event {
+                    hub.defer_raw_payload(delivery);
+                }
+            }
+            drop(hub.drain_packets(ctx));
+            assert_eq!(hub.guests[1].yaw, 60.0);
+            assert_ne!(hub.guests[0].yaw, 30.0);
+            assert!(!hub.packets_paused());
+            assert!(hub.payload_deferred());
+            let retry = hub.poll(ctx);
+            assert_eq!(
+                retry
+                    .iter()
+                    .filter(|e| matches!(e, HostEvent::RawPayload(_)))
+                    .count(),
+                1
+            );
+            hub.finish_raw_payload(Some(hub.guests[0].conn));
+            drop(retry);
+            drop(hub.drain_packets(ctx));
+            assert_eq!(hub.guests[0].yaw, 30.0);
+        });
+    });
+}
+
+#[test]
+fn busy_raw_root_keeps_the_head_and_yields_until_the_next_receiving_turn() {
+    crate::raw_payloads::test_support::with_peer(|transport| {
+        let (mut hub, _out) = raw_hub(transport);
+        publish_raw(&hub, vec![1]);
+        publish_packet(&hub, rotation(30.0));
+        publish_raw(&hub, vec![2]);
+        with_input_context(|ctx| {
+            drop(hub.poll(ctx));
+            let mut first = None;
+            for event in hub.drain_packets(ctx) {
+                if let HostEvent::RawPayload(delivery) = event {
+                    first = Some(delivery);
+                }
+            }
+            let first = first.unwrap();
+            let credit = Arc::downgrade(&first.incoming.lease);
+            hub.defer_raw_payload(first);
+            assert!(hub.payload_deferred());
+            assert!(
+                hub.drain_packets(ctx).is_empty(),
+                "Busy must yield, not spin the frozen pass"
+            );
+            assert_ne!(hub.guests[0].yaw, 30.0);
+            assert!(credit.upgrade().is_some());
+            let retried: Vec<_> = hub
+                .poll(ctx)
+                .into_iter()
+                .filter_map(|event| {
+                    if let HostEvent::RawPayload(delivery) = event {
+                        Some(delivery)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(retried.len(), 1);
+            let crate::raw_payloads::Body::Payload(bytes) = &retried[0].incoming.body else {
+                panic!("expected original payload")
+            };
+            assert_eq!(bytes.0, [1]);
+            assert!(
+                hub.drain_packets(ctx).is_empty(),
+                "later movement waits for the retried root to finish"
+            );
+            drop(retried);
+            hub.finish_raw_payload(Some(hub.guests[0].conn));
+            let next: Vec<_> = hub
+                .drain_packets(ctx)
+                .into_iter()
+                .filter_map(|event| {
+                    if let HostEvent::RawPayload(delivery) = event {
+                        Some(delivery)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(hub.guests[0].yaw, 30.0);
+            assert_eq!(next.len(), 1);
+            let crate::raw_payloads::Body::Payload(bytes) = &next[0].incoming.body else {
+                panic!("expected second payload")
+            };
+            assert_eq!(bytes.0, [2]);
+            assert!(credit.upgrade().is_none());
+        });
+    });
 }

@@ -64,6 +64,15 @@ impl Game<'_> {
             Target::Player => self.riding,
             Target::Guest(conn) => self.command_guest(conn)?.vehicle,
             Target::Mob(id) => self.mob_object(id).filter(|m| !m.removed)?.extra.mount,
+            // A general row rides the row its tree loaded with; a row queued
+            // for removal rides nothing, as a removed mob does not.
+            Target::General(id) => self
+                .resident_entities
+                .general
+                .rows
+                .iter()
+                .find(|row| row.id == id && !self.persist.removals.contains(&Target::General(id)))
+                .and_then(|row| row.mount),
             _ => None,
         }
     }
@@ -74,7 +83,24 @@ impl Game<'_> {
     }
     /// What the entity rides (`Entity.getVehicle`): `None` when it rides
     /// nothing, its actual vehicle is off-level, or the input handle is stale.
+    /// Client-side reads use passenger packets and the local player's predicted ride.
     pub(super) fn entity_vehicle(&self, entity: EntityRef) -> Option<EntityRef> {
+        if !self.is_logical_server() {
+            // A remembered passenger relationship must not resurrect an entity
+            // that left this client level, or an old level's entity handle.
+            if self.native_client_entity_target(entity).is_none()
+                && self.native_client_tracked(entity).is_none()
+            {
+                return None;
+            }
+            let remote = self.remote.as_ref().filter(|remote| remote.logged_in)?;
+            let vehicle_id = if i32::try_from(entity.id()).ok()? == remote.entity_id {
+                self.riding
+            } else {
+                remote.passenger_vehicles.get(&entity.id()).copied()
+            }?;
+            return self.entity(vehicle_id);
+        }
         self.native_vehicle(entity).flatten()
     }
     /// Whether the entity rides another object, including a retained off-level vehicle.
@@ -457,16 +483,13 @@ impl Game<'_> {
         match rider {
             Target::Player => {
                 match vehicle {
-                    Target::Boat(id) => {
-                        if let Some(boat) = self.boats.iter().find(|b| b.id == id) {
-                            self.yaw = boat.yaw;
-                        }
-                    }
+                    // `ServerPlayer.startRiding` teleports with `Relative.ROTATION`: the
+                    // rider keeps their view, whatever the vehicle's yaw.
+                    Target::Boat(_) => {}
                     Target::Mob(id) => {
                         if let Some(mob) = self.mobs.iter_mut().find(|m| m.id == id) {
                             mob.extra.flag = false;
                             mob.extra.counter = 0;
-                            self.yaw = mob.yaw;
                         }
                         self.mount.jump_ticks = 0;
                         self.mount.jump_scale = 0.0;
@@ -487,6 +510,8 @@ impl Game<'_> {
             Target::Mob(id) => {
                 horizon_client::mobs::riders::link(&mut self.mobs, id, vehicle_id);
                 self.seat_mob(id);
+                // `Mob.startRiding`: `dropLeash()`, before the rider is seated.
+                self.break_leash(id, true, false);
             }
             _ => return false,
         }
@@ -629,6 +654,24 @@ impl Game<'_> {
             Target::Player | Target::Guest(_) => {
                 self.for_player(t, |g| g.stop_riding());
             }
+            // A general row gets off by its mount link: the row keeps its
+            // identity and place, and the level's next walk sees it as a
+            // root (`Entity.stopRiding` clears the mount and nothing else).
+            // The mount rewrite also retires the rows' rider index, which
+            // the list's own write stamp does not see.
+            Target::General(id) => {
+                let Some(row) = self
+                    .resident_entities
+                    .general
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                else {
+                    return false;
+                };
+                row.mount = None;
+                self.resident_entities.general.mount_writes += 1;
+            }
             _ => return false,
         }
         let stopped = self.native_vehicle_id(t).is_none();
@@ -708,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn generic_seat_mount_payloads_cancellation_and_capacity() {
         use horizon_client::entities::ArmorStand;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -766,6 +809,16 @@ mod tests {
                         mounting,
                     };
                     events.lock().unwrap().clear();
+                    if vehicle_kind == "minecraft:marker" {
+                        // Marker.couldAcceptPassenger refuses even a forced mount,
+                        // before the cancellable mount notification.
+                        assert!(!game.entity_start_riding(rider, vehicle, false));
+                        assert!(!game.entity_start_riding(rider, vehicle, true));
+                        assert_eq!(rider.vehicle(game), None);
+                        assert_eq!(vehicle.passengers(game), Some(vec![]));
+                        assert!(events.lock().unwrap().is_empty());
+                        continue;
+                    }
 
                     // A canceled handle write reports the type but changes neither side.
                     cancel.store(true, Ordering::SeqCst);
@@ -825,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn canceled_dismount_keeps_old_mount_and_mount_hook_fires_once() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -849,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn full_vehicle_checks_distinguish_forced_mobs_from_storage_limits() {
         use super::super::boats::Boat;
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -906,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn camel_admits_multiple_mob_passengers_but_not_a_fourth() {
         super::super::native_entity_refs::tests::with_game(|game| {
             for (id, name) in [
@@ -980,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn boat_and_cart_interactions_use_shared_mount_path() {
         use super::super::{
             InteractTarget,
@@ -990,6 +1043,7 @@ mod tests {
         use horizon_client::motion::PlayerMotion;
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.yaw = 10.0;
             game.boats
                 .push(Boat::new(60, "oak".into(), Vec3::ZERO, 45.0));
             assert!(game.interact_boat(Some(InteractTarget {
@@ -997,7 +1051,7 @@ mod tests {
                 location: [0.0; 3]
             })));
             assert_eq!(game.riding, Some(60));
-            assert_eq!(game.yaw, 45.0);
+            assert_eq!(game.yaw, 10.0, "mounting keeps the rider's view");
             game.riding = None;
             game.carts
                 .push(Minecart::new(61, CartKind::Rideable, Vec3::ZERO));
@@ -1010,7 +1064,47 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn a_rider_boards_another_cart_or_boat_straight_from_its_vehicle() {
+        use super::super::{
+            InteractTarget,
+            boats::Boat,
+            minecarts::{CartKind, Minecart},
+        };
+        use horizon_client::motion::PlayerMotion;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.carts
+                .push(Minecart::new(61, CartKind::Rideable, Vec3::ZERO));
+            game.carts
+                .push(Minecart::new(62, CartKind::Rideable, Vec3::ZERO));
+            let mut chest_boat = Boat::new(63, "oak".into(), Vec3::ZERO, 0.0);
+            chest_boat.chest = true;
+            game.boats.push(chest_boat);
+            let at = |id| {
+                Some(InteractTarget {
+                    id,
+                    location: [0.0; 3],
+                })
+            };
+            assert!(game.interact_cart(at(61)));
+            assert_eq!(game.riding, Some(61));
+            // Minecart.interact -> Entity.startRiding, which leaves the old
+            // vehicle first: the rider changes carts in one click.
+            assert!(game.interact_cart(at(62)));
+            assert_eq!(game.riding, Some(62));
+            // AbstractChestBoat.interact tries AbstractBoat.interact's
+            // boarding first; the chest only opens when that passes.
+            assert!(game.interact_boat(at(63)));
+            assert_eq!(game.riding, Some(63));
+            assert_eq!(game.container, None, "the chest stays closed");
+            assert!(game.interact_cart(at(61)));
+            assert_eq!(game.riding, Some(61), "and from a boat into a cart");
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn handles_reject_held_out_and_stale_entities() {
         super::super::native_entity_refs::tests::with_game(|game| {
             for id in [50, 51] {
@@ -1064,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_nested_tree_lists_passengers_depth_first_and_shares_its_root() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let camel = add_mob(game, 80, "minecraft:camel", Vec3::ZERO);
@@ -1186,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn passengers_keep_the_order_they_boarded_in_not_the_mob_list() {
         use horizon_core::nbt::Tag;
         super::super::native_entity_refs::tests::with_game(|game| {
@@ -1242,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_boards_ahead_of_a_mob_and_behind_a_player_as_add_passenger_says() {
         use horizon_client::motion::PlayerMotion;
         super::super::native_entity_refs::tests::with_game(|game| {
@@ -1287,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_first_passenger_controls_only_what_it_can_steer() {
         use super::super::boats::Boat;
         use horizon_client::items::ItemStack;
@@ -1394,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn entity_drops_gates_a_dying_mobs_lead_in_the_tick_not_in_detach() {
         use horizon_client::{
             gamerules::Value,
@@ -1413,6 +1507,7 @@ mod tests {
                     mob: 160,
                     drop: true,
                     sound: false,
+                    at: None,
                 };
                 game.handle_mob_events(vec![event]).unwrap();
                 assert_eq!(game.mobs[0].extra.leash, None);
@@ -1475,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mob_gets_off_where_the_query_says() {
         use super::super::{
             boats::Boat,
@@ -1513,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_gets_off_where_the_query_says() {
         use super::super::{
             boats::Boat,
@@ -1529,16 +1624,16 @@ mod tests {
             hub.update_guest(1, |g| g.motion = Some(Box::new(motion)))
                 .unwrap();
 
-            // Beside a cow, 0.45 + 0.4 across its facing, and to the other side past a wall.
+            // Animal searches neighbouring block centres, then the other side past a wall.
             let cow = add_mob(game, 120, "minecraft:cow", at);
-            assert_near(get_off(game, player, cow), [-0.35, 64.0, 0.5]);
+            assert_near(get_off(game, player, cow), [-0.5, 64.0, 0.5]);
             let registry = game.pack.assets.registry;
             let stone = registry.default_state("minecraft:stone").unwrap();
             let air = registry.default_state("minecraft:air").unwrap();
             for y in [64, 65] {
                 game.world.set(-1, y, 0, stone).unwrap();
             }
-            assert_near(get_off(game, player, cow), [1.35, 64.0, 0.5]);
+            assert_near(get_off(game, player, cow), [1.5, 64.0, 0.5]);
             for y in [64, 65] {
                 game.world.set(-1, y, 0, air).unwrap();
             }
@@ -1551,15 +1646,15 @@ mod tests {
             game.boats.push(Boat::new(123, "oak".into(), at, 0.0));
             let boat = game.entity(123).unwrap();
             assert_near(get_off(game, player, boat), [0.5, 64.0, 1.77229]);
-            // Unlike a mob's, a player's search takes a cart's yaw as it is.
+            // As for a mob, a cart facing south lets it off to the north.
             game.carts.push(Minecart::new(124, CartKind::Rideable, at));
             let cart = game.entity(124).unwrap();
-            assert_near(get_off(game, player, cart), [-0.5, 64.0, 0.5]);
+            assert_near(get_off(game, player, cart), [0.5, 64.0, -0.5]);
         });
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_gets_off_along_their_own_yaw_on_their_turn_or_not() {
         use super::super::boats::Boat;
         use horizon_client::motion::PlayerMotion;
@@ -1599,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn dismount_location_answers_without_a_ride_or_a_live_handle() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let at = Vec3::new(0.5, 64.0, 0.5);
@@ -1639,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn leash_writes_change_the_holder_and_tell_the_mods() {
         use super::super::boats::Boat;
         use horizon_client::{mobs::leash::Pending, motion::PlayerMotion};
@@ -1753,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mount_rejects_cycles_and_respects_cooldown_unless_forced() {
         super::super::native_entity_refs::tests::with_game(|game| {
             for id in [30, 31, 32] {

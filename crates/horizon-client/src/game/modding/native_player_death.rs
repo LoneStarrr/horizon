@@ -117,6 +117,7 @@ pub(in crate::game) mod tests {
             max_players: 2,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         };
         game.lan_host(settings, net, config).unwrap();
         let guest = new_guest(1, 123);
@@ -125,7 +126,7 @@ pub(in crate::game) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_players_last_death_location_reads_from_their_record() {
         with_game(|game| {
             let player = add_guest(game);
@@ -203,7 +204,7 @@ pub(in crate::game) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_acting_players_location_reads_and_writes_through_their_turn() {
         with_game(|game| {
             let player = add_guest(game);
@@ -233,7 +234,7 @@ pub(in crate::game) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_death_location_survives_a_playerdata_save_and_load() {
         use horizon_client::lan::playerdata;
 
@@ -252,7 +253,7 @@ pub(in crate::game) mod tests {
             // A fresh record of the same player never died until it loads.
             let mut fresh = new_guest(2, 123);
             assert_eq!(fresh.last_death, None);
-            assert!(playerdata::load(&mut fresh, &world));
+            assert!(playerdata::load(&mut fresh, &world, &Default::default()));
             assert_eq!(
                 fresh.last_death,
                 Some(("minecraft:overworld".into(), [4, 70, -9]))
@@ -266,7 +267,7 @@ pub(in crate::game) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_death_records_the_floored_block_and_dimension() {
         with_game(|game| {
             let player = add_guest(game);

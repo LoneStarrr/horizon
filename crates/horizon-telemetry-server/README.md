@@ -23,6 +23,7 @@ It runs at **https://telemetry.playhorizon.dev** (`DEFAULT_ENDPOINT` in `crates/
 | `POST /hub/vote` | `{"item": "<roadmap id>", "voter": "<the browser's random id>", "up": true}`: a 👍 on a roadmap item, one per voter; `"up": false` takes it back. Returns `{"item", "votes"}`. 400 for a bad id, 429 over the address's limit. |
 | `GET /hub/votes` | `{"votes": {"<item>": n}}`. Made again at most every minute. |
 | `POST /hub/report` | A bug report from the hub's form: `{"title", "did", "happened", "expected", "version"?, "system", "name"?}`. Opens a GitHub issue at once (labels `bug` and `from-website`, the `#horizon-bugs` template, "Reported on playhorizon.dev") and returns 201 `{"id", "issue": "<url>"}`. If GitHub fails: 202 `{"id", "issue": null}`, and the upkeep tries again for a week. The same report twice in a day returns the first one's issue. 400 for an empty or too long field, 429 over the address's limit, 503 past the day's cap or without `GITHUB_TOKEN`. |
+| `POST /v1/report` | A bug or performance report from the game: the fields in docs/telemetry.md "Bug reports from the game". Opens a GitHub issue in the game's template (labels `from-game`, and `bug` with the player's area or `perf`) and answers as `POST /hub/report` does. Its own daily cap; the same per-address limit as the hub's form. |
 | `GET /healthz` | `ok` |
 
 The hub's posts take JSON from the website (`OPTIONS` preflights answer with its origin). A form's hidden `website` field filled in (a bot) gets 202 and is dropped.
@@ -80,7 +81,7 @@ All are environment variables:
 - `HORIZON_TELEMETRY_MIN_INSTALL_DAYS` (5)
 - `HORIZON_TELEMETRY_REQUESTS_PER_HOUR` per address (60, bursts of 6)
 - `HORIZON_TELEMETRY_ITEMS_PER_DAY` per install (100)
-- `HORIZON_TELEMETRY_TRUST_PROXY=1` behind a proxy, with `HORIZON_TELEMETRY_CLIENT_IP_HEADER` naming the one header the proxy overwrites with the client's address (`x-real-ip` on Railway; its last comma-separated entry is used). No other header is read. The address is used only for the rate limits, in memory, and never stored or logged. `TRUST_PROXY=1` without the header would count the TCP peer, which behind a proxy is the proxy, so every client would share one bucket: the server refuses to start instead.
+- `HORIZON_TELEMETRY_TRUST_PROXY=1` behind a proxy, with `HORIZON_TELEMETRY_CLIENT_IP_HEADER` naming the one header the proxy overwrites with the client's address (`cf-connecting-ip` behind Cloudflare; its last comma-separated entry is used). No other header is read. The address is used only for the rate limits, in memory, and never stored or logged. `TRUST_PROXY=1` without the header would count the TCP peer, which behind a proxy is the proxy, so every client would share one bucket: the server refuses to start instead.
 - `HORIZON_TELEMETRY_ALLOW_ORIGIN` (`https://playhorizon.dev`)
 - `HORIZON_TELEMETRY_LIVE_PER_HOUR` per address, pings and reads (600, bursts of 60: ten players behind one address)
 - `HORIZON_TELEMETRY_LIVE_WINDOW_SECONDS` (120)
@@ -90,6 +91,7 @@ All are environment variables:
 - `HORIZON_TELEMETRY_HUB_PER_HOUR` votes and vote reads per address (600, bursts of 60: a page load is one read, and several players can share an address)
 - `HORIZON_TELEMETRY_HUB_POSTS_PER_HOUR` bug reports per address (20, bursts of 2)
 - `HORIZON_TELEMETRY_HUB_REPORTS_PER_DAY` from everyone (30): each opens an issue
+- `HORIZON_TELEMETRY_GAME_REPORTS_PER_DAY` reports from the game, from everyone (20): each opens an issue
 - `HORIZON_TELEMETRY_HUB_KEEP_DAYS` (90)
 - `HORIZON_TELEMETRY_GITHUB_TOKEN`: a fine-grained token with Issues read and write on the repository only (unset: `POST /hub/report` answers 503 and the form points to GitHub and Discord)
 - `HORIZON_TELEMETRY_GITHUB_REPO` (`horizon-rust/horizon`)
@@ -102,19 +104,11 @@ All are environment variables:
 
 `Dockerfile` builds it from the repository root (`docker build -f crates/horizon-telemetry-server/Dockerfile .`). The database goes on a volume mounted at `/data`.
 
-On Railway it is a service of the same project as the website:
+Production runs on Ludovic's home server **ludothinkpad** (NixOS, in Switzerland) since 2026-11-22, declared in `nixos/ludothinkpad/horizon.nix` of ludovic111/LifeOS:
 
-- Source: this repository, root directory `/` (the Dockerfile needs the shared crate), config file `/crates/horizon-telemetry-server/railway.json` (Dockerfile build, health check `/healthz`, one replica in `europe-west4`, Amsterdam: one SQLite file can't be shared).
-- A volume mounted at `/data`. The Dockerfile already sets `HORIZON_TELEMETRY_DB=/data/telemetry.sqlite3`, `HORIZON_TELEMETRY_TRUST_PROXY=1` and `HORIZON_TELEMETRY_CLIENT_IP_HEADER=x-real-ip`; Railway sets `PORT`.
-- The custom domain `telemetry.playhorizon.dev`: a `CNAME` at Porkbun to the target Railway gives.
+- The system service `horizon-telemetry` (user `horizon`, a low-priority slice with capped CPU and memory) listens on `127.0.0.1:8182` (`HOST`, `PORT`); a Cloudflare Tunnel publishes it at `telemetry.playhorizon.dev`, so `HORIZON_TELEMETRY_TRUST_PROXY=1` with `HORIZON_TELEMETRY_CLIENT_IP_HEADER=cf-connecting-ip`. No port is open.
+- The database is `/var/lib/horizon/telemetry/telemetry.sqlite3`; the host's nightly `horizon-backup` copies it to the Mac mini.
+- **A push to `main` goes live** when it changes a path in `deploy.json` (`watchPatterns`): the host's `horizon-deploy` timer builds `cargo build --release --locked --manifest-path crates/horizon-telemetry-server/Cargo.toml`, restarts the service, checks `/healthz` and rolls back to the previous build if it fails.
+- Secrets (`TELEMETRY_EXPORT_TOKEN`, `HORIZON_TELEMETRY_GITHUB_TOKEN`, …) are one environment file kept in 1Password (Agents, `Horizon host env telemetry`), written to the host by `horizon-secrets telemetry`.
 
-Check it with `curl https://telemetry.playhorizon.dev/healthz`.
-
-At Railway's prices (RAM $10/GB-month, CPU $20/vCPU-month, volumes $0.15/GB-month, egress $0.05/GB), one more service with a 1 GB volume uses about $0.35 a month:
-
-- RAM about 15 MB: $0.15
-- CPU nearly idle: under $0.05
-- the volume: $0.15
-- egress, the cached totals: cents
-
-That fits inside the Hobby plan's included $5 of usage. Railway Postgres would cost a few dollars a month for its memory alone and buys nothing at this size. A bucket isn't needed: crash reports are a few KB compressed and live in the same file.
+Check it with `curl https://telemetry.playhorizon.dev/healthz`. It costs nothing beyond the home server's power: about 15 MB of RAM and nearly no CPU; crash reports are a few KB compressed and live in the same file.

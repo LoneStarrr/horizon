@@ -12,6 +12,7 @@ use horizon_client::{
 use horizon_core::nbt::Tag;
 
 mod contents;
+pub(in crate::game) mod slot_sources;
 use contents::Component;
 
 /// One addressable slot.
@@ -35,6 +36,8 @@ pub(in crate::game) enum Slot {
     /// The ender dragon's equipment (`EquipmentSlot` ordinal).
     Dragon(u32, usize),
     Frame(u32),
+    /// A dropped item's stack: `ItemEntity.getSlot(0)`, the `contents` slot.
+    Item(u32),
     /// A chest or hopper minecart's slot (`ContainerEntity.getChestVehicleSlot`).
     Cart(u32, usize),
     Block([i32; 3], usize),
@@ -54,6 +57,38 @@ struct SlotCandidate {
 pub(in crate::game) enum Owner {
     Entity(Target),
     Block([i32; 3]),
+}
+
+#[derive(Clone, Copy)]
+struct ItemModifier<'a> {
+    json: &'a serde_json::Value,
+    /// The original typed component payloads of an inline modifier.
+    snbt: Option<&'a Tag>,
+}
+
+impl<'a> ItemModifier<'a> {
+    fn field(self, key: &str) -> Self {
+        Self {
+            json: &self.json[key],
+            snbt: self.snbt.and_then(|tag| tag.get(key)),
+        }
+    }
+
+    fn elements(self) -> impl Iterator<Item = Self> {
+        let tags = match self.snbt {
+            Some(Tag::List(tags)) => tags.as_slice(),
+            _ => &[],
+        };
+        self.json
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(move |(i, json)| Self {
+                json,
+                snbt: tags.get(i),
+            })
+    }
 }
 
 fn mob_slot(name: &str) -> Option<usize> {
@@ -93,6 +128,14 @@ fn matches_name(pattern: &str, name: &str) -> bool {
 }
 
 impl Game<'_> {
+    /// The item's default `minecraft:rarity` ("common" when it has none).
+    pub(in crate::game) fn item_rarity(&self, item: &str) -> String {
+        self.items()
+            .enchantments
+            .props
+            .get(item)
+            .map_or_else(|| "common".into(), |props| props.rarity.clone())
+    }
     fn owner_of(&mut self, ctx: &Context, prefix: &str, many: bool) -> R<Vec<Owner>> {
         let kind = ctx
             .literals
@@ -210,6 +253,16 @@ impl Game<'_> {
                     add(Slot::Frame(*id));
                 }
             }
+            // `ItemEntity.getSlot(0)`: `contents`, `container.0` and `hotbar.0`
+            // are all slot 0 (`SlotRanges`), and it holds the stack.
+            Owner::Entity(Target::Item(id)) => {
+                if matches_name(name, "contents")
+                    || matches_name(name, "container.0")
+                    || matches_name(name, "hotbar.0")
+                {
+                    add(Slot::Item(*id));
+                }
+            }
             // `getChestVehicleSlot` takes any index below `getContainerSize`.
             Owner::Entity(Target::Cart(id)) => {
                 let size = self
@@ -229,15 +282,19 @@ impl Game<'_> {
     }
     /// `ItemCommands.getSlotsFromProvider`: evaluate inline sources against
     /// the accessor's live owner. Named ranges retain their existing adapter.
-    fn command_slots(&mut self, owner: &Owner, raw: &str) -> Vec<Slot> {
-        if raw.starts_with('{') || raw.starts_with('[') {
-            let Ok((tag, _)) = horizon_core::nbt::parse_snbt(raw) else {
-                return Vec::new();
-            };
-            self.inline_slots(owner, &horizon_client::scoreboard::tag_to_json(&tag))
-        } else {
-            self.slots_named(owner, raw)
+    fn command_slots(&mut self, owner: &Owner, raw: &str) -> R<Vec<Slot>> {
+        if let Owner::Block(p) = owner
+            && self.block_container_size(*p).is_none()
+        {
+            return Err(err(
+                "commands.item.source.not_a_container",
+                &[&p[0], &p[1], &p[2]],
+            ));
         }
+        Ok(match self.resolved_slot_source(raw)? {
+            Some(source) => self.inline_slots(owner, &source),
+            None => self.slots_named(owner, raw),
+        })
     }
     /// `SlotCollection.itemCopies` / `size`: transforms apply to the
     /// collection, before a command's item predicate or item modifier.
@@ -259,7 +316,11 @@ impl Game<'_> {
                     .flat_map(|s| self.inline_slots(owner, s))
                     .collect()
             }),
-            "slot_range" => self.slots_named(owner, source["slots"].as_str().unwrap_or_default()),
+            "slot_range" => self
+                .slot_source_owner(owner, source)
+                .map_or_else(Vec::new, |owner| {
+                    self.slots_named(&owner, source["slots"].as_str().unwrap_or_default())
+                }),
             "contents" => {
                 let Some(component) = source["component"].as_str().and_then(Component::named)
                 else {
@@ -273,7 +334,7 @@ impl Game<'_> {
             }
             "limit_slots" => {
                 let mut slots = self.inline_slots(owner, &source["slot_source"]);
-                slots.truncate(source["limit"].as_u64().unwrap_or(0) as usize);
+                slots.truncate(slot_sources::limit(source));
                 slots
             }
             "filtered" => {
@@ -296,25 +357,29 @@ impl Game<'_> {
     /// live stack when visited. Limits share the command's TrackingSelector
     /// count across owners and group terms, and count selected empty slots
     /// only for replacement (not modification).
-    fn command_slot_candidates(&mut self, owner: &Owner, raw: &str) -> Vec<SlotCandidate> {
-        let source = horizon_core::nbt::parse_snbt(raw)
-            .ok()
-            .map(|(tag, _)| horizon_client::scoreboard::tag_to_json(&tag));
-        if raw.starts_with('{') || raw.starts_with('[') {
+    fn command_slot_candidates(&mut self, owner: &Owner, raw: &str) -> R<Vec<SlotCandidate>> {
+        if let Owner::Block(p) = owner
+            && self.block_container_size(*p).is_none()
+        {
+            return Err(err(
+                "commands.item.target.not_a_container",
+                &[&p[0], &p[1], &p[2]],
+            ));
+        }
+        if let Some(source) = self.resolved_slot_source(raw)? {
             let mut out = Vec::new();
-            if let Some(source) = source {
-                self.slot_candidates(owner, &source, &[], usize::MAX, &mut out);
-            }
-            out
+            self.slot_candidates(owner, &source, &[], usize::MAX, &mut out);
+            Ok(out)
         } else {
-            self.slots_named(owner, raw)
+            Ok(self
+                .slots_named(owner, raw)
                 .into_iter()
                 .map(|slot| SlotCandidate {
                     slot,
                     filters: Vec::new(),
                     limit: usize::MAX,
                 })
-                .collect()
+                .collect())
         }
     }
     /// `CompositeSlotSource.provide` and `TransformedSlotSource.provide`:
@@ -346,7 +411,10 @@ impl Game<'_> {
                 }
             }
             "slot_range" => {
-                for slot in self.slots_named(owner, source["slots"].as_str().unwrap_or_default()) {
+                let Some(owner) = self.slot_source_owner(owner, source) else {
+                    return;
+                };
+                for slot in self.slots_named(&owner, source["slots"].as_str().unwrap_or_default()) {
                     out.push(SlotCandidate {
                         slot,
                         filters: filters.to_vec(),
@@ -374,7 +442,7 @@ impl Game<'_> {
                 owner,
                 &source["slot_source"],
                 filters,
-                limit.min(source["limit"].as_u64().unwrap_or(0) as usize),
+                limit.min(slot_sources::limit(source)),
                 out,
             ),
             _ => {}
@@ -427,6 +495,12 @@ impl Game<'_> {
                 .equipment
                 .get(*i)
                 .cloned(),
+            Slot::Item(id) => self
+                .dropped
+                .iter()
+                .find(|e| e.id == *id)
+                .map(|e| e.stack.clone())
+                .filter(|s| &*s.item != "minecraft:air" && s.count > 0),
             Slot::Dragon(id, i) => self
                 .dragon
                 .as_ref()
@@ -438,14 +512,7 @@ impl Game<'_> {
             Slot::Cart(id, i) => self
                 .edit_cart_slots(*id, |slots| slots.get(*i).cloned().flatten())
                 .flatten(),
-            Slot::Block(p, i) => self
-                .world
-                .block_entities
-                .get(&(p[0], p[1], p[2]))?
-                .slots()
-                .get(*i)
-                .cloned()
-                .flatten(),
+            Slot::Block(p, i) => self.loot_inventory_item((p[0], p[1], p[2]), *i),
         }
     }
     pub(in crate::game) fn slot_accepts(&self, s: &Slot, stack: Option<&ItemStack>) -> bool {
@@ -477,6 +544,7 @@ impl Game<'_> {
         let Some(size) = self.block_container_size(p).filter(|&size| i < size) else {
             return false;
         };
+        self.unpack_loot(crate::game::container_loot::LootTarget::Block(key), None);
         let book = stack.as_ref().is_none_or(|s| {
             self.items()
                 .item_tags
@@ -484,6 +552,9 @@ impl Game<'_> {
                 .is_some_and(|m| m.contains(&*s.item))
         });
         let recipes = world_recipes!(self);
+        // `ChiseledBookShelfBlockEntity.setItem`: the slot written is the one
+        // `updateState` takes, even when its occupancy does not change.
+        let mut shelf_slot = None;
         match self.world.block_entities.get_mut(&key) {
             Some(BlockEntity::Furnace(f)) if i == 0 => {
                 f.set_input(&self.loop_context, recipes, stack)
@@ -494,6 +565,15 @@ impl Game<'_> {
                 return true;
             }
             Some(BlockEntity::ChiseledBookshelf(_)) if !book => return true,
+            Some(BlockEntity::ChiseledBookshelf(b)) => {
+                // A book put in, or a stack taken out: `removeItem` only
+                // updates the state when it found something.
+                let had_book = b.items[i].is_some();
+                b.items[i] = stack;
+                if had_book || b.items[i].is_some() {
+                    shelf_slot = Some(i);
+                }
+            }
             Some(BlockEntity::Jukebox(_)) => {
                 self.jukebox_set_item(p, stack);
                 return true;
@@ -510,6 +590,9 @@ impl Game<'_> {
             }
             Some(entity) => entity.slots_mut()[i] = stack,
             None => return false,
+        }
+        if let Some(slot) = shelf_slot {
+            self.chiseled_bookshelf_update_state(p, slot);
         }
         self.container_changed(key);
         true
@@ -565,6 +648,7 @@ impl Game<'_> {
         slot: &Slot,
         stack: Option<ItemStack>,
     ) -> bool {
+        let stack = stack.filter(|s| s.count > 0 && &*s.item != "minecraft:air");
         self.equipment_slot_accepts(slot, &stack) && self.slot_set(slot, stack)
     }
     /// Put a stack (or nothing) in a slot; false when the slot cannot take it.
@@ -579,6 +663,14 @@ impl Game<'_> {
         stack: Option<ItemStack>,
         effects: bool,
     ) -> bool {
+        let stack = stack.filter(|s| s.count > 0 && &*s.item != "minecraft:air");
+        if matches!(
+            s,
+            Slot::Inv(_) | Slot::MainHand | Slot::Armor(_) | Slot::Offhand | Slot::Equipment(_)
+        ) {
+            let uuid = self.native_acting_id();
+            self.journal_player(uuid);
+        }
         match s {
             Slot::Contents(..) => false,
             Slot::ContentItem(parent, component, index) => {
@@ -596,33 +688,34 @@ impl Game<'_> {
             Slot::Guest(conn, slot) => self
                 .for_player(Target::Guest(*conn), |g| g.slot_set(slot, stack))
                 .unwrap_or(false),
-            Slot::Inv(i) => match self.inventory.get_mut(*i) {
-                Some(slot) => {
-                    *slot = stack;
-                    true
-                }
-                None => false,
-            },
+            Slot::Inv(i) if *i < self.inventory.len() => {
+                self.stop_use_replaced(*i, stack.as_ref());
+                self.inventory[*i] = stack;
+                true
+            }
+            Slot::Inv(_) => false,
             // LivingEntity's equipment SlotAccess: setItemSlot, so onEquipItem.
-            Slot::MainHand => match self.inventory.get_mut(self.selected) {
-                Some(slot) => {
-                    let old = std::mem::replace(slot, stack.clone());
-                    self.player_on_equip("mainhand", old.as_ref(), stack.as_ref());
-                    true
-                }
-                None => false,
-            },
+            Slot::MainHand if self.selected < self.inventory.len() => {
+                self.stop_use_replaced(self.selected, stack.as_ref());
+                let old = std::mem::replace(&mut self.inventory[self.selected], stack.clone());
+                self.player_on_equip("mainhand", old.as_ref(), stack.as_ref());
+                true
+            }
+            Slot::MainHand => false,
             Slot::Armor(i) => match self.armor.get_mut(*i) {
                 Some(slot) => {
                     let old = std::mem::replace(slot, stack.clone());
                     let name = ["head", "chest", "legs", "feet"][*i];
                     self.player_on_equip(name, old.as_ref(), stack.as_ref());
-                    self.apply_equipment();
+                    if self.transactions.is_empty() {
+                        self.apply_equipment();
+                    }
                     true
                 }
                 None => false,
             },
             Slot::Offhand => {
+                self.stop_use_replaced(crate::game::shield::OFFHAND_SLOT, stack.as_ref());
                 let old = std::mem::replace(&mut self.offhand, stack.clone());
                 self.player_on_equip("offhand", old.as_ref(), stack.as_ref());
                 true
@@ -641,7 +734,16 @@ impl Game<'_> {
             }
             Slot::Ender(i) => match self.ender_items.get_mut(*i) {
                 Some(slot) => {
-                    *slot = stack;
+                    *slot = stack.clone();
+                    // An open ender chest menu shows a copy, which closing copies back
+                    // over `ender_items`: the write goes into the copy as well.
+                    if let Some(key) = self.ender_open
+                        && let Some(BlockEntity::Chest(items)) =
+                            self.world.block_entities.get_mut(&key)
+                        && let Some(open) = items.get_mut(*i)
+                    {
+                        *open = stack;
+                    }
                     true
                 }
                 None => false,
@@ -724,6 +826,17 @@ impl Game<'_> {
                 .as_mut()
                 .filter(|d| d.id == *id)
                 .is_some_and(|d| d.equipment.set(*i, stack)),
+            Slot::Item(id) => match self.dropped.iter_mut().find(|e| e.id == *id) {
+                Some(entity) => {
+                    // `ItemEntity.setItem`: the stack is the entity's.
+                    match stack.filter(|s| &*s.item != "minecraft:air" && s.count > 0) {
+                        Some(stack) => entity.stack = stack,
+                        None => entity.stack = ItemStack::new("minecraft:air", 0),
+                    }
+                    true
+                }
+                None => false,
+            },
             Slot::Frame(id) => match self.item_frames.iter().position(|f| f.id == *id) {
                 Some(i) => {
                     self.set_frame_item(i, stack);
@@ -777,16 +890,43 @@ impl Game<'_> {
             .as_deref()
             .map(horizon_client::item_data::command_components)
         {
-            Some(Ok(tag)) => horizon_client::item_data::decode_components(Some(&tag)),
+            Some(Ok(mut tag)) => {
+                // PatchedDataComponentMap.applyPatch drops values equal to the
+                // prototype. In vanilla, common item components include empty
+                // enchantments; a native mod can change or remove that default.
+                if let Tag::Compound(patch) = &mut tag {
+                    patch.retain(|key, value| {
+                        if !matches!(value, Tag::Compound(levels) if levels.is_empty())
+                            || !key
+                                .0
+                                .iter()
+                                .copied()
+                                .eq("minecraft:enchantments".encode_utf16())
+                        {
+                            return true;
+                        }
+                        self.items()
+                            .component_defaults
+                            .get(id)
+                            .and_then(|prototype| prototype.get(key))
+                            != Some(value)
+                    });
+                }
+                horizon_client::item_data::decode_components_for_item(id, Some(&tag))
+            }
             Some(Err(e)) => return Err(CommandError::new(Text::literal(e))),
             None => (0, None),
         };
-        let stack = ItemStack {
+        let mut stack = ItemStack {
             item: id.as_str().into(),
             count,
             damage,
             extra,
         };
+        // The same applyPatch rule for the decoded values: `damage=-0.5f` is the prototype's 0.
+        if let Some(prototype) = self.items().component_defaults.get(id) {
+            horizon_client::item_data::drop_prototype_values(&mut stack, prototype);
+        }
         // ItemInput.createItemStack: a count above the stack's max (its
         // max_stack_size component, else the item's) is refused.
         let max_stack = self.stack_max_size(&stack);
@@ -870,7 +1010,7 @@ impl Game<'_> {
     /// applied to a stack; `None` when the stack ends up empty.
     fn apply_item_modifier(
         &mut self,
-        m: &serde_json::Value,
+        modifier: ItemModifier<'_>,
         stack: Option<ItemStack>,
         rng: &mut horizon_core::random::LegacyRandom,
         this: Option<&horizon_client::advancements::EntityView>,
@@ -895,12 +1035,20 @@ impl Game<'_> {
                 _ => v["value"].as_f64().unwrap_or(0.) as i32,
             }
         };
+        let m = modifier.json;
         match m {
-            Value::Array(list) => list.iter().fold(stack, |s, f| {
+            Value::Array(_) => modifier.elements().fold(stack, |s, f| {
                 self.apply_item_modifier(f, s, rng, this, origin, depth + 1)
             }),
             Value::String(id) => match self.fns.store.item_modifiers.get(id).cloned() {
-                Some(f) => self.apply_item_modifier(&f, stack, rng, this, origin, depth + 1),
+                Some(f) => self.apply_item_modifier(
+                    ItemModifier { json: &f, snbt: None },
+                    stack,
+                    rng,
+                    this,
+                    origin,
+                    depth + 1,
+                ),
                 None => stack,
             },
             Value::Object(_) => {
@@ -911,12 +1059,9 @@ impl Game<'_> {
                     return Some(stack);
                 }
                 match m["type"].as_str().unwrap_or("") {
-                    "minecraft:sequence" => {
+                    "minecraft:sequence" | "sequence" => {
                         #[allow(clippy::manual_try_fold)]
-                        return m["functions"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
+                        return modifier.field("functions").elements()
                             .fold(Some(stack), |s, f| {
                                 self.apply_item_modifier(f, s, rng, this, origin, depth + 1)
                             });
@@ -1046,29 +1191,22 @@ impl Game<'_> {
                         };
                         set_custom_data(&mut stack, &tag);
                     }
-                    "minecraft:set_components" => {
-                        let patch = m["components"].clone();
-                        edit_components(&mut stack, |c| {
-                            for (k, v) in patch.as_object().into_iter().flatten() {
-                                let (remove, key) = match k.strip_prefix('!') {
-                                    Some(rest) => (true, rest),
-                                    None => (false, k.as_str()),
-                                };
-                                let key = if key.contains(':') {
-                                    key.to_owned()
-                                } else {
-                                    format!("minecraft:{key}")
-                                };
-                                if remove {
-                                    c.remove(&key.as_str().into());
-                                } else {
-                                    c.insert(
-                                        key.as_str().into(),
-                                        horizon_client::scoreboard::json_to_tag(v),
-                                    );
-                                }
-                            }
-                        });
+                    "minecraft:set_components" | "set_components" => {
+                        // SetComponentsFunction.run validates before ItemCommands limits the count.
+                        let components = modifier.field("components");
+                        let patch = components.snbt.map_or_else(
+                            || std::borrow::Cow::Owned(
+                                horizon_client::scoreboard::json_to_tag(components.json)
+                            ),
+                            std::borrow::Cow::Borrowed,
+                        );
+                        if let Tag::Compound(patch) = patch.as_ref() {
+                            horizon_client::item_data::apply_components_and_validate(
+                                &mut stack,
+                                patch,
+                                self.items(),
+                            );
+                        }
                     }
                     "minecraft:toggle_tooltips" => {
                         let toggles = m["toggles"].clone();
@@ -1121,10 +1259,10 @@ impl Game<'_> {
                             c.insert("minecraft:tooltip_display".into(), Tag::compound(display));
                         });
                     }
-                    "minecraft:filtered" => {
+                    "minecraft:filtered" | "filtered" => {
                         let pass = self.loot_item_filter(&m["item_filter"], &stack);
-                        let branch = if pass { &m["on_pass"] } else { &m["on_fail"] };
-                        if branch.is_null() {
+                        let branch = modifier.field(if pass { "on_pass" } else { "on_fail" });
+                        if branch.json.is_null() {
                             return Some(stack);
                         }
                         return self.apply_item_modifier(
@@ -1144,17 +1282,14 @@ impl Game<'_> {
             _ => stack,
         }
     }
-    /// `ItemStack.getMaxStackSize`: the max_stack_size component, else the
-    /// item's.
+    /// `ItemStack.getMaxStackSize`: the max_stack_size component (a removed
+    /// one being vanilla's default of 1), else the item's.
     pub(in crate::game) fn stack_max_size(&self, s: &ItemStack) -> u32 {
-        if let Some(Tag::Int(n)) = s.data().and_then(|d| d.other("minecraft:max_stack_size")) {
-            return (*n).clamp(1, 99) as u32;
-        }
-        self.items().get(&s.item).map_or(64, |i| i.max_stack)
+        s.max_stack_size(self.items())
     }
-    /// `ResourceOrIdArgument.getItemModifier`: an inline modifier (SNBT) or
+    /// `ResourceOrIdArgument.getLootModifier`: an inline modifier (SNBT) or
     /// a registered one.
-    pub(super) fn item_modifier_arg(&mut self, ctx: &Context, name: &str) -> R<serde_json::Value> {
+    fn item_modifier_arg(&self, ctx: &Context, name: &str) -> R<(serde_json::Value, Option<Tag>)> {
         let raw = match ctx.get(name) {
             Some(Arg::Resource(s) | Arg::Str(s)) => s.clone(),
             _ => return Err(err("command.failed", &[])),
@@ -1162,7 +1297,7 @@ impl Game<'_> {
         if raw.starts_with('{') || raw.starts_with('[') {
             let (tag, _) = horizon_core::nbt::parse_snbt(&raw)
                 .map_err(|e| err("argument.nbt.invalid", &[&e]))?;
-            return Ok(horizon_client::scoreboard::tag_to_json(&tag));
+            return Ok((horizon_client::scoreboard::tag_to_json(&tag), Some(tag)));
         }
         let id = if raw.contains(':') {
             raw
@@ -1174,7 +1309,13 @@ impl Game<'_> {
             .item_modifiers
             .get(&id)
             .cloned()
-            .ok_or_else(|| err("argument.item_modifier.unknown", &[&id]))
+            .map(|json| (json, None))
+            .ok_or_else(|| {
+                err(
+                    "argument.resource_or_id.no_such_element",
+                    &[&id, &"minecraft:item_modifier"],
+                )
+            })
     }
     /// `/item modify (entity|block) <target> <slot> <modifier>`.
     pub(super) fn cmd_item_modify(&mut self, ctx: &Context) -> R<i32> {
@@ -1182,9 +1323,10 @@ impl Game<'_> {
         let Some(Arg::Str(slot_name)) = ctx.get("slot").cloned() else {
             return Ok(0);
         };
-        let modifier = self.item_modifier_arg(ctx, "modifier")?;
+        let (json, snbt) = self.item_modifier_arg(ctx, "modifier")?;
+        let modifier = ItemModifier { json: &json, snbt: snbt.as_ref() };
         let source = self.command_source.unwrap_or_else(|| self.player_source());
-        let view = source.entity.map(|t| self.entity_view_asked(t, &modifier));
+        let view = source.entity.map(|t| self.entity_view_asked(t, &json));
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
@@ -1192,7 +1334,7 @@ impl Game<'_> {
         let mut tracker = Tracker::default();
         let mut selected = 0;
         for o in &targets {
-            let slots = self.command_slot_candidates(o, &slot_name);
+            let slots = self.command_slot_candidates(o, &slot_name)?;
             if slots.is_empty() {
                 if let Owner::Block(p) = o
                     && self.block_container_size(*p).is_none()
@@ -1214,7 +1356,7 @@ impl Game<'_> {
                         &mut selected,
                         |g, current| {
                             g.apply_item_modifier(
-                                &modifier,
+                                modifier,
                                 Some(current),
                                 &mut rng,
                                 view.as_ref(),
@@ -1238,7 +1380,7 @@ impl Game<'_> {
                     continue;
                 };
                 let new = self.apply_item_modifier(
-                    &modifier,
+                    modifier,
                     Some(current.clone()),
                     &mut rng,
                     view.as_ref(),
@@ -1326,7 +1468,7 @@ impl Game<'_> {
             };
             let mut found = Vec::new();
             for o in &sources {
-                for s in self.command_slots(o, &source_slots) {
+                for s in self.command_slots(o, &source_slots)? {
                     found.push(self.slot_get(&s));
                 }
             }
@@ -1346,16 +1488,17 @@ impl Game<'_> {
             }
             // ItemCommands.applyModifier on each source stack.
             if ctx.get("modifier").is_some() {
-                let modifier = self.item_modifier_arg(ctx, "modifier")?;
+                let (json, snbt) = self.item_modifier_arg(ctx, "modifier")?;
+                let modifier = ItemModifier { json: &json, snbt: snbt.as_ref() };
                 let source = self.command_source.unwrap_or_else(|| self.player_source());
-                let view = source.entity.map(|t| self.entity_view_asked(t, &modifier));
+                let view = source.entity.map(|t| self.entity_view_asked(t, &json));
                 let mut rng = horizon_core::random::LegacyRandom::new(0);
                 found = found
                     .into_iter()
                     .map(|s| {
                         s.and_then(|s| {
                             self.apply_item_modifier(
-                                &modifier,
+                                modifier,
                                 Some(s),
                                 &mut rng,
                                 view.as_ref(),
@@ -1372,7 +1515,7 @@ impl Game<'_> {
         let mut tracker = Tracker::default();
         let mut selected = 0;
         for o in &targets {
-            let slots = self.command_slot_candidates(o, &slot_name);
+            let slots = self.command_slot_candidates(o, &slot_name)?;
             if slots.is_empty() {
                 if let Owner::Block(p) = o
                     && self.block_container_size(*p).is_none()
@@ -1507,24 +1650,6 @@ impl Game<'_> {
         let Some(Arg::Str(slot_name)) = c.get("slots").cloned() else {
             return Ok((false, 0));
         };
-        // SlotSourceArgument keeps literal ranges ahead of registered holders.
-        // Only condition reads resolve named definitions here: the item write
-        // candidate adapters retain their existing supported scope.
-        let registered = if slot_name.starts_with('{')
-            || slot_name.starts_with('[')
-            || horizon_client::command::args::slot_ranges()
-                .iter()
-                .any(|(name, _)| name == &slot_name)
-        {
-            None
-        } else {
-            let id = if slot_name.contains(':') {
-                slot_name.clone()
-            } else {
-                format!("minecraft:{slot_name}")
-            };
-            self.fns.store.slot_sources.get(&id).cloned()
-        };
         let predicate = match c.get("item_predicate") {
             Some(Arg::Item(p)) => Some(p.clone()),
             _ => None,
@@ -1539,10 +1664,7 @@ impl Game<'_> {
                     &[&p[0], &p[1], &p[2]],
                 ));
             }
-            let slots = match &registered {
-                Some(source) => self.inline_slots(&o, source),
-                None => self.command_slots(&o, &slot_name),
-            };
+            let slots = self.command_slots(&o, &slot_name)?;
             if predicate.is_none() {
                 count += slots.len() as i32;
                 continue;
@@ -1569,7 +1691,8 @@ fn edit_components(stack: &mut ItemStack, f: impl FnOnce(&mut horizon_core::nbt:
     };
     f(&mut c);
     let tag = Tag::Compound(c);
-    let (damage, extra) = horizon_client::item_data::decode_components(Some(&tag));
+    let (damage, extra) =
+        horizon_client::item_data::decode_components_for_item(&stack.item, Some(&tag));
     stack.damage = damage;
     stack.extra = extra;
     stack.tidy();
@@ -1763,7 +1886,7 @@ mod stand_equip_event_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn commands_post_stand_equipment_events_after_its_first_tick() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -1911,7 +2034,7 @@ mod mob_equipment_command_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn world_pack_enchantments_reach_actual_game_catalog() {
         use horizon_client::enchant::EffectContext;
         use horizon_core::random::LegacyRandom;
@@ -1952,9 +2075,7 @@ mod mob_equipment_command_tests {
             let stack = game.reload_datapacks(false, &features).unwrap();
             assert!(game.fns.store.functions.contains_key("wpenchant:ready"));
             let root = game.options.resources.clone();
-            let prepared = game
-                .prepare_world_reload(&stack, &root, game.mods.data_switched)
-                .unwrap();
+            let prepared = game.prepare_world_reload(&stack, &root).unwrap();
             game.install_world_tables(prepared);
             game.run_native_advancement_grants();
             let raw_present = game
@@ -2030,7 +2151,7 @@ mod mob_equipment_command_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn body_commands_reject_wrong_items_without_changing_head() {
         with_game(|game| {
             for (n, kind, slot, item) in [
@@ -2087,7 +2208,7 @@ mod mob_equipment_command_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn saddle_commands_round_trip_existing_model_and_saved_equipment() {
         use super::Slot;
         use horizon_core::nbt::Tag;
@@ -2153,7 +2274,7 @@ mod mob_equipment_command_tests {
     /// `SulfurCube.getEquipmentSlotForItem`: a `#sulfur_cube_swallowable`
     /// item is a body item, so the body's `SlotAccess` takes it (#12038).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_sulfur_cubes_body_takes_a_swallowable_block() {
         with_game(|game| {
             assert!(game.run_command("summon sulfur_cube 4.5 200 4.5 {NoAI:1b,Tags:[\"cube\"]}"));
@@ -2180,7 +2301,7 @@ mod mob_equipment_command_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn effective_item_composition_rejects_before_destination_mutation() {
         use super::Slot;
         with_game(|game| {
@@ -2218,7 +2339,7 @@ mod mob_equipment_command_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn effective_item_validation_view_uses_loaded_prototypes_and_typed_removals() {
         use horizon_core::nbt::Tag;
         with_game(|game| {
@@ -2344,7 +2465,7 @@ mod mob_equipment_stack_tests {
         );
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn offhand_commands_adopt_and_copy_the_whole_stack() {
         use super::Slot;
         with_game(|game| {
@@ -2404,7 +2525,7 @@ mod mob_equipment_stack_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn armor_command_copy_keeps_the_already_adopted_stack() {
         use super::Slot;
         with_game(|game| {
@@ -2473,7 +2594,7 @@ mod builtin_component_delivery_tests {
     use std::sync::{Arc, atomic::AtomicI32, mpsc};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn h283_actual_command_inventory_bridge_encodes_four_builtin_components() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.options.dedicated = Some(Vec::new());
@@ -2511,6 +2632,7 @@ mod builtin_component_delivery_tests {
                     max_players: 2,
                     integrated: false,
                     levels: Default::default(),
+                    level_seeds: Default::default(),
                 },
             )
             .unwrap();
@@ -2684,7 +2806,7 @@ mod builtin_component_delivery_tests {
 mod registered_slot_source_read_tests {
     use super::*;
     #[test]
-    #[ignore = "needs prepared resources and isolated homes/cwd"]
+    #[ignore = "daily"]
     fn registered_first_three_reads_match_inline_and_keep_the_chest() {
         let mut resources = None;
         let mut game = crate::game::game_tests::tests::server_game(&mut resources);
@@ -2787,6 +2909,18 @@ mod registered_slot_source_preservation_tests {
         resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>,
         name: &str,
     ) -> (Game<'a>, std::path::PathBuf) {
+        let (mut game, high) = packs(resources, name);
+        game.ensure_datapacks();
+        assert!(game.run_command("setblock 0 100 0 chest{Items:[{Slot:0b,id:\"stone\",count:5},{Slot:1b,id:\"dirt\",count:2},{Slot:3b,id:\"stone\",count:7}]}"));
+        assert!(game.run_command("scoreboard objectives add slotprobe dummy"));
+        (game, high)
+    }
+
+    /// A world with two packs that both define `parity:first_three`; nothing loaded yet.
+    fn packs<'a>(
+        resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>,
+        name: &str,
+    ) -> (Game<'a>, std::path::PathBuf) {
         let mut game = crate::game::game_tests::tests::server_game(resources);
         game.build_registries();
         game.set_allow_commands(true);
@@ -2802,10 +2936,42 @@ mod registered_slot_source_preservation_tests {
             high = path;
         }
         game.world_root = root;
-        game.ensure_datapacks();
+        (game, high)
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_broken_slot_source_refuses_the_first_load_until_it_is_fixed() {
+        let mut resources = None;
+        let directory = tempfile::tempdir().unwrap();
+        let world = directory.path().join("slot-source-first-load-world");
+        let (mut game, file) = packs(&mut resources, world.to_str().unwrap());
+        let features = game.level.enabled_features.clone();
+        let fixed = std::fs::read_to_string(&file).unwrap();
+        // Broken before any command runs, since a command loads the packs lazily.
+        std::fs::write(&file, "{").unwrap();
         assert!(game.run_command("setblock 0 100 0 chest{Items:[{Slot:0b,id:\"stone\",count:5},{Slot:1b,id:\"dirt\",count:2},{Slot:3b,id:\"stone\",count:7}]}"));
         assert!(game.run_command("scoreboard objectives add slotprobe dummy"));
-        (game, high)
+        // The last one parses and binds; only its codec refuses the slot range.
+        for definition in [
+            "{",
+            r#""parity:first_three""#,
+            r#"{"type":"minecraft:slot_range","slots":"container.nope"}"#,
+        ] {
+            std::fs::write(&file, definition).unwrap();
+            // MinecraftServer: the world does not open on a failed first load.
+            assert!(
+                game.open_world_datapacks(&features).is_err(),
+                "{definition}"
+            );
+            // The lazy path admits nothing either.
+            game.ensure_datapacks();
+            assert!(!game.run_command("execute if slots block 0 100 0 parity:first_three"));
+        }
+        // Nothing marked the packs loaded, so the next lazy load picks up the fix.
+        std::fs::write(&file, fixed).unwrap();
+        game.ensure_datapacks();
+        count(&mut game, 3);
     }
 
     fn count(game: &mut Game<'_>, expected: i32) {
@@ -2816,8 +2982,69 @@ mod registered_slot_source_preservation_tests {
         );
     }
 
+    /// A world's first open admits the packs before its tables exist, so a filter and a
+    /// function naming a tag their pack adds must not be dropped after the check passed.
     #[test]
-    #[ignore = "needs prepared resources and isolated homes/cwd"]
+    #[ignore = "daily"]
+    fn a_first_open_admits_a_filter_naming_an_item_tag_its_pack_adds() {
+        let mut resources = None;
+        let directory = tempfile::tempdir().unwrap();
+        let world = directory.path().join("slot-source-first-open-tag-world");
+        let (mut game, file) = packs(&mut resources, world.to_str().unwrap());
+        let data = file.parent().unwrap().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(data.join("tags/item")).unwrap();
+        std::fs::write(
+            data.join("tags/item/allowed.json"),
+            r#"{"values":["minecraft:stone"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(data.join("function")).unwrap();
+        std::fs::write(
+            data.join("function/probe.mcfunction"),
+            "execute if items block 0 100 0 container.0 #parity:allowed\n",
+        )
+        .unwrap();
+        std::fs::write(&file, r##"{"type":"minecraft:filtered","slot_source":{"type":"minecraft:slot_range","slots":"container.*"},"item_filter":{"items":"#parity:allowed"}}"##).unwrap();
+        let features = game.level.enabled_features.clone();
+        let stack = game.open_world_datapacks(&features).unwrap();
+        let root = game.options.resources.clone();
+        game.open_world_tables(&stack, &root).unwrap();
+        assert!(game.run_command("setblock 0 100 0 chest{Items:[{Slot:0b,id:\"stone\",count:5},{Slot:1b,id:\"dirt\",count:2},{Slot:3b,id:\"stone\",count:7}]}"));
+        assert!(game.run_command("scoreboard objectives add slotprobe dummy"));
+        count(&mut game, 2); // The two stone stacks: the source was admitted.
+        assert!(game.run_command("function parity:probe")); // So was the function.
+    }
+
+    /// The candidate's own item tags count: the world tables that publish them are staged
+    /// after the slot sources are checked.
+    #[test]
+    #[ignore = "daily"]
+    fn a_filtered_source_may_name_an_item_tag_its_pack_adds() {
+        let mut resources = None;
+        let directory = tempfile::tempdir().unwrap();
+        let world = directory.path().join("slot-source-pack-tag-world");
+        let (mut game, file) = scene(&mut resources, world.to_str().unwrap());
+        let features = game.level.enabled_features.clone();
+        count(&mut game, 3);
+        let tag = file
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tags/item/allowed.json");
+        std::fs::create_dir_all(tag.parent().unwrap()).unwrap();
+        std::fs::write(&tag, r#"{"values":["minecraft:stone"]}"#).unwrap();
+        std::fs::write(&file, r##"{"type":"minecraft:filtered","slot_source":{"type":"minecraft:slot_range","slots":"container.*"},"item_filter":{"items":"#parity:allowed"}}"##).unwrap();
+        assert!(game.reload_datapacks(true, &features).is_ok());
+        count(&mut game, 2); // The two stone stacks.
+        // Without the tag the same source names a tag no pack defines any more.
+        std::fs::remove_file(&tag).unwrap();
+        assert!(game.reload_datapacks(true, &features).is_err());
+        count(&mut game, 2); // The rejected candidate keeps the loaded snapshot.
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn loaded_snapshot_changes_only_on_existing_reload_with_pack_precedence() {
         let mut resources = None;
         let directory = tempfile::tempdir().unwrap();
@@ -2831,35 +3058,65 @@ mod registered_slot_source_preservation_tests {
         game.reload_datapacks(true, &game.level.enabled_features.clone())
             .unwrap();
         count(&mut game, 2);
-        std::fs::write(file, "{").unwrap();
-        game.reload_datapacks(true, &game.level.enabled_features.clone())
-            .unwrap();
-        count(&mut game, 1); // Existing policy: invalid higher JSON is skipped.
+        let features = game.level.enabled_features.clone();
+        std::fs::write(&file, "{").unwrap();
+        assert!(game.reload_datapacks(true, &features).is_err());
+        count(&mut game, 2); // Rejected candidate retains the accepted snapshot.
+        // The registry reads a file with TYPED_CODEC: neither a holder id nor an
+        // inline list of sources loads, nor a source the codec refuses.
+        for definition in [
+            r#""parity:first_three""#,
+            r#"[{"type":"minecraft:slot_range","source":"container","slots":"container.0"}]"#,
+            // Parses and binds; only its codec refuses the slot range.
+            r#"{"type":"minecraft:slot_range","slots":"container.nope"}"#,
+            // FilteredSlotSource's item_filter is an ItemPredicate: its items must exist.
+            r#"{"type":"minecraft:filtered","slot_source":{"type":"minecraft:slot_range","slots":"container.0"},"item_filter":{"items":"minecraft:does_not_exist"}}"#,
+        ] {
+            std::fs::write(&file, definition).unwrap();
+            assert!(
+                game.reload_datapacks(true, &features).is_err(),
+                "{definition}"
+            );
+            count(&mut game, 2);
+        }
+        // The same filtered source with an item that exists loads.
+        std::fs::write(&file, r#"{"type":"minecraft:filtered","slot_source":{"type":"minecraft:slot_range","slots":"container.0"},"item_filter":{"items":"minecraft:stone"}}"#).unwrap();
+        assert!(game.reload_datapacks(true, &features).is_ok());
+        count(&mut game, 1); // container.0 holds stone.
         assert!(!game.run_command("execute if slots block 0 100 0 first_three"));
         assert_eq!(game.block_entity_nbt([0, 100, 0]).as_ref(), Some(&before));
         assert_eq!(game.world.game_time, clock);
     }
 
     #[test]
-    #[ignore = "needs prepared resources and isolated homes/cwd"]
-    fn admitted_item_arguments_still_fail_without_writing_or_player_fallback() {
+    #[ignore = "daily"]
+    fn admitted_absent_executor_sources_fail_without_player_fallback() {
         let mut resources = None;
         let (mut game, _) = scene(&mut resources, "slot-source-unsupported-world");
+        let path = game
+            .world_root
+            .join("datapacks/parity/data/parity/slot_source/this.json");
+        std::fs::write(
+            path,
+            r#"{"type":"minecraft:slot_range","source":"this","slots":"weapon.mainhand"}"#,
+        )
+        .unwrap();
+        game.reload_datapacks(true, &[]).unwrap();
         let before = game.block_entity_nbt([0, 100, 0]).unwrap();
         let clock = game.world.game_time;
         count(&mut game, 3);
         let player_was_present = game.player.is_some();
-        println!("unsupported registered item routes: actual Player present={player_was_present}");
+        println!("absent executor: actual Player present={player_was_present}");
         let mut commands = vec![
-            "item modify block 0 100 0 parity:first_three {type:\"minecraft:set_count\",count:1}"
+            "item modify block 0 100 0 parity:this {type:\"minecraft:set_count\",count:1}"
                 .to_owned(),
         ];
         for mode in ["replace", "fill", "override"] {
             commands.push(format!(
-                "item {mode} block 0 100 0 parity:first_three with diamond"
+                "item {mode} block 0 100 0 parity:this with diamond"
             ));
             commands.push(format!(
-                "item {mode} block 0 100 0 container.0 from block 0 100 0 parity:first_three"
+                "item {mode} block 0 100 0 container.0 from block 0 100 0 parity:this"
             ));
         }
         for command in commands {
@@ -2873,7 +3130,7 @@ mod registered_slot_source_preservation_tests {
             );
             assert!(
                 !game.run_command(&command),
-                "unsupported registered write must fail: {command}"
+                "absent executor must not fall back to a Player: {command}"
             );
             assert_eq!(
                 game.block_entity_nbt([0, 100, 0]).as_ref(),
@@ -2884,7 +3141,125 @@ mod registered_slot_source_preservation_tests {
             assert_eq!(game.world.game_time, clock);
         }
     }
+
+    /// SlotSources.CODEC is a holder codec: a quoted id is the same reference
+    /// as an unquoted one, and so is a group's single quoted term.
+    /// LimitSlotSource's limit is ExtraCodecs.POSITIVE_INT: a string or 0
+    /// fails to parse, and the command changes nothing.
+    #[test]
+    #[ignore = "daily"]
+    fn quoted_holders_resolve_and_a_non_int_limit_fails_to_parse() {
+        let mut resources = None;
+        let (mut game, _) = scene(&mut resources, "slot-source-quoted-world");
+        let before = game.block_entity_nbt([0, 100, 0]).unwrap();
+        let clock = game.world.game_time;
+        count(&mut game, 3);
+        for source in [
+            r#""parity:first_three""#,
+            r#"{type:"group",terms:"parity:first_three"}"#,
+        ] {
+            assert!(game.run_command("scoreboard players set #q slotprobe -99"));
+            assert!(game.run_command(&format!(
+                "execute store result score #q slotprobe run execute if slots block 0 100 0 {source}"
+            )));
+            assert_eq!(
+                game.score.board.score("#q", "slotprobe").unwrap().value,
+                3,
+                "{source}"
+            );
+        }
+        for limit in [r#""x""#, "0"] {
+            assert!(game.run_command("scoreboard players set #q slotprobe -99"));
+            let command = format!(
+                "execute store result score #q slotprobe run execute if slots block 0 100 0 {{type:\"limit_slots\",limit:{limit},slot_source:{{type:\"slot_range\",slots:\"container.*\"}}}}"
+            );
+            assert!(!game.run_command(&command), "{command}");
+            assert_eq!(
+                game.score.board.score("#q", "slotprobe").unwrap().value,
+                -99,
+                "{command}"
+            );
+        }
+        assert_eq!(game.block_entity_nbt([0, 100, 0]).as_ref(), Some(&before));
+        assert_eq!(game.world.game_time, clock);
+    }
+
+    /// `Codec.INT` gives `limit:1b` and `limit:2.5d` their `Number.intValue()`:
+    /// a read counts that many slots and a write changes that many.
+    #[test]
+    #[ignore = "daily"]
+    fn a_byte_or_fractional_limit_selects_its_int_value() {
+        let mut resources = None;
+        let (mut game, _) = scene(&mut resources, "slot-source-numeric-limit-world");
+        let source = |limit: &str| {
+            format!(
+                "{{type:\"limit_slots\",limit:{limit},slot_source:{{type:\"slot_range\",slots:\"container.*\"}}}}"
+            )
+        };
+        for (limit, slots) in [("1b", 1), ("2.5d", 2)] {
+            assert!(game.run_command("scoreboard players set #q slotprobe -99"));
+            assert!(game.run_command(&format!(
+                "execute store result score #q slotprobe run execute if slots block 0 100 0 {}",
+                source(limit)
+            )));
+            assert_eq!(
+                game.score.board.score("#q", "slotprobe").unwrap().value,
+                slots,
+                "{limit}"
+            );
+        }
+        // `/item override` writes the stack over the selected slots and no further:
+        // one slot for `1b`, two for `2.5d`, the stone in the fourth slot never.
+        let held = |game: &mut Game<'_>| {
+            [0, 1, 3].map(|slot| {
+                game.slot_get(&Slot::Block([0, 100, 0], slot))
+                    .map(|stack| (stack.item.to_string(), stack.count))
+            })
+        };
+        let stack = |item: &str, count| Some((format!("minecraft:{item}"), count));
+        assert!(game.run_command(&format!(
+            "item override block 0 100 0 {} with minecraft:diamond 2",
+            source("1b")
+        )));
+        assert_eq!(
+            held(&mut game),
+            [stack("diamond", 2), stack("dirt", 2), stack("stone", 7)]
+        );
+        assert!(game.run_command(&format!(
+            "item override block 0 100 0 {} with minecraft:emerald 2",
+            source("2.5d")
+        )));
+        assert_eq!(
+            held(&mut game),
+            [stack("emerald", 2), None, stack("stone", 7)]
+        );
+    }
+
+    /// A command the player types runs as them (`CommandSourceStack.getEntity`),
+    /// so `source:"this"` is their own slots without an `execute as`.
+    #[test]
+    #[ignore = "daily"]
+    fn a_command_the_player_types_binds_this_to_them() {
+        let mut resources = None;
+        let (mut game, _) = scene(&mut resources, "slot-source-player-this-world");
+        game.player = Some(
+            horizon_client::motion::PlayerMotion::new(
+                game.motion,
+                horizon_core::geometry::Vec3::new(0.5, 101.0, 0.5),
+            )
+            .unwrap(),
+        );
+        assert!(game.command_source.is_none());
+        assert!(game.run_command(
+            r#"item replace entity @s {type:"slot_range",source:"this",slots:"weapon.mainhand"} with minecraft:stone"#
+        ));
+        let hand = game.slot_get(&Slot::MainHand).unwrap();
+        assert_eq!((&*hand.item, hand.count), ("minecraft:stone", 1));
+    }
 }
+
+#[cfg(test)]
+include!("items/registered_source_qualification_v2_tests.rs");
 
 #[cfg(test)]
 mod set_custom_data_tests {
@@ -2898,3 +3273,6 @@ mod set_custom_data_tests {
         assert!(saved.is_none_or(|c| c.get("minecraft:custom_data").is_none()));
     }
 }
+
+#[cfg(test)]
+mod item_entity_contents_tests;

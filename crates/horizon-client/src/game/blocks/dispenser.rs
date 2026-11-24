@@ -3,8 +3,8 @@
 //! entities for. A behaviour returns what is left in the slot and the level
 //! event it plays (`DefaultDispenseItemBehavior.dispense` then plays that
 //! event and the smoke animation, event 2000).
-use super::level_sounds::LevelSound;
 use super::{Game, item_abilities::ability};
+use super::{entity_sections::section_order, level_sounds::LevelSound};
 use horizon_client::{
     Result,
     collisions::SceneCollisions,
@@ -13,7 +13,6 @@ use horizon_client::{
     mobs::{Mob, Species, equip::equippable, sulfur_cube},
     particles::{ParticleOptions, ParticleType},
     projectiles::{Projectile, ProjectileKind},
-    random_source,
 };
 use mod_api::SoundSource;
 // Its old home, for mixin code that names it here.
@@ -24,16 +23,16 @@ use horizon_core::{
 };
 use horizon_world::{
     fluid::FluidKind,
-    level::{BucketContent, PlaceContext, PlaceOutcome},
+    level::{ItemKind, PlaceContext, PlaceOutcome},
     registry::BlockStateId,
 };
 use std::sync::Arc;
 
-type Pos = (i32, i32, i32);
+pub(super) type Pos = (i32, i32, i32);
 
 /// The sound event of a plain click, a failed dispense and a launched projectile.
-const CLICK: i32 = 1000;
-const FAIL: i32 = 1001;
+pub(super) const CLICK: i32 = 1000;
+pub(super) const FAIL: i32 = 1001;
 const LAUNCH: i32 = 1002;
 
 fn step(d: Direction) -> [i32; 3] {
@@ -46,7 +45,7 @@ fn step(d: Direction) -> [i32; 3] {
         Direction::East => [1, 0, 0],
     }
 }
-fn offset(p: Pos, d: Direction) -> Pos {
+pub(super) fn offset(p: Pos, d: Direction) -> Pos {
     let s = step(d);
     (p.0 + s[0], p.1 + s[1], p.2 + s[2])
 }
@@ -86,14 +85,6 @@ fn block_box(p: Pos) -> Aabb {
         Vec3::new(f64::from(p.0 + 1), f64::from(p.1 + 1), f64::from(p.2 + 1)),
     )
 }
-/// `EntitySectionStorage.forEachAccessibleNonEmptySection`: x ascending, then
-/// the packed key (`SectionPos.asLong`: z as 22 unsigned bits, then y as 20);
-/// within a section the entities go in the order they joined, which ids follow.
-fn section_order(at: Vec3) -> (i32, u32, u32) {
-    let s = |v: f64| (v.floor() as i32) >> 4;
-    let (x, y, z) = (s(at.x), s(at.y), s(at.z));
-    (x, z as u32 & 0x3F_FFFF, y as u32 & 0xF_FFFF)
-}
 fn overlaps(a: Aabb, b: Aabb) -> bool {
     let (a0, a1, b0, b1) = (
         a.min_position(),
@@ -109,7 +100,7 @@ fn shrink(mut stack: ItemStack) -> Option<ItemStack> {
     (stack.count > 0).then_some(stack)
 }
 /// A dispenser's answer: the slot's new content and the level event played.
-type Dispensed = (Option<ItemStack>, i32);
+pub(super) type Dispensed = (Option<ItemStack>, i32);
 
 /// None keeps vanilla's behaviour; an explicit empty remainder consumes the stack.
 fn mod_dispensed(answer: Option<mod_api::Dispensed>, items: &Items) -> Option<Dispensed> {
@@ -160,6 +151,18 @@ pub(super) enum Slot {
     Saddle,
 }
 impl Slot {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::MainHand => "mainhand",
+            Self::OffHand => "offhand",
+            Self::Feet => "feet",
+            Self::Legs => "legs",
+            Self::Chest => "chest",
+            Self::Head => "head",
+            Self::Body => "body",
+            Self::Saddle => "saddle",
+        }
+    }
     pub(super) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "mainhand" => Self::MainHand,
@@ -339,7 +342,7 @@ impl Game<'_> {
             f64::from(p.2) + 0.5,
         ]
     }
-    fn pos_of(p: Pos) -> BlockPos {
+    pub(super) fn pos_of(p: Pos) -> BlockPos {
         BlockPos::new(p.0, p.1, p.2)
     }
 
@@ -504,6 +507,25 @@ impl Game<'_> {
         }
         self.default_execute((pos[0], pos[1], pos[2]), facing, stack)
     }
+    /// `dispense_with_remainder`: `consume_with_remainder` for a mod's dispense answer, in the
+    /// level in place; `stack` unchanged off it, as `dispense_default` keeps it.
+    pub(super) fn dispense_with_remainder(
+        &mut self,
+        dimension: &str,
+        pos: [i32; 3],
+        facing: Direction,
+        stack: ItemStack,
+        remainder: ItemStack,
+    ) -> Option<ItemStack> {
+        if !(self.serving.is_some() || self.options.dedicated.is_some())
+            || dimension != self.dim.id()
+            || !self.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4))
+            || stack.count == 0
+        {
+            return Some(stack).filter(|stack| stack.count > 0);
+        }
+        self.consume_with_remainder((pos[0], pos[1], pos[2]), facing, stack, remainder)
+    }
     /// `new DefaultDispenseItemBehavior().dispense(..)` including its events.
     pub(super) fn dispense_default_in_level(
         &mut self,
@@ -518,7 +540,7 @@ impl Game<'_> {
     }
     /// `DefaultDispenseItemBehavior.consumeWithRemainder`: the remainder goes
     /// into the dispenser (`insertItem`) or is dropped.
-    fn consume_with_remainder(
+    pub(super) fn consume_with_remainder(
         &mut self,
         pos: Pos,
         facing: Direction,
@@ -584,17 +606,26 @@ impl Game<'_> {
     ) -> Result<Option<ItemStack>> {
         let mut answer = None;
         if self.serving.is_some() || self.options.dedicated.is_some() {
-            // The block the dispenser faces has the first say (`dispense_method`), then the
-            // item's own part (`dispense_item`); the first answer wins.
-            let front = self.block_at(offset(pos, facing));
-            self.native_dispense_method(
+            // A mod's global `dispenser_acts` first, then the block the dispenser faces
+            // (`dispense_method`), then the item's part (`dispense_item`); the first answer wins.
+            self.native_dispenser_acts(
                 self.dim.id(),
                 [pos.0, pos.1, pos.2],
                 facing,
-                front,
                 &stack,
                 &mut answer,
             );
+            if answer.is_none() {
+                let front = self.block_at(offset(pos, facing));
+                self.native_dispense_method(
+                    self.dim.id(),
+                    [pos.0, pos.1, pos.2],
+                    facing,
+                    front,
+                    &stack,
+                    &mut answer,
+                );
+            }
             if answer.is_none() {
                 self.native_dispense_item(
                     self.dim.id(),
@@ -663,8 +694,23 @@ impl Game<'_> {
             "minecraft:brush" => self.dispense_brush(pos, facing, stack),
             "minecraft:honeycomb" => self.dispense_honeycomb(pos, facing, stack)?,
             "minecraft:potion" => self.dispense_potion(pos, facing, stack)?,
-            _ if item.ends_with("shulker_box") => self.dispense_shulker_box(pos, facing, stack)?,
-            _ if horizon_world::fluid::mod_fluid_of_bucket(&item).is_some() => {
+            // A declared standing/wall item has no built-in placement behavior,
+            // even if its id happens to end with the shulker-box suffix.
+            _ if item.ends_with("shulker_box")
+                && !self
+                    .res
+                    .behaviours()
+                    .item_binding(&item)
+                    .is_some_and(|binding| {
+                        matches!(
+                            binding.kind,
+                            ItemKind::StandingAndWall | ItemKind::HangingSign
+                        )
+                    }) =>
+            {
+                self.dispense_shulker_box(pos, facing, stack)?
+            }
+            _ if self.dispenses_as_filled_bucket(&item) => {
                 self.dispense_filled_bucket(pos, facing, stack)?
             }
             _ if super::boats::any_boat_wood(&item).is_some() => {
@@ -831,6 +877,30 @@ impl Game<'_> {
     }
     /// `EntityType.spawn(.., pos, reason, tryMoveDown, false)` for a mob.
     pub(super) fn spawn_mob_at(&mut self, kind: &str, p: Pos, try_move_down: bool) -> Option<u32> {
+        self.spawn_mob_finalized_at(
+            kind,
+            p,
+            try_move_down,
+            horizon_client::mobs::spawn_rules::Reason::Dispenser,
+        )
+    }
+    /// `MobBucketItem.spawn`: `EntityType.create(.., EntitySpawnReason.BUCKET, true, false)`.
+    /// `Axolotl.finalizeSpawn` returns first for that reason, without a draw.
+    pub(super) fn spawn_bucket_mob(&mut self, kind: &str, p: Pos) -> Option<u32> {
+        self.spawn_mob_finalized_at(
+            kind,
+            p,
+            true,
+            horizon_client::mobs::spawn_rules::Reason::Bucket,
+        )
+    }
+    fn spawn_mob_finalized_at(
+        &mut self,
+        kind: &str,
+        p: Pos,
+        try_move_down: bool,
+        reason: horizon_client::mobs::spawn_rules::Reason,
+    ) -> Option<u32> {
         let name = if kind.contains(':') {
             kind.to_owned()
         } else {
@@ -851,12 +921,7 @@ impl Game<'_> {
                 f64::from(p.1) + y_off,
                 f64::from(p.2) + 0.5,
             ];
-            return self.spawn_dragon_spawned(
-                at,
-                super::creatures::SpawnSite::Finalizing(
-                    horizon_client::mobs::spawn_rules::Reason::Dispenser,
-                ),
-            );
+            return self.spawn_dragon_spawned(at, super::creatures::SpawnSite::Finalizing(reason));
         }
         let t = self.res.mob_types().get(&name)?.clone();
         let y_off = if try_move_down {
@@ -869,14 +934,16 @@ impl Game<'_> {
             f64::from(p.1) + y_off,
             f64::from(p.2) + 0.5,
         ];
-        let id = self.spawn_mob(
-            &name,
-            at,
-            true,
-            super::creatures::SpawnSite::Finalizing(
-                horizon_client::mobs::spawn_rules::Reason::Dispenser,
-            ),
-        )?;
+        let site = super::creatures::SpawnSite::Finalizing(reason);
+        // EntityType.create: `snapTo(.., Mth.wrapDegrees(level.random.nextFloat() * 360), 0)`.
+        let id = if reason == horizon_client::mobs::spawn_rules::Reason::Bucket {
+            // The bucket's reason is not among the ones that wrap the yaw
+            // itself, so the draw is made here, the same single level draw.
+            let yaw = horizon_client::camera::wrap_degrees(self.world.random.next_float() * 360.0);
+            self.spawn_mob_facing(&name, at, true, site, yaw)?
+        } else {
+            self.spawn_mob(&name, at, true, site)?
+        };
         Some(id)
     }
     /// `Player.setItemSlot` of a dispensed piece for the player in place:
@@ -918,17 +985,55 @@ impl Game<'_> {
         };
         // `Equippable.canBeEquippedBy`, then the item's parts (`canEquip`) with the stack converted
         // once, for the entity in front.
+        let targets = self.targets_at(front);
+        let observed = mod_api::__private::item_listens(mod_api::HookId::CanEquip, &stack.item);
+        let mut source_slot = observed.then(|| Some(stack.clone()));
+        let mut source = source_slot.as_mut().map(|slot| {
+            horizon_client::mobs::equip::EquipDecision::new(stack as *const _ as usize as u64, slot)
+        });
+        let kinds = if observed {
+            targets
+                .iter()
+                .map(|target| match target {
+                    Target::Mob(i) => self.mobs[*i].kind.id.as_str(),
+                    Target::Stand(_) => "minecraft:armor_stand",
+                    _ => "minecraft:player",
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let entities = if observed {
+            targets
+                .iter()
+                .filter_map(|target| match target {
+                    Target::Player => Some(self.own_entity_id() as u32),
+                    Target::Guest(conn) => self
+                        .lan
+                        .as_ref()?
+                        .hub
+                        .guest(*conn)
+                        .map(|guest| guest.entity_id as u32),
+                    Target::Stand(i) => Some(self.armor_stands[*i].id),
+                    Target::Mob(i) => Some(self.mobs[*i].id),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let input = source.as_deref().map_or(&*stack, |source| source);
         let (tags, prepared) = (
             &self.stations().enchantments.entity_tags,
-            self.equip_stack(stack),
+            self.equip_stack(input, &kinds, &entities),
         );
+        let stamp = source.as_ref().and_then(|source| source.stamp());
         let allows = |entity: u32, id: &str| {
             let data = equippable.allows(id, tags);
             self.can_equip(&prepared, equippable.slot, entity, id, data)
         };
         // LivingEntity.canEquipWithDispenser: alive, the slot usable, the
         // item's allowed entities, the slot empty and the dispenser rule.
-        let target = self.targets_at(front).into_iter().find(|t| match *t {
+        let target = targets.into_iter().find(|t| match *t {
             // Player.canUseSlot: every slot; the armour and the off hand are
             // the ones an equippable item can reach.
             Target::Player => {
@@ -968,8 +1073,30 @@ impl Game<'_> {
         let Some(target) = target else {
             return false;
         };
-        stack.count -= 1;
+        let entity = match target {
+            Target::Player => Some(self.own_entity_id() as u32),
+            Target::Guest(conn) => self
+                .lan
+                .as_ref()
+                .and_then(|lan| lan.hub.guest(conn))
+                .map(|guest| guest.entity_id as u32),
+            Target::Stand(i) => Some(self.armor_stands[i].id),
+            Target::Mob(i) => Some(self.mobs[i].id),
+        };
+        if !entity.is_some_and(|id| self.equip_can_apply(&prepared, id)) {
+            return false;
+        }
+        if let Some(source) = source.as_mut() {
+            if !stamp.is_some_and(|stamp| source.matches(stamp)) {
+                return false;
+            }
+            *source.count_mut().expect("live dispenser source") -= 1;
+            stack.count = source.count;
+        } else {
+            stack.count -= 1;
+        }
         // setItemSlot: onEquipItem plays the equip sound and the equip event.
+        let hook_stack = one.clone();
         let (at, sound) = match target {
             Target::Guest(conn) => {
                 // The guest's own turn: their state in place, so the slot, the
@@ -1002,6 +1129,7 @@ impl Game<'_> {
                 return true;
             }
             Target::Stand(i) => {
+                let sound = self.mod_equip_sound(&hook_stack, slot.name(), sound);
                 let stand = &mut self.armor_stands[i];
                 if let Some(s) = slot.stand_index() {
                     stand.equipment[s] = Some(one);
@@ -1013,12 +1141,15 @@ impl Game<'_> {
                 mob_set_slot(m, slot, one);
                 // setGuaranteedDrop / setPersistenceRequired.
                 m.persistent = true;
-                let sound = if m.silent {
+                let silent = m.silent;
+                let at = m.position;
+                let sound = if silent {
                     None
                 } else {
                     equip_sound(m, slot, sound)
                 };
-                (Some(m.position), sound)
+                let sound = self.mod_equip_sound(&hook_stack, slot.name(), sound);
+                (Some(at), sound)
             }
         };
         if let Some(at) = at {
@@ -1045,7 +1176,7 @@ impl Game<'_> {
         true
     }
     /// After `EntityType.spawn` / `MobBucketItem.spawn`: `mob.playAmbientSound()`.
-    fn mob_ambient(&mut self, id: u32) -> Result<()> {
+    pub(super) fn mob_ambient(&mut self, id: u32) -> Result<()> {
         if self.dragon_spawn_ambient(id) {
             return Ok(());
         }
@@ -1071,7 +1202,9 @@ impl Game<'_> {
     pub(super) fn mob_placed(&mut self, id: u32, stack: &ItemStack) -> Result<()> {
         if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
             m.persistent = false;
-            horizon_client::entity_nbt::apply_item_components(m, stack);
+        }
+        self.apply_bucket_stack_config(id, stack);
+        if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
             match m.species() {
                 Species::Cod
                 | Species::Salmon
@@ -1118,7 +1251,7 @@ impl Game<'_> {
         // EntityType.updateCustomEntityTag: a configured egg
         // (`/give @s pig_spawn_egg[minecraft:entity_data={…}]`) spawns the mob
         // it describes from a dispenser too, not only from a player's hand.
-        self.apply_spawn_egg_entity_data(id, &stack);
+        self.apply_spawn_egg_entity_data(id, &stack, true);
         self.mob_ambient(id)?;
         // SpawnEggItemBehavior: the entity was placed by the dispenser.
         self.post_block_game_event("minecraft:entity_place", [pos.0, pos.1, pos.2], None, None);
@@ -1200,9 +1333,9 @@ impl Game<'_> {
             "minecraft:experience_bottle"
             | "minecraft:splash_potion"
             | "minecraft:lingering_potion" => {
-                let mut shot = Projectile::new(ProjectileKind::Snowball, at, None);
-                shot.shoot(&mut random_source::entity(), dir, power, uncertainty);
-                self.launch_thrown(one, at, shot.velocity, None);
+                let mut shot = super::potions::thrown_projectile(one, at, false);
+                shot.shoot_own(dir, power, uncertainty);
+                self.add_projectile(shot);
             }
             _ => {
                 let kind = match item.as_str() {
@@ -1269,14 +1402,18 @@ impl Game<'_> {
         self.next_entity += 1;
         let (_, uuid) = horizon_client::mobs::living_random();
         self.persist.uuids.insert(self.next_entity, uuid);
-        let mut stand =
+        let stand =
             horizon_client::entities::ArmorStand::new(self.next_entity, foot, y_rot(facing));
-        // Entity.applyImplicitComponents: a name from an anvil names the stand.
-        if let Some(name) = stack.custom_name() {
-            stand.custom_name = Some(horizon_client::text::Text::literal(name));
-        }
         self.world.modified.insert((front.0 >> 4, front.2 >> 4));
         self.armor_stands.push(stand);
+        // EntityType.appendDefaultStackConfig: the dispenser's yaw first, then
+        // the item's createDefaultStackConfig with no user.
+        self.apply_item_stack_config(
+            super::commands::Target::Stand(self.next_entity),
+            "minecraft:armor_stand",
+            &stack,
+            false,
+        );
         (shrink(stack), CLICK)
     }
     /// A tame donkey, mule or llama in front without a chest gets it.
@@ -1345,7 +1482,7 @@ impl Game<'_> {
         self.boats.push(boat);
         // BoatDispenseItemBehavior: createDefaultStackConfig with no user,
         // then setYRot(direction.toYRot()).
-        self.apply_vehicle_stack_config(super::commands::Target::Boat(id), &kind, &stack, false);
+        self.apply_item_stack_config(super::commands::Target::Boat(id), &kind, &stack, false);
         self.set_boat_yaw(id, yaw);
         if self.serving.is_some() || self.options.dedicated.is_some() {
             let boat = self.boats.last().unwrap();
@@ -1369,14 +1506,14 @@ impl Game<'_> {
             c[2] + f64::from(s[2]) * 1.125,
         );
         let front = offset(pos, facing);
-        let y_offset = if let Some(rail) = self.rail(front.0, front.1, front.2) {
+        let y_offset = if let Some(rail) = self.rail(None, front.0, front.1, front.2) {
             if rail.shape.is_slope() { 0.6 } else { 0.1 }
         } else {
             if !self.res.facts().is_air(self.block_at(front)) {
                 return (self.dispense_default_in_level(pos, facing, stack), CLICK);
             }
             let below = (front.0, front.1 - 1, front.2);
-            let Some(rail) = self.rail(below.0, below.1, below.2) else {
+            let Some(rail) = self.rail(None, below.0, below.1, below.2) else {
                 return (self.dispense_default_in_level(pos, facing, stack), CLICK);
             };
             if facing != Direction::Down && rail.shape.is_slope() {
@@ -1395,12 +1532,7 @@ impl Game<'_> {
         self.carts.push(cart);
         // AbstractMinecart.createMinecart: createDefaultStackConfig with no user.
         let id = self.next_entity;
-        self.apply_vehicle_stack_config(
-            super::commands::Target::Cart(id),
-            kind.id(),
-            &stack,
-            false,
-        );
+        self.apply_item_stack_config(super::commands::Target::Cart(id), kind.id(), &stack, false);
         if self.serving.is_some() || self.options.dedicated.is_some() {
             let cart = self.carts.last().unwrap();
             self.native_vehicle_create(
@@ -1413,52 +1545,6 @@ impl Game<'_> {
 
     // ---- buckets ----
 
-    /// The filled bucket behaviour: `DispensibleContainerItem.emptyContents`.
-    fn dispense_filled_bucket(
-        &mut self,
-        pos: Pos,
-        facing: Direction,
-        stack: ItemStack,
-    ) -> Result<Dispensed> {
-        let item = stack.item.to_string();
-        let target = offset(pos, facing);
-        let (content, sound, mob) =
-            horizon_client::items::bucket_contents(&item).expect("filled bucket dispatcher");
-        let target_pos = Self::pos_of(target);
-        let emptied = self.with_level(|b, level, ticks| {
-            b.bucket_empty(level, ticks, target_pos, None, content, sound, false, false)
-        });
-        self.process_level_events()?;
-        if emptied.is_none() {
-            return Ok((self.dispense_default_in_level(pos, facing, stack), CLICK));
-        }
-        if self.dimension_type().water_evaporates
-            && matches!(
-                content,
-                BucketContent::Fluid(FluidKind::Water) | BucketContent::MobWater
-            )
-        {
-            self.evaporation_smoke([target.0, target.1, target.2]);
-        }
-        if let Some(kind) = mob {
-            // MobBucketItem.checkExtraContent: the mob from the bucket calls
-            // out, then ENTITY_PLACE.
-            if let Some(id) = self.spawn_mob_at(kind, target, true) {
-                self.mob_placed(id, &stack)?;
-            }
-            self.post_block_game_event(
-                "minecraft:entity_place",
-                [target.0, target.1, target.2],
-                None,
-                None,
-            );
-        }
-        let bucket = ItemStack::new("minecraft:bucket", 1);
-        Ok((
-            self.consume_with_remainder(pos, facing, stack, bucket),
-            CLICK,
-        ))
-    }
     /// The empty bucket: `BucketPickup.pickupBlock`.
     fn dispense_empty_bucket(
         &mut self,
@@ -1785,6 +1871,25 @@ impl Game<'_> {
         if !self.with_level(|b, level, ticks| b.directional_can_place(level, ticks, &ctx)) {
             return Ok((Some(stack), FAIL));
         }
+        if mod_api::__private::listened(mod_api::HookId::EntityPlace)
+            && let Some(preview) =
+                self.with_level(|b, level, ticks| b.placement_preview(level, ticks, &ctx))
+        {
+            let against = ctx.placed_against_pos(preview.pos);
+            let against = self.world.block(against.x, against.y, against.z);
+            let mut canceled = false;
+            self.native_entity_place(
+                None,
+                preview.pos,
+                preview.state,
+                against,
+                mod_api::Placement::Single,
+                &mut canceled,
+            );
+            if canceled {
+                return Ok((Some(stack), FAIL));
+            }
+        }
         let outcome = self.with_level(|b, level, ticks| b.place_block(level, ticks, &ctx));
         let PlaceOutcome::Placed { pos: placed, state } = outcome else {
             self.process_level_events()?;
@@ -1797,9 +1902,8 @@ impl Game<'_> {
         {
             self.world.block_entities.insert(target, entity);
         }
-        if self.world.block_entities.get(&target).is_some() {
-            self.apply_placed_item([target.0, target.1, target.2], &stack, false);
-        }
+        self.apply_placed_item([target.0, target.1, target.2], &stack, false);
+        self.block_item_placed(&stack, None, placed, &ctx);
         self.process_level_events()?;
         Ok((shrink(stack), CLICK))
     }
@@ -1961,7 +2065,7 @@ impl Game<'_> {
         at: Vec3,
         y_offset: f64,
         stack: ItemStack,
-    ) -> [f64; 3] {
+    ) -> Option<(u32, [f64; 3])> {
         self.spawn_item_own(stack, [at.x, at.y + y_offset, at.z], 10)
     }
     /// `MushroomCow.shear`: `player` is who sheared it, none for a dispenser.
@@ -1996,6 +2100,7 @@ impl Game<'_> {
                 keep_equipment: false,
                 preserve_can_pick_up_loot: false,
             },
+            false,
             |game, _| {
                 game.mooshroom_shear_puff([at.x, at.y, at.z], height);
                 let mut drops =
@@ -2025,7 +2130,7 @@ impl Game<'_> {
         );
     }
     /// `ShearsDispenseItemBehavior.tryShearEntity`: the first live, ready
-    /// `Shearable` in the block is sheared.
+    /// `Shearable` in the block is sheared (an entity part's `IShearable` answer comes first).
     pub(super) fn shear_entity(&mut self, target: Pos) -> Result<bool> {
         let shears = ItemStack::new("minecraft:shears", 1);
         for t in self.targets_at(target) {
@@ -2034,127 +2139,9 @@ impl Game<'_> {
                 return Ok(true);
             }
             let Target::Mob(i) = t else { continue };
-            let m = &self.mobs[i];
-            if !m.alive() {
+            let (entity_id, kind) = (self.mobs[i].id, self.mobs[i].kind.id.clone());
+            if !self.shear_mob(i, &shears) {
                 continue;
-            }
-            let at = m.position;
-            let entity_id = m.id;
-            let kind = m.kind.id.clone();
-            let sound_at = Some([at.x, at.y, at.z]);
-            // shear(level, BLOCKS, tool): level.playSound(null, this, sound, BLOCKS, 1, 1).
-            let shear_sound = |name: &'static str| {
-                LevelSound::new(name, [at.x, at.y, at.z], 1.0, 1.0).in_source(SoundSource::Blocks)
-            };
-            match m.species() {
-                Species::SulfurCube if sulfur_cube::has_body(m) => {
-                    // SulfurCube.shear: the swallowed block comes out at the
-                    // passenger attachment, and nothing is swallowed for 5 s.
-                    let height = f64::from(m.height());
-                    let id = m.id;
-                    if let Some(body) = self.mobs[i].take_body_equipment() {
-                        self.spawn_at_location(at, height, body);
-                    }
-                    // setItemSlot(BODY, EMPTY): an unequip.
-                    let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
-                    self.post_game_event("minecraft:unequip", [at.x, at.y, at.z], ctx);
-                    self.mobs[i].extra.ints[3] = sulfur_cube::PICKUP_TIMER;
-                    self.audio
-                        .play("minecraft:entity.sulfur_cube.eject", sound_at, 1.0, 1.0);
-                }
-                Species::Sheep if !m.extra.sheared && !m.is_baby() => {
-                    let color =
-                        horizon_client::mobs::render::DYE_NAMES[m.extra.color as usize & 15];
-                    self.play_bound_sound(
-                        shear_sound("minecraft:entity.sheep.shear"),
-                        entity_id,
-                        None,
-                    );
-                    let drops = self.sequence_loot(
-                        "minecraft:shearing/sheep",
-                        &format!("minecraft:shearing/sheep/{color}"),
-                        Some(&shears),
-                    );
-                    for stack in drops {
-                        for _ in 0..stack.count {
-                            let one = ItemStack {
-                                count: 1,
-                                ..stack.clone()
-                            };
-                            self.spawn_at_location(at, 1.0, one);
-                            // Sheep.shear nudges each item with the sheep's own random.
-                            let r = &mut self.mobs[i].random;
-                            let push = [
-                                f64::from((r.next_float() - r.next_float()) * 0.1),
-                                f64::from(r.next_float() * 0.05),
-                                f64::from((r.next_float() - r.next_float()) * 0.1),
-                            ];
-                            if let Some(item) = self.just_spawned_item() {
-                                item.velocity = Vec3::new(
-                                    item.velocity.x + push[0],
-                                    item.velocity.y + push[1],
-                                    item.velocity.z + push[2],
-                                );
-                            }
-                        }
-                    }
-                    self.mobs[i].extra.sheared = true;
-                }
-                Species::Bogged if !m.extra.sheared => {
-                    let height = f64::from(m.height());
-                    self.play_bound_sound(
-                        shear_sound("minecraft:entity.bogged.shear"),
-                        entity_id,
-                        None,
-                    );
-                    let drops = self.sequence_loot(
-                        "minecraft:shearing/bogged",
-                        "minecraft:shearing/bogged",
-                        Some(&shears),
-                    );
-                    for stack in drops {
-                        self.spawn_at_location(at, height, stack);
-                    }
-                    self.mobs[i].extra.sheared = true;
-                }
-                Species::SnowGolem if !m.extra.sheared => {
-                    let eye = m.eye_height();
-                    self.play_bound_sound(
-                        shear_sound("minecraft:entity.snow_golem.shear"),
-                        entity_id,
-                        None,
-                    );
-                    self.mobs[i].extra.sheared = true;
-                    let drops = self.sequence_loot(
-                        "minecraft:shearing/snow_golem",
-                        "minecraft:shearing/snow_golem",
-                        Some(&shears),
-                    );
-                    for stack in drops {
-                        self.spawn_at_location(at, eye, stack);
-                    }
-                }
-                // CopperGolem.shear: the antenna's flower drops 1.5 up.
-                Species::CopperGolem if self.golem_shearable(i) => {
-                    self.play_bound_sound(
-                        shear_sound("minecraft:entity.copper_golem.shear"),
-                        entity_id,
-                        None,
-                    );
-                    let antenna = self.mobs[i].saddle_item();
-                    let id = self.mobs[i].id;
-                    // setItemSlot(EQUIPMENT_SLOT_ANTENNA, EMPTY): an unequip.
-                    self.mobs[i].set_saddle(None);
-                    let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
-                    self.post_game_event("minecraft:unequip", [at.x, at.y, at.z], ctx);
-                    if let Some(antenna) = antenna {
-                        self.spawn_at_location(at, 1.5, antenna);
-                    }
-                }
-                Species::Mooshroom if !m.is_baby() => {
-                    self.shear_mooshroom(i, None, &shears);
-                }
-                _ => continue,
             }
             self.native_block_shear_entity(
                 self.dim.id(),
@@ -2172,6 +2159,136 @@ impl Game<'_> {
         }
         Ok(false)
     }
+    /// `ShearsDispenseItemBehavior.tryShearEntity` for one mob: the shearing of mob `i` with `shears`
+    /// (`Shearable.shear`, its sounds, drops and state). False when the mob cannot be sheared now: not alive,
+    /// a part that refuses, or a species or state that does not match.
+    pub(in crate::game) fn shear_mob(&mut self, i: usize, shears: &ItemStack) -> bool {
+        let part = self.part_shearable(i, None, shears);
+        let m = &self.mobs[i];
+        if !m.alive() || part.is_some_and(|(_, shearable)| !shearable) {
+            return false;
+        }
+        let (at, entity_id) = (m.position, m.id);
+        let sound_at = Some([at.x, at.y, at.z]);
+        // shear(level, BLOCKS, tool): level.playSound(null, this, sound, BLOCKS, 1, 1).
+        let shear_sound = |name: &'static str| {
+            LevelSound::new(name, [at.x, at.y, at.z], 1.0, 1.0).in_source(SoundSource::Blocks)
+        };
+        match m.species() {
+            _ if let Some((part, _)) = part => self.part_shear(i, part, None, shears),
+            Species::SulfurCube if sulfur_cube::has_body(m) => {
+                // SulfurCube.shear: the swallowed block comes out at the
+                // passenger attachment, and nothing is swallowed for 5 s.
+                let height = f64::from(m.height());
+                let id = m.id;
+                if let Some(body) = self.mobs[i].take_body_equipment() {
+                    self.spawn_at_location(at, height, body);
+                }
+                // setItemSlot(BODY, EMPTY): an unequip.
+                let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
+                self.post_game_event("minecraft:unequip", [at.x, at.y, at.z], ctx);
+                self.mobs[i].extra.ints[3] = sulfur_cube::PICKUP_TIMER;
+                self.audio
+                    .play("minecraft:entity.sulfur_cube.eject", sound_at, 1.0, 1.0);
+            }
+            Species::Sheep if !m.extra.sheared && !m.is_baby() => {
+                let color =
+                    horizon_client::mobs::render::DYE_NAMES[m.extra.color as usize & 15];
+                self.play_bound_sound(
+                    shear_sound("minecraft:entity.sheep.shear"),
+                    entity_id,
+                    None,
+                );
+                let drops = self.sequence_loot(
+                    "minecraft:shearing/sheep",
+                    &format!("minecraft:shearing/sheep/{color}"),
+                    Some(shears),
+                );
+                for stack in drops {
+                    for _ in 0..stack.count {
+                        let one = ItemStack {
+                            count: 1,
+                            ..stack.clone()
+                        };
+                        if let Some((id, _)) = self.spawn_at_location(at, 1.0, one) {
+                            // Sheep.shear nudges each item with the sheep's own random.
+                            let r = &mut self.mobs[i].random;
+                            let push = [
+                                f64::from((r.next_float() - r.next_float()) * 0.1),
+                                f64::from(r.next_float() * 0.05),
+                                f64::from((r.next_float() - r.next_float()) * 0.1),
+                            ];
+                            if let Some(item) = self.dropped_item_mut(id) {
+                                item.velocity = Vec3::new(
+                                    item.velocity.x + push[0],
+                                    item.velocity.y + push[1],
+                                    item.velocity.z + push[2],
+                                );
+                            }
+                        }
+                    }
+                }
+                self.mobs[i].extra.sheared = true;
+            }
+            Species::Bogged if !m.extra.sheared => {
+                let height = f64::from(m.height());
+                self.play_bound_sound(
+                    shear_sound("minecraft:entity.bogged.shear"),
+                    entity_id,
+                    None,
+                );
+                let drops = self.sequence_loot(
+                    "minecraft:shearing/bogged",
+                    "minecraft:shearing/bogged",
+                    Some(shears),
+                );
+                for stack in drops {
+                    self.spawn_at_location(at, height, stack);
+                }
+                self.mobs[i].extra.sheared = true;
+            }
+            Species::SnowGolem if !m.extra.sheared => {
+                let eye = m.eye_height();
+                self.play_bound_sound(
+                    shear_sound("minecraft:entity.snow_golem.shear"),
+                    entity_id,
+                    None,
+                );
+                self.mobs[i].extra.sheared = true;
+                let drops = self.sequence_loot(
+                    "minecraft:shearing/snow_golem",
+                    "minecraft:shearing/snow_golem",
+                    Some(shears),
+                );
+                for stack in drops {
+                    self.spawn_at_location(at, eye, stack);
+                }
+            }
+            // CopperGolem.shear: the antenna's flower drops 1.5 up.
+            Species::CopperGolem if self.golem_shearable(i) => {
+                self.play_bound_sound(
+                    shear_sound("minecraft:entity.copper_golem.shear"),
+                    entity_id,
+                    None,
+                );
+                let antenna = self.mobs[i].saddle_item();
+                let id = self.mobs[i].id;
+                // setItemSlot(EQUIPMENT_SLOT_ANTENNA, EMPTY): an unequip.
+                self.mobs[i].set_saddle(None);
+                let ctx = self.who_context(Some(horizon_client::mobs::Who::Mob(id)), None);
+                self.post_game_event("minecraft:unequip", [at.x, at.y, at.z], ctx);
+                if let Some(antenna) = antenna {
+                    self.spawn_at_location(at, 1.5, antenna);
+                }
+            }
+            Species::Mooshroom if !m.is_baby() => {
+                self.shear_mooshroom(i, None, shears);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// `Entity.shearOffAllLeashConnections(null)`: the entity's own lead and
     /// every lead held by it (within a 32 block box around its centre) drop;
     /// a shear game event at the entity and a snip at its block follow.
@@ -2189,7 +2306,30 @@ impl Game<'_> {
                 };
                 (Holder::Player, v.bounds.center(), None)
             }
-            Target::Guest(_) | Target::Stand(_) => return false,
+            // A server's player holds leads but wears none (`Player` is not
+            // `Leashable`). Their own turn drops the mobs and boats on their
+            // lead and posts the shear game event without a source
+            // (`dropAllLeashConnections(null)`); the snip, PLAYERS for a
+            // player, plays at their block after it.
+            Target::Guest(conn) => {
+                let Some(at) = (self.lan.as_ref())
+                    .and_then(|h| h.hub.guest(conn))
+                    .map(|g| g.position)
+                else {
+                    return false;
+                };
+                let dropped = self.for_player(super::commands::Target::Guest(conn), |g| {
+                    g.drop_all_leash_connections()
+                });
+                if dropped != Some(true) {
+                    return false;
+                }
+                let block = at.map(|v| v.floor() + 0.5);
+                self.audio
+                    .play("minecraft:item.shears.snip", Some(block), 1.0, 1.0);
+                return true;
+            }
+            Target::Stand(_) => return false,
         };
         let area = Aabb::new(centre, centre).inflate(Vec3::new(16.0, 16.0, 16.0));
         let mut leashed: Vec<(u32, usize)> = self
@@ -2323,21 +2463,8 @@ impl Game<'_> {
     ) -> Result<Dispensed> {
         let target = offset(pos, facing);
         let state = self.block_at(target);
-        let name = self.dispenser_block_name(target);
-        // HoneycombItem.WAXABLES: each copper block has a waxed twin.
-        let waxed = name.strip_prefix("minecraft:").and_then(|n| {
-            if n.starts_with("waxed_") {
-                return None;
-            }
-            let twin = format!("minecraft:waxed_{n}");
-            let mut s = self.pack.assets.registry.state(state)?.clone();
-            self.pack.assets.registry.default_state(&twin)?;
-            s.name = twin;
-            self.pack.assets.registry.resolve(&s).ok()
-        });
-        let Some(waxed) =
-            waxed.filter(|_| name.contains("copper") || name.contains("lightning_rod"))
-        else {
+        // HoneycombItem.getWaxed, as the player's honeycomb waxes.
+        let Some(waxed) = self.honeycomb_waxed(state) else {
             return Ok((
                 self.default_execute(pos, facing, stack),
                 optional_event("honeycomb"),
@@ -2491,7 +2618,7 @@ mod tests {
     /// answers first and wins for any item; with no answer from it the item's
     /// part decides; with neither, vanilla drops one item as before.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_faced_block_answers_before_the_item_and_vanilla_stands_when_no_part_listens() {
         use horizon_client::chunk::Chunk;
         use std::sync::Arc;
@@ -2683,7 +2810,7 @@ mod tests {
     /// one stands through its `Host`. An item with no part is as vanilla, and a handle that
     /// names no live entity is refused without asking the part.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_can_equip_part_decides_which_entity_a_dispenser_dresses() {
         let fits = Fits::new("minecraft:armor_stand");
         fits.installed(|| {
@@ -2712,11 +2839,20 @@ mod tests {
                 assert_eq!((done, worn, stand), (false, None, false));
                 assert_eq!(fits.asked().len(), 2);
                 // A missing entity is refused, and the part never hears of it.
-                let prepared = game.equip_stack(&helmet);
+                let prepared = game.equip_stack(
+                    &helmet,
+                    &[
+                        "minecraft:player",
+                        "minecraft:zombie",
+                        "minecraft:armor_stand",
+                    ],
+                    &[],
+                );
                 assert!(!game.can_equip(&prepared, "head", 9_999, "minecraft:zombie", true));
                 assert!(fits.asked().is_empty());
                 // With no part to ask, the component's answer stands for any entity.
-                let chestplate = game.equip_stack(&ItemStack::new("minecraft:iron_chestplate", 1));
+                let chestplate =
+                    game.equip_stack(&ItemStack::new("minecraft:iron_chestplate", 1), &[], &[]);
                 assert!(game.can_equip(&chestplate, "chest", 9_999, "minecraft:zombie", true));
             });
         });
@@ -2727,7 +2863,7 @@ mod tests {
     /// feet, `allowed_entities` naming only armour stands skips the zombie for the stand, an
     /// explicitly empty list allows nobody, and `dispensable: false` keeps the dispenser out.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_reads_the_stacks_own_equippable() {
         use horizon_core::nbt::Tag;
         super::super::native_entity_refs::tests::with_game(|game| {
@@ -2773,7 +2909,7 @@ mod tests {
     /// keeps it off; and with no part, a stack whose `allowed_entities` leaves the player out is
     /// not dispensed onto them.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_can_equip_part_decides_whether_a_dispenser_dresses_a_guest() {
         use horizon_core::nbt::Tag;
         let fits = Fits::new("minecraft:armor_stand");
@@ -2815,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn bucket_ambient_extraction_keeps_the_bound_mob_owner() {
         use horizon_mod_runtime::attachments::{
             AttachmentType, Attachments, HasAttachmentLifetime, Holder, index::AttachmentIndex,
@@ -2864,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn dispenser_stack_damage_preserves_break_remainder() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let mut shears = ItemStack::new("minecraft:shears", 2);
@@ -2880,7 +3016,7 @@ mod tests {
     /// brushing) whose part halves it loses 8, one whose part cancels it keeps its durability, and
     /// the shears, which have no part, lose the whole point.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; process-wide parts, run this test alone"]
+    #[ignore = "daily"]
     fn a_damage_item_part_changes_the_wear_of_a_dispensed_tool() {
         use crate::game::damage_item_tests::{Rule, with_wear_part};
         with_wear_part("minecraft:brush", Rule::Halve, |game, wear| {
@@ -2900,7 +3036,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn sulfur_cube_dispenser_replacement_drops_the_full_old_stack() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let kind = game
@@ -2931,7 +3067,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mod_dispenser_answers_preserve_fallback_and_own_consumption() {
         use super::super::api_values::{StackReadError, TryIntoApi};
         super::super::native_entity_refs::tests::with_game(|game| {
@@ -3003,6 +3139,7 @@ mod tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -3041,7 +3178,7 @@ mod tests {
     /// `EquipmentDispenseItemBehavior`: a server's player, the integrated
     /// owner or a guest, takes the piece (a server has no player of its own).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_equips_a_server_player_in_front() {
         let mut resources = None;
         let mut game = server_with_guest(&mut resources);
@@ -3066,9 +3203,57 @@ mod tests {
         assert!(guest.armor[3].is_some() && guest.armor[1].is_none());
     }
 
+    /// `ShearsDispenseItemBehavior.tryShearEntity`: a server's player in front
+    /// has the leads they hold cut (`shearOffAllLeashConnections(null)`), each
+    /// falling as a lead at its mob; a lead another player holds stays.
+    #[test]
+    #[ignore = "daily"]
+    fn dispensed_shears_cut_the_leads_a_server_player_holds() {
+        use horizon_client::{lan::playerdata::uuid_ints, mobs::leash::Holder};
+        let mut resources = None;
+        let mut game = server_with_guest(&mut resources);
+        let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
+        // Cow 40 on the guest's lead, cow 41 on someone else's, both out of
+        // the block in front.
+        for (id, x, holder) in [(40, 12.5, 208), (41, 4.5, 999)] {
+            let mut cow = Mob::new(id, kind.clone(), Vec3::new(x, 200.0, 8.5), 0.0);
+            cow.extra.leash = Some(Holder::Player);
+            cow.extra.leash_player = Some(uuid_ints(holder));
+            game.mobs.push(cow);
+        }
+        let leash = |game: &Game<'_>, id: u32| {
+            let cow = game.mobs.iter().find(|m| m.id == id).unwrap();
+            cow.extra.leash
+        };
+        game.audio.capture = Some(Vec::new());
+        crate::game::sculk::TEST_POSTED_EVENTS.with(|e| *e.borrow_mut() = Some(Vec::new()));
+        // The guest's feet are in block (8, 200, 8), the only entity there.
+        assert!(game.shear_entity((8, 200, 8)).unwrap());
+        assert_eq!(leash(&game, 40), None);
+        assert_eq!(leash(&game, 41), Some(Holder::Player));
+        let drops: Vec<_> = (game.dropped.iter())
+            .map(|i| (&*i.stack.item, i.stack.count, i.position))
+            .collect();
+        assert_eq!(drops, [("minecraft:lead", 1, Vec3::new(12.5, 200.0, 8.5))]);
+        // The shear game event at the player, without a source, and the snip
+        // at their block.
+        let shear = ("minecraft:shear", [8.5, 200.0, 8.5], None);
+        crate::game::sculk::TEST_POSTED_EVENTS.with(|e| {
+            assert!(e.borrow_mut().take().unwrap().contains(&shear));
+        });
+        let snips = game.audio.capture.take().unwrap();
+        assert!(
+            snips
+                .iter()
+                .any(|s| s.event == "minecraft:item.shears.snip" && s.position == [8.5, 200.5, 8.5])
+        );
+        // Nothing is left to cut: the next shears find nothing to do.
+        assert!(!game.shear_entity((8, 200, 8)).unwrap());
+    }
+
     /// A spectator is not a target (`canEquipWithDispenser`: `!isSpectator()`).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_skips_a_spectator_and_a_dead_player() {
         let mut resources = None;
         let mut game = server_with_guest(&mut resources);
@@ -3087,7 +3272,7 @@ mod tests {
     /// that can wear the piece gets it. Bit `1 << filterBit` locks a slot
     /// (head 4, chest 3, legs 2, feet 1); a hand needs arms.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_skips_an_armor_stand_whose_slot_is_locked() {
         use horizon_client::entities::ArmorStand;
         let mut resources = None;
@@ -3130,7 +3315,7 @@ mod tests {
     /// respawned, no ServerboundPlayerLoadedPacket yet) is in the level all the
     /// same: `getEntitiesOfClass` finds it and it wears the piece.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_equips_a_player_whose_client_is_still_loading() {
         let mut resources = None;
         let mut game = server_with_guest(&mut resources);
@@ -3147,7 +3332,7 @@ mod tests {
     /// Players are entities of the level: in one section they go in join
     /// order (entity ids) with the mobs and stands, not after them.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_and_a_stand_in_front_go_in_join_order() {
         // (stand id, guest id) -> who wears the helmet: the lower id joined first.
         for (stand_id, guest_id, guest_first) in [(7, 5, true), (3, 5, false)] {
@@ -3177,7 +3362,7 @@ mod tests {
     /// a stand whose feet are in section x 1 but whose box reaches into block
     /// x 15 comes after one in section x 0, even with the lower id.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dispenser_walks_entity_sections_before_ids() {
         let mut resources = None;
         let mut game = server_with_guest(&mut resources);
@@ -3207,3 +3392,7 @@ mod tests {
         assert!(at(15.9, 0.0, 0.0) < at(16.0, 0.0, 0.0));
     }
 }
+
+#[cfg(test)]
+#[path = "dispenser/decision_tests.rs"]
+mod decision_tests;

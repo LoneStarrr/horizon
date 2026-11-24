@@ -15,31 +15,148 @@ pub(super) fn tag_conditions_hold(
     Ok(allowed)
 }
 
-/// A tag file's accepted values with `more` appended (no repeats).
+/// A tag file's `key` list (`values`, `remove`); empty where it has none.
+pub(super) fn tag_list<'a>(tag: &'a J, key: &str) -> &'a [J] {
+    match tag.get(key) {
+        Some(J::Arr(list)) => list,
+        _ => &[],
+    }
+}
+
+/// A tag file's accepted values with `more` appended (no repeats), and
+/// `remove` after its own `remove` entries (NeoForge's tag `remove` list).
+/// The mods' layers of one tag, in load order: each layer's `values` and,
+/// after them, its `remove` entries (`TagLoader`: a file adds, then removes).
+pub(super) struct TagLayers<'a> {
+    pub(super) values: &'a [J],
+    pub(super) remove: &'a [J],
+}
+
+/// `vanilla`'s tag file over what the mods made of it: the mods' layers join
+/// its `values` as ordered entries, a removal carried as `{"id": ..., "remove":
+/// true}` (`TagLoader.EntryWithSource.remove`), so the folder walks adds and
+/// removals in the mods' load order instead of all adds before all removals.
 pub(super) fn merge_tag(
     text: Option<&str>,
-    more: &[J],
+    layers: &[TagLayers<'_>],
     what: &str,
-    conditions: &horizon_world::conditions::LoadConditions,
+    _conditions: &horizon_world::conditions::LoadConditions,
 ) -> Result<String> {
     let mut doc = match text {
         Some(t) => serde_json::from_str(t).map_err(|e| format!("{what}: {e}"))?,
         None => J::Obj(vec![("values".into(), J::Arr(Vec::new()))]),
     };
-    if !tag_conditions_hold(&doc, conditions, what)? {
-        doc = J::Obj(vec![("values".into(), J::Arr(Vec::new()))]);
-    }
-    // These conditions selected one source layer, not the flattened result.
+    // Tags do not evaluate load conditions.
     doc.remove("neoforge:conditions");
+    // The vanilla file's own `remove` entries apply right after its values,
+    // before the mods' layers: they join `values` as removal objects.
+    let vanilla_remove = match doc.get("remove") {
+        Some(J::Arr(remove)) => Some(remove.clone()),
+        _ => None,
+    };
+    doc.remove("remove");
     let Some(J::Arr(values)) = doc.get_mut("values") else {
         return Err(format!("{what}: no values").into());
     };
-    for v in more {
-        if !values.contains(v) {
-            values.push(v.clone());
+    if let Some(remove) = vanilla_remove {
+        for r in &remove {
+            let removal = match r {
+                J::Str(id) => J::Obj(vec![
+                    ("id".into(), J::Str(id.clone())),
+                    ("remove".into(), J::Bool(true)),
+                ]),
+                other => {
+                    let mut entry = other.clone();
+                    entry.set("remove", J::Bool(true));
+                    entry
+                }
+            };
+            values.push(removal);
         }
     }
+    for layer in layers {
+        for v in layer.values {
+            values.push(v.clone());
+        }
+        for r in layer.remove {
+            let removal = match r {
+                J::Str(id) => J::Obj(vec![
+                    ("id".into(), J::Str(id.clone())),
+                    ("remove".into(), J::Bool(true)),
+                ]),
+                other => {
+                    let mut entry = other.clone();
+                    entry.set("remove", J::Bool(true));
+                    entry
+                }
+            };
+            values.push(removal);
+        }
+    }
+    doc.remove("remove");
     Ok(serde_json::to_string_pretty(&doc)?)
+}
+
+/// What the mods do to one tag file, in load order (a data pack's
+/// TagLoader): each adds its values, and one that replaces the tag first
+/// drops vanilla's entries and the mods' before it.
+#[derive(Default)]
+pub(super) struct TagMerge {
+    /// A mod replaced the tag: vanilla's entries are left out.
+    pub(super) replaced: bool,
+    /// The mods whose values are in `values`.
+    pub(super) mods: Vec<String>,
+    /// Each mod file's additions and, after them, its removals, in load
+    /// order (`TagLoader`: one file adds its values, then its `remove`
+    /// entries apply). A replace drops the layers below it.
+    pub(super) layers: Vec<(Vec<J>, Vec<J>)>,
+}
+
+impl TagMerge {
+    /// Adds one mod's tag file. A replace that drops entries (vanilla's in a
+    /// `shared` tag, one not in the mod's namespaces, or other mods') warns.
+    pub(super) fn add(
+        &mut self,
+        id: &str,
+        file: &str,
+        replace: bool,
+        shared: bool,
+        values: &[J],
+    ) -> Option<String> {
+        let mut warning = None;
+        if replace {
+            let mut dropped: Vec<String> = Vec::new();
+            if shared && !self.replaced {
+                dropped.push("vanilla's entries".into());
+            }
+            if !self.mods.is_empty() {
+                dropped.push(format!("those of {}", self.mods.join(", ")));
+            }
+            if !dropped.is_empty() {
+                warning = Some(format!(
+                    "mod {id} replaces {file}: {} are left out, as a data pack's replace \
+                     does; the mods after it in load order still add to it",
+                    dropped.join(" and ")
+                ));
+            }
+            self.replaced = true;
+            self.mods.clear();
+            self.layers.clear();
+        }
+        if !self.mods.iter().any(|m| m == id) {
+            self.mods.push(id.to_owned());
+        }
+        self.layers.push((values.to_vec(), Vec::new()));
+        warning
+    }
+
+    /// The layers' entries for [`merge_tag`].
+    pub(super) fn layers(&self) -> Vec<TagLayers<'_>> {
+        self.layers
+            .iter()
+            .map(|(values, remove)| TagLayers { values, remove })
+            .collect()
+    }
 }
 
 /// Build generated tables using the owning load's registered condition snapshot.
@@ -80,9 +197,12 @@ pub fn build_with_conditions(
     tables(base, &plan, &overlay, &jobs)?;
     // Mod files, and every tag addition gathered per tag file.
     let mut tags: BTreeMap<String, TagMerge> = BTreeMap::new();
-    let mut warnings = Vec::new();
+    let mut warnings = plan.warnings.clone();
     let mut worldgen: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     let mut additions: BTreeMap<&str, Vec<Addition>> = BTreeMap::new();
+    // Carvers the root leaves out: the worldgen loader drops a biome's
+    // reference to one only when no data pack supplies it.
+    let mut left_out_carvers: BTreeSet<String> = BTreeSet::new();
     let mut modifiers = Vec::new();
     let mut structure_modifiers = Vec::new();
     let mut namespaces: std::collections::BTreeSet<String> = mods
@@ -128,19 +248,19 @@ pub fn build_with_conditions(
                 })?;
                 // Dynamic registry entries use the same owning-load conditions as tags.
                 // Evaluate before parsing required modifier fields.
-                if biomes::is_modifier(&file) || structures::is_modifier(&file) {
+                let carver = worldgen_entry(&file).filter(|(bundle, _)| *bundle == CARVERS);
+                if biomes::is_modifier(&file) || structures::is_modifier(&file) || carver.is_some()
+                {
                     let doc: J = serde_json::from_slice(&bytes)
                         .map_err(|e| format!("mod {}: {file}: {e}", m.id))?;
                     if !tag_conditions_hold(&doc, conditions, &file)? {
+                        left_out_carvers.extend(carver.map(|(_, id)| id));
                         continue;
                     }
                 }
                 if is_tag {
                     let doc: J =
                         serde_json::from_slice(&bytes).map_err(|e| format!("{file}: {e}"))?;
-                    if !tag_conditions_hold(&doc, conditions, &file)? {
-                        continue;
-                    }
                     let Some(J::Arr(values)) = doc.get("values") else {
                         return Err(format!("{}: {file}: no values", m.id).into());
                     };
@@ -149,6 +269,9 @@ pub fn build_with_conditions(
                     let shared = !m.content.namespaces.iter().any(|n| n == ns);
                     let merge = tags.entry(file.clone()).or_default();
                     warnings.extend(merge.add(&m.id, &file, replace, shared, values));
+                    if let Some((_, remove)) = merge.layers.last_mut() {
+                        remove.extend(tag_list(&doc, "remove").iter().cloned());
+                    }
                 } else if !file.starts_with(&declarations) {
                     if structures::is_modifier(&file) {
                         let text = String::from_utf8(bytes).map_err(|e| format!("{file}: {e}"))?;
@@ -168,6 +291,16 @@ pub fn build_with_conditions(
                         )?);
                     } else if let Some((bundle, id)) = worldgen_entry(&file) {
                         let text = String::from_utf8(bytes).map_err(|e| format!("{file}: {e}"))?;
+                        // The world decodes every carver at start, used or
+                        // not: one it can't read is left out.
+                        if bundle == CARVERS
+                            && let Err(e) =
+                                horizon_world::worldgen::carver::WorldCarver::from_json(&text)
+                        {
+                            warnings.push(format!("mod {}: {file}: carver left out: {e}", m.id));
+                            left_out_carvers.insert(id);
+                            continue;
+                        }
                         let entries = worldgen.entry(bundle).or_default();
                         match Addition::read(bundle, &text).map_err(|e| format!("{file}: {e}"))? {
                             Some(addition) => additions.entry(bundle).or_default().push(addition),
@@ -181,9 +314,16 @@ pub fn build_with_conditions(
     // A tag naming an id nobody registers fails as a whole in vanilla, and
     // carried-over mods name blocks left out or other mods' ids: such
     // entries are dropped instead, so the rest of the tag holds.
-    let known = Known::new(base, &plan, &tags)?;
+    let mut known = Known::new(base, &plan, &tags)?;
+    // The mods' own biomes join the bundle below, so their tags may name them.
+    if base.join(BIOMES).exists() {
+        let ids = worldgen.get(BIOMES).into_iter().flatten();
+        known.biomes.extend(ids.map(|(id, _)| id.clone()));
+    }
     for (file, merge) in &mut tags {
-        merge.values.retain(|v| known.keeps(file, v));
+        for (values, _) in &mut merge.layers {
+            values.retain(|v| known.keeps(file, v));
+        }
     }
     let mut bundles: Vec<(&str, J)> = Vec::new();
     for name in TAG_BUNDLES {
@@ -197,7 +337,7 @@ pub fn build_with_conditions(
             .filter(|_| !merge.replaced);
         overlay.write(
             file,
-            merge_tag(vanilla.as_deref(), &merge.values, file, conditions)?.as_bytes(),
+            merge_tag(vanilla.as_deref(), &merge.layers(), file, conditions)?.as_bytes(),
         )?;
         // data/<ns>/tags/block/<path>.json is the block tag <ns>:<path>.
         let Some((ns, path)) = file
@@ -213,7 +353,7 @@ pub fn build_with_conditions(
                 Some(J::Str(t)) if !merge.replaced => Some(t.clone()),
                 _ => None,
             };
-            let merged = merge_tag(text.as_deref(), &merge.values, name, conditions)?;
+            let merged = merge_tag(text.as_deref(), &merge.layers(), name, conditions)?;
             doc.set(&id, J::Str(merged));
         }
     }
@@ -238,7 +378,7 @@ pub fn build_with_conditions(
                 Some(J::Str(t)) if !merge.replaced => Some(t.clone()),
                 _ => None,
             };
-            let merged = merge_tag(text.as_deref(), &merge.values, BIOME_TAGS, conditions)?;
+            let merged = merge_tag(text.as_deref(), &merge.layers(), BIOME_TAGS, conditions)?;
             doc.set(&id, J::Str(merged));
         }
         overlay.write(BIOME_TAGS, &serde_json::to_vec(&doc)?)?;
@@ -247,10 +387,7 @@ pub fn build_with_conditions(
     // Structures and the pools, sets, processors and features they use, then
     // what mods add to sets, pools and lists, by priority, then in mod and
     // file order.
-    for list in additions.values_mut() {
-        list.sort_by_key(|a| a.priority);
-    }
-    let mut placed_doc = None;
+    let (mut placed_doc, mut biome_doc) = (None, None);
     for (bundle, entries) in &worldgen {
         if !base.join(bundle).exists() {
             continue;
@@ -259,14 +396,18 @@ pub fn build_with_conditions(
         for (id, text) in entries {
             doc.set(id, J::Str(text.clone()));
         }
-        for addition in additions.get(bundle).into_iter().flatten() {
-            addition
-                .apply(&mut doc)
-                .map_err(|e| format!("{bundle}: {e}"))?;
+        if let Some(list) = additions.get_mut(bundle) {
+            apply_additions(&mut doc, list).map_err(|e| format!("{bundle}: {e}"))?;
         }
         overlay.write(bundle, &serde_json::to_vec(&doc)?)?;
+        if *bundle == CARVERS && !left_out_carvers.is_empty() {
+            let name = format!("worldgen/{}", horizon_world::worldgen::carver::LEFT_OUT);
+            overlay.write(&name, &serde_json::to_vec(&left_out_carvers)?)?;
+        }
         if *bundle == PLACED_FEATURES {
             placed_doc = Some(doc);
+        } else if *bundle == BIOMES {
+            biome_doc = Some(doc);
         }
     }
     if !modifiers.is_empty() || (!mods.is_empty() && base.join(BIOMES).exists()) {
@@ -275,6 +416,7 @@ pub fn build_with_conditions(
             &overlay,
             &modifiers,
             inventory.server_ids().map(str::to_owned).collect(),
+            biome_doc,
             biome_tag_doc,
             placed_doc,
             &tags,
@@ -285,7 +427,7 @@ pub fn build_with_conditions(
         structures::apply(base, &overlay, &structure_modifiers, &tags, &mut warnings)?;
     }
     // The commands suggest ids from `command-registries.json`: add the
-    // structures, pools, sets and features the mods bring.
+    // biomes, structures, pools, sets and features the mods bring.
     let registries = out_path(&overlay, "command-registries.json");
     if let Ok(mut doc) = read_json(&registries) {
         // Registry names hold `/`, so each key is looked up by itself.
@@ -324,6 +466,10 @@ pub fn build_with_conditions(
             overlay.write(&own, &fs::read(&vanilla)?)?;
         }
     }
+    // Vanilla's namespace isn't a content mod's, even when a mod ships files
+    // under it (`data/minecraft/tags/...`): every loader reads it already, and
+    // listed again it read each vanilla recipe twice, once as `minecraft:<name>`.
+    namespaces.remove("minecraft");
     overlay.write(MARKER, &serde_json::to_vec(&namespaces)?)?;
     let requirements =
         collect_jar_requirements(mods.iter().map(|m| (m.id.as_str(), m.jars.as_slice())))?;
@@ -345,7 +491,16 @@ pub fn build_with_conditions(
             by_item(|i| i.crafting_remainder.as_deref()),
         ),
         (MOD_ITEM_TEMPLATES, by_item(|i| i.template.as_deref())),
-        (MOD_ITEM_BLOCKS, by_item(|i| i.block.as_deref())),
+        // A wall form can be earlier in the block registry than its primary form.
+        // The shared Block.asItem is not enough to choose the item's primary block.
+        (
+            MOD_ITEM_BLOCKS,
+            by_item(|i| {
+                i.block
+                    .as_deref()
+                    .or_else(|| i.wall_pair.as_ref().map(|_| i.rename.to.as_str()))
+            }),
+        ),
     ] {
         if !map.is_empty() {
             overlay.write(name, &serde_json::to_vec(&map)?)?;
@@ -407,26 +562,35 @@ pub fn resource_root_with_conditions(
             || !m.content.blocks.is_empty()
             || !m.content.items.is_empty()
             || !m.content.block_entity_types.is_empty()
+            || !m.content.vanilla_shapes.is_empty()
     });
     if inventory.is_empty() && !has_content {
         return Ok(base.to_owned());
     }
     let mut stamp = stamp(base, jar_store, mods, inventory)?;
-    if conditions.has_registered() {
+    // Code-only roots never read the conditions, so they keep one root per stamp.
+    if has_content && (conditions.has_registered() || conditions.feature_flags().is_some()) {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         stamp.hash(&mut hash);
         conditions.hash(&mut hash);
-        // Handlers can read config that has no persistent fingerprint. Give each
-        // build a fresh root, leaving every previously usable root untouched.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-            .hash(&mut hash);
+        if conditions.has_registered() {
+            // Handlers can read config that has no persistent fingerprint. Give each
+            // build a fresh root, leaving every previously usable root untouched.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+                .hash(&mut hash);
+        }
         stamp = format!("{:016x}{stamp}", hash.finish());
     }
     let roots = cache.join("mod-content");
     let out = roots.join(&stamp[..ROOT_NAME]);
+    // Pin before examining the root. If a prune already admitted the old generation, this
+    // waits for it to move that generation aside before looking for its stamp.
+    // The lock file goes beside the root, so the folder must exist before the hold.
+    fs::create_dir_all(&roots)?;
+    let _preparing = retain_root(&out);
     if fs::read(out.join(STAMP)).is_ok_and(|s| s == stamp.as_bytes())
         && fs::read(out.join(horizon_mod_package::enabled::MARKER)).is_ok_and(|bytes| {
             serde_json::from_slice::<horizon_mod_package::enabled::EnabledMods>(&bytes)
@@ -438,7 +602,7 @@ pub fn resource_root_with_conditions(
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
         // Used again: kept another day. Marked beside the root, not in it: the pack overlay
         // laid over the root reads its files, and a rewritten one would rebuild it (#12403).
-        let _ = fs::write(used_path(&out), b"");
+        super::root_lifetime::renew_root(&out);
         return Ok(out);
     }
     if has_content {
@@ -457,6 +621,19 @@ pub fn resource_root_with_conditions(
         overlay.write(GENERATED_FILES, b"[]")?;
     }
     fs::write(out.join(STAMP), stamp)?;
-    prune_roots(&roots, &out, KEEP_ROOTS);
+    // Old roots go on a thread of their own: removing one linked file by file takes seconds, and
+    // the start would wait for each. Tests prune inline: a detached prune holds lock files open
+    // while a test removes its cache, which Windows refuses.
+    let current = out.clone();
+    if cfg!(test) {
+        prune_roots(&roots, &current, KEEP_ROOTS);
+        return Ok(out);
+    }
+    let spawned = std::thread::Builder::new()
+        .name("mod-content-prune".into())
+        .spawn(move || prune_roots(&roots, &current, KEEP_ROOTS));
+    if spawned.is_err() {
+        log::warn!("Horizon: old mod content roots are left for the next start");
+    }
     Ok(out)
 }

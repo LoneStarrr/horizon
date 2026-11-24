@@ -358,6 +358,16 @@ pub fn write_block(
 /// A placed structure piece.
 pub trait LegacyPiece: std::fmt::Debug + Send + Sync {
     fn bounding_box(&self) -> BoundingBox;
+    /// The box once placed, as `StructureManager.structureHasPieceAt` reads it:
+    /// `TemplateStructurePiece.postProcess` moves the box of a piece that settles on the terrain
+    /// (shipwrecks, ocean ruins, igloos). The box it was made with otherwise.
+    fn placed_bounding_box(&self) -> BoundingBox {
+        self.bounding_box()
+    }
+    /// Cached terrain override for a mod piece; vanilla pieces use their structure's rule.
+    fn beardifier(&self) -> Option<horizon_core::density::RigidPiece> {
+        None
+    }
     /// The vanilla StructurePieceType id, for diagnostics and comparisons.
     fn type_name(&self) -> &'static str;
     /// `StructurePiece.createTag`; None while Horizon cannot save this type,
@@ -512,7 +522,7 @@ impl PieceFrame {
             state = c.resources.transforms.mirror(state, self.mirror);
         }
         if self.rotation != Rotation::None {
-            state = c.resources.transforms.rotate(state, self.rotation);
+            state = c.resources.transforms.rotate_at(state, pos, self.rotation);
         }
         write_block(c.world, c.resources, pos, state)
     }
@@ -1066,7 +1076,9 @@ fn filter_blocks(
                 .is_none_or(|bb| bb.is_inside(pos))
                 .then(|| BlockInfo {
                     pos,
-                    state: resources.transforms.rotate(b.state, settings.rotation),
+                    state: resources
+                        .transforms
+                        .rotate_at(b.state, pos, settings.rotation),
                     nbt: b.nbt.clone(),
                 })
         })

@@ -47,7 +47,7 @@ fn blows(cases: &[Case]) -> Vec<(i32, f32)> {
             let mut m = Mob::new(41, type_, Vec3::new(2.5, 64.0, 0.5), 0.0);
             m.fire_ticks = if burning { 100 } else { 0 };
             m.extra.set_main_hand(hand.map(Arc::from));
-            m.random = LegacyRandom::new(seed);
+            m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(seed));
             g.mobs.push(m);
             // The mob out of the level while its own blow runs, as in its tick.
             let mut mobs = std::mem::take(&mut g.mobs);
@@ -84,7 +84,7 @@ fn blows(cases: &[Case]) -> Vec<(i32, f32)> {
 /// 0.7309677600860596 for 0, so each expected pair below is that seed's first
 /// float where the chance was not drawn and its second where it was.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_burning_zombies_burn_rides_a_blow_that_landed() {
     let (normal, hard) = (Difficulty::Normal, Difficulty::Hard);
     let zombie = "minecraft:zombie";

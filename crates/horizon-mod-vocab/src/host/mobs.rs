@@ -7,7 +7,7 @@ pub trait MobsHost {
     /// Side: both.
     /// The entity as a vanilla Mob: a mob or the ender dragon. Players, armor
     /// stands, stale handles and clients are rejected. Mobs taken out for
-    /// ticking are unavailable (a #29 follow-up).
+    /// ticking are unavailable.
     #[access(WorldOnly)]
     fn mob(&self, entity: EntityRef) -> Option<MobRef>;
 }
@@ -69,6 +69,38 @@ pub trait MobsBackend {
     /// stale or unavailable mob, or on a client, and for the dragon.
     #[access(WorldOnly)]
     fn mob_navigation_speed(&self, mob: MobRef) -> Option<f64>;
+
+    /// Side: server.
+    /// Whether this navigation may open doors.
+    /// None for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_can_open_doors(&self, mob: MobRef) -> Option<bool>;
+
+    /// Side: server.
+    /// Whether this navigation may pass doors.
+    /// None for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_can_pass_doors(&self, mob: MobRef) -> Option<bool>;
+
+    /// Side: server.
+    /// Whether this navigation may float.
+    /// None for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_can_float(&self, mob: MobRef) -> Option<bool>;
+    /// Side: server.
+    /// `MoveControl.getWantedX/Y/Z`: the stored wish, even after consumption.
+    /// None for a stale mob, a client, the dragon or a mob held out of the level.
+    #[access(WorldOnly)]
+    fn mob_wanted_position(&self, mob: MobRef) -> Option<[f64; 3]>;
+    /// Side: server.
+    /// `MoveControl.getSpeedModifier`: the stored move-control speed.
+    /// None for a stale mob, a client, the dragon or a mob held out of the level.
+    #[access(WorldOnly)]
+    fn mob_speed_modifier(&self, mob: MobRef) -> Option<f64>;
+
     /// Side: server.
     /// `Mob.getPathfindingMalus`: what a node of `kind` costs this mob's
     /// pathfinder — its own override, else the kind's default (a negative
@@ -113,6 +145,13 @@ pub trait MobsBackend {
     /// for anything but a mob.
     #[access(WorldOnly)]
     fn mob_no_ai(&self, mob: MobRef) -> Option<bool>;
+    /// Side: server.
+    /// Whether a mod paused the mob's AI step with `set_ai_paused`. False
+    /// for a mob no mod paused, whether or not it has `NoAI`. None for a
+    /// stale or held-out handle, anything but a mob, the dragon, or on a
+    /// client.
+    #[access(WorldOnly)]
+    fn mob_ai_paused(&self, mob: MobRef) -> Option<bool>;
     /// Side: server.
     /// `Mob.getRestrictCenter`: the restriction's block position, kept
     /// after `clear_restriction` and after a load (`[0, 0, 0]` for a mob
@@ -197,6 +236,15 @@ pub trait MobsBackend {
     #[access(WorldOnly)]
     fn unspawned_mob_tags(&self, mob: UnspawnedMobRef) -> Result<Vec<String>, UnspawnedMobError>;
     /// Side: server.
+    /// Whether the unspawned mob is a baby (`LivingEntity.isBaby`): a negative age on a type
+    /// that can be one. `finalize_spawn` lends the mob before finalization runs, so one that
+    /// finalization makes a baby (a baby zombie, a young animal of a natural spawn's pack) is
+    /// still an adult there. The ender dragon never is a baby; `Unsupported` where the game
+    /// lends no mob of its own (as for `equipment`). `Expired` once the hook that lent it has
+    /// returned.
+    #[access(WorldOnly)]
+    fn unspawned_mob_baby(&self, mob: UnspawnedMobRef) -> Result<bool, UnspawnedMobError>;
+    /// Side: server.
     /// The unspawned mob's custom name, if it has one. `Expired` once the hook that lent it has returned.
     #[access(WorldOnly)]
     fn unspawned_mob_custom_name(
@@ -215,7 +263,9 @@ pub trait MobsBackendMut {
     /// clients get the synced `DATA_PHASE`. Setting the phase it holds does
     /// nothing, as in vanilla (a strafing dragon keeps its player). No
     /// random draw. False for a stale handle or a client. The new phase
-    /// runs from the dragon's next tick.
+    /// runs from the dragon's next tick. The phase is set directly:
+    /// `dragon_change_phase` hears only the phase changes the game itself
+    /// makes, never this call.
     #[access(WorldOnly)]
     fn dragon_set_phase(&mut self, dragon: DragonRef, phase: DragonPhase) -> bool;
     /// Side: server.
@@ -252,6 +302,18 @@ pub trait MobsBackendMut {
     #[access(WorldOnly)]
     fn mob_remove_target_goal(&mut self, mob: MobRef, id: &str) -> Option<usize>;
     /// Side: server.
+    /// Gives the mob the goals a new mob of its kind gets, for a mod whose
+    /// goals changed while the mob lived (a hot reload, a new
+    /// configuration): `register_goals` is asked once, when a mob is made.
+    /// Every running goal is stopped, both selectors are emptied and the
+    /// mob's goals are registered again, the species' own and then each
+    /// part's, with the mob as it stands now. What was added to the mob since
+    /// it was made (`add_goal`, `add_target_goal`) is gone, and the flags a
+    /// rider disables stay. False for a stale or unavailable mob, a client,
+    /// and the dragon.
+    #[access(WorldOnly)]
+    fn mob_reset_goals(&mut self, mob: MobRef) -> bool;
+    /// Side: server.
     /// `PathNavigation.moveTo(x, y, z, speed)`: true if a path was started.
     /// Refuses a stale or unavailable mob, a client, non-finite arguments,
     /// and coordinates too large for safe block arithmetic. As in vanilla,
@@ -259,6 +321,37 @@ pub trait MobsBackendMut {
     /// dragon, which flies by its phase and keeps no navigation.
     #[access(WorldOnly)]
     fn mob_move_to(&mut self, mob: MobRef, at: [f64; 3], speed: f64) -> bool;
+    /// `PathNavigation.moveTo(Path, speed)`: follow a path the mod computed.
+    /// Each [`PathNode`] is floored to its block, and the engine classifies
+    /// the node's [`PathType`] on submit (the mod gives no types); the
+    /// classification is information for the follower, never a filter: a node
+    /// it calls blocked is not refused, moved or dropped, so the path is
+    /// followed as given. As every `moveTo`, this trims the path: a node in a
+    /// cauldron is raised onto its rim, and with avoid-sun a ground navigation
+    /// cuts at the first node that can see the sky. The path is finished once
+    /// its next-node index reaches the node count; [`mob_is_done`](MobsBackend::mob_is_done)
+    /// is true when there is no path or it is finished. A supplied path keeps
+    /// no recompute target, so a block change on it or the stuck check drops
+    /// it and no search is ever run in its place (stricter than vanilla, which
+    /// re-searches to the previous target); the per-node timeout drops it as
+    /// well. Only non-finite coordinates and speeds are refused; there is no
+    /// cap on the node count, and unloaded or out-of-world nodes are neither
+    /// refused nor clamped: a finite coordinate at the edge of the `i32` range
+    /// saturates when it is floored to its block, and every block step after
+    /// it (the classifier's neighbours, the floor under a node, the follower's
+    /// waypoint) saturates too, so no mod input panics the engine. As in
+    /// vanilla, the mob's own goals may replace the path next tick. Refuses
+    /// with a [`MoveToPathError`]: `NotFinite` for such a coordinate or speed,
+    /// `Unavailable` for a stale or unavailable mob, a client, and the dragon
+    /// (which flies by its phase and keeps no navigation), and `Empty` when
+    /// the path has no node left to follow after the trim.
+    #[access(WorldOnly)]
+    fn mob_move_to_path(
+        &mut self,
+        mob: MobRef,
+        nodes: Vec<PathNode>,
+        speed: f64,
+    ) -> Result<(), MoveToPathError>;
     /// Side: server.
     /// `PathNavigation.stop`. False for a stale or unavailable mob, or on a
     /// client, and for the dragon (no navigation).
@@ -272,6 +365,33 @@ pub trait MobsBackendMut {
     /// unavailable mob, or on a client, and for the dragon.
     #[access(WorldOnly)]
     fn mob_set_navigation_speed(&mut self, mob: MobRef, speed: f64) -> bool;
+
+    /// Side: server.
+    /// `PathNavigation.setCanOpenDoors`: sets the navigation can_open_doors flag.
+    /// Changes only this flag, leaving the current path intact. The mob's
+    /// own setup may set it again. Write from `entity_join`.
+    /// False for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_set_can_open_doors(&mut self, mob: MobRef, value: bool) -> bool;
+
+    /// Side: server.
+    /// `PathNavigation.setCanPassDoors`: sets the navigation can_pass_doors flag.
+    /// Changes only this flag, leaving the current path intact. The mob's
+    /// own setup may set it again. Write from `entity_join`.
+    /// False for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_set_can_pass_doors(&mut self, mob: MobRef, value: bool) -> bool;
+
+    /// Side: server.
+    /// `PathNavigation.setCanFloat`: sets the navigation can_float flag.
+    /// Changes only this flag, leaving the current path intact. The mob's
+    /// own setup may set it again. Write from `entity_join`.
+    /// False for a stale handle, a client, a mob held out of the level,
+    /// or a mob with no ground or flying navigation (water and amphibious refuse).
+    #[access(WorldOnly)]
+    fn mob_set_can_float(&mut self, mob: MobRef, value: bool) -> bool;
     /// Side: server.
     /// `Mob.setPathfindingMalus`: what the mob's next paths cost through
     /// `kind` (negative closes it, as the species' own overrides do); not
@@ -285,7 +405,7 @@ pub trait MobsBackendMut {
     /// can be stored in the current level are supported; armor stands are
     /// refused. The dragon stores a mob or a player, which its flight ignores
     /// and its save does not keep (vanilla keeps no target either). Brain-backed mobs refuse writes: vanilla's setter
-    /// does not update their brain memory (#934). A fox, an enderman or a
+    /// does not update their brain memory. A fox, an enderman or a
     /// zombified piglin stores the target with its own `setTarget` side
     /// effects (`Mob::set_target`).
     /// Invalid targets are refused (false, mob unchanged); vanilla instead
@@ -309,6 +429,24 @@ pub trait MobsBackendMut {
     #[access(WorldOnly)]
     fn mob_set_no_ai(&mut self, mob: MobRef, no_ai: bool) -> bool;
     /// Side: server.
+    /// Pauses (`true`) or resumes the mob's AI step while its physics runs
+    /// on, as vanilla's `isImmobile` does (a dying mob, a stunned ravager).
+    /// A paused mob skips `Mob.serverAiStep` whole: its Brain or its goal and
+    /// target selectors, its navigation and its move, look and jump
+    /// controls, for brain and goal mobs alike. `LivingEntity.aiStep` still
+    /// runs with every move input (`xxa`, `yya`, `zza`) and the jump flag
+    /// zeroed, so it travels with gravity, through fluids, and is pushed,
+    /// knocked back, hurt and killed. Its path, move target, target, running
+    /// goals and brain memories are kept and resume on the next AI step; the
+    /// navigation timeout does not count the pause. `NoAI` is neither read nor
+    /// written, and the per-species `isNoAi` checks outside the AI step still
+    /// read only `NoAI`. Saved with the entity as an attachment-style value
+    /// (`horizon:attachments`, `horizon` / `ai_paused`), never a vanilla key,
+    /// and read back on load. Refused, with nothing changed, as
+    /// `MobAiPauseRefusal` names.
+    #[access(WorldOnly)]
+    fn mob_set_ai_paused(&mut self, mob: MobRef, paused: bool) -> Result<(), MobAiPauseRefusal>;
+    /// Side: server.
     /// `Mob.setBaby` through the species' setter: ageable mobs use their
     /// baby start age (`-48000` for sniffers, otherwise `-24000`) or `0`,
     /// including age-boundary attribute and AI setup changes. Non-ageable
@@ -330,6 +468,20 @@ pub trait MobsBackendMut {
     #[access(WorldOnly)]
     fn mob_look_at(&mut self, mob: MobRef, at: [f64; 3]) -> bool;
     /// Side: server.
+    /// `MoveControl.setWantedPosition`: a momentary wish consumed by the mob's
+    /// own movement. Its AI may replace it next tick. Unloaded positions and
+    /// finite negative speeds are accepted. Non-finite inputs return named
+    /// errors without changing the wish. Ok(false) for a stale mob, a client,
+    /// the dragon or a mob held out of the level.
+    #[access(WorldOnly)]
+    fn mob_set_wanted_position(
+        &mut self,
+        mob: MobRef,
+        at: [f64; 3],
+        speed: f64,
+    ) -> Result<bool, WantedPositionError>;
+
+    /// Side: server.
     /// `JumpControl.jump`: the mob jumps on its next own tick by its own
     /// jump path — no velocity is written, and the control consumes the
     /// wish on that tick (a rabbit's jump control reads it too). The mob's
@@ -339,6 +491,20 @@ pub trait MobsBackendMut {
     /// or unavailable mob, a client, and the dragon.
     #[access(WorldOnly)]
     fn mob_jump(&mut self, mob: MobRef) -> bool;
+    /// Side: server.
+    /// `Mob.doHurtTarget` against `target`: the mob's own melee blow, the
+    /// one a melee goal deals, with the held weapon's damage and
+    /// enchantments, the knockback and the species' extra effects (a
+    /// cave spider's poison, a wither skeleton's wither). It goes through
+    /// the mob combat path the goal's blow takes, so a shield or armour can
+    /// take it. It does not swing the arm, start the attack cooldown or
+    /// check reach: those belong to the goal that calls it. True means the
+    /// blow was dealt, not that it landed. False for a stale or unavailable
+    /// mob or target, a client, the dragon, a target the mob may not attack
+    /// (the same rule `set_target` applies), a mob attacking itself, and a
+    /// guest target (refused for now).
+    #[access(WorldOnly)]
+    fn mob_attack(&mut self, mob: MobRef, target: LivingRef) -> bool;
     /// Side: server.
     /// `Mob.restrictTo(pos, radius)`: the home area the mob keeps to — its
     /// own stroll and wander goals pick their positions inside it, as a
@@ -361,6 +527,21 @@ pub trait MobsBackendMut {
     #[access(WorldOnly)]
     fn mob_set_left_handed(&mut self, mob: MobRef, left_handed: bool) -> bool;
     /// Side: server.
+    /// `Shearable.shear` with shears, as a dispenser's shears shear a mob, without the block's
+    /// events: the mob's sounds, drops and sheared state (sheep wool, a bogged's mushrooms, a snow
+    /// golem's pumpkin, a mooshroom that becomes a cow, a copper golem's antenna). False for a stale
+    /// handle, a client, the dragon, or a mob that cannot be sheared now (a baby sheep, one already
+    /// sheared, another kind).
+    #[access(WorldOnly)]
+    fn mob_shear(&mut self, mob: MobRef) -> bool;
+    /// `AbstractPiglin.finishConversion`, as a mod starts it: the piglin turns into a zombified piglin in its
+    /// place, keeping its equipment and loot pickup (`ConversionParams` as vanilla's zombification), with the
+    /// nausea it leaves and `living_conversion_pre` as the game's own conversions. Only a piglin: other kinds
+    /// refuse. Immunity to zombification does not stop the call. False for a stale handle, a client, the dragon,
+    /// or a mob that is not a piglin.
+    #[access(WorldOnly)]
+    fn mob_zombify(&mut self, mob: MobRef) -> bool;
+    /// Side: server.
     /// `Mob.setCanPickUpLoot`: whether the mob picks up the items it sees
     /// (saved with it as `CanPickUpLoot`; clients are not told, as in
     /// vanilla). An allay and a sulfur cube decide for themselves. False
@@ -378,7 +559,7 @@ pub trait MobsBackendMut {
     /// `Brain.setMemory(ATTACK_TARGET, target)`, or `eraseMemory` for None:
     /// the target a brain-driven mob — an axolotl, a breeze, a creaking, a
     /// hoglin, a piglin or piglin brute, a warden or a zoglin — reads instead
-    /// of `Mob.setTarget`'s (#934). A plain, non-expiring memory write: the
+    /// of `Mob.setTarget`'s. A plain, non-expiring memory write: the
     /// brain's own behaviours act on it from the next tick (a target the
     /// species may not attack is dropped there, as vanilla's
     /// `StopAttackingIfTargetInvalid` drops it), and none of a species' own

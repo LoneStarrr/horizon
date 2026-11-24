@@ -10,6 +10,7 @@
 //! other `GateBehavior`s shuffle with a random of their own, seeded with
 //! `Brain::shuffle_seed` when the brain is built.
 mod reputation;
+mod restock;
 pub use reputation::murder_witnesses;
 use reputation::targetable;
 
@@ -21,8 +22,9 @@ use super::{
 use crate::health::DamageLevel;
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{LegacyRandom, LevelRandom, RandomSource},
 };
+pub(super) use restock::restock_if_due;
 
 /// `MemorySlot.NEVER_EXPIRE`.
 pub(super) const NEVER: i64 = i64::MAX;
@@ -378,7 +380,7 @@ impl Brain {
         };
         b.list = packages(baby, shuffle_seed, farmer);
         // The parts' behaviors join before the sort, so each lands after
-        // vanilla's of its priority and activity (#824). Nothing joins a
+        // vanilla's of its priority and activity (arismoko/horizon#824). Nothing joins a
         // type no part attached to, and nothing is asked or built then.
         let before = b.list.len();
         attach_behaviors(mob_id, &mut b.list);
@@ -589,7 +591,7 @@ fn sync(m: &mut Mob, now: i64) {
 
 // ---- Sensors ------------------------------------------------------------
 
-fn tick_sensors(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom) {
+fn tick_sensors(m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom) {
     for i in 0..9 {
         let fire = {
             let b = brain_mut(m);
@@ -687,7 +689,7 @@ fn sense_players(m: &mut Mob, w: &MobWorld) {
 }
 /// `NearestBedSensor`: babies remember the nearest reachable bed, trying
 /// at most four beds a scan and skipping the ones tried lately.
-fn sense_bed(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom) {
+fn sense_bed(m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom) {
     if !m.is_baby() {
         return;
     }
@@ -747,28 +749,7 @@ fn sense_hurt(m: &mut Mob, w: &MobWorld) {
         mm.hurt_by_entity.clear();
     }
 }
-/// `VillagerHostilesSensor.ACCEPTABLE_DISTANCE_FROM_HOSTILES`.
-fn hostile_distance(s: Species) -> Option<f32> {
-    Some(match s {
-        Species::Drowned
-        | Species::Husk
-        | Species::Vex
-        | Species::Zombie
-        | Species::ZombieVillager => 8.0,
-        Species::Evoker | Species::Illusioner | Species::Ravager => 12.0,
-        Species::Pillager => 15.0,
-        Species::Vindicator | Species::Zoglin => 10.0,
-        _ => return None,
-    })
-}
-fn sense_hostiles(m: &mut Mob, w: &MobWorld) {
-    let hostile = find_closest(m, w, |m, who| {
-        let Who::Mob(id) = who else { return false };
-        let Some(s) = w.seen(id) else { return false };
-        hostile_distance(s.species).is_some_and(|d| m.distance_sqr(s.position) <= f64::from(d * d))
-    });
-    mem(m).nearest_hostile.set_opt(hostile);
-}
+include!("villager_brain/hostile_sensor.rs");
 fn sense_babies(m: &mut Mob, w: &MobWorld) {
     let list = mem_ref(m)
         .and_then(|mm| mm.visible_mobs.get())
@@ -859,7 +840,7 @@ pub(super) fn others_tickets(
     w: &MobWorld,
 ) -> crate::fast_hash::FxHashMap<[i32; 3], usize> {
     let mut taken = crate::fast_hash::FxHashMap::default();
-    for o in w.others {
+    let mut count = |o: &super::Seen| {
         if o.id != m.id && o.alive && o.species == Species::Villager {
             for q in [o.job, o.bed, o.potential_job, o.meeting]
                 .into_iter()
@@ -868,6 +849,12 @@ pub(super) fn others_tickets(
                 *taken.entry(q).or_insert(0) += 1;
             }
         }
+    };
+    match w.others_villagers {
+        Some(slots) => {
+            slots.iter().for_each(|&i| count(&w.others[i as usize]));
+        }
+        None => w.others.iter().for_each(count),
     }
     taken
 }
@@ -984,14 +971,8 @@ fn manhattan(a: [i32; 3], b: [i32; 3]) -> i32 {
     (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs()
 }
 /// The village sections: sections holding a taken village POI.
-pub(super) fn village_sections(m: &Mob, w: &MobWorld) -> Vec<[i32; 3]> {
-    let mut out = Vec::new();
-    let mut add = |p: [i32; 3]| {
-        let s = [p[0] >> 4, p[1] >> 4, p[2] >> 4];
-        if !out.contains(&s) {
-            out.push(s);
-        }
-    };
+pub(super) fn village_sections(m: &Mob, w: &MobWorld) -> super::village_index::Villages {
+    let mut own = Vec::new();
     if let Some(mm) = mem_ref(m) {
         for s in [
             &mm.job_site,
@@ -1002,42 +983,16 @@ pub(super) fn village_sections(m: &Mob, w: &MobWorld) -> Vec<[i32; 3]> {
             if let Some(&p) = s.get()
                 && poi_at(w, p[0], p[1], p[2]).is_some()
             {
-                add(p);
+                own.push([p[0] >> 4, p[1] >> 4, p[2] >> 4]);
             }
         }
     }
-    let mut villager = |o: &super::Seen| {
-        if o.alive && o.species == Species::Villager {
-            for p in [o.job, o.bed, o.potential_job, o.meeting]
-                .into_iter()
-                .flatten()
-            {
-                if poi_at(w, p[0], p[1], p[2]).is_some() {
-                    add(p);
-                }
-            }
-        }
-    };
-    match w.others_villagers {
-        Some(slots) => slots.iter().for_each(|&i| villager(&w.others[i as usize])),
-        None => w.others.iter().for_each(villager),
-    }
-    out
+    super::village_index::Villages::new(w, &own)
 }
 /// `PoiManager.sectionsToVillage`: the Chebyshev distance in sections to a
 /// village section, at most 7.
-pub(super) fn sections_to_village(villages: &[[i32; 3]], s: [i32; 3]) -> i32 {
-    villages
-        .iter()
-        .map(|v| {
-            (v[0] - s[0])
-                .abs()
-                .max((v[1] - s[1]).abs())
-                .max((v[2] - s[2]).abs())
-        })
-        .min()
-        .unwrap_or(7)
-        .min(7)
+pub(super) fn sections_to_village(villages: &super::village_index::Villages, s: [i32; 3]) -> i32 {
+    villages.distance(s)
 }
 
 /// A memory a gate or behaviour conditions on.
@@ -1249,7 +1204,7 @@ enum B {
         what: LookAt,
     },
     UpdateActivity(bool),
-    /// A mod's behavior (#824), wrapped by `mod_behaviors`.
+    /// A mod's behavior (arismoko/horizon#824), wrapped by `mod_behaviors`.
     Mod(super::mod_behaviors::ModBehavior),
     WorkAtPoi {
         t: Timed,
@@ -1700,7 +1655,7 @@ impl B {
                         pos: site,
                     });
                 }
-                restock_if_due(m, cx.w);
+                restock_if_due(m, cx.w, cx.events);
                 true
             }
             B::HarvestFarmland {
@@ -1987,7 +1942,7 @@ impl B {
                     return false;
                 }
                 let kind = *kind;
-                if kind == Interact::BreedVillager && !super::villager::can_breed(m) {
+                if kind == Interact::BreedVillager && !super::villager::can_breed_in(m, cx.w) {
                     return false;
                 }
                 let w = cx.w;
@@ -2828,7 +2783,7 @@ impl B {
                 if close {
                     if now - *started > 20 {
                         cx.events.push(MobEvent::ThrowGift {
-                            table: super::villager::gift_table(m),
+                            table: super::villager::gift_table(m, cx.w.mob_maps),
                             from: [m.position.x, m.eye_y() - 0.3, m.position.z],
                             to: [p.position.x, p.position.y, p.position.z],
                         });
@@ -2959,7 +2914,7 @@ impl B {
                     if now >= *birth {
                         // The parent's half happens in its own tick: it eats,
                         // takes a bed for the child, picks its type and rests.
-                        super::villager::ext_mut(m).eat_and_digest();
+                        super::villager::eat_and_digest_in(m, cx.w);
                         let child = take_bed_for_child(m, cx.w).map(|bed| {
                             // Villager.getBreedOffspring: half the biome's type,
                             // a quarter each parent's.
@@ -3362,18 +3317,6 @@ fn play_work_sound(m: &mut Mob, cx: &mut Bx) {
         }
     }
 }
-/// `WorkAtPoi.start`'s restock.
-fn restock_if_due(m: &mut Mob, w: &MobWorld) {
-    if w.professions.state_index(&m.extra.profession).is_none() {
-        return;
-    }
-    let day = w.day_time.div_euclid(24000);
-    if let Some(t) = m.extra.trade.as_mut()
-        && t.should_restock(w.game_time, day)
-    {
-        t.restock(w.game_time);
-    }
-}
 #[cfg(test)]
 #[path = "villager_farming_tests.rs"]
 mod farming_tests;
@@ -3405,6 +3348,7 @@ fn farmland(w: &MobWorld, p: [i32; 3]) -> bool {
         .has_class("FarmlandBlock")
 }
 /// `HarvestFarmland.validPos`: a ripe CropBlock or air above farmland.
+#[horizon_mod_api_macros::replaceable]
 fn farmland_valid(w: &MobWorld, p: [i32; 3]) -> bool {
     super::villager::ripe_crop(w, p)
         || w.facts.is_air(w.world.block(p[0], p[1], p[2])) && farmland(w, [p[0], p[1] - 1, p[2]])
@@ -3431,6 +3375,7 @@ fn seed_crop(w: &MobWorld, item: &str) -> Option<horizon_world::registry::BlockS
 }
 /// `HarvestFarmland.tick` at the farmland: harvest a ripe crop, sow bare
 /// farmland, and move on from a growing crop.
+#[horizon_mod_api_macros::replaceable]
 fn harvest_tick(
     m: &mut Mob,
     cx: &mut Bx,
@@ -3591,7 +3536,7 @@ fn breeding_possible(m: &mut Mob, w: &MobWorld) -> bool {
         return false;
     };
     villager_target_valid(m, w, Mem::BreedTarget)
-        && super::villager::can_breed(m)
+        && super::villager::can_breed_in(m, w)
         && w.seen(id).is_some_and(|s| s.in_love)
 }
 /// `VillagerMakeLove.takeVacantBed`: `PoiManager.take(HOME, ..., 48)` over a
@@ -3800,7 +3745,11 @@ fn happy_particles(m: &Mob, cx: &mut Bx) {
     });
 }
 /// `BehaviorUtils.findSectionClosestToVillage`.
-pub(super) fn closest_section(villages: &[[i32; 3]], center: [i32; 3], radius: i32) -> [i32; 3] {
+pub(super) fn closest_section(
+    villages: &super::village_index::Villages,
+    center: [i32; 3],
+    radius: i32,
+) -> [i32; 3] {
     let here = sections_to_village(villages, center);
     let mut best: Option<([i32; 3], i32)> = None;
     for z in center[2] - radius..=center[2] + radius {
@@ -4297,7 +4246,7 @@ fn packages(baby: bool, seed: i64, farmer: bool) -> Vec<Entry> {
 
 // ---- Mod behaviors ------------------------------------------------------
 
-/// The parts' behaviors for this villager's brain (#824): each joins the
+/// The parts' behaviors for this villager's brain (arismoko/horizon#824): each joins the
 /// list with its activity and priority, refused where the villager brain has
 /// no such activity.
 fn attach_behaviors(mob_id: &str, list: &mut Vec<Entry>) {

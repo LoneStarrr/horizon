@@ -1,5 +1,5 @@
 //! Weather writes for native server mods through a `LevelRef`, on the same path as
-//! `/weather`: `ServerLevel.setWeatherParameters` with the weather and thunder hooks, and
+//! `/weather`: `MinecraftServer.setWeatherParameters` with the weather and thunder hooks, and
 //! `Level.setRainLevel` / `setThunderLevel` for how strong the rain and thunder are now. Like
 //! the command, they act on the level in place; a parked level, a stale handle or a client
 //! returns false. The players see the change on the next host sync.
@@ -8,7 +8,7 @@ use crate::game::level_control_hooks::LevelControl;
 use mod_api::LevelRef;
 
 impl Game<'_> {
-    /// `ServerLevel.setWeatherParameters(clear, time, raining, thundering)` in the level in
+    /// `MinecraftServer.setWeatherParameters(clear, time, raining, thundering)` in the level in
     /// place, as `/weather` and mods set it: `weather_change` may cancel all of it and
     /// `thunder_change` the thunder half.
     pub(in crate::game) fn set_weather_parameters(
@@ -41,7 +41,7 @@ impl Game<'_> {
                 w.thundering,
             ) = previous;
         } else {
-            // ServerLevel.setWeatherParameters.
+            // MinecraftServer.setWeatherParameters.
             let w = &mut self.world.weather;
             w.clear_time = clear;
             w.rain_time = time;
@@ -100,7 +100,7 @@ mod tests {
     use mod_api::{LevelRef, WorldEpoch};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn weather_writes_set_the_level_in_place_and_refuse_others() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn local_difficulty_and_tick_rate_reach_the_game() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
@@ -225,7 +225,7 @@ mod tests {
     /// to the first. The outer writes stand, and a write of the value already there is heard
     /// by nobody.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_listener_calling_its_own_setter_is_refused() {
         let log = Log::default();
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -269,7 +269,7 @@ mod tests {
     /// multiplier 0.125) before day time 72 000, and 3 x (0.75 + 0.25) = 3.0 (special 0.5)
     /// once the time factor is full at 1 512 000.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn local_difficulty_matches_vanilla_values_for_an_unloaded_chunk() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();

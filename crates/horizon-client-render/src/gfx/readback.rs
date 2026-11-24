@@ -1,7 +1,7 @@
 //! Screenshots of a swapchain that cannot be copied from. OpenGL's surfaces
 //! offer `RENDER_ATTACHMENT` only, so a frame whose pixels are read back
 //! (the screenshot key, a world's icon) is drawn into a texture that can be,
-//! then drawn onto the swapchain image as a fullscreen triangle. A 16-bit frame
+//! then drawn onto the swapchain image as a fullscreen triangle. A float frame
 //! (`Renderer::frame_format`) with HDR output off goes the same way every frame.
 
 /// The texture a frame to read back is drawn into, and the pass that puts it
@@ -17,6 +17,46 @@ pub struct Readback {
     drawn: bool,
 }
 
+/// A swapchain image (or the offscreen target) a frame is drawn for: its size, format and usage.
+#[derive(Clone, Copy)]
+pub struct Image {
+    pub size: wgpu::Extent3d,
+    pub format: wgpu::TextureFormat,
+    pub usage: wgpu::TextureUsages,
+}
+
+impl Image {
+    fn of(texture: &wgpu::Texture) -> Self {
+        Self {
+            size: texture.size(),
+            format: texture.format(),
+            usage: texture.usage(),
+        }
+    }
+}
+
+/// Whether a frame in `format` drawn for `image` needs a texture of its own (`Readback::target`).
+fn needed(image: Image, format: wgpu::TextureFormat, screenshot: bool) -> bool {
+    format != image.format.remove_srgb_suffix()
+        || (screenshot && !image.usage.contains(wgpu::TextureUsages::COPY_SRC))
+}
+
+/// The texture a frame in `format` for `image` is drawn into.
+fn texture(device: &wgpu::Device, image: Image, format: wgpu::TextureFormat) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Horizon screenshot frame"),
+        size: image.size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
 impl Readback {
     /// The texture this frame draws into instead of the swapchain image
     /// `surface`, in the frame's `format`: `None` unless that differs from the
@@ -29,31 +69,47 @@ impl Readback {
         format: wgpu::TextureFormat,
         screenshot: bool,
     ) -> Option<wgpu::Texture> {
-        if format == surface.format().remove_srgb_suffix()
-            && (!screenshot || surface.usage().contains(wgpu::TextureUsages::COPY_SRC))
-        {
+        let image = Image::of(surface);
+        if !needed(image, format, screenshot) {
+            // A frame given up after `target` (#13624) left `drawn` set, and `present` would
+            // draw its stale texture over this one.
+            self.drawn = false;
             return None;
         }
-        if self
-            .texture
-            .as_ref()
-            .is_none_or(|t| t.size() != surface.size() || t.format() != format)
-        {
-            self.texture = Some(device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Horizon screenshot frame"),
-                size: surface.size(),
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }));
+        if !self.fits(image, format) {
+            self.texture = Some(texture(device, image, format));
         }
         self.drawn = true;
         self.texture.clone()
+    }
+
+    /// Makes `target`'s texture where a frame for `image` needs one it lacks, the old one let go
+    /// first: `false` where there was no room for it (#13624), and nothing is kept then. Called
+    /// before the swapchain image is taken, so the frame can be skipped and tried again on the
+    /// next without holding one.
+    pub fn ready(
+        &mut self,
+        device: &wgpu::Device,
+        image: Image,
+        format: wgpu::TextureFormat,
+        screenshot: bool,
+    ) -> bool {
+        if !needed(image, format, screenshot) || self.fits(image, format) {
+            return true;
+        }
+        self.texture = None;
+        self.texture =
+            super::frame_targets::made(device, super::frame_targets::Kind::Readback, || {
+                texture(device, image, format)
+            });
+        self.texture.is_some()
+    }
+
+    /// Whether `texture` is there at `image`'s size in `format`.
+    fn fits(&self, image: Image, format: wgpu::TextureFormat) -> bool {
+        self.texture
+            .as_ref()
+            .is_some_and(|t| t.size() == image.size && t.format() == format)
     }
 
     /// The frame `target` gave, finished onto 8 bits of the swapchain image `surface`'s format,
@@ -132,7 +188,7 @@ impl Readback {
         self.blit(device, encoder, frame, &target, format);
     }
 
-    /// `frame` (a 16-bit frame) in an 8-bit texture of `format`, clamped to 0..1
+    /// `frame` (a float frame) in an 8-bit texture of `format`, clamped to 0..1
     /// as an 8-bit frame holds it, for a screenshot to read back.
     pub fn unorm_copy(
         &mut self,
@@ -239,7 +295,9 @@ mod tests {
     /// the swapchain, with no validation error (the copy used to need the
     /// swapchain's missing `COPY_SRC`), and the swapchain shows the frame.
     #[test]
+    #[ignore = "daily"]
     fn screenshot_of_a_surface_without_copy_src() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -292,7 +350,9 @@ mod tests {
     /// A surface that can be copied from, or a frame nobody reads back,
     /// draws straight into the swapchain image.
     #[test]
+    #[ignore = "daily"]
     fn frames_draw_straight_to_a_readable_surface() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = device() else {
             return;
         };
@@ -307,7 +367,7 @@ mod tests {
         assert!(readback.texture.is_none() && !readback.drawn);
     }
 
-    /// A 16-bit frame with HDR output off draws into a 16-bit texture of its own, and both
+    /// A float frame with HDR output off draws into a float texture of its own, and both
     /// the swapchain and a screenshot's 8-bit copy get it clamped as an 8-bit frame holds it.
     fn reaches_an_8_bit_swapchain(
         device: &wgpu::Device,
@@ -338,41 +398,12 @@ mod tests {
         assert_eq!(last_pixel(device, &presented), expected);
     }
 
-    /// `Rgba16Unorm`, the frame HDR output draws into where the device can
-    /// (`Renderer::frame_format`).
+    /// `Rgba16Float`, the frame of a shader API 0.2 pack, or of HDR on without a pack
+    /// (`Renderer::frame_format`): what is left over 1 is clipped on the way.
     #[test]
-    fn a_16_bit_unorm_frame_reaches_an_8_bit_swapchain() {
-        let instance = crate::gfx::test_gpu::instance();
-        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-            return;
-        };
-        let wide = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-        if !adapter.features().contains(wide) {
-            return;
-        }
-        let descriptor = wgpu::DeviceDescriptor {
-            required_features: wide,
-            ..Default::default()
-        };
-        let Ok((device, queue)) = pollster::block_on(adapter.request_device(&descriptor)) else {
-            return;
-        };
-        let color = wgpu::Color {
-            r: 1.0,
-            g: 0.2,
-            b: 0.0,
-            a: 1.0,
-        };
-        let unorm = wgpu::TextureFormat::Rgba16Unorm;
-        reaches_an_8_bit_swapchain(&device, &queue, unorm, color, [0, 51, 255, 255]);
-    }
-
-    /// `Rgba16Float`, the frame of a shader API 0.2 pack, or of HDR on without a pack, under
-    /// `HORIZON_HDR_FRAME=float` (`Renderer::frame_format`): what is left over 1 is clipped on
-    /// the way.
-    #[test]
+    #[ignore = "daily"]
     fn a_float_frame_reaches_an_8_bit_swapchain() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
@@ -395,7 +426,9 @@ mod tests {
     /// itself, which `present` then leaves alone, or, for a screenshot of an image that can't
     /// be copied from, on a texture of its own that the screenshot reads and `present` draws.
     #[test]
+    #[ignore = "daily"]
     fn a_float_frame_finishes_on_8_bits_before_the_overlays() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };

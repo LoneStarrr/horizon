@@ -3,6 +3,7 @@ use horizon_world::heightmap::HeightmapType as EngineHeightmap;
 use horizon_world::registry::BlockStateId;
 use horizon_world::worldgen::mod_features::{
     ModFeature, ModFeatureRandom, ModFeatureType, ModFeatureTypes, ModFeatureWorld,
+    install_mod_feature_types,
 };
 use mod_api::{
     ConfiguredFeature, FeatureHeightmap, FeatureRandom, FeatureRegion, FeatureState, FeatureType,
@@ -106,6 +107,13 @@ pub(in crate::game) fn installed_feature_types() -> ModFeatureTypes {
         .into_iter()
         .map(|(id, ty)| (id, Arc::new(Adapter(ty)) as Arc<dyn ModFeatureType>))
         .collect()
+}
+
+/// Hand the feature types the mods registered to the engine, before any world opens.
+pub(in crate::game) fn install() {
+    if install_mod_feature_types(installed_feature_types()).is_err() {
+        log::warn!("Mod feature types already installed; keeping the first table");
+    }
 }
 
 #[cfg(test)]

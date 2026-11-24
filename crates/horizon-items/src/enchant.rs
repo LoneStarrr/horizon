@@ -3,10 +3,14 @@
 //! rules used by the enchanting table, display names, and evaluation of the
 //! value/attribute effect components (`LevelBasedValue`, `EnchantmentValueEffect`
 //! and the loot-condition subset that enchantment requirements use).
+mod holder_sets;
 use crate::item_data::Levels;
 use crate::items::{ItemStack, Items};
+pub use holder_sets::HolderSetBinding;
+use horizon_client_core::{lang, text::Text};
 use horizon_core::nbt::Tag;
 use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_world::tag_layers::TagLayers;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -16,6 +20,18 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+
+impl Items {
+    /// Vanilla's enchantment-provider tag gives 1.0; non-members give 0.0.
+    /// Parts may override this answer; tag membership is not a separate particle-provider test.
+    pub fn default_enchant_power(&self, block: &str) -> f32 {
+        if self.block_in_tag("minecraft:enchantment_power_provider", block) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
 
 /// Load-owned custom damage effect slots. Installed before resources load.
 static DAMAGE_EFFECT_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -182,6 +198,9 @@ pub struct Enchantments {
     pub damage_tags: HashMap<String, HashSet<String>>,
     pub props: HashMap<Arc<str>, ItemProps>,
     lang: HashMap<String, String>,
+    /// The mods' `isPrimaryItemFor` answers resolved for this snapshot
+    /// (`ItemPart::is_primary_item_for`).
+    primary_answers: crate::primary_items::PrimaryAnswerTable,
 }
 
 fn string_list(v: &Value) -> Vec<String> {
@@ -194,10 +213,18 @@ fn string_list(v: &Value) -> Vec<String> {
         _ => vec![],
     }
 }
-fn read_tag_dir(
-    dir: &Path,
-    conditions: &horizon_world::conditions::LoadConditions,
-) -> HashMap<String, Vec<String>> {
+fn read_tag_dir(dir: &Path) -> HashMap<String, TagLayers> {
+    read_tag_dir_in(dir, "minecraft")
+}
+/// The resource root's `data/` namespaces other than `minecraft`, in name
+/// order: content mods' files land there (`horizon_client::mod_content`'s
+/// overlay), as a data pack's namespaces do in `RegistryDataLoader`.
+fn other_namespaces(root: &Path) -> Vec<String> {
+    let mut out = horizon_world::json_folder::namespaces(&root.join("data"));
+    out.retain(|ns| ns != "minecraft");
+    out
+}
+fn read_tag_dir_in(dir: &Path, namespace: &str) -> HashMap<String, TagLayers> {
     let Ok(folder) = horizon_world::json_folder::read(dir) else {
         return HashMap::new();
     };
@@ -206,36 +233,12 @@ fn read_tag_dir(
         .iter()
         .filter_map(|file| {
             let v = serde_json::from_slice::<Value>(file.bytes().ok()?).ok()?;
-            if !conditions.allows_path(&v, dir, &file.name) {
-                return None;
-            }
-            let values = v["values"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.as_str().or_else(|| e["id"].as_str()).map(str::to_owned))
-                .collect();
-            Some((format!("minecraft:{}", file.name), values))
+            Some((
+                format!("{namespace}:{}", file.name),
+                TagLayers::from_file(&v),
+            ))
         })
         .collect()
-}
-/// Expand a tag keeping first-seen order (`TagLoader` builds a linked set).
-fn expand_ordered(
-    name: &str,
-    raw: &HashMap<String, Vec<String>>,
-    out: &mut Vec<String>,
-    depth: u32,
-) {
-    if depth > 16 {
-        return;
-    }
-    for v in raw.get(name).into_iter().flatten() {
-        match v.strip_prefix('#') {
-            Some(t) => expand_ordered(t, raw, out, depth + 1),
-            None if !out.contains(v) => out.push(v.clone()),
-            None => {}
-        }
-    }
 }
 /// Roman numerals as in `enchantment.level.N` (falls back to the number).
 pub fn level_name(level: u32) -> String {
@@ -252,6 +255,15 @@ fn parse_entry(
     tags: &HashMap<String, Vec<Arc<str>>>,
     lang: &HashMap<String, String>,
 ) -> crate::Result<Enchantment> {
+    if let Some(field) = ["supported_items", "primary_items", "exclusive_set"]
+        .into_iter()
+        .find(|field| v[*field].is_object())
+    {
+        return Err(format!(
+            "enchantment {id} {field}: holder-set object has no owning registry binding"
+        )
+        .into());
+    }
     let native_post_attack = v["effects"]["minecraft:post_attack"]
         .as_array()
         .into_iter()
@@ -331,53 +343,35 @@ impl Enchantments {
         defaults: &horizon_world::item_defaults::ItemDefaults,
     ) -> crate::Result<Self> {
         let data = root.join("data/minecraft");
-        let mut raw_tags = read_tag_dir(&data.join("tags/enchantment"), overlay.conditions);
+        let mut raw_tags = read_tag_dir(&data.join("tags/enchantment"));
+        let namespaces = other_namespaces(root);
+        // Mods' own enchantment tags (`data/<ns>/tags/enchantment/`): an
+        // `exclusive_set` or a tag of the mod's enchantments.
+        for ns in &namespaces {
+            let dir = root.join("data").join(ns).join("tags/enchantment");
+            for (id, values) in read_tag_dir_in(&dir, ns) {
+                raw_tags.insert(id, values);
+            }
+        }
         for (id, files) in overlay.tag_kind("enchantment") {
             for bytes in files {
                 let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
                     continue;
                 };
-                if !overlay.conditions.allows_id(&v, "tags/enchantment", &id) {
-                    continue;
-                }
-                let slot = raw_tags.entry(id.clone()).or_default();
-                if v["replace"].as_bool() == Some(true) {
-                    slot.clear();
-                }
-                if let Some(values) = v["values"].as_array() {
-                    slot.extend(
-                        values
-                            .iter()
-                            .filter_map(|e| e.as_str().or_else(|| e["id"].as_str()))
-                            .map(str::to_owned),
-                    );
-                }
+                raw_tags.entry(id.clone()).or_default().push(&v);
             }
         }
-        let tags: HashMap<String, Vec<Arc<str>>> = raw_tags
-            .keys()
-            .map(|k| {
-                let mut v = Vec::new();
-                expand_ordered(k, &raw_tags, &mut v, 0);
-                (
-                    k.clone(),
-                    v.into_iter().map(|s| Arc::from(s.as_str())).collect(),
-                )
-            })
+        let tags: HashMap<String, Vec<Arc<str>>> = TagLayers::resolve_all(raw_tags)
+            .into_iter()
+            .map(|(id, members)| (id, members.into_iter().map(Arc::from).collect()))
             .collect();
-        let unordered = |raw: HashMap<String, Vec<String>>| -> HashMap<String, HashSet<String>> {
-            raw.keys()
-                .map(|k| {
-                    let mut v = Vec::new();
-                    expand_ordered(k, &raw, &mut v, 0);
-                    (k.clone(), v.into_iter().collect())
-                })
-                .collect()
+        let unordered = |raw| {
+            TagLayers::resolve_all(raw)
+                .into_iter()
+                .map(|(id, members)| (id, members.into_iter().collect()))
+                .collect::<HashMap<String, HashSet<String>>>()
         };
-        let entity_tags = unordered(read_tag_dir(
-            &data.join("tags/entity_type"),
-            overlay.conditions,
-        ));
+        let entity_tags = unordered(read_tag_dir(&data.join("tags/entity_type")));
         let damage_tags = match horizon_world::damage_source::Catalog::load(root, overlay) {
             Ok(catalog) => catalog
                 .tags()
@@ -389,15 +383,20 @@ impl Enchantments {
                 })
                 .collect(),
             // Small tools/fixtures may not carry the prepared catalog.
-            Err(_) => unordered(read_tag_dir(
-                &data.join("tags/damage_type"),
-                overlay.conditions,
-            )),
+            Err(_) => unordered(read_tag_dir(&data.join("tags/damage_type"))),
         };
         // The registry lists entries sorted by id, like the data-pack loader.
-        let files: BTreeMap<String, Value> = crate::items::data_files(root, "enchantment", overlay)
-            .into_iter()
-            .collect();
+        let mut files: BTreeMap<String, Value> =
+            crate::items::data_files(root, "enchantment", overlay)
+                .into_iter()
+                .collect();
+        if files.values().any(HolderSetBinding::needed) {
+            let binding =
+                HolderSetBinding::load(root, overlay, defaults, files.keys().cloned().collect())?;
+            for (id, value) in &mut files {
+                binding.bind(id, value)?;
+            }
+        }
         let lang: HashMap<String, String> =
             horizon_core::prepared_files::read(&root.join("assets/minecraft/lang/en_us.json"))
                 .ok()
@@ -426,6 +425,23 @@ impl Enchantments {
                         || k.starts_with("recipe.toast.")
                 })
                 .collect();
+        // Mods' English names for their enchantments (`assets/<ns>/lang/`),
+        // under vanilla's, which win a clash.
+        let mut lang = lang;
+        for ns in &namespaces {
+            let path = root.join("assets").join(ns).join("lang/en_us.json");
+            let Some(map) = horizon_core::prepared_files::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
+            else {
+                continue;
+            };
+            for (k, v) in map {
+                if k.starts_with("enchantment.") {
+                    lang.entry(k).or_insert(v);
+                }
+            }
+        }
         let mut custom_damage = HashMap::new();
         let list = files
             .iter()
@@ -479,7 +495,13 @@ impl Enchantments {
             damage_tags,
             props,
             lang,
+            primary_answers: Default::default(),
         })
+    }
+    /// The `isPrimaryItemFor` answers the server resolved for this snapshot when its parts
+    /// installed ([`crate::primary_items`]); selection reads them.
+    pub fn primary_answers(&self) -> &crate::primary_items::PrimaryAnswerTable {
+        &self.primary_answers
     }
     pub fn get(&self, id: &str) -> Option<&Enchantment> {
         self.index.get(id).map(|&i| &self.list[i])
@@ -638,42 +660,90 @@ impl Enchantments {
         level: u32,
         numeric: bool,
     ) -> (String, bool) {
-        let tr = |key: &str| language.and_then(|l| l.get(key).map(str::to_owned));
         let Some(e) = self.get(id) else {
             return (format!("{id} {}", level_name(level)), false);
         };
-        let mut name = tr(&e.description_key).unwrap_or_else(|| e.description.clone());
-        if (level != 1 || e.max_level != 1) && numeric {
+        let mut name = language
+            .and_then(|language| language.get(&e.description_key))
+            .unwrap_or(&e.description)
+            .to_owned();
+        if let Some(suffix) = self.level_suffix(e, language, level, numeric) {
             name.push(' ');
-            name.push_str(&level.to_string());
-        } else if level != 1 || e.max_level != 1 {
-            name.push(' ');
-            let key = format!("enchantment.level.{level}");
-            let suffix = tr(&key)
-                .or_else(|| self.lang.get(&key).cloned())
-                .unwrap_or_else(|| {
-                    if (1..=10).contains(&level) {
-                        level_name(level)
-                    } else {
-                        key
-                    }
-                });
             name.push_str(&suffix);
         }
         (name, self.is_curse(id))
     }
+
+    fn level_suffix(
+        &self,
+        enchantment: &Enchantment,
+        language: Option<&lang::Language>,
+        level: u32,
+        numeric: bool,
+    ) -> Option<String> {
+        if level == 1 && enchantment.max_level == 1 {
+            return None;
+        }
+        if numeric {
+            return Some(level.to_string());
+        }
+        let key = format!("enchantment.level.{level}");
+        if let Some(name) = language
+            .and_then(|language| language.get(&key))
+            .or_else(|| self.translate(&key))
+        {
+            Some(name.to_owned())
+        } else if (1..=10).contains(&level) {
+            Some(level_name(level))
+        } else {
+            Some(key)
+        }
+    }
     /// Tooltip lines for a level list, in `#tooltip_order` then remaining order.
     pub fn tooltip(&self, levels: &[(Arc<str>, u32)]) -> Vec<(String, bool)> {
+        let language = lang::current();
+        let numeric = NUMERIC_LEVELS.load(Ordering::Relaxed);
+        self.ordered_tooltip(levels, |id, level| {
+            self.full_name_with(language.as_deref(), id, level, numeric)
+        })
+    }
+
+    /// The visible enchantment tooltip, with the description's translation key
+    /// still on the root component so a mod can identify the line after localization.
+    pub fn tooltip_text(&self, levels: &[(Arc<str>, u32)]) -> Vec<(Text, bool)> {
+        let language = lang::current();
+        let numeric = NUMERIC_LEVELS.load(Ordering::Relaxed);
+        self.ordered_tooltip(levels, |id, level| {
+            let Some(e) = self.get(id) else {
+                return (Text::literal(format!("{id} {}", level_name(level))), false);
+            };
+            let mut name = if e.description_key.is_empty() {
+                Text::literal(&e.description)
+            } else {
+                Text::translate_with_fallback(&e.description_key, &e.description, &[])
+            };
+            if let Some(suffix) = self.level_suffix(e, language.as_deref(), level, numeric) {
+                name.push(format!(" {suffix}"));
+            }
+            (name, self.is_curse(id))
+        })
+    }
+
+    fn ordered_tooltip<T>(
+        &self,
+        levels: &[(Arc<str>, u32)],
+        mut line: impl FnMut(&str, u32) -> T,
+    ) -> Vec<T> {
         let order = self.tag("minecraft:tooltip_order");
         let mut out = Vec::new();
         for id in order {
             if let Some((_, l)) = levels.iter().find(|(e, _)| e == id) {
-                out.push(self.full_name(id, *l));
+                out.push(line(id, *l));
             }
         }
         for (id, l) in levels {
             if !order.contains(id) {
-                out.push(self.full_name(id, *l));
+                out.push(line(id, *l));
             }
         }
         out
@@ -719,7 +789,10 @@ impl Enchantments {
             _ => selected.max(bookcases * 2),
         }
     }
-    /// `EnchantmentHelper.getAvailableEnchantmentResults`.
+    /// `EnchantmentHelper.getAvailableEnchantmentResults`. A non-book is offered an
+    /// enchantment that is primary for it: vanilla's `isPrimaryItem`, or the answer a part
+    /// gave when this snapshot's parts installed (`ItemPart::is_primary_item_for`,
+    /// [`Self::primary_answers`]).
     pub fn available_results(
         &self,
         items: &Items,
@@ -731,7 +804,12 @@ impl Enchantments {
         let mut out = Vec::new();
         for id in pool {
             let Some(e) = self.get(id) else { continue };
-            if !(book || self.is_primary(items, e, item)) {
+            if !(book
+                || self
+                    .primary_answers
+                    .answer(item, &e.id)
+                    .unwrap_or_else(|| self.is_primary(items, e, item)))
+            {
                 continue;
             }
             for level in (1..=e.max_level).rev() {
@@ -1495,6 +1573,106 @@ pub mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A content mod's enchantments (`data/<ns>/enchantment/`, copied into the
+    /// resource root beside vanilla's) join the catalog with their own tags and
+    /// English names, nested files keep their path, and a world's pack still
+    /// replaces one.
+    #[test]
+    fn mod_namespace_definitions_join_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-enchantment-mods-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |path: &str, value: &Value| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            std::fs::read(path).unwrap()
+        };
+        std::fs::create_dir_all(root.join("data/harvestmod/enchantment/tools")).unwrap();
+        std::fs::write(
+            root.join("data/harvestmod/enchantment/tools/broken.json"),
+            b"{",
+        )
+        .unwrap();
+        let definition = |description: Value, max_level| {
+            json!({
+                "description": description, "supported_items": "minecraft:diamond_hoe",
+                "weight": 1, "max_level": max_level,
+                "min_cost": {"base": 1, "per_level_above_first": 0},
+                "max_cost": {"base": 1, "per_level_above_first": 0},
+                "anvil_cost": 1, "slots": ["mainhand"],
+                "exclusive_set": "#harvestmod:exclusive/area"
+            })
+        };
+        write(
+            "data/minecraft/enchantment/mending.json",
+            &json!({"description": "Mending", "supported_items": "minecraft:diamond_hoe",
+                "max_level": 1, "weight": 2, "anvil_cost": 4, "slots": ["any"],
+                "min_cost": {"base": 1, "per_level_above_first": 0},
+                "max_cost": {"base": 1, "per_level_above_first": 0}}),
+        );
+        write(
+            "data/harvestmod/enchantment/scythe.json",
+            &definition(json!({"translate": "enchantment.harvestmod.scythe"}), 3),
+        );
+        write(
+            "data/harvestmod/enchantment/tools/sweep.json",
+            &definition(json!("Sweep"), 1),
+        );
+        write(
+            "data/harvestmod/tags/enchantment/exclusive/area.json",
+            &json!({"values": ["harvestmod:scythe", "harvestmod:tools/sweep"]}),
+        );
+        write(
+            "data/minecraft/tags/enchantment/in_enchanting_table.json",
+            &json!({"values": ["minecraft:mending", "harvestmod:scythe"]}),
+        );
+        write(
+            "assets/harvestmod/lang/en_us.json",
+            &json!({"enchantment.harvestmod.scythe": "Scythe", "item.harvestmod.x": "X"}),
+        );
+        write("items.json", &json!({}));
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let loaded = Enchantments::load(&root, &defaults).unwrap();
+        let scythe = loaded
+            .get("harvestmod:scythe")
+            .expect("a mod's own enchantment must enter the catalog");
+        assert_eq!(scythe.description, "Scythe");
+        assert_eq!(scythe.max_level, 3);
+        assert!(scythe.exclusive.contains("harvestmod:tools/sweep"));
+        assert_eq!(
+            loaded.get("harvestmod:tools/sweep").unwrap().description,
+            "Sweep"
+        );
+        assert!(loaded.in_tag("harvestmod:exclusive/area", "harvestmod:scythe"));
+        assert!(loaded.in_tag("minecraft:in_enchanting_table", "harvestmod:scythe"));
+        assert!(loaded.get("minecraft:mending").is_some());
+        assert!(loaded.get("minecraft:scythe").is_none());
+        assert!(loaded.get("harvestmod:tools/broken").is_none());
+
+        // A world's pack replaces the mod's definition for its id.
+        let pack = write(
+            "packs/p/data/harvestmod/enchantment/scythe.json",
+            &definition(json!("Pack scythe"), 5),
+        );
+        let files = vec![("enchantment/harvestmod:scythe".to_owned(), vec![pack])];
+        let packed = Enchantments::load_with(
+            &root,
+            &horizon_world::loot::PackOverlay::new(&files),
+            &defaults,
+        )
+        .unwrap();
+        let scythe = packed.get("harvestmod:scythe").unwrap();
+        assert_eq!(scythe.description, "Pack scythe");
+        assert_eq!(scythe.max_level, 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_payloads_are_retained_and_invalid_definitions_refused() {
         let tags = HashMap::new();
@@ -1695,6 +1873,7 @@ pub mod tests {
             damage_tags,
             props,
             lang: HashMap::new(),
+            primary_answers: Default::default(),
         }
     }
     pub fn sample_items() -> Items {
@@ -2008,6 +2187,42 @@ pub mod tests {
 mod ignite_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn false_conditions_do_not_suppress_enchantment_tag_operations() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-enchantment-tag-conditions-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("data/minecraft/tags/enchantment")).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        std::fs::write(root.join("data/minecraft/tags/enchantment/conditional.json"), json!({"neoforge:conditions":[{"type":"neoforge:false"}],"values":["minecraft:sharpness"]}).to_string()).unwrap();
+        let files = vec![("tags/minecraft:enchantment/conditional".into(), vec![json!({"neoforge:conditions":[{"type":"neoforge:false"}],"values":["minecraft:smite"],"remove":["minecraft:sharpness"]}).to_string().into_bytes()])];
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let base = Enchantments::load(&root, &defaults).unwrap();
+        assert_eq!(
+            base.tag("minecraft:conditional")
+                .iter()
+                .map(|id| id.as_ref())
+                .collect::<Vec<_>>(),
+            ["minecraft:sharpness"]
+        );
+        let loaded = Enchantments::load_with(
+            &root,
+            &horizon_world::loot::PackOverlay::new(&files),
+            &defaults,
+        )
+        .unwrap();
+        assert_eq!(
+            loaded
+                .tag("minecraft:conditional")
+                .iter()
+                .map(|id| id.as_ref())
+                .collect::<Vec<_>>(),
+            ["minecraft:smite"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Fire Aspect as the data pack has it: 4 seconds per level.
     fn registry() -> Enchantments {

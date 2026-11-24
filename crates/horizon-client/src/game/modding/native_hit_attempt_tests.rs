@@ -9,7 +9,7 @@ use horizon_client::{
     projectiles::{Hit, Projectile, ProjectileKind},
 };
 use horizon_core::geometry::Vec3;
-use mod_api::{EntityInvulnerabilityCheckEvent, Hooks, LevelRandomHost};
+use mod_api::{EntityInvulnerabilityCheckEvent, Hooks, LevelSide};
 use std::sync::{Arc, Mutex};
 
 struct Probe(Arc<Mutex<Vec<bool>>>, Arc<Mutex<Option<bool>>>);
@@ -17,7 +17,7 @@ struct Probe(Arc<Mutex<Vec<bool>>>, Arc<Mutex<Option<bool>>>);
 impl Hooks for Probe {
     fn entity_invulnerability_check(
         &self,
-        _: &mut dyn LevelRandomHost,
+        _: LevelSide<'_>,
         event: &mut EntityInvulnerabilityCheckEvent<'_>,
     ) {
         self.0.lock().unwrap().push(event.original_invulnerability);
@@ -37,7 +37,7 @@ fn fresh_player(game: &mut super::Game<'_>, mode: GameMode) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn hit_attempts_reach_the_listener_once_including_refusals() {
     let heard = Arc::new(Mutex::new(Vec::new()));
     let override_answer = Arc::new(Mutex::new(None));

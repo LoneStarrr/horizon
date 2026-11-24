@@ -15,7 +15,7 @@ fn item(id: u32, at: Vec3) -> ItemEntity {
     ItemEntity {
         attachment_lifetime: Default::default(),
         fall_distance: 0.0,
-        random: horizon_core::random::LegacyRandom::new(0),
+        random: horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(0)),
         rotation: [0.0, 0.0],
         join: Default::default(),
         no_gravity: true,
@@ -47,7 +47,7 @@ fn item(id: u32, at: Vec3) -> ItemEntity {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn items_past_the_simulation_distance_enter_no_end_gateway() {
     let mut resources = None;
     let mut game = server_game(&mut resources);
@@ -70,6 +70,7 @@ fn items_past_the_simulation_distance_enter_no_end_gateway() {
         game.world
             .chunks
             .insert((cx, 0), Arc::new(Chunk::empty(cx, 0)));
+        game.load_ticking_neighbourhood(cx, 0);
         game.world.set(x, 64, 8, gateway).unwrap();
         game.dropped
             .push(item(id, Vec3::new(f64::from(x) + 0.5, 64.2, 8.5)));
@@ -99,7 +100,7 @@ fn items_past_the_simulation_distance_enter_no_end_gateway() {
 /// itself, so `/data get block` reads 0, then 5, then 25 (#13202), also far
 /// from the player, where nothing draws the gateway.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_ticking_gateway_counts_its_age_in_its_block_entity() {
     use horizon_client::containers::BlockEntity;
     let mut game_resources = None;

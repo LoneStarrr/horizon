@@ -224,8 +224,16 @@ pub fn move_control(m: &mut Mob) {
     m.body_yaw = yaw;
 }
 /// `Vex` travel with `noPhysics`: straight through blocks, air friction.
-pub fn travel(m: &mut Mob) -> bool {
+pub fn travel(m: &mut Mob, w: &super::MobWorld) -> bool {
+    let from = m.position;
     m.position = m.position.add_vector(m.velocity);
+    super::living::section_writes::record_with(
+        m.id,
+        m.join,
+        from,
+        m.position,
+        w.section_writer.clone(),
+    );
     m.velocity = Vec3::new(
         m.velocity.x * 0.91,
         m.velocity.y * 0.98,
@@ -450,6 +458,7 @@ mod owner_save_tests {
     /// `TargetingConditions.forNonCombat()`, whose `canBeSeenByAnyone` drops a
     /// dead target. A dead target is not copied.
     #[test]
+    #[ignore = "daily"]
     fn a_vex_does_not_copy_a_dead_owners_target() {
         use crate::mobs::world::with_test_world;
         let mut outcomes = Vec::new();
@@ -463,7 +472,10 @@ mod owner_save_tests {
                 target_kind.species = Species::Cow;
                 let mut target = Mob::new(3, Arc::new(target_kind), Vec3::new(2.5, 64.0, 0.5), 0.0);
                 target.health = if alive { target.health } else { 0.0 };
-                let seen = [owner.seen(None), target.seen(None)];
+                let seen = [
+                    owner.seen(None, &crate::items::Items::empty()),
+                    target.seen(None, &crate::items::Items::empty()),
+                ];
                 let world = crate::mobs::MobWorld {
                     others: &seen,
                     ..w.clone()

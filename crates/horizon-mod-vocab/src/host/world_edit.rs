@@ -16,6 +16,59 @@ pub trait WorldEditServerHost {
     #[access(WorldOnly)]
     fn edit_blocks(&mut self, dimension: &str, edit: &BlockEdit) -> Result<u64, String>;
     /// Side: server.
+    /// A block entity's data saved at `data_version` (a schematic's, a structure file's, an older world's), upgraded
+    /// as the chunk loader upgrades a block entity of a chunk of that version: its type's datafixes up to the game's
+    /// DataVersion. Data of exactly the game's version comes back unchanged, and so does a block entity whose `id`
+    /// that version doesn't know, or data the fixes can't read. The chunk-wide fixes (blocks around it, bed block
+    /// entities removed) need a chunk and don't run. Pure: nothing in the world changes. `Err` names the refusal.
+    /// Before any fix runs: a negative version ([`NbtUpgradeError::NegativeVersion`]), one newer than the game's
+    /// ([`NbtUpgradeError::FutureVersion`]), or data with a list or compound 512 levels deep or more, counted as
+    /// encoded with the wrapper compound of each mixed-list element as a level ([`NbtUpgradeError::TooDeep`], the
+    /// depth cap of every NBT read). After the fixes: upgraded data that deep ([`NbtUpgradeError::UpgradedTooDeep`]),
+    /// as no NBT read could take it back. There is no size refusal.
+    #[access(WorldOnly)]
+    fn upgrade_block_entity_nbt(
+        &self,
+        data_version: i32,
+        nbt: Compound,
+    ) -> Result<Compound, NbtUpgradeError>;
+    /// Side: server.
+    /// An entity's data saved at `data_version`, upgraded as the entity chunk loader upgrades an entity of a chunk
+    /// of that version: its type's datafixes, its passengers' included, up to the game's DataVersion. Data of exactly
+    /// the game's version, or data the fixes can't read, comes back unchanged. Pure: nothing in the world changes.
+    /// Refused by name as `upgrade_block_entity_nbt` refuses.
+    #[access(WorldOnly)]
+    fn upgrade_entity_nbt(
+        &self,
+        data_version: i32,
+        nbt: Compound,
+    ) -> Result<Compound, NbtUpgradeError>;
+    /// Side: server.
+    /// A block state's NBT (`{Name, Properties}`) saved at `data_version`, upgraded as the datafixers upgrade a block
+    /// state of a chunk of that version: every fix registered for block states from that version up to the game's
+    /// DataVersion runs, including pre-1.13 flattening (`BlockStateData`) and post-flattening renames. Data of
+    /// exactly the game's version, or data the fixes can't read, comes back unchanged. Pure: nothing in the world
+    /// changes. Refused by name as `upgrade_block_entity_nbt` refuses.
+    #[access(WorldOnly)]
+    fn upgrade_block_state_nbt(
+        &self,
+        data_version: i32,
+        nbt: Compound,
+    ) -> Result<Compound, NbtUpgradeError>;
+    /// Side: server.
+    /// One saved value of `kind` at `from_version`, upgraded by the game's datafixers as `upgrade_block_state_nbt`,
+    /// `upgrade_block_entity_nbt` and `upgrade_entity_nbt` do it. This build upgrades only up to its own DataVersion:
+    /// any other `to_version` is refused as `TargetNotCurrent`, before any fix runs. Pure: nothing in the world changes.
+    /// Otherwise refused by name, as `DataFixError::Upgrade`, as `upgrade_block_entity_nbt` refuses.
+    #[access(WorldOnly)]
+    fn data_fix(
+        &self,
+        kind: DataKind,
+        nbt: Compound,
+        from_version: i32,
+        to_version: i32,
+    ) -> Result<Compound, DataFixError>;
+    /// Side: server.
     /// For a server mod: each column's height by `heightmap` in the authoritative level `dimension` (the one being
     /// ticked), none for a column not loaded. `Err` says why nothing was read: another dimension or a client of a
     /// server, or more than 65,536 columns (`MAX_COLUMNS`).
@@ -41,6 +94,19 @@ pub trait WorldEditServerHost {
         heightmap: Heightmap,
         range: (u32, u32),
     ) -> Result<ColumnBlocks, String>;
+    /// Side: server.
+    /// For a server mod: what the generator makes at each of `columns` of the level `dimension` (the one being
+    /// ticked) before its features are placed, whether or not the chunk is loaded: it reads the generator and
+    /// creates no chunk. Decorated blocks (trees, lava, cacti) are not in it: read the chunk once it is loaded.
+    /// None for a column with no solid block (the End's void) and where the world has no generator of its own.
+    /// `Err` says why nothing was read: another dimension or a client of a server, or more than 4,096 columns
+    /// (`MAX_TERRAIN_COLUMNS`). API @API:terrain_surface@.
+    #[access(WorldOnly)]
+    fn terrain_surface(
+        &self,
+        dimension: &str,
+        columns: &[(i32, i32)],
+    ) -> Result<Vec<Option<TerrainColumn>>, String>;
     /// Side: server.
     /// For a server mod: structure template `id` (`mymod:hut`, found as
     /// `StructureTemplateManager.get` finds it: the world's saved structures,

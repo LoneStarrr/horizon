@@ -2,6 +2,7 @@
 //! events (`CriteriaTriggers`), awarding with rewards, the toast and the
 //! chat announcement, and `players/advancements/<uuid>.json`.
 use super::{Dim, Game};
+mod icons;
 
 #[cfg(test)]
 #[path = "inventory_changed_tests.rs"]
@@ -25,6 +26,7 @@ use std::{
     time::Instant,
 };
 
+mod location_memo;
 #[cfg(test)]
 mod progress_tests;
 
@@ -50,7 +52,7 @@ fn progress_snapshot(a: &adv::Advancement, progress: &Progress) -> mod_api::Adva
 }
 
 pub(super) struct Toast {
-    icon: String,
+    icon: ItemStack,
     frame: Frame,
     title: Text,
     description: Option<Text>,
@@ -69,7 +71,7 @@ impl Toast {
     /// `RecipeToast.addOrUpdate` on a new toast.
     pub(super) fn recipe(items: Vec<(String, ItemStack)>) -> Self {
         Self {
-            icon: String::new(),
+            icon: ItemStack::new("minecraft:air", 0),
             frame: Frame::Task,
             title: Text::translate("recipe.toast.title", &[]),
             description: Some(Text::translate("recipe.toast.description", &[])),
@@ -134,12 +136,16 @@ pub(super) struct AdvState {
     /// place on its tab (`DisplayInfo` x, y), in tree order.
     pub(super) positions: Option<Vec<(f32, f32)>>,
     pub(super) progress: Progress,
+    /// How many times a mod replaced a player's whole progress (`player.set_advancements`), by player
+    /// (the game's own player under 0): a grant that ran a hook which replaced that player's progress
+    /// completed nothing itself.
+    pub(super) replaced: std::collections::HashMap<u128, u32>,
     pub(super) loaded: bool,
     pub(super) toasts: VecDeque<Toast>,
     /// Awards skip the toast (`/advancement grant ... everything`).
     pub(super) quiet: bool,
     /// The inventory last seen by `inventory_changed`.
-    pub(super) last_inventory: u64,
+    pub(super) last_inventory: Option<u64>,
     /// `ServerPlayer.levitationStartPos` and `levitationStartTime`.
     pub(super) levitation: Option<([f64; 3], u64)>,
     /// The fall, lava ride, Nether trip, blast and effects `tick_marks` follows.
@@ -155,6 +161,11 @@ pub(super) struct AdvState {
     pub(super) pending_tree: Option<std::thread::JoinHandle<Arc<Tree>>>,
     /// `inventory_changed`'s criteria by item, built for `tree`.
     inventory_index: Option<(Arc<Tree>, Arc<adv::InventoryIndex>)>,
+    /// Reusable candidate list for `tick_advancements` so matching ticks avoid allocating.
+    tick_candidates: Vec<(usize, usize)>,
+    /// How many `/reload`s the game has applied: the tree stays the same one when the packs add
+    /// no advancements, though the tags the criteria read changed.
+    reloads: u32,
 }
 impl AdvState {
     /// Drop the prefetched tree and the index built for the old one (a
@@ -162,6 +173,7 @@ impl AdvState {
     pub(super) fn reset_tree(&mut self) {
         self.pending_tree = None;
         self.inventory_index = None;
+        self.reloads = self.reloads.wrapping_add(1);
     }
 }
 /// The game's world for predicates.
@@ -275,6 +287,113 @@ impl adv::World for View<'_, '_> {
                 .is_some_and(|source| self.0.health_resources.damage.in_tag(source, tag)),
             _ => false,
         }
+    }
+}
+/// Predicate world view scoped to a single `trigger_criteria` evaluation: caches
+/// repeated biome and structure queries at the same block position (e.g. the 50+
+/// biome criteria of `minecraft:location` / `adventuring_time`) without allocating.
+struct CachedView<'a, 'g> {
+    game: &'a Game<'g>,
+    biome: std::cell::Cell<Option<([i32; 3], &'a str)>>,
+    structures: std::cell::RefCell<Option<([i32; 3], Vec<String>)>>,
+}
+impl<'a, 'g> CachedView<'a, 'g> {
+    fn new(game: &'a Game<'g>) -> Self {
+        Self {
+            game,
+            biome: std::cell::Cell::new(None),
+            structures: std::cell::RefCell::new(None),
+        }
+    }
+    fn biome_str(&self, p: [i32; 3]) -> &'a str {
+        if let Some((cached_pos, name)) = self.biome.get()
+            && cached_pos == p
+        {
+            return name;
+        }
+        let name = self
+            .game
+            .world
+            .chunks
+            .get(&(p[0] >> 4, p[2] >> 4))
+            .map(|c| {
+                self.game
+                    .res
+                    .biomes()
+                    .get(c.biome(p[0], p[1], p[2]))
+                    .name
+                    .as_str()
+            })
+            .unwrap_or("");
+        self.biome.set(Some((p, name)));
+        name
+    }
+}
+impl adv::World for CachedView<'_, '_> {
+    fn predicate(&self, id: &str) -> Option<&Value> {
+        self.game.fns.store.predicates.get(id)
+    }
+    fn dimension(&self) -> &str {
+        self.game.dim.id()
+    }
+    fn weather(&self) -> (bool, bool) {
+        View(self.game).weather()
+    }
+    fn biome(&self, p: [i32; 3]) -> String {
+        self.biome_str(p).to_owned()
+    }
+    fn check_biome(&self, p: [i32; 3], f: &mut dyn FnMut(&str) -> bool) -> bool {
+        f(self.biome_str(p))
+    }
+    fn structures(&self, p: [i32; 3]) -> Vec<String> {
+        let mut cache = self.structures.borrow_mut();
+        if let Some((cached_pos, list)) = cache.as_ref()
+            && *cached_pos == p
+        {
+            return list.clone();
+        }
+        let list = self.game.structures_at(p);
+        *cache = Some((p, list.clone()));
+        list
+    }
+    fn any_structure(&self, p: [i32; 3], f: &mut dyn FnMut(&str) -> bool) -> bool {
+        let hit = self
+            .structures
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached_pos, _)| *cached_pos == p);
+        if !hit {
+            *self.structures.borrow_mut() = Some((p, self.game.structures_at(p)));
+        }
+        let cache = self.structures.borrow();
+        let Some((_, list)) = cache.as_ref() else {
+            return false;
+        };
+        list.iter().any(|s| f(s))
+    }
+    fn block(&self, p: [i32; 3]) -> (String, BTreeMap<String, String>) {
+        View(self.game).block(p)
+    }
+    fn block_property_values(&self, block: &str, property: &str) -> Option<Vec<String>> {
+        View(self.game).block_property_values(block, property)
+    }
+    fn fluid(&self, p: [i32; 3]) -> Option<String> {
+        View(self.game).fluid(p)
+    }
+    fn can_see_sky(&self, p: [i32; 3]) -> bool {
+        View(self.game).can_see_sky(p)
+    }
+    fn light(&self, p: [i32; 3]) -> i32 {
+        View(self.game).light(p)
+    }
+    fn smokey(&self, p: [i32; 3]) -> bool {
+        View(self.game).smokey(p)
+    }
+    fn block_entity_nbt(&self, p: [i32; 3]) -> Option<horizon_core::nbt::Tag> {
+        View(self.game).block_entity_nbt(p)
+    }
+    fn in_tag(&self, registry: &str, tag: &str, id: &str) -> bool {
+        View(self.game).in_tag(registry, tag, id)
     }
 }
 type Tags = std::collections::HashMap<String, std::collections::HashSet<String>>;
@@ -407,7 +526,7 @@ impl Game<'_> {
         let data = self.options.resources.join("data");
         // The world's packs' advancements go over the game's own, and a
         // native mod's contributed files are already among them: the tables
-        // were built for this open (`build_world_tables`), so the hook is
+        // were built for this open (`stage_world_tables`), so the hook is
         // asked once, not again here.
         let files = match &self.world_tables {
             Some(tables) => tables.files.clone(),
@@ -468,11 +587,8 @@ impl Game<'_> {
             .adv
             .progress
             .to_json(&self.adv.tree, horizon_world::DATA_VERSION);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
+        if let Err(e) = super::stats::write_player_json(&path, &json) {
+            log::warn!("{e}");
         }
     }
     /// The player as predicates see it.
@@ -610,7 +726,7 @@ impl Game<'_> {
             level: asked.level.then_some(g.xp_level),
             // The guest's food as last written back from its body.
             food: Some((g.food, g.saturation)),
-            stats: stats.filter(|_| asked.stats).map(|s| s.values.clone()),
+            stats: stats.filter(|_| asked.stats).map(|s| s.merged_values()),
             advancements: asked
                 .advancements
                 .then(|| (self.adv.tree.clone(), g.advancements.clone())),
@@ -652,7 +768,7 @@ impl Game<'_> {
             // `ServerPlayer.getFoodData`, read by every player predicate:
             // two numbers, so always filled.
             food: Some((p.health.food.food, p.health.food.saturation)),
-            stats: (asked.stats && self.stats.loaded).then(|| self.stats.values.clone()),
+            stats: (asked.stats && self.stats.loaded).then(|| self.stats.merged_values()),
             advancements: (asked.advancements && self.adv.loaded)
                 .then(|| (self.adv.tree.clone(), self.adv.progress.clone())),
             recipes: asked
@@ -874,7 +990,7 @@ impl Game<'_> {
         }
         let mut hits = Vec::new();
         {
-            let view = View(self);
+            let view = CachedView::new(self);
             for &(ai, ci) in list {
                 let a = &tree.list[ai];
                 let c = &a.criteria[ci];
@@ -886,6 +1002,9 @@ impl Game<'_> {
                 }
             }
         }
+        self.award_criteria_hits(tree, hits);
+    }
+    fn award_criteria_hits(&mut self, tree: &Tree, hits: Vec<(usize, usize)>) {
         if hits.is_empty() {
             return;
         }
@@ -893,15 +1012,32 @@ impl Game<'_> {
         for (ai, ci) in hits {
             let a = &tree.list[ai];
             let was = self.adv.progress.done(a);
+            let replaced = self.replacements();
             let criterion = &a.criteria[ci].name;
             if self.adv.progress.grant(&a.id, criterion, &date) {
                 self.advancement_progress(a, criterion, ProgressType::Grant);
             }
             self.progress_changed(ai);
-            if !was && self.adv.progress.done(a) {
+            // A mod's hook that replaced the progress is no grant of this criterion: what it imported
+            // completed the advancement, not this trigger, and nothing is awarded for it.
+            if !was && self.adv.progress.done(a) && self.replacements() == replaced {
                 self.award(ai);
             }
         }
+    }
+    /// How many times a mod replaced the progress of the player the game acts as now.
+    pub(in crate::game) fn replacements(&self) -> u32 {
+        self.replacements_of(self.lan_acting_uuid.unwrap_or(0))
+    }
+    /// How many times a mod replaced the progress of one player.
+    fn replacements_of(&self, player: u128) -> u32 {
+        self.adv.replaced.get(&player).copied().unwrap_or(0)
+    }
+    /// A mod replaced the acting player's whole progress.
+    pub(in crate::game) fn note_replacement(&mut self) {
+        let player = self.lan_acting_uuid.unwrap_or(0);
+        let count = self.adv.replaced.entry(player).or_insert(0);
+        *count = count.wrapping_add(1);
     }
     /// `PlayerAdvancements.award` / `revoke` after a criterion's progress changed.
     fn advancement_progress(
@@ -965,6 +1101,7 @@ impl Game<'_> {
         for task in tasks {
             let mut fresh = Vec::new();
             for grant in &task.grants {
+                let replaced = self.replacements_of(task.player);
                 let Some(was_done) = self
                     .with_advancement_hub(|hub, owners| hub.grant_native_tick(&task, grant, owners))
                     .flatten()
@@ -1011,6 +1148,11 @@ impl Game<'_> {
                     })
                     .flatten()
                     .unwrap_or(false);
+                // A hook that replaced this player's progress during the grant is no grant of this
+                // criterion: what it imported completed the advancement, so nothing is awarded.
+                if self.replacements_of(task.player) != replaced {
+                    continue;
+                }
                 if self.lan_acting == Some(task.conn) {
                     if !was_done && done {
                         self.award_definition(definition);
@@ -1138,15 +1280,15 @@ impl Game<'_> {
     }
     /// `AdvancementRewards.grant`'s pickup: volume 0.2 at the player's feet,
     /// pitch `(nextFloat - nextFloat) * 0.7 + 1`, times 2. `playSound(null, …)`
-    /// so the player hears it. The draws are the level random, which is the
-    /// stream item pickup already uses for this pitch.
+    /// so the player hears it. The draws are the player's own random
+    /// (`player.getRandom()`), which no level draw shares.
     fn advancement_pickup_sound(&mut self) {
         let Some(p) = self.player.as_ref() else {
             return;
         };
         let at = [p.position.x, p.position.y, p.position.z];
-        let pitch =
-            ((self.world.random.next_float() - self.world.random.next_float()) * 0.7 + 1.0) * 2.0;
+        let mut random = horizon_client::random_source::entity();
+        let pitch = ((random.next_float() - random.next_float()) * 0.7 + 1.0) * 2.0;
         self.audio
             .play("minecraft:entity.item.pickup", Some(at), 0.2, pitch);
     }
@@ -1197,7 +1339,7 @@ impl Game<'_> {
                 let name = adv_name(a);
                 // PlayerList.broadcastSystemMessage: everyone hears of a
                 // network player's advancement.
-                match self.lan_acting_name.clone() {
+                match self.lan_acting_name.as_ref() {
                     // Player.getDisplayName.
                     Some(_) => {
                         let player = self.target_name(super::commands::Target::Player);
@@ -1264,7 +1406,7 @@ impl Game<'_> {
     /// `InventoryChangeTrigger`, checked when the inventory changes.
     pub(super) fn check_inventory_trigger(&mut self) {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = horizon_core::fast_hash::FxHasher::default();
         for s in self
             .inventory
             .iter()
@@ -1274,13 +1416,13 @@ impl Game<'_> {
             s.as_ref().map(|s| (&s.item, s.count)).hash(&mut h);
         }
         let key = h.finish();
-        if key == self.adv.last_inventory {
+        if self.adv.last_inventory == Some(key) {
             return;
         }
-        self.adv.last_inventory = key;
+        self.adv.last_inventory = Some(key);
         // Native mods hear the change before any criterion is looked at, so
         // they do with no `inventory_changed` advancement in the tree too
-        // (`native_player_inventory_changed`, API @API:player_inventory_changed@).
+        // (`native_player_inventory_changed`, API 579).
         if self.remote.is_none()
             && !self.no_player_here()
             && mod_api::__private::listened(mod_api::HookId::PlayerInventoryChanged)
@@ -1363,23 +1505,114 @@ impl Game<'_> {
                 )
         });
     }
-    /// `PlayerTrigger.LOCATION` every second, and the other per-tick checks.
+    fn has_open_trigger(&mut self, name: &str) -> bool {
+        if self.lan_acting_fake || self.remote.is_some() || self.no_player_here() {
+            return false;
+        }
+        self.load_advancements();
+        let Some(list) = self.adv.tree.by_trigger.get(name) else {
+            return false;
+        };
+        list.iter().any(|&(ai, ci)| {
+            let a = &self.adv.tree.list[ai];
+            !self.adv.progress.has(&a.id, &a.criteria[ci].name) && !self.adv.progress.done(a)
+        })
+    }
+    fn tick_filter_matches(&self, f: &adv::TickFilter) -> bool {
+        let Some(p) = self.player.as_ref() else {
+            return false;
+        };
+        if f.requires_sneaking && p.pose != horizon_client::pose::Pose::Crouching {
+            return false;
+        }
+        if f.requires_sprinting && !p.sprinting {
+            return false;
+        }
+        if f.requires_swimming && p.pose != horizon_client::pose::Pose::Swimming {
+            return false;
+        }
+        if f.requires_on_fire && p.fire_ticks <= 0 {
+            return false;
+        }
+        if f.requires_vehicle && self.riding.is_none() {
+            return false;
+        }
+        if f.requires_effects && self.potions.effects.list.is_empty() {
+            return false;
+        }
+        let eq = f.requires_equipment_mask;
+        if eq != 0 {
+            if eq & 1 != 0 && self.held().is_none() {
+                return false;
+            }
+            if eq & 2 != 0 && self.offhand.is_none() {
+                return false;
+            }
+            for slot in 0..4 {
+                if eq & (1 << (2 + slot)) != 0 && self.armor[slot].is_none() {
+                    return false;
+                }
+            }
+        }
+        if let Some(wanted) = &f.requires_location_block {
+            let pos = [
+                p.position.x.floor() as i32,
+                p.position.y.floor() as i32,
+                p.position.z.floor() as i32,
+            ];
+            let state = self.world.block(pos[0], pos[1], pos[2]);
+            let name: &str = &self.res.facts().get(state).name;
+            if name != wanted {
+                return false;
+            }
+        }
+        true
+    }
+    /// `PlayerTrigger.LOCATION` every 20 of the player's own ticks (`tickCount % 20`), and the others.
     pub(super) fn tick_advancements(&mut self) {
         if self.player.is_none() || self.remote.is_some() {
             return;
         }
         self.check_inventory_trigger();
-        // ServerPlayer.tick: PlayerTrigger.TICK every tick.
-        let me = self.player_entity_for("minecraft:tick");
-        self.trigger("minecraft:tick", |c, w| {
-            let ctx = adv::Entities {
-                this: Some(&me),
-                origin: me.position,
-                tool: None,
-                block_pos: None,
-            };
-            adv::conditions(&c["player"], &ctx, w)
-        });
+        // ServerPlayer.tick: PlayerTrigger.TICK every tick, pre-filtered against
+        // necessary top-level criteria flags/equipment/blocks before building `EntityView`.
+        if !self.lan_acting_fake && !self.no_player_here() {
+            self.load_advancements();
+            let tree = self.adv.tree.clone();
+            if let Some(list) = tree.by_trigger.get("minecraft:tick") {
+                let filters = tree.tick_filters();
+                let mut candidates = std::mem::take(&mut self.adv.tick_candidates);
+                candidates.clear();
+                for (pos, &(ai, ci)) in list.iter().enumerate() {
+                    let a = &tree.list[ai];
+                    if self.adv.progress.done(a) || self.adv.progress.has(&a.id, &a.criteria[ci].name)
+                    {
+                        continue;
+                    }
+                    if filters
+                        .get(pos)
+                        .is_some_and(|f| !self.tick_filter_matches(f))
+                    {
+                        continue;
+                    }
+                    candidates.push((ai, ci));
+                }
+                if !candidates.is_empty() {
+                    let me = self.player_entity_for("minecraft:tick");
+                    self.trigger_criteria(&tree, &candidates, |c, w| {
+                        let ctx = adv::Entities {
+                            this: Some(&me),
+                            origin: me.position,
+                            tool: None,
+                            block_pos: None,
+                        };
+                        adv::conditions(&c["player"], &ctx, w)
+                    });
+                }
+                candidates.clear();
+                self.adv.tick_candidates = candidates;
+            }
+        }
         // ServerPlayer.onEffectAdded and onEffectsRemoved keep the start of a
         // levitation; tick fires LEVITATION while there is one.
         let levitating = self
@@ -1403,17 +1636,10 @@ impl Game<'_> {
             self.trigger_levitation(start, (self.ticks - since) as i64);
         }
         self.tick_marks();
-        if self.ticks.is_multiple_of(20) {
-            let me = self.player_entity_for("minecraft:location");
-            self.trigger("minecraft:location", |c, w| {
-                let ctx = adv::Entities {
-                    this: Some(&me),
-                    origin: me.position,
-                    tool: None,
-                    block_pos: None,
-                };
-                adv::conditions(&c["player"], &ctx, w)
-            });
+        if self.own_tick_count().is_some_and(|n| n % 20 == 0)
+            && self.has_open_trigger("minecraft:location")
+        {
+            self.tick_location();
         }
     }
     /// A player condition plus one entity (`player`, `entity` keys).
@@ -1564,7 +1790,7 @@ impl Game<'_> {
     }
     /// `DistanceTrigger`: the player's `player` condition, `start_position`
     /// at `start`, and the `distance` from `start` to the player.
-    fn trigger_distance(&mut self, name: &str, start: [f64; 3]) {
+    pub(super) fn trigger_distance(&mut self, name: &str, start: [f64; 3]) {
         let me = self.player_entity_for(name);
         self.trigger(name, move |c, w| {
             let pctx = adv::Entities {
@@ -2306,16 +2532,24 @@ impl Game<'_> {
     /// Overworld position the player went into the Nether from (`at`) is kept
     /// for the way back, and any other trip drops it.
     pub(super) fn trigger_dimension(&mut self, from: Dim, to: Dim, at: [f64; 3]) {
-        let (from_id, to_id) = (from.id().to_owned(), to.id().to_owned());
-        self.trigger("minecraft:changed_dimension", move |c, _| {
-            c["from"].as_str().is_none_or(|f| adv::full(f) == from_id)
-                && c["to"].as_str().is_none_or(|t| adv::full(t) == to_id)
-        });
+        self.trigger_changed_dimension(from, to);
         if from == Dim::Overworld && to == Dim::Nether {
             self.adv.marks.nether = Some(at);
         } else if !(from == Dim::Nether && to == Dim::Overworld) {
             self.adv.marks.nether = None;
         }
+    }
+    /// `CriteriaTriggers.CHANGED_DIMENSION` alone, without the
+    /// `enteredNetherPosition` bookkeeping of
+    /// `ServerPlayer.triggerDimensionChangeTriggers`: a respawn after the
+    /// credits triggers the criterion (`END` → `OVERWORLD`, whatever level
+    /// the point is in) and leaves that position as it is.
+    pub(super) fn trigger_changed_dimension(&mut self, from: Dim, to: Dim) {
+        let (from_id, to_id) = (from.id().to_owned(), to.id().to_owned());
+        self.trigger("minecraft:changed_dimension", move |c, _| {
+            c["from"].as_str().is_none_or(|f| adv::full(f) == from_id)
+                && c["to"].as_str().is_none_or(|t| adv::full(t) == to_id)
+        });
     }
     /// `ToastManager.SLOT_COUNT`.
     pub(super) const TOAST_SLOTS: usize = 5;
@@ -2403,26 +2637,27 @@ impl Game<'_> {
     }
 
     /// The `AdvancementToast` or `RecipeToast` at `index` in its slot at `y`.
-    fn draw_toast(&mut self, batch: &mut HudBatch, index: usize, y: f32, multiplier: f64) {
+    fn draw_toast(&self, batch: &mut HudBatch, index: usize, y: f32, multiplier: f64) {
         let t = &self.adv.toasts[index];
         let x = batch.width - 160.0 * t.slide.portion;
         let fully_for = t.slide.fully_for;
-        let (title, frame, icon) = (t.title.clone(), t.frame, t.icon.clone());
-        let description = t.description.clone().unwrap_or_else(|| Text::literal(""));
+        let (title, frame, icon) = (&t.title, t.frame, &t.icon);
+        let empty = Text::literal("");
+        let description = t.description.as_ref().unwrap_or(&empty);
         let recipe = t
             .is_recipe()
-            .then(|| t.recipes[t.displayed_recipe(fully_for, multiplier)].clone());
+            .then(|| &t.recipes[t.displayed_recipe(fully_for, multiplier)]);
         if let Some((station, item)) = recipe {
             // RecipeToast: black description under a purple title, the
             // station at 0.6 scale in the corner over the cycling result.
             let atlas = &self.gui.atlas;
             batch.sprite(atlas, "gui/sprites/toast/recipe", x, y);
-            batch.text_styled(atlas, &title, x + 30.0, y + 7.0, 0xFF50_0050, false);
-            batch.text_styled(atlas, &description, x + 30.0, y + 18.0, 0xFF00_0000, false);
+            batch.text_styled(atlas, title, x + 30.0, y + 7.0, 0xFF50_0050, false);
+            batch.text_styled(atlas, description, x + 30.0, y + 18.0, 0xFF00_0000, false);
             let start = batch.vertices.len();
-            self.draw_item_model(batch, &ItemStack::new(&station, 1), x + 3.0, y + 3.0);
+            self.draw_item_model(batch, &ItemStack::new(station, 1), x + 3.0, y + 3.0);
             batch.scale_since(start, x, y, 0.6, 0.6);
-            self.draw_item_model(batch, &item, x + 8.0, y + 8.0);
+            self.draw_item_model(batch, item, x + 8.0, y + 8.0);
             return;
         }
         let atlas = &self.gui.atlas;
@@ -2435,13 +2670,13 @@ impl Game<'_> {
         let label = title;
         let rgb = color & 0x00FF_FFFF;
         if let [line] = lines.as_slice() {
-            batch.text_styled(atlas, &label, x + 30.0, y + 7.0, color, false);
+            batch.text_styled(atlas, label, x + 30.0, y + 7.0, color, false);
             batch.text_styled(atlas, line, x + 30.0, y + 18.0, u32::MAX, false);
         } else if fully_for < 1500 {
             let fade = ((1500 - fully_for) as f32 / 300.0).clamp(0.0, 1.0);
             let alpha = (fade * 255.0).floor() as u32;
             if alpha != 0 {
-                batch.text_styled(atlas, &label, x + 30.0, y + 11.0, alpha << 24 | rgb, false);
+                batch.text_styled(atlas, label, x + 30.0, y + 11.0, alpha << 24 | rgb, false);
             }
         } else {
             let fade = ((fully_for - 1500) as f32 / 300.0).clamp(0.0, 1.0);
@@ -2461,7 +2696,7 @@ impl Game<'_> {
                 }
             }
         }
-        self.draw_item(batch, &ItemStack::new(&icon, 1), x + 8.0, y + 8.0);
+        self.draw_item(batch, icon, x + 8.0, y + 8.0);
     }
 }
 /// The toast's frame label and its colour (`AdvancementToast`: -30465, pink,
@@ -2533,11 +2768,14 @@ impl Game<'_> {
         let mut changed = false;
         for c in names {
             let was = self.adv.progress.done(a);
+            let replaced = self.replacements();
             if self.adv.progress.grant(&a.id, c, &date) {
                 changed = true;
                 self.advancement_progress(a, c, ProgressType::Grant);
                 self.progress_changed(index);
-                if !was && self.adv.progress.done(a) {
+                // A progress hook that replaced this player's progress (a mod's import) completed
+                // nothing by this grant: no reward for it.
+                if !was && self.adv.progress.done(a) && self.replacements() == replaced {
                     self.award(index);
                 }
             }
@@ -2576,12 +2814,10 @@ impl Game<'_> {
 impl Game<'_> {
     /// `ClientAdvancements.update` (ClientboundUpdateAdvancementsPacket):
     /// the server's advancements replace or join the tree, each changed one
-    /// takes the progress sent, and one just done shows its toast. `icons`
-    /// are the added advancements' icon items by name.
+    /// takes the progress sent, and one just done shows its toast.
     pub(super) fn remote_advancements(
         &mut self,
         p: horizon_protocol::packets::play::UpdateAdvancements,
-        icons: Vec<String>,
     ) {
         use horizon_client::scoreboard::tag_to_json;
         let mut list: Vec<adv::Advancement> = Vec::new();
@@ -2599,11 +2835,12 @@ impl Game<'_> {
         }
         for id in &p.removed {
             self.adv.progress.criteria.remove(id);
+            self.adv.progress.memo = None;
         }
-        for (a, icon) in p.added.into_iter().zip(icons) {
+        for a in p.added {
             list.retain(|o| o.id != a.id);
             let display = a.display.map(|d| adv::Display {
-                icon,
+                icon: self.remote_advancement_icon(d.icon),
                 title: tag_to_json(&d.title),
                 description: tag_to_json(&d.description),
                 frame: match d.frame {
@@ -2656,6 +2893,7 @@ impl Game<'_> {
                 .map(|(name, _)| (name, String::new()))
                 .collect();
             self.adv.progress.criteria.insert(id, obtained);
+            self.adv.progress.memo = None;
             let a = &tree.list[i];
             if !p.reset
                 && p.show
@@ -2688,7 +2926,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn helmet_wear_reports_the_old_stack_and_the_unclamped_damage() {
         const ID: &str = "testmod:wear";
         let scratch = std::env::temp_dir().join(format!("helmet-wear-{}", std::process::id()));
@@ -2720,8 +2958,9 @@ mod tests {
             let mut helmet = ItemStack::new("minecraft:iron_helmet", 1);
             helmet.damage = 164;
             game.armor[0] = Some(helmet);
-            let source = game.motion.health.damage.id("minecraft:falling_anvil");
-            game.hurt_helmet(source.unwrap(), 8.0);
+            let source =
+                horizon_client::health::NO_ATTACK.player_source("minecraft:falling_anvil", 0);
+            game.hurt_helmet(&source, 8.0);
             assert_eq!(game.armor[0], None);
             assert!(game.adv.progress.has(ID, "worn"));
         });
@@ -2729,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn toast_admission_cancels_edits_and_preserves_queue_behavior() {
         use mod_api::{ClientHost, Flow, Hooks, ModEntry, ToastAddEvent, ToastKind};
         struct Listener;
@@ -2756,7 +2995,7 @@ mod tests {
                 game.options.execution_role = super::super::execution_role::ExecutionRole::Client;
                 game.adv.toasts.clear();
                 let advancement = |name: &str| Toast {
-                    icon: "minecraft:stone".into(),
+                    icon: ItemStack::new("minecraft:stone", 1),
                     frame: Frame::Challenge,
                     title: Text::translate("advancements.toast.challenge", &[]),
                     description: Some(Text::literal(name)),
@@ -2775,7 +3014,7 @@ mod tests {
                     serde_json::json!({"translate": "advancements.toast.challenge"})
                 );
                 assert_eq!(original.description.as_ref().unwrap().plain(), "untouched");
-                assert_eq!(original.icon, "minecraft:stone");
+                assert_eq!(original.icon, ItemStack::new("minecraft:stone", 1));
                 assert!(original.slot.is_none());
                 assert!(
                     original.slide.origin.is_none(),
@@ -2818,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_name_components_read_live_text_without_saved_nbt() {
         use crate::game::{Audio, Options, Settings, commands::Target, load_resources};
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -2906,7 +3145,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_predicate_view_reads_active_effect_instances() {
         use crate::game::{Audio, Options, Settings, commands::Target, load_resources};
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -2964,11 +3203,10 @@ mod tests {
         game.mobs[0].add_effect_with("minecraft:speed", -1, 2, false, false);
         assert_eq!(
             game.mobs[0].extra.effects,
-            vec![horizon_client::mobs::StoredEffect::new(
-                "minecraft:speed",
-                -1,
-                2
-            )]
+            vec![horizon_client::mobs::StoredEffect {
+                show_icon: false,
+                ..horizon_client::mobs::StoredEffect::new("minecraft:speed", -1, 2)
+            }]
         );
         assert_eq!(
             game.entity_view_of(Target::Mob(32300)).effects,
@@ -3140,7 +3378,7 @@ mod tests {
             id: "quests:board".into(),
             parent: None,
             display: Some(adv::Display {
-                icon: "minecraft:book".into(),
+                icon: horizon_client::items::ItemStack::new("minecraft:book", 1),
                 title,
                 description,
                 frame: Frame::Task,
@@ -3284,7 +3522,7 @@ mod structure_tag_tests {
     /// `worldgen/structure` tags, and with a world's data packs theirs over
     /// the game's.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn location_structure_tags_hold_their_structures() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -3367,9 +3605,7 @@ mod structure_tag_tests {
             &[],
             &[],
         );
-        let (tables, _) = game
-            .build_world_tables(&stack, false, &root, false)
-            .unwrap();
+        let (tables, _, _) = game.stage_world_tables(&stack, false, &root).unwrap();
         game.world_tables = tables;
         assert!(game.world_tables.is_some());
         assert!(holds(&game, "#mypack:village", "minecraft:igloo"));
@@ -3391,7 +3627,7 @@ mod random_chance_command_tests {
     use crate::game::commands::Target;
     use horizon_core::nbt::Tag;
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn registered_named_random_chance_uses_real_source_and_world_draws() {
         use crate::game::{Audio, Options, Settings, load_resources};
         use std::time::Instant;
@@ -3530,7 +3766,7 @@ mod custom_data_equipment_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn actual_mob_equipment_projects_typed_custom_data_into_named_predicate_evaluation() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.build_registries();
@@ -3662,7 +3898,7 @@ mod movement_predicate_tests {
     use serde_json::json;
 
     #[test]
-    #[ignore = "requires prepared resources and scratch cwd/homes"]
+    #[ignore = "daily"]
     fn actual_registered_movement_predicate_uses_admitted_mob() {
         let mut resources = None;
         let mut game = server_game(&mut resources);

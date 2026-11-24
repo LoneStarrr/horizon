@@ -205,6 +205,18 @@ impl StateTransforms {
                 .map_or(state, |t| BlockStateId(t[r as usize - 1])),
         }
     }
+    /// `BlockState.rotate(level, pos, rotation)` as a template places `state`, already
+    /// mirrored, at `pos` (NeoForge's `IBlockExtension.rotate`): this table's turned state, or
+    /// another state of the block its parts answer (`rotate`). Every template placement turns
+    /// its states through here.
+    pub fn rotate_at(
+        &self,
+        state: BlockStateId,
+        pos: [i32; 3],
+        rotation: Rotation,
+    ) -> BlockStateId {
+        crate::native_worldgen_hooks::rotate(state, pos, rotation, self.rotate(state, rotation))
+    }
     pub fn mirror(&self, state: BlockStateId, mirror: Mirror) -> BlockStateId {
         match mirror {
             Mirror::None => state,
@@ -230,6 +242,24 @@ fn qualified(id: &str) -> String {
     }
 }
 
+/// `dir/<namespace>/<path>.nbt` for a template id, or `None` when the resolved path
+/// leaves `dir`. `Identifier` allows `.` and `/`, so a saved piece's `Template` could
+/// otherwise name `structure/../../.../foo.nbt` and read a file outside the template
+/// root (the prepared-files reader falls back to the disk). Nested paths stay valid.
+fn template_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    let (namespace, path) = id.split_once(':')?;
+    let file = dir.join(namespace).join(format!("{path}.nbt"));
+    for component in file.strip_prefix(dir).ok()?.components() {
+        // A template name never contains a whole `.` or `..` segment; refusing them
+        // keeps the resolved file under the template root even when `dir` itself is
+        // relative.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+    }
+    Some(file)
+}
+
 /// The template files and the ones loaded so far, shared by the resources and
 /// their lazy templates.
 struct TemplateStore {
@@ -245,11 +275,10 @@ impl TemplateStore {
         if let Some(found) = self.loaded.read().unwrap().get(id) {
             return found.clone();
         }
-        let (namespace, path) = id.split_once(':').unwrap();
-        let file = self.dir.join(namespace).join(format!("{path}.nbt"));
         let bytes = match self.pack_templates.get(id) {
             Some(resource) => resource.read().ok(),
-            None => horizon_core::prepared_files::read(&file).ok(),
+            None => template_path(&self.dir, id)
+                .and_then(|file| horizon_core::prepared_files::read(&file).ok()),
         };
         let loaded = bytes.and_then(|bytes| {
             let mut raw = Vec::new();
@@ -458,5 +487,38 @@ impl StructureResources {
     }
     pub fn is_jigsaw(&self, state: BlockStateId) -> bool {
         self.jigsaw_states.contains_key(&state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::template_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn template_paths_stay_inside_the_template_root() {
+        let root = Path::new("/templates");
+        assert_eq!(
+            template_path(root, "minecraft:shipwreck/with_mast"),
+            Some(PathBuf::from(
+                "/templates/minecraft/shipwreck/with_mast.nbt"
+            )),
+            "a valid nested path stays"
+        );
+        assert_eq!(
+            template_path(root, "modid:path/to/nested/template"),
+            Some(PathBuf::from(
+                "/templates/modid/path/to/nested/template.nbt"
+            ))
+        );
+        for escape in [
+            "minecraft:../secret",
+            "minecraft:a/../../secret",
+            "minecraft:/etc/passwd",
+            "../templates/secret",
+            "minecraft:sub/../../../secret",
+        ] {
+            assert_eq!(template_path(root, escape), None, "{escape} escapes");
+        }
     }
 }

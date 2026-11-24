@@ -15,6 +15,7 @@ use horizon_client::{
     text::Text,
 };
 use horizon_core::geometry::{Aabb, Vec3};
+use horizon_protocol::packets::play::{self, Clientbound as C};
 
 /// The player projectiles that meet other players: arrows (their hurt), and
 /// snowballs, eggs and mods' thrown types, which break on them
@@ -48,7 +49,7 @@ pub(super) struct Strike {
     /// The attacking guest, kept after their turn through `as_guest` ends.
     attacker: Option<u32>,
     /// The attacker's creative mode: their hit passes the victim's
-    /// invulnerability (`DamageSource.isCreativePlayer`, #916).
+    /// invulnerability (`DamageSource.isCreativePlayer`, arismoko/horizon#916).
     creative: bool,
     amount: f32,
     scale: f32,
@@ -124,7 +125,7 @@ pub(super) struct Sweep {
     /// The attacking guest (none: the host).
     attacker: Option<u32>,
     /// The attacker's creative mode: their hit passes the victim's
-    /// invulnerability (`DamageSource.isCreativePlayer`, #916).
+    /// invulnerability (`DamageSource.isCreativePlayer`, arismoko/horizon#916).
     creative: bool,
     from: [f64; 3],
     /// The damage after the enchantments and the attack strength.
@@ -334,13 +335,34 @@ impl Game<'_> {
                     .combat
                     .enchantment_projectile_attacker
                     .replace(effect_attacker);
+                g.combat.arrow_hurt_player = false;
                 let r = g.projectile_hit(p, on_player);
                 g.combat.refuse_player_hit = false;
                 g.combat.projectile_attacker = None;
                 g.combat.enchantment_projectile_attacker = saved_effect_attacker;
-                r
+                (r, std::mem::take(&mut g.combat.arrow_hurt_player))
             }),
         };
+        let (result, hurt) = match result {
+            Some((r, hurt)) => (Some(r), hurt),
+            None => (None, false),
+        };
+        // AbstractArrow.onHitEntity: an arrow that hurt a player sends its
+        // shooter, a ServerPlayer other than that player, PLAY_ARROW_HIT_SOUND
+        // (game event 6), the ding their client plays, unless the arrow is silent.
+        if hurt
+            && !self.entity_silent(p.id)
+            && let Some(shooter) = p.guest.filter(|&s| Some(s) != victim.conn())
+            && let Some(host) = self.lan.as_ref()
+        {
+            host.hub.send_to(
+                shooter,
+                &C::GameEvent(play::GameEvent {
+                    event: 6,
+                    param: 0.0,
+                }),
+            );
+        }
         result.unwrap_or(Ok(()))
     }
 
@@ -461,7 +483,7 @@ impl Game<'_> {
                 }
             }
         }
-        self.pvp_aftermath(victim, s.attacker, hurt, thorns);
+        self.pvp_aftermath(victim, s.attacker, thorns);
         let sound = match (hurt, s.crit, s.scale > 0.9) {
             (false, ..) => "minecraft:entity.player.attack.nodamage",
             (true, true, _) => "minecraft:entity.player.attack.crit",
@@ -499,35 +521,16 @@ impl Game<'_> {
         hurt
     }
 
-    /// The victim's kill score and thorns after a player's blow lands.
+    /// What follows a player's blow on a player as the victim's hurt ends:
+    /// the victim's thorns dealt back to the attacker (`ServerPlayer.die`'s
+    /// `awardKillScore` waits for the death itself, in
+    /// [`guest_award_kill_score`](Self::guest_award_kill_score)).
     pub(super) fn pvp_aftermath(
         &mut self,
         victim: Victim,
         attacker: Option<u32>,
-        hurt: bool,
         thorns: Vec<f32>,
     ) {
-        // ServerPlayer.awardKillScore: the blow that kills a player.
-        if hurt {
-            let died = match victim {
-                // A totem that fired is applied on the next tick_totem, so the
-                // victim is still at zero health but is not dying.
-                Victim::Guest(conn) => self
-                    .lan
-                    .as_ref()
-                    .and_then(|host| host.hub.guest(conn))
-                    .and_then(|g| g.motion.as_deref())
-                    .is_some_and(|p| p.health.dead_or_dying() && !p.health.totem_used),
-            };
-            if died {
-                match attacker {
-                    Some(conn) => {
-                        self.as_guest(conn, |g| g.award_custom_stat("player_kills", 1));
-                    }
-                    None => self.award_custom_stat("player_kills", 1),
-                }
-            }
-        }
         let thorns_cause = self.player_attacker(victim.conn());
         for damage in thorns {
             match attacker {
@@ -547,6 +550,50 @@ impl Game<'_> {
                 }
             }
         }
+    }
+
+    /// `ServerPlayer.die`'s `killer.awardKillScore(this, source)` for a guest,
+    /// whatever source killed them (`LivingEntity.getKillCredit`), then
+    /// `createWitherRose(killer)`: the killer's kill counts and `player_kills`,
+    /// and the rose a wither's kill leaves where they fell. A mob credits no
+    /// score.
+    pub(super) fn guest_award_kill_score(&mut self, victim: u32, at: [f64; 3]) {
+        let Some(id) = self
+            .guest_combat
+            .get(&victim)
+            .and_then(|c| c.kill_credit(self.world.game_time))
+        else {
+            return;
+        };
+        let name = self
+            .lan
+            .as_ref()
+            .and_then(|host| host.hub.guest(victim))
+            .map(|g| g.name.clone());
+        let in_place = self.lan_acting.is_none()
+            && self
+                .player
+                .as_ref()
+                .is_some_and(|p| p.entity_id as u32 == id);
+        let guest = self.lan.as_ref().and_then(|host| {
+            host.hub
+                .guests
+                .iter()
+                // `awardKillScore`'s `victim != this`: a player's own blow that
+                // killed them credits nothing.
+                .find(|g| g.entity_id as u32 == id && g.conn != victim)
+                .map(|g| g.conn)
+        });
+        if in_place {
+            self.award_custom_stat("player_kills", 1);
+            self.score_player_killed_named(name, true);
+        } else if let Some(kconn) = guest {
+            self.as_guest(kconn, |g| {
+                g.award_custom_stat("player_kills", 1);
+                g.score_player_killed_named(name, true);
+            });
+        }
+        self.create_wither_rose_by(at, Some(id));
     }
 
     /// The sweep of the player in place, for the players it reaches: the

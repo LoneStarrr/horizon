@@ -82,6 +82,38 @@ class ProcessTreeTests(unittest.TestCase):
         self.assertIsNotNone(harness.returncode)
         self.assertTrue(output.closed(30), "the harness's child outlived it")
 
+    @unittest.skipUnless(os.name != "nt" and hasattr(os, "waitid"), "POSIX with os.waitid (Python 3.13+ on macOS)")
+    def test_wait_signals_the_group_before_reaping_the_leader(self):
+        """wait() must signal while the leader is an unreaped zombie: a reaped id may name another group."""
+        harness, output = self.start([sys.executable, "-c", HARNESS, "exit"])
+        real_killpg = process_tree.os.killpg
+        signaled = []
+
+        def record_killpg(group, sig):
+            # Still waitable without reaping (WNOWAIT): the kernel, not returncode, says the leader is unreaped.
+            waitable = os.waitid(os.P_PID, harness.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            signaled.append((group, waitable is not None and waitable.si_pid == harness.pid))
+            return real_killpg(group, sig)
+
+        with mock.patch.object(process_tree.os, "killpg", record_killpg):
+            self.assertEqual(process_tree.wait(harness, 30), 0)
+        self.assertEqual(len(signaled), 1, "the group was not signalled exactly once")
+        self.assertEqual(signaled[0][0], harness.pid)
+        self.assertTrue(signaled[0][1], "the group was signalled after the leader had been reaped")
+        self.assertTrue(output.closed(30), "the harness's child outlived wait()")
+
+    @unittest.skipUnless(os.name != "nt", "POSIX-only: a reaped leader's group id is unsafe to signal")
+    def test_a_reaped_leader_is_never_signalled(self):
+        """A leader reaped before cleanup must not be killpg'd: its numeric group id may name another group."""
+        harness, output = self.start([sys.executable, "-c", HARNESS, "exit"])
+        self.addCleanup(self.stop_child, output)  # the child survives; end it by its own pid, not by group
+        harness.wait(30)  # simulate an old caller reaping the leader before cleanup
+        self.assertIsNotNone(harness.returncode)
+        with mock.patch.object(process_tree.os, "killpg") as killpg:
+            process_tree.kill(harness)
+            self.assertTrue(process_tree.ended(harness))
+        killpg.assert_not_called()
+
     def test_killing_a_harness_kills_what_it_started(self):
         harness, output = self.start([sys.executable, "-c", HARNESS, "hang"])
         while not output.lines:
@@ -133,22 +165,28 @@ class ProcessTreeTests(unittest.TestCase):
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
-        # A stand-in sccache: --start-server leaves a server running, as the real one does, and exits.
-        (directory / "server.py").write_text(textwrap.dedent("""
-            import os, pathlib, time
-            pathlib.Path(__file__).with_name("server.txt").write_text(f"{os.getpid()} {os.environ['SCCACHE_IDLE_TIMEOUT']}")
-            time.sleep(60)
-        """))
-        (directory / "sccache.cmd").write_text(f'@start "" /b "{sys.executable}" "%~dp0server.py"\n')
+        # A stand-in sccache: --start-server leaves a server running, as the real one does, and exits. The server is
+        # Windows PowerShell, not this Python: started by cmd, the Microsoft Store's Python (an app execution alias)
+        # runs outside cmd's job, where sccache's server, a plain program, doesn't (#16861).
+        (directory / "sccache.cmd").write_text(
+            '@set "SERVER_TXT=%~dp0server.txt"\n'
+            '@start "" /b "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive'
+            ' -Command "Set-Content -LiteralPath $env:SERVER_TXT'
+            ' -Value (\'{0} {1}\' -f $PID, $env:SCCACHE_IDLE_TIMEOUT); Start-Sleep 60"\n')
         with mock.patch.dict(os.environ, {"RUSTC_WRAPPER": str(directory / "sccache.cmd")}):
             process_tree.start_build_server()
         starter = process_tree.BUILD_SERVERS.pop()
         self.addCleanup(process_tree._release, starter)
+        written = ""
         for _ in range(600):
-            if (directory / "server.txt").exists() and (directory / "server.txt").read_text():
+            try:
+                written = (directory / "server.txt").read_text()
+            except OSError:  # not there yet, or Set-Content still holds it open (PermissionError, #17172)
+                pass
+            if written:
                 break
             threading.Event().wait(0.05)
-        pid, idle = (directory / "server.txt").read_text().split()
+        pid, idle = written.split()
         self.assertEqual(idle, "0")  # it never idles out, so no harness's build restarts it in its own job
         server = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
         self.assertTrue(server)

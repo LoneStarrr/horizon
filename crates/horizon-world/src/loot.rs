@@ -8,6 +8,11 @@
 //! maps are kept as found (structure search is not run); conditions that
 //! need an entity, tool or damage source fail when the context has none, as
 //! they do for containers.
+mod fill;
+pub mod query;
+#[path = "loot_query.rs"]
+mod query_context;
+pub use fill::ContainerLootContext;
 #[path = "loot/tags.rs"]
 mod loot_tags;
 use horizon_core::random::{LegacyRandom, RandomSource};
@@ -22,7 +27,7 @@ use std::{
 };
 use {
     crate::{lazy_json::LazyJson, native_load_context::LoadContext},
-    horizon_core::nbt::Tag,
+    horizon_core::{identifier::parse_or_keep, nbt::Tag},
 };
 
 /// Raw files a world's data packs add over the game's own data, by
@@ -115,6 +120,7 @@ pub fn native_invoke_loot_condition(
 }
 
 /// The tool a loot context names: its item id and enchantments.
+#[derive(Clone)]
 pub struct LootTool {
     pub item: String,
     pub enchantments: Vec<(String, i32)>,
@@ -128,6 +134,11 @@ pub struct LootTool {
 /// loot engine; each is None in the other. A table without a mod's kinds
 /// draws nothing and stays bit-for-bit the same.
 pub struct LootContext<'a> {
+    /// First id wins; written after the root and all nested rolls, before arismoko/horizon#1270's modifier pass.
+    /// Unset reads as `UNKNOWN_LOOT_TABLE`; nested rolls never write it.
+    pub queried_table_id: Option<String>,
+    /// Stack whose data is queried; unchanged through nested rolls, absent in existing callers.
+    pub queried_stack: Option<LootStack>,
     /// The entity the table names (`this`), if any.
     pub entity: Option<&'a LootEntity>,
     /// The damage that killed it, if any.
@@ -167,8 +178,55 @@ pub struct LootPlace {
     /// break, saved with its id and position (`saveWithFullMetadata`); a
     /// mod's block entity carries its own data and its `Items`.
     pub block_entity: Option<Tag>,
+    /// `BlockEntity.collectComponents`: the components a block predicate's
+    /// `components` map tests, explicit ones plus the type's implicit ones
+    /// (`container`, `custom_name`, `lock`, banner patterns, ...). None when
+    /// the roll has no block entity.
+    pub block_entity_components: Option<Tag>,
     /// The level the roll is in.
     pub level: Option<LootLevel>,
+    /// `Level.getBiome` at [`Self::origin`]: the biome id
+    /// (`minecraft:jungle`). None when the place had no loaded level to ask,
+    /// so a `biomes` predicate fails there.
+    pub biome: Option<String>,
+    /// The block at [`Self::origin`] when the game had a level to read it
+    /// from: what `LocationPredicate.block` compares. It is the block the
+    /// roll started on (the broken block for a block's own drops), not the
+    /// block at a `location_check` offset.
+    pub block: Option<LootBlockState>,
+    /// `Level.getMaxLocalRawBrightness` at [`Self::origin`]: the brighter of
+    /// the block light and the sky light less `Level.getSkyDarken`.
+    pub light: Option<i32>,
+    /// `Level.canSeeSky` at [`Self::origin`]: sky light 15 there.
+    pub can_see_sky: Option<bool>,
+    /// `Level.getFluidState` at [`Self::origin`]: `minecraft:water` or
+    /// `minecraft:lava`; `None` is the empty fluid.
+    pub fluid: Option<String>,
+    /// `StructureManager.getStructureAt` / `getStructureWithPieceAt` at
+    /// [`Self::origin`]: the structures whose start box reaches the position,
+    /// each with whether a piece of it covers the position too. None when the
+    /// place had no level to ask, so a `structures` predicate fails there.
+    pub structures: Option<Vec<LootStructure>>,
+}
+
+/// One structure whose start box reaches a loot roll's origin, as
+/// `StructureManager.getStructureAt` finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LootStructure {
+    /// The structure's registry id (`minecraft:village_plains`).
+    pub name: String,
+    /// A piece of the start covers the position (`getStructureWithPieceAt`);
+    /// a start whose box reaches it but whose pieces do not is false.
+    pub piece: bool,
+}
+
+/// The block a loot roll happens on, as `LocationPredicate.block` sees it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LootBlockState {
+    /// The block's registry id (`minecraft:oak_log`).
+    pub name: String,
+    /// The state's property values, in name order.
+    pub properties: crate::chunk::BlockProperties,
 }
 
 /// The level a loot roll is in, as a mod's own loot kinds see it.
@@ -320,16 +378,20 @@ impl Enchantment {
     }
 }
 
+#[path = "loot/holder_sets.rs"]
+mod holder_sets;
+
 /// Loot tables, items, enchantments and the tags they reference.
 pub struct LootData {
+    holder_sets: holder_sets::Binding,
     tables: Arc<LootTables>,
     modifiers: HashMap<String, Value>,
     predicates: HashMap<String, Value>,
     items: HashMap<String, ItemFacts>,
     /// Enchantments in registry (identifier) order.
     enchantments: Vec<Enchantment>,
-    /// Raw tag files by (registry, tag id).
-    tags: HashMap<(String, String), Vec<Value>>,
+    /// Tag files' layers by (registry, tag id).
+    tags: HashMap<(String, String), crate::tag_layers::TagLayers>,
     /// Smelting recipes in recipe id order: (ingredient, result, result count).
     smelting: Vec<(Value, String, i32)>,
 }
@@ -422,16 +484,65 @@ fn slot_in_group(slot: &str, group: &str) -> bool {
         _ => slot == group,
     }
 }
+/// `SlotRanges`' equipment ranges, as the `LootEntity.equipment` names they
+/// cover. The container, ender chest, mob and horse inventories and a
+/// player's cursor and crafting grid are slots a loot context's entity does
+/// not expose, so a range naming those matches nothing.
+fn slot_range_equipment(range: &str) -> &'static [&'static str] {
+    match range {
+        "weapon" | "weapon.mainhand" => &["mainhand"],
+        "weapon.offhand" => &["offhand"],
+        "weapon.*" => &["mainhand", "offhand"],
+        "armor.head" => &["head"],
+        "armor.chest" => &["chest"],
+        "armor.legs" => &["legs"],
+        "armor.feet" => &["feet"],
+        "armor.body" => &["body"],
+        "armor.*" => &["head", "chest", "legs", "feet", "body"],
+        "saddle" => &["saddle"],
+        _ => &[],
+    }
+}
 /// The item a recipe's `result` names. `ItemStackTemplate.CODEC` and `TransmuteResult.CODEC`
 /// read a stack's fields (`id`, `count`, `components`) or, as their alternative, a bare item id
 /// (`Item.CODEC`): `"result": {"id": "mod:item"}` and `"result": "mod:item"` are the same item.
+/// `Item.CODEC` reads the id through `Identifier.CODEC`, which is `Identifier.parse`: an id
+/// written without a namespace (`"stick"`, `":stick"`) names `minecraft:stick`. The id is
+/// canonical here, where the parse boundary is, so everything downstream that compares or sends
+/// it already holds the name the item table knows. An id `Identifier.parse` refuses is returned
+/// as written: whether such a recipe loads is the load's question, not this read's.
 /// None for a stack without an `id` and for anything else, such as the `item` key of older
 /// versions.
-pub fn recipe_result_id(result: &Value) -> Option<&str> {
-    match result {
-        Value::String(id) => Some(id),
-        Value::Object(fields) => fields.get("id")?.as_str(),
-        _ => None,
+pub fn recipe_result_id(result: &Value) -> Option<String> {
+    let id = match result {
+        Value::String(id) => id,
+        Value::Object(fields) => fields.get("id")?.as_str()?,
+        _ => return None,
+    };
+    Some(parse_or_keep(id))
+}
+/// `Ingredient.CODEC` (`HolderSetCodec`): each id or `#tag` a smelting recipe's
+/// ingredient names is read through `Identifier.parse` (`TagKey.hashedCodec` for
+/// tags, `Item.CODEC` for items), so a bare one names `minecraft`'s. Canonical
+/// here, at the load boundary, so `furnace_smelt`'s `item_in` matches the
+/// canonical stack id and the tag table's canonical keys. An id `Identifier.parse`
+/// refuses is kept as written, as `recipe_result_id` does.
+fn canonical_ingredient(v: &Value) -> Value {
+    let canonical = |s: &str| match s.strip_prefix('#') {
+        Some(tag) => format!("#{}", parse_or_keep(tag)),
+        None => parse_or_keep(s),
+    };
+    match v {
+        Value::String(s) => Value::String(canonical(s)),
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|e| match e {
+                    Value::String(s) => Value::String(canonical(s)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 /// `LevelBasedValue.calculate`.
@@ -556,17 +667,34 @@ fn int_bounds(v: &Value, value: i32) -> bool {
 fn list_operation<T: Clone>(
     spec: &Value,
     existing: Vec<T>,
+    draw: impl FnMut(&Value) -> T,
+) -> Vec<T> {
+    list_operation_capped(spec, existing, usize::MAX, draw)
+}
+
+/// The same with the codec max size (`ListOperation.codec`): the values are
+/// limited to it, and an append, insert or section replacement that would
+/// grow the list past it is logged and ignored in vanilla, so the original
+/// list is returned here.
+fn list_operation_capped<T: Clone>(
+    spec: &Value,
+    existing: Vec<T>,
+    max_size: usize,
     mut draw: impl FnMut(&Value) -> T,
 ) -> Vec<T> {
     let values: Vec<T> = (spec["values"].as_array().into_iter().flatten())
+        .take(max_size)
         .map(&mut draw)
         .collect();
     let offset = spec["offset"].as_i64().unwrap_or(0).max(0) as usize;
     // A section replacement or an insertion past the end is logged and ignored.
     let fits = offset <= existing.len();
     match spec["mode"].as_str().unwrap_or("replace_all") {
-        "append" => existing.into_iter().chain(values).collect(),
-        "insert" if fits => {
+        "append" if existing.len().saturating_add(values.len()) <= max_size => {
+            existing.into_iter().chain(values).collect()
+        }
+        "append" => existing,
+        "insert" if fits && existing.len().saturating_add(values.len()) <= max_size => {
             let mut out = existing;
             let tail = out.split_off(offset);
             out.extend(values);
@@ -574,13 +702,22 @@ fn list_operation<T: Clone>(
             out
         }
         "replace_section" if fits => {
-            let mut out = existing;
             let size = (spec["size"].as_i64()).map_or(values.len(), |s| s.max(0) as usize);
-            let tail = out.split_off((offset + size).min(out.len()));
-            out.truncate(offset);
-            out.extend(values);
-            out.extend(tail);
-            out
+            let tail_at = (offset + size).min(existing.len());
+            if offset
+                .saturating_add(values.len())
+                .saturating_add(existing.len() - tail_at)
+                > max_size
+            {
+                existing
+            } else {
+                let mut out = existing;
+                let tail = out.split_off(tail_at);
+                out.truncate(offset);
+                out.extend(values);
+                out.extend(tail);
+                out
+            }
         }
         "insert" | "replace_section" => existing,
         // `replace_all`, and a mode the codec refuses
@@ -633,6 +770,8 @@ fn int_value(v: &Value) -> Option<i64> {
 #[path = "loot_conditions.rs"]
 mod loot_conditions;
 use loot_conditions::overlay_map;
+mod predicates;
+pub use predicates::load_predicates;
 
 /// Loot tables by id. Each is kept as its JSON text and read into a [`Value`]
 /// the first time it is rolled: of vanilla's ~1,450 tables a game rolls a
@@ -744,63 +883,10 @@ pub fn native_loot_table_load(context: &LoadContext, id: &str, table: &mut Value
     crate::native_load_hooks::loot_table_load(context, id, table);
 }
 
-fn load_kind(data: &Path, kind: &str, out: &mut HashMap<String, Value>) -> io::Result<()> {
-    let Ok(entries) = fs::read_dir(data) else {
-        return Ok(());
-    };
-    let mut namespaces: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-        .collect();
-    namespaces.sort();
-    for ns in namespaces {
-        load_dir(&data.join(&ns).join(kind), &ns, "", out)?;
-    }
-    Ok(())
-}
+#[path = "loot/load_resources.rs"]
+mod load_resources;
+use load_resources::{hash_files, load_kind};
 
-/// Every file's path, size and modification time under `dir`, in name order.
-fn hash_files(dir: &Path, hasher: &mut impl std::hash::Hasher) {
-    use std::hash::Hash;
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_dir() {
-            hash_files(&path, hasher);
-        } else {
-            path.hash(hasher);
-            meta.len().hash(hasher);
-            meta.modified().ok().hash(hasher);
-        }
-    }
-}
-
-fn load_dir(
-    dir: &Path,
-    namespace: &str,
-    prefix: &str,
-    out: &mut HashMap<String, Value>,
-) -> io::Result<()> {
-    // Through `json_folder`: a load holding the folder (the recipes, read by
-    // the item tables, the recipe book and the server's sync too) shares one
-    // read of it.
-    let Ok(folder) = crate::json_folder::read(dir) else {
-        return Ok(());
-    };
-    for file in &folder.files {
-        let value = serde_json::from_slice(file.bytes()?)?;
-        out.insert(format!("{namespace}:{prefix}{}", file.name), value);
-    }
-    Ok(())
-}
 fn cost(v: &Value) -> (i32, i32) {
     (
         v["base"].as_i64().unwrap_or(0) as i32,
@@ -818,14 +904,11 @@ impl LootData {
         defaults: &crate::item_defaults::ItemDefaults,
     ) -> io::Result<Self> {
         let all = root.join("data");
-        let data = all.join("minecraft");
         let tables = shared_tables(root, overlay)?;
         let mut modifiers = HashMap::new();
         load_kind(&all, "item_modifier", &mut modifiers)?;
         overlay_map(overlay, "item_modifier", &mut modifiers);
-        let mut predicates = HashMap::new();
-        load_kind(&all, "predicate", &mut predicates)?;
-        overlay_map(overlay, "predicate", &mut predicates);
+        let predicates = load_predicates(root, overlay)?;
         let items = defaults
             .entries()
             .iter()
@@ -842,17 +925,14 @@ impl LootData {
                 )
             })
             .collect();
+        // Every namespace's, as the item tables read them: a content mod's
+        // `data/<ns>/enchantment/` lands in the root beside vanilla's.
         let mut raw_enchantments = HashMap::new();
-        load_dir(
-            &data.join("enchantment"),
-            "minecraft",
-            "",
-            &mut raw_enchantments,
-        )?;
+        load_kind(&all, "enchantment", &mut raw_enchantments)?;
         overlay_map(overlay, "enchantment", &mut raw_enchantments);
         let mut names: Vec<&String> = raw_enchantments.keys().collect();
         names.sort();
-        let enchantments = names
+        let enchantments: Vec<Enchantment> = names
             .into_iter()
             .map(|name| {
                 let e = &raw_enchantments[name];
@@ -887,32 +967,25 @@ impl LootData {
             "damage_type",
             // What `location_check`'s `biomes` names.
             "worldgen/biome",
+            // What `location_check`'s `structures` names.
+            "worldgen/structure",
         ] {
             let mut raw = HashMap::new();
             load_kind(&all, &format!("tags/{registry}"), &mut raw)?;
             for (name, value) in raw {
-                if !overlay.conditions.allows_tag(&value, registry, &name) {
-                    continue;
-                }
-                let values = value["values"].as_array().cloned().unwrap_or_default();
-                tags.insert((registry.to_owned(), name), values);
+                let layers = crate::tag_layers::TagLayers::from_file(&value);
+                tags.insert((registry.to_owned(), name), layers);
             }
             // The packs' entries join the game's own, in pack order; a
-            // `replace` file drops what the lower sources put in
-            // (`TagLoader.load` walks the resource stack the same way).
+            // `replace` file drops what the lower sources put in and `remove`
+            // takes entries out (`TagLoader.load` walks the stack the same way).
             for (id, files) in overlay.tag_kind(registry) {
                 for bytes in files {
                     let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
                         continue;
                     };
-                    if !overlay.conditions.allows_tag(&v, registry, &id) {
-                        continue;
-                    }
                     let slot = tags.entry((registry.to_owned(), id.clone())).or_default();
-                    if v["replace"].as_bool() == Some(true) {
-                        slot.clear();
-                    }
-                    slot.extend(v["values"].as_array().cloned().unwrap_or_default());
+                    slot.push(&v);
                 }
             }
         }
@@ -928,10 +1001,12 @@ impl LootData {
             .filter_map(|r| {
                 let result = recipe_result_id(&r["result"])?.to_owned();
                 let count = r["result"]["count"].as_i64().unwrap_or(1) as i32;
-                Some((r["ingredient"].clone(), result, count))
+                Some((canonical_ingredient(&r["ingredient"]), result, count))
             })
             .collect();
-        Ok(Self {
+        let binding = holder_sets::Binding::load(root, overlay, &items, &enchantments)?;
+        let mut loaded = Self {
+            holder_sets: Default::default(),
             tables,
             modifiers,
             predicates,
@@ -939,7 +1014,10 @@ impl LootData {
             enchantments,
             tags,
             smelting,
-        })
+        };
+        binding.snapshot(&mut loaded)?;
+        loaded.holder_sets = binding;
+        Ok(loaded)
     }
     /// The table snapshot used by this loot data.
     pub fn tables(&self) -> &Arc<LootTables> {
@@ -947,8 +1025,9 @@ impl LootData {
     }
 
     /// Apply native load hooks to a private server snapshot, leaving shared raw tables unchanged.
-    /// `context` is the owning server data load's.
-    pub fn apply_native_table_loads(&mut self, context: &LoadContext) {
+    /// `context` is the owning server data load's. Invalid holder-set objects refuse
+    /// the replacement snapshot with a table and field-qualified error.
+    pub fn apply_native_table_loads(&mut self, context: &LoadContext) -> io::Result<()> {
         let mut ids: Vec<_> = self.tables.0.keys().collect();
         ids.sort();
         self.tables = Arc::new(
@@ -956,10 +1035,16 @@ impl LootData {
                 .map(|id| {
                     let mut table = self.tables[id.as_str()].clone();
                     native_loot_table_load(context, id, &mut table);
-                    (id.clone(), table)
+                    self.holder_sets.walk(
+                        &format!("native loot_table {id}"),
+                        &mut table,
+                        &self.tags,
+                    )?;
+                    Ok((id.clone(), table))
                 })
-                .collect(),
+                .collect::<io::Result<LootTables>>()?,
         );
+        Ok(())
     }
 
     pub fn has_table(&self, table: &str) -> bool {
@@ -1015,6 +1100,7 @@ impl LootData {
             luck: 0.0,
         };
         let mut c = Context {
+            query: query::current_query(),
             data: self,
             random: LegacyRandom::new(0),
             biome: None,
@@ -1041,7 +1127,18 @@ impl LootData {
     fn tag(&self, registry: &str, name: &str) -> Vec<String> {
         loot_tags::members(&self.tags, registry, name)
     }
-    /// A HolderSet: "#tag", "id" or a list of ids.
+    /// The tag names of `registry` the tag files declare, sorted.
+    fn tag_names_of(&self, registry: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tags
+            .keys()
+            .filter(|(r, _)| r == registry)
+            .map(|(_, name)| name.clone())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+    /// A published HolderSet: "#tag", "id" or resolved IDs. Objects bind at load.
     fn holder_set(&self, registry: &str, v: &Value) -> Vec<String> {
         match v {
             Value::String(s) => match s.strip_prefix('#') {
@@ -1066,34 +1163,6 @@ impl LootData {
         })
     }
 
-    /// LootTable.getRandomItems with the given random (its state is
-    /// advanced), luck and, for fishing, whether the hook is in open water.
-    pub fn roll<R: RandomSource + Clone>(
-        &self,
-        table: &str,
-        random: &mut R,
-        luck: f32,
-        biome: Option<&str>,
-        open_water: Option<bool>,
-    ) -> Vec<LootStack> {
-        let Some(json) = self.tables.get(table) else {
-            return Vec::new();
-        };
-        let mut c = Context {
-            data: self,
-            random: random.clone(),
-            biome,
-            visited: Vec::new(),
-            luck,
-            open_water,
-            entity: None,
-            enchanted_level: None,
-        };
-        let mut items = Vec::new();
-        c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
-        *random = c.random;
-        items
-    }
     /// LootTable.getRandomItems for an entity context: the generated stacks
     /// after the stack splitter, in order. `random` is the table's random
     /// sequence (or the level random) and is advanced.
@@ -1128,6 +1197,7 @@ impl LootData {
             return Vec::new();
         };
         let mut c = Context {
+            query: query::current_query(),
             data: self,
             random: random.clone(),
             biome: None,
@@ -1139,6 +1209,7 @@ impl LootData {
         };
         let mut items = Vec::new();
         c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
+        c.query.finish(Some(table));
         *random = c.random;
         items
     }
@@ -1150,27 +1221,33 @@ impl LootData {
         table: &str,
         random: &mut R,
     ) -> Vec<LootStack> {
-        let Some(json) = self.tables.get(table) else {
-            return Vec::new();
-        };
-        let mut c = Context {
-            data: self,
-            random: random.clone(),
-            biome: None,
-            visited: Vec::new(),
-            luck: 0.0,
-            open_water: None,
-            entity: None,
-            enchanted_level: None,
-        };
-        let mut items = Vec::new();
-        c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
-        *random = c.random;
-        items
+        self.roll_container_with(table, random, ContainerLootContext::default())
+            .unwrap_or_default()
+    }
+    /// `ItemStack.getMaxStackSize` of a rolled stack: its last `max_stack_size`
+    /// patch, 1 when that patch removes it (`getOrDefault(MAX_STACK_SIZE, 1)`;
+    /// the patch's `"!minecraft:max_stack_size"` key, or a null value), else its
+    /// item's.
+    fn stack_max(&self, stack: &LootStack) -> i32 {
+        const KEY: &str = "minecraft:max_stack_size";
+        let patch = stack
+            .components
+            .iter()
+            .rev()
+            .find(|(id, _)| id.strip_prefix('!').unwrap_or(id) == KEY);
+        match patch {
+            Some((id, _)) if id.starts_with('!') => 1,
+            Some((_, Some(Tag::Byte(n)))) => i32::from(*n),
+            Some((_, Some(Tag::Short(n)))) => i32::from(*n),
+            Some((_, Some(Tag::Int(n)))) => *n,
+            Some((_, None)) => 1,
+            _ => self.facts(&stack.item).max_stack,
+        }
+        .max(1)
     }
     /// LootTable.createStackSplitter (every item is enabled).
     fn split(&self, stack: LootStack, items: &mut Vec<LootStack>) {
-        let max = self.facts(&stack.item).max_stack.max(1);
+        let max = self.stack_max(&stack);
         if stack.count < max {
             items.push(stack);
         } else {
@@ -1182,53 +1259,6 @@ impl LootData {
                 items.push(copy);
             }
         }
-    }
-    /// LootTable.fill into an empty container of `slots` slots with
-    /// `RandomSource.create(seed)`; `biome` is the container's biome for
-    /// location checks (None: no origin, checks fail).
-    pub fn fill(
-        &self,
-        table: &str,
-        seed: i64,
-        slots: usize,
-        biome: Option<&str>,
-    ) -> Vec<Option<LootStack>> {
-        self.fill_with(table, &mut LegacyRandom::new(seed), slots, biome)
-    }
-    /// LootTable.fill drawing from `random` (a seeded random or the table's
-    /// random sequence), which is advanced.
-    pub fn fill_with<R: RandomSource + Clone>(
-        &self,
-        table: &str,
-        random: &mut R,
-        slots: usize,
-        biome: Option<&str>,
-    ) -> Vec<Option<LootStack>> {
-        let mut out = vec![None; slots];
-        let Some(json) = self.tables.get(table) else {
-            return out;
-        };
-        let mut c = Context {
-            data: self,
-            random: random.clone(),
-            biome,
-            visited: Vec::new(),
-            luck: 0.0,
-            open_water: None,
-            entity: None,
-            enchanted_level: None,
-        };
-        let mut items = Vec::new();
-        c.table_raw(table, json, &mut |c, stack| c.data.split(stack, &mut items));
-        *random = c.random;
-        let mut available: Vec<usize> = (0..slots).collect();
-        shuffle(&mut available, random);
-        shuffle_and_split(&mut items, available.len(), random);
-        for stack in items {
-            let Some(slot) = available.pop() else { break };
-            out[slot] = (!stack.is_empty()).then_some(stack);
-        }
-        out
     }
 }
 
@@ -1287,6 +1317,52 @@ fn weight_draw(random: &mut impl RandomSource, total: i64) -> i64 {
     }
 }
 
+/// Whether a codec's id names `full`: a bare path is `minecraft:`'s.
+fn same_id(id: &str, full: &str) -> bool {
+    id == full || (!id.contains(':') && full.strip_prefix("minecraft:") == Some(id))
+}
+
+/// `MinMaxBounds.Doubles.matches`: a bare number is an exact bound.
+fn bounds_f(v: &Value, x: f64) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Number(n) => n.as_f64() == Some(x),
+        Value::Object(o) => {
+            o.get("min")
+                .and_then(Value::as_f64)
+                .is_none_or(|min| x >= min)
+                && o.get("max")
+                    .and_then(Value::as_f64)
+                    .is_none_or(|max| x <= max)
+        }
+        _ => false,
+    }
+}
+
+/// `StatePropertiesPredicate.RangedMatcher`, whose bounds are strings; an
+/// integer property compares numerically, any other by its string value.
+fn property_bounds(bounds: &serde_json::Map<String, Value>, have: &str) -> bool {
+    let bound = |key: &str| {
+        bounds.get(key).and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
+    };
+    let min_ok =
+        bound("min").is_none_or(|min| compare_property(have, &min) != std::cmp::Ordering::Less);
+    let max_ok =
+        bound("max").is_none_or(|max| compare_property(have, &max) != std::cmp::Ordering::Greater);
+    min_ok && max_ok
+}
+
+fn compare_property(have: &str, bound: &str) -> std::cmp::Ordering {
+    match (have.parse::<i64>(), bound.parse::<i64>()) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => have.cmp(bound),
+    }
+}
+
 /// Mth.nextInt.
 fn next_int(random: &mut impl RandomSource, min: i32, max: i32) -> i32 {
     if min >= max {
@@ -1332,6 +1408,7 @@ fn shuffle_and_split(result: &mut Vec<LootStack>, slots: usize, random: &mut imp
 }
 
 struct Context<'a, R> {
+    query: std::rc::Rc<query::LootQuery>,
     data: &'a LootData,
     random: R,
     biome: Option<&'a str>,
@@ -1346,6 +1423,242 @@ struct Context<'a, R> {
     enchanted_level: Option<&'a mut EnchantedLevel<'a, R>>,
 }
 type Sink<'s, R> = dyn FnMut(&mut Context<'_, R>, LootStack) + 's;
+
+/// `LocationCheck.test` / `LocationPredicate.matches` against a captured
+/// [`LootPlace`]: the predicate at `ORIGIN + offset`. A field whose data the
+/// roll did not capture fails; it is never taken as unconstrained.
+/// `holder_set` resolves a published HolderSet (`#tag`, an id or a list of
+/// ids) for the registries a location check names. A roll with neither an
+/// origin nor a biome has nothing to test: no match.
+pub fn evaluate_location_check(
+    c: &Value,
+    place: Option<&LootPlace>,
+    biome: Option<&str>,
+    holder_set: &dyn Fn(&str, &Value) -> Vec<String>,
+) -> bool {
+    let origin = place.and_then(|p| p.origin);
+    // An explicit biome (the fishing roll names one without a place) wins
+    // over the place's, which is captured at the origin.
+    let biome = biome.or_else(|| place.and_then(|p| p.biome.as_deref()));
+    // `LocationCheck.test`: no ORIGIN, no match. The main engine's
+    // fishing roll names its biome without a place, so a biome-only
+    // predicate keeps matching there.
+    if origin.is_none() && biome.is_none() {
+        return false;
+    }
+    let predicate = &c["predicate"];
+    if predicate.is_null() {
+        return true;
+    }
+    let Some(predicate) = predicate.as_object() else {
+        return false;
+    };
+    let offset = [
+        c["offsetX"].as_i64().unwrap_or(0),
+        c["offsetY"].as_i64().unwrap_or(0),
+        c["offsetZ"].as_i64().unwrap_or(0),
+    ];
+    let at = origin.map(|p| {
+        [
+            p[0] + offset[0] as f64,
+            p[1] + offset[1] as f64,
+            p[2] + offset[2] as f64,
+        ]
+    });
+    if let Some(position) = predicate.get("position").filter(|p| !p.is_null()) {
+        let Some(at) = at else { return false };
+        // `LocationPredicate.PositionPredicate.matches`.
+        if !bounds_f(&position["x"], at[0])
+            || !bounds_f(&position["y"], at[1])
+            || !bounds_f(&position["z"], at[2])
+        {
+            return false;
+        }
+    }
+    if let Some(dimension) = predicate.get("dimension").filter(|d| !d.is_null()) {
+        let Some(level) = place.and_then(|p| p.level.as_ref()) else {
+            return false;
+        };
+        let Some(dimension) = dimension.as_str() else {
+            return false;
+        };
+        if !same_id(dimension, &level.dimension) {
+            return false;
+        }
+    }
+    if let Some(biomes) = predicate.get("biomes").filter(|b| !b.is_null()) {
+        // `LocationPredicate.biomes` reads `Level.getBiome` at the checked
+        // position; the roll captured the biome at the origin only, so a
+        // nonzero offset has no biome to compare and fails instead of
+        // reusing the origin's.
+        if offset != [0, 0, 0] {
+            return false;
+        }
+        let Some(biome) = biome else {
+            return false;
+        };
+        // `LocationPredicate.biomes`: a HolderSet, so a `#tag` (the loot
+        // data's biome tags, packs included), an id or a list of ids.
+        if !holder_set("worldgen/biome", biomes)
+            .iter()
+            .any(|b| b == biome)
+        {
+            return false;
+        }
+    }
+    // Every remaining field is a fact of the block at the origin; the
+    // place carries no world to read at an offset from it.
+    let origin_only = place.filter(|_| offset == [0, 0, 0]);
+    if let Some(block) = predicate.get("block").filter(|b| !b.is_null()) {
+        let Some(place) = origin_only else {
+            return false;
+        };
+        if !block_predicate_matches(block, place, holder_set) {
+            return false;
+        }
+    }
+    if let Some(light) = predicate.get("light").filter(|l| !l.is_null()) {
+        let Some(place) = origin_only else {
+            return false;
+        };
+        let Some(light_at) = place.light else {
+            return false;
+        };
+        if !int_bounds(&light["light"], light_at) {
+            return false;
+        }
+    }
+    if let Some(fluid) = predicate.get("fluid").filter(|f| !f.is_null()) {
+        let Some(place) = origin_only else {
+            return false;
+        };
+        // A FluidState's properties are not captured, so a `state`
+        // matcher cannot be answered.
+        if !fluid["state"].is_null() {
+            return false;
+        }
+        let have = place.fluid.as_deref().unwrap_or("minecraft:empty");
+        let fluids = &fluid["fluids"];
+        if !fluids.is_null() && !holder_set("fluid", fluids).iter().any(|f| f == have) {
+            return false;
+        }
+    }
+    if let Some(want) = predicate.get("can_see_sky").filter(|s| !s.is_null()) {
+        let Some(place) = origin_only else {
+            return false;
+        };
+        let Some(want) = want.as_bool() else {
+            return false;
+        };
+        if place.can_see_sky != Some(want) {
+            return false;
+        }
+    }
+    // `CampfireBlock.isSmokeyPos` needs the block's collision shape and
+    // a campfire tag read from the level; the place captures neither.
+    if predicate.get("smokey").is_some_and(|s| !s.is_null()) {
+        return false;
+    }
+    if let Some(structures) = predicate.get("structures").filter(|s| !s.is_null()) {
+        // `LocationPredicate.structures`: `getStructureWithPieceAt` finds
+        // a start of a named structure with a piece at the position.
+        let Some(place) = origin_only else {
+            return false;
+        };
+        let Some(here) = place.structures.as_ref() else {
+            return false;
+        };
+        let wanted = holder_set("worldgen/structure", structures);
+        if !here
+            .iter()
+            .any(|s| s.piece && wanted.iter().any(|w| same_id(w, &s.name)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// `BlockPredicate.matchesState` and `matchesBlockEntity` for the block
+/// [`LootPlace::block`] captured. `holder_set` resolves the `blocks`
+/// HolderSet.
+pub fn block_predicate_matches(
+    predicate: &Value,
+    place: &LootPlace,
+    holder_set: &dyn Fn(&str, &Value) -> Vec<String>,
+) -> bool {
+    let Some(state) = place.block.as_ref() else {
+        return false;
+    };
+    let blocks = &predicate["blocks"];
+    if !blocks.is_null() && !holder_set("block", blocks).iter().any(|b| b == &state.name) {
+        return false;
+    }
+    for key in ["state", "properties"] {
+        let Some(properties) = predicate.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, want) in properties {
+            let Some(have) = state.properties.get(name) else {
+                return false;
+            };
+            let holds = match want {
+                Value::String(value) => have == value,
+                Value::Bool(value) => have == &value.to_string(),
+                Value::Number(value) => have == &value.to_string(),
+                Value::Object(bounds) => property_bounds(bounds, have),
+                _ => false,
+            };
+            if !holds {
+                return false;
+            }
+        }
+    }
+    if let Some(nbt) = predicate.get("nbt").and_then(Value::as_str) {
+        let Ok((pattern, _)) = horizon_core::nbt::parse_snbt(nbt) else {
+            return false;
+        };
+        if !horizon_core::nbt::compare_nbt(&pattern, place.block_entity.as_ref()) {
+            return false;
+        }
+    }
+    // `DataComponentMatchers.components`: each listed component must
+    // equal the block entity's collected value exactly, as the item
+    // side compares it. A place captured without one fails.
+    if let Some(matchers) = predicate
+        .get("components")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+    {
+        let Some(have) = place.block_entity_components.as_ref() else {
+            return false;
+        };
+        for (id, want) in matchers {
+            let want = match want {
+                // `CustomData.CODEC` reads a compound; a data pack may
+                // write it as JSON or as SNBT, as `NbtPredicate` does.
+                Value::String(_) if id == "minecraft:custom_data" => nbt_predicate_tag(want),
+                _ => json_tag(want),
+            };
+            // A conversion that fails matches nothing, not an absent component.
+            let Some(want) = want else {
+                return false;
+            };
+            let Some(have) = have.get(id.as_str()) else {
+                return false;
+            };
+            if have != &want {
+                return false;
+            }
+        }
+    }
+    // A custom predicate needs the predicate registry, which the place
+    // does not carry; only an empty map holds.
+    !predicate
+        .get("predicates")
+        .and_then(Value::as_object)
+        .is_some_and(|p| !p.is_empty())
+}
 
 impl<R: RandomSource> Context<'_, R> {
     /// A `LootContext.EntityTarget` parameter.
@@ -1422,6 +1735,16 @@ impl<R: RandomSource> Context<'_, R> {
     fn entity_matches(&self, p: &Value, e: Option<&LootEntity>) -> bool {
         self.data.entity_matches(p, e)
     }
+
+    /// `LocationCheck.test` / `LocationPredicate.matches`: the predicate at
+    /// `ORIGIN + offset`. A field whose data the roll did not capture fails;
+    /// it is never taken as unconstrained.
+    fn location_matches(&self, c: &Value) -> bool {
+        let place = current_native_loot_place();
+        evaluate_location_check(c, place.as_deref(), self.biome, &|registry, value| {
+            self.data.holder_set(registry, value)
+        })
+    }
     /// A number provider. An unknown type gives 0, as in items.rs `number`
     /// (a data pack's typo yields nothing rather than a full roll).
     fn int(&mut self, v: &Value) -> i32 {
@@ -1464,6 +1787,13 @@ impl<R: RandomSource> Context<'_, R> {
         }
     }
     fn condition(&mut self, c: &Value) -> bool {
+        if let Some(holds) =
+            query::condition(c, &self.query, self.query.tool.as_ref(), |item, ability| {
+                crate::native_load_hooks::item_ability_default(item, ability, self.data)
+            })
+        {
+            return holds;
+        }
         let data = self.data;
         match c {
             Value::Null => true,
@@ -1542,21 +1872,7 @@ impl<R: RandomSource> Context<'_, R> {
                     let chance = self.float(&c["chance"]);
                     self.random.next_float() < chance
                 }
-                "minecraft:location_check" => {
-                    let Some(biome) = self.biome else {
-                        return false;
-                    };
-                    // `LocationPredicate.biomes`: a HolderSet, so a `#tag`
-                    // (the loot data's biome tags, packs included), an id or
-                    // a list of ids.
-                    match &c["predicate"]["biomes"] {
-                        Value::Null => true,
-                        set => data
-                            .holder_set("worldgen/biome", set)
-                            .iter()
-                            .any(|b| b == biome),
-                    }
-                }
+                "minecraft:location_check" => self.location_matches(c),
                 // A mod's own kind: the hook answers; a bare type name is
                 // minecraft's own and an unknown one fails.
                 k if k.contains(':') && !k.starts_with("minecraft:") => {
@@ -1588,22 +1904,6 @@ impl<R: RandomSource> Context<'_, R> {
                 self.run(m, stack)
             }
             _ => stack,
-        }
-    }
-    /// The context a mod's own loot kinds see: drawn lazily, only when
-    /// the table has a mod's kind, so the random stays untouched without.
-    fn native_ctx(&mut self) -> LootContext<'_> {
-        let seed = self.random.next_long();
-        LootContext {
-            entity: self.entity.map(|e| &e.this),
-            damage: self.entity.and_then(|e| e.damage.as_ref()),
-            player: self.entity.and_then(|e| e.player.as_ref()),
-            tool: None, // The tool is not in this engine's context.
-            block: None,
-            luck: self.luck,
-            biome: self.biome,
-            seed,
-            place: current_native_loot_place(),
         }
     }
     fn run(&mut self, f: &Value, mut stack: LootStack) -> LootStack {
@@ -2056,6 +2356,41 @@ impl<R: RandomSource> Context<'_, R> {
                     .components
                     .push((id.to_owned(), Some(Tag::Compound(content))));
             }
+            // SetWritableBookPagesFunction: the pages go through the
+            // function's `ListOperation` over the writable book content the
+            // stack already has (`WritableBookContent.EMPTY` when it has
+            // none), keeping the stack's other components. The item layer
+            // reads the content into the book's editable pages
+            // (`item_data::decode_components` -> `writable_pages`).
+            "minecraft:set_writable_book_pages" => {
+                let id = "minecraft:writable_book_content";
+                let mut content = stack
+                    .components
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == id)
+                    .and_then(|(_, v)| match v {
+                        Some(Tag::Compound(map)) => Some(map.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let old = match content.remove(&"pages".into()) {
+                    Some(Tag::List(values)) => values,
+                    _ => Vec::new(),
+                };
+                let mut spec = f.clone();
+                spec["values"] = f["pages"].clone();
+                // `WritableBookContent.MAX_PAGES`: the page codec limits the
+                // replacement list, and append or insert past 100 is ignored.
+                let pages = list_operation_capped(&spec, old, 100, |v| {
+                    horizon_core::json_nbt::json_to_tag(v).unwrap_or(Tag::String("".into()))
+                });
+                content.insert("pages".into(), Tag::List(pages));
+                stack.components.retain(|(k, _)| k != id);
+                stack
+                    .components
+                    .push((id.to_owned(), Some(Tag::Compound(content))));
+            }
             // SetComponentsFunction: the patch's components, applied when the
             // stack becomes an item (trim on worn armour, see `mobs::finalize`).
             "minecraft:set_components" => {
@@ -2374,11 +2709,12 @@ mod namespace_tests {
         let loot = LootData::load(&root, &off, &defaults).unwrap();
         assert_eq!(
             loot.tags[&("item".into(), "demo:food".into())],
-            vec![serde_json::json!("minecraft:bread")]
+            crate::tag_layers::TagLayers::from_file(
+                &serde_json::json!({"values": ["minecraft:stone"]})
+            )
         );
         assert!(
-            !loot
-                .tags
+            loot.tags
                 .contains_key(&("item".into(), "demo:absent".into()))
         );
         fs::remove_dir_all(root).unwrap();
@@ -2468,6 +2804,61 @@ mod namespace_tests {
         drop(tables);
         fs::write(dir.join("dirt.json"), r#"{"pools": [}"#).unwrap();
         assert!(shared_tables(&root, &PackOverlay::NONE).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A content mod's enchantments (`data/<ns>/enchantment/`) load beside
+    /// vanilla's, and a world's pack replaces one.
+    #[test]
+    fn loads_every_namespace_enchantments() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-loot-enchant-ns-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let files = [
+            ("items.json", r#"{"minecraft:diamond_hoe": {}}"#),
+            ("data/harvestmod/enchantment/tools/broken.json", "{"),
+            (
+                "data/minecraft/enchantment/mending.json",
+                r#"{"supported_items": "minecraft:diamond_hoe", "max_level": 1}"#,
+            ),
+            (
+                "data/harvestmod/enchantment/scythe.json",
+                r#"{"supported_items": "minecraft:diamond_hoe", "max_level": 3}"#,
+            ),
+            (
+                "data/harvestmod/enchantment/tools/sweep.json",
+                r#"{"supported_items": "minecraft:diamond_hoe", "max_level": 1}"#,
+            ),
+        ];
+        for (name, text) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        // A valid folder or namespace named enchantment must not change another kind's error policy.
+        let unrelated = root.join("data/enchantment/recipe/enchantment/broken.json");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, b"{").unwrap();
+        assert!(load_kind(&root.join("data"), "recipe", &mut HashMap::new()).is_err());
+        fs::remove_file(unrelated).unwrap();
+        let defaults = crate::item_defaults::read(&root).unwrap();
+        let data = LootData::load(&root, &PackOverlay::NONE, &defaults).unwrap();
+        let level = |data: &LootData, name: &str| {
+            data.enchantments
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.max_level)
+        };
+        assert_eq!(level(&data, "minecraft:mending"), Some(1));
+        assert_eq!(level(&data, "harvestmod:scythe"), Some(3));
+        assert_eq!(level(&data, "harvestmod:tools/broken"), None);
+        assert_eq!(level(&data, "harvestmod:tools/sweep"), Some(1));
+        let pack = vec![(
+            "enchantment/harvestmod:scythe".to_owned(),
+            vec![br#"{"supported_items": "minecraft:diamond_hoe", "max_level": 5}"#.to_vec()],
+        )];
+        let data = LootData::load(&root, &PackOverlay::new(&pack), &defaults).unwrap();
+        assert_eq!(level(&data, "harvestmod:scythe"), Some(5));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2885,6 +3276,77 @@ mod namespace_tests {
                 "author": "Cartographer",
                 "pages": [{"raw": "page two"}],
             })
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `SetWritableBookPagesFunction`: the function's pages go through its
+    /// `ListOperation` over the writable book content an earlier function
+    /// wrote, keeping it when the mode appends and replacing it otherwise;
+    /// an insert past the end leaves the pages as they were. The item layer
+    /// reads the content into the book's editable pages.
+    #[test]
+    fn set_writable_book_pages_applies_the_page_operation() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-loot-writable-pages-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("data/minecraft/loot_table/chests")).unwrap();
+        fs::write(
+            root.join("items.json"),
+            r#"{"minecraft:writable_book": {}}"#,
+        )
+        .unwrap();
+        let pages = |function: &str| {
+            let table = format!(
+                r#"{{"pools": [{{"rolls": 1, "entries": [{{"type": "minecraft:item", "name": "minecraft:writable_book",
+                    "modifier": [
+                        {{"type": "minecraft:set_components", "components": {{"minecraft:writable_book_content": {{"pages": [{{"raw": "page one"}}]}}}}}},
+                        {function}
+                    ]}}]}}]}}"#
+            );
+            fs::write(
+                root.join("data/minecraft/loot_table/chests/writable.json"),
+                table,
+            )
+            .unwrap();
+            let defaults = crate::item_defaults::read(&root).unwrap();
+            let data = LootData::load(&root, &PackOverlay::NONE, &defaults).unwrap();
+            let filled = data.fill("minecraft:chests/writable", 5, 27, None);
+            let book = filled.iter().flatten().next().expect("a book");
+            let content: Vec<_> = book
+                .components
+                .iter()
+                .filter(|(k, _)| k == "minecraft:writable_book_content")
+                .collect();
+            assert_eq!(content.len(), 1, "{:?}", book.components);
+            match &content[0].1 {
+                Some(horizon_core::nbt::Tag::Compound(map)) => map
+                    .get(&"pages".into())
+                    .map_or(serde_json::Value::Null, crate::worldgen::tag_json),
+                _ => serde_json::Value::Null,
+            }
+        };
+        assert_eq!(
+            pages(
+                r#"{"type": "minecraft:set_writable_book_pages", "mode": "append", "pages": [{"raw": "page two"}]}"#
+            ),
+            serde_json::json!([{"raw": "page one"}, {"raw": "page two"}])
+        );
+        assert_eq!(
+            pages(
+                r#"{"type": "minecraft:set_writable_book_pages", "mode": "replace_all", "pages": [{"raw": "page three"}]}"#
+            ),
+            serde_json::json!([{"raw": "page three"}])
+        );
+        // An insert past the end is logged and ignored in vanilla, so the
+        // earlier content is still the book's content.
+        assert_eq!(
+            pages(
+                r#"{"type": "minecraft:set_writable_book_pages", "mode": "insert", "offset": 9, "pages": [{"raw": "page four"}]}"#
+            ),
+            serde_json::json!([{"raw": "page one"}])
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -3345,17 +3807,20 @@ mod recipe_result_tests;
 mod location_check_biome_tests {
     use super::*;
 
-    /// A table that drops one stone where `biomes` matches, read with a
-    /// jungle biome tag of the game's own and `packs` over it.
-    fn table(name: &str, biomes: &str, packs: &[(String, Vec<Vec<u8>>)]) -> LootData {
+    /// A table that drops one stone where the `location_check` `condition`
+    /// (the fields after the type) holds, read with a jungle biome tag of the
+    /// game's own and `packs` over it.
+    fn table_with(name: &str, condition: &str, packs: &[(String, Vec<Vec<u8>>)]) -> LootData {
         let root = std::env::temp_dir().join(format!("loot-biomes-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let dir = root.join("data/minecraft/loot_table");
         fs::create_dir_all(&dir).unwrap();
-        let json = format!(
-            r#"{{"pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"minecraft:stone",
-                "condition":{{"type":"minecraft:location_check","predicate":{{"biomes":{biomes}}}}}}}]}}]}}"#
-        );
+        let json = [
+            r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","condition":"#,
+            condition,
+            "}]}]}",
+        ]
+        .concat();
         fs::write(dir.join("test.json"), json).unwrap();
         let tags = root.join("data/minecraft/tags/worldgen/biome");
         fs::create_dir_all(&tags).unwrap();
@@ -3369,6 +3834,16 @@ mod location_check_biome_tests {
         let data = LootData::load(&root, &PackOverlay::new(packs), &defaults).unwrap();
         let _ = fs::remove_dir_all(&root);
         data
+    }
+
+    fn table(name: &str, biomes: &str, packs: &[(String, Vec<Vec<u8>>)]) -> LootData {
+        let condition = [
+            r#"{"type":"minecraft:location_check","predicate":{"biomes":"#,
+            biomes,
+            "}}",
+        ]
+        .concat();
+        table_with(name, &condition, packs)
     }
 
     fn drops(data: &LootData, biome: Option<&str>) -> bool {
@@ -3434,6 +3909,466 @@ mod location_check_biome_tests {
         assert!(drops(&data, Some("minecraft:bamboo_jungle")));
         assert!(drops(&data, Some("minecraft:desert")));
         assert!(!drops(&data, Some("minecraft:savanna")));
+    }
+
+    /// `LocationCheck.test` with an offset reads the biome at the checked
+    /// position, not the origin's. The roll captured the origin biome only,
+    /// so a nonzero offset fails instead of reusing it; zero still matches.
+    #[test]
+    fn a_nonzero_offset_biome_check_fails() {
+        let offset = table_with(
+            "offset",
+            r#"{"type":"minecraft:location_check","offsetX":100,"predicate":{"biomes":"minecraft:jungle"}}"#,
+            &[],
+        );
+        assert!(!drops(&offset, Some("minecraft:jungle")));
+        let at_origin = table_with(
+            "offset_zero",
+            r#"{"type":"minecraft:location_check","offsetX":0,"predicate":{"biomes":"minecraft:jungle"}}"#,
+            &[],
+        );
+        assert!(drops(&at_origin, Some("minecraft:jungle")));
+    }
+
+    /// An entity roll has no explicit biome (`roll_entity_with` leaves it
+    /// None), so a biome-only predicate reads the roll site's: it matches at
+    /// a known biome and fails when the place captured none, never matching
+    /// unconstrained.
+    #[test]
+    fn entity_loot_reads_the_places_biome() {
+        let data = table("entity", r#""minecraft:jungle""#, &[]);
+        let place = |biome: Option<&str>| LootPlace {
+            origin: Some([0.5, 64.0, 0.5]),
+            level: Some(LootLevel {
+                dimension: "minecraft:overworld".to_owned(),
+                ..LootLevel::default()
+            }),
+            biome: biome.map(str::to_owned),
+            ..LootPlace::default()
+        };
+        let drops = |place: Option<LootPlace>| {
+            let roll = || {
+                !data
+                    .roll_entity(
+                        "minecraft:test",
+                        &mut LegacyRandom::new(1),
+                        &EntityLootParams::default(),
+                    )
+                    .is_empty()
+            };
+            match place {
+                Some(place) => with_native_loot_place(place, roll),
+                None => roll(),
+            }
+        };
+        assert!(drops(Some(place(Some("minecraft:jungle")))));
+        assert!(!drops(Some(place(Some("minecraft:desert")))));
+        assert!(!drops(Some(place(None))), "no captured biome fails");
+        assert!(!drops(None), "no place fails");
+    }
+
+    /// A biome the roll names itself (the fishing roll) wins over the
+    /// place's, which is captured at the origin only.
+    #[test]
+    fn an_explicit_biome_wins_over_the_places() {
+        let data = table("explicit", r#""minecraft:jungle""#, &[]);
+        let place = |biome: &str| LootPlace {
+            origin: Some([0.5, 64.0, 0.5]),
+            biome: Some(biome.to_owned()),
+            ..LootPlace::default()
+        };
+        let with_place = |place: LootPlace, biome: Option<&str>| {
+            with_native_loot_place(place, || drops(&data, biome))
+        };
+        assert!(with_place(
+            place("minecraft:desert"),
+            Some("minecraft:jungle")
+        ));
+        assert!(!with_place(
+            place("minecraft:jungle"),
+            Some("minecraft:desert")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod location_check_fields_tests {
+    use super::*;
+
+    /// One stone drop whose `location_check` is `condition` (the fields after
+    /// the type).
+    fn table(name: &str, condition: &str) -> LootData {
+        let root =
+            std::env::temp_dir().join(format!("loot-location-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("data/minecraft/loot_table");
+        fs::create_dir_all(&dir).unwrap();
+        let json =
+            r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone",
+            "condition":{"type":"minecraft:location_check",CONDITION}}]}]}"#
+                .replace("CONDITION", condition);
+        fs::write(dir.join("test.json"), json).unwrap();
+        let tags = root.join("data/minecraft/tags/block");
+        fs::create_dir_all(&tags).unwrap();
+        fs::write(
+            tags.join("logs.json"),
+            r#"{"values":["minecraft:oak_log"]}"#,
+        )
+        .unwrap();
+        let structures = root.join("data/minecraft/tags/worldgen/structure");
+        fs::create_dir_all(&structures).unwrap();
+        fs::write(
+            structures.join("village.json"),
+            r#"{"values":["minecraft:village_plains","minecraft:village_taiga"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("items.json"), "{}").unwrap();
+        let defaults = crate::item_defaults::read(&root).unwrap();
+        let data = LootData::load(&root, &PackOverlay::NONE, &defaults).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        data
+    }
+
+    fn drops(data: &LootData, place: LootPlace) -> bool {
+        with_native_loot_place(place, || {
+            !data
+                .roll("minecraft:test", &mut LegacyRandom::new(1), 0.0, None, None)
+                .is_empty()
+        })
+    }
+
+    fn place() -> LootPlace {
+        LootPlace {
+            origin: Some([0.5, 64.0, 0.5]),
+            level: Some(LootLevel {
+                dimension: "minecraft:overworld".to_owned(),
+                ..LootLevel::default()
+            }),
+            ..LootPlace::default()
+        }
+    }
+
+    fn block_place(name: &str, properties: &[(&str, &str)]) -> LootPlace {
+        LootPlace {
+            block: Some(LootBlockState {
+                name: name.to_owned(),
+                properties: properties
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            }),
+            ..place()
+        }
+    }
+
+    fn with_dimension(dimension: &str) -> LootPlace {
+        LootPlace {
+            level: Some(LootLevel {
+                dimension: dimension.to_owned(),
+                ..LootLevel::default()
+            }),
+            ..place()
+        }
+    }
+
+    /// `LocationPredicate.dimension` is a `ResourceKey<Level>`; a bare path
+    /// names the `minecraft:` dimension.
+    #[test]
+    fn dimension_matches_the_place_level() {
+        let data = table(
+            "dimension",
+            r#""predicate":{"dimension":"minecraft:the_nether"}"#,
+        );
+        assert!(drops(&data, with_dimension("minecraft:the_nether")));
+        assert!(!drops(&data, with_dimension("minecraft:overworld")));
+
+        let bare = table(
+            "dimension_bare",
+            r#""predicate":{"dimension":"the_nether"}"#,
+        );
+        assert!(drops(&bare, with_dimension("minecraft:the_nether")));
+
+        // Without a level in the place there is nothing to compare.
+        let missing = table(
+            "dimension_missing",
+            r#""predicate":{"dimension":"minecraft:overworld"}"#,
+        );
+        assert!(!drops(
+            &missing,
+            LootPlace {
+                level: None,
+                ..place()
+            }
+        ));
+    }
+
+    /// `LocationPredicate.position` reads the x, y and z `MinMaxBounds` at
+    /// `ORIGIN + offset`; the offset is `LocationCheck`'s.
+    #[test]
+    fn position_reads_the_origin_and_offset() {
+        let data = table(
+            "position",
+            r#""predicate":{"position":{"x":{"min":1.0,"max":2.0},"y":64.0,"z":{"max":0.5}}}"#,
+        );
+        let mut at = place();
+        at.origin = Some([1.5, 64.0, 0.5]);
+        assert!(drops(&data, at.clone()));
+        at.origin = Some([1.5, 64.001, 0.5]);
+        assert!(!drops(&data, at.clone()));
+        at.origin = Some([0.5, 64.0, 0.5]);
+        assert!(!drops(&data, at.clone()));
+
+        let offset = table(
+            "position_offset",
+            r#""predicate":{"position":{"x":{"min":2.0,"max":3.0}}},"offsetX":2"#,
+        );
+        at.origin = Some([0.5, 64.0, 0.5]);
+        assert!(drops(&offset, at.clone()));
+        at.origin = Some([1.5, 64.0, 0.5]);
+        assert!(!drops(&offset, at.clone()));
+
+        let offset_y = table(
+            "position_offset_y",
+            r#""predicate":{"position":{"y":65.0}},"offsetY":1"#,
+        );
+        at.origin = Some([0.5, 64.0, 0.5]);
+        assert!(drops(&offset_y, at));
+    }
+
+    /// `BlockPredicate.blocks` is a HolderSet (`#tag`, an id or a list) and
+    /// `state` is a `StatePropertiesPredicate` (exact or ranged).
+    #[test]
+    fn block_matches_its_holder_set_state_and_properties() {
+        let data = table(
+            "block",
+            r##""predicate":{"block":{"blocks":"#minecraft:logs","state":{"axis":"x"}}}"##,
+        );
+        assert!(drops(
+            &data,
+            block_place("minecraft:oak_log", &[("axis", "x")])
+        ));
+        assert!(!drops(
+            &data,
+            block_place("minecraft:oak_log", &[("axis", "y")])
+        ));
+        assert!(!drops(
+            &data,
+            block_place("minecraft:stone", &[("axis", "x")])
+        ));
+
+        let list = table(
+            "block_list",
+            r#""predicate":{"block":{"blocks":["minecraft:oak_log","minecraft:birch_log"]}}"#,
+        );
+        assert!(drops(&list, block_place("minecraft:birch_log", &[])));
+
+        let ranged = table(
+            "block_range",
+            r#""predicate":{"block":{"blocks":"minecraft:wheat","state":{"age":{"min":"2","max":"4"}}}}"#,
+        );
+        assert!(drops(
+            &ranged,
+            block_place("minecraft:wheat", &[("age", "3")])
+        ));
+        assert!(!drops(
+            &ranged,
+            block_place("minecraft:wheat", &[("age", "5")])
+        ));
+        assert!(!drops(&ranged, block_place("minecraft:wheat", &[])));
+    }
+
+    /// `BlockPredicate.nbt` compares the block entity's full metadata.
+    #[test]
+    fn block_nbt_matches_the_block_entity() {
+        let data = table(
+            "block_nbt",
+            r#""predicate":{"block":{"nbt":"{id:\"minecraft:chest\",Lock:\"key\"}"}}"#,
+        );
+        let mut p = block_place("minecraft:chest", &[]);
+        p.block_entity = Some(Tag::compound([
+            ("id", Tag::String("minecraft:chest".into())),
+            ("Lock", Tag::String("key".into())),
+        ]));
+        assert!(drops(&data, p.clone()));
+        p.block_entity = Some(Tag::compound([
+            ("id", Tag::String("minecraft:chest".into())),
+            ("Lock", Tag::String("other".into())),
+        ]));
+        assert!(!drops(&data, p));
+    }
+
+    /// `BlockPredicate.components` reads the components the roll collected
+    /// for the block entity; a different value or none does not match.
+    #[test]
+    fn block_components_read_the_collected_map() {
+        let data = table(
+            "block_components",
+            r#""predicate":{"block":{"blocks":"minecraft:chest","components":{"minecraft:custom_name":"Loot"}}}"#,
+        );
+        let mut p = block_place("minecraft:chest", &[]);
+        p.block_entity_components = Some(Tag::compound([(
+            "minecraft:custom_name",
+            Tag::String("Loot".into()),
+        )]));
+        assert!(drops(&data, p.clone()));
+        p.block_entity_components = Some(Tag::compound([(
+            "minecraft:custom_name",
+            Tag::String("Other".into()),
+        )]));
+        assert!(!drops(&data, p.clone()));
+        p.block_entity_components = None;
+        assert!(!drops(&data, p));
+    }
+
+    /// `LightPredicate.composite` reads the captured
+    /// `getMaxLocalRawBrightness`.
+    #[test]
+    fn light_reads_the_captured_brightness() {
+        let data = table(
+            "light",
+            r#""predicate":{"light":{"light":{"min":10,"max":15}}}"#,
+        );
+        let mut p = place();
+        p.light = Some(12);
+        assert!(drops(&data, p.clone()));
+        p.light = Some(5);
+        assert!(!drops(&data, p.clone()));
+        p.light = None;
+        assert!(!drops(&data, p.clone()));
+
+        let exact = table("light_exact", r#""predicate":{"light":{"light":7}}"#);
+        p.light = Some(7);
+        assert!(drops(&exact, p));
+    }
+
+    /// `FluidPredicate.fluids` is a HolderSet of the captured fluid; the
+    /// empty fluid is any fluids-free predicate.
+    #[test]
+    fn fluid_reads_the_captured_fluid() {
+        let data = table(
+            "fluid",
+            r#""predicate":{"fluid":{"fluids":"minecraft:water"}}"#,
+        );
+        let mut p = place();
+        p.fluid = Some("minecraft:water".to_owned());
+        assert!(drops(&data, p.clone()));
+        p.fluid = Some("minecraft:lava".to_owned());
+        assert!(!drops(&data, p.clone()));
+
+        let any = table("fluid_any", r#""predicate":{"fluid":{}}"#);
+        p.fluid = None;
+        assert!(drops(&any, p.clone()));
+
+        let state = table(
+            "fluid_state",
+            r#""predicate":{"fluid":{"state":{"level":"0"}}}"#,
+        );
+        p.fluid = Some("minecraft:water".to_owned());
+        assert!(!drops(&state, p));
+    }
+
+    /// `LocationPredicate.canSeeSky` reads the captured `Level.canSeeSky`.
+    #[test]
+    fn can_see_sky_reads_the_captured_flag() {
+        let data = table("sky", r#""predicate":{"can_see_sky":true}"#);
+        let mut p = place();
+        p.can_see_sky = Some(true);
+        assert!(drops(&data, p.clone()));
+        p.can_see_sky = Some(false);
+        assert!(!drops(&data, p.clone()));
+        let dark = table("sky_dark", r#""predicate":{"can_see_sky":false}"#);
+        p.can_see_sky = Some(false);
+        assert!(drops(&dark, p));
+    }
+
+    /// `LocationPredicate.structures` reads `getStructureWithPieceAt`: the
+    /// structures whose start box reaches the position and whose pieces cover
+    /// it too.
+    #[test]
+    fn structures_read_the_structures_with_a_piece_at_the_place() {
+        let data = table(
+            "structures",
+            r##""predicate":{"structures":"#minecraft:village"}"##,
+        );
+        let mut p = place();
+        // A village start with a piece at the origin matches the tag.
+        p.structures = Some(vec![LootStructure {
+            name: "minecraft:village_plains".to_owned(),
+            piece: true,
+        }]);
+        assert!(drops(&data, p.clone()));
+        // A start whose box reaches the origin but no piece covers it is
+        // `getStructureAt` without `getStructureWithPieceAt`: no match.
+        p.structures = Some(vec![LootStructure {
+            name: "minecraft:village_plains".to_owned(),
+            piece: false,
+        }]);
+        assert!(!drops(&data, p.clone()));
+        // Outside: a structure with a piece there, but not a village.
+        p.structures = Some(vec![LootStructure {
+            name: "minecraft:shipwreck".to_owned(),
+            piece: true,
+        }]);
+        assert!(!drops(&data, p.clone()));
+        // The place had no level to ask: the predicate fails instead of
+        // passing unconstrained.
+        p.structures = None;
+        assert!(!drops(&data, p.clone()));
+        // A single id and a bare path match too.
+        let id = table(
+            "structures_id",
+            r#""predicate":{"structures":"minecraft:village_plains"}"#,
+        );
+        p.structures = Some(vec![LootStructure {
+            name: "minecraft:village_plains".to_owned(),
+            piece: true,
+        }]);
+        assert!(drops(&id, p.clone()));
+        let bare = table(
+            "structures_bare",
+            r#""predicate":{"structures":"village_plains"}"#,
+        );
+        assert!(drops(&bare, p.clone()));
+        // The place captured only the origin, so an offset cannot be
+        // answered.
+        let offset = table(
+            "structures_offset",
+            r##""predicate":{"structures":"#minecraft:village"},"offsetY":1"##,
+        );
+        assert!(!drops(&offset, p));
+    }
+
+    /// Fields whose data the place does not capture fail instead of passing
+    /// unconstrained: `smokey`, uncollected components, fluid state
+    /// properties, a snapshot field at a non-zero offset, and no origin.
+    #[test]
+    fn fields_without_captured_data_fail() {
+        for (name, condition) in [
+            ("smokey", r#""predicate":{"smokey":false}"#),
+            (
+                "components",
+                r#""predicate":{"block":{"blocks":"minecraft:oak_log","components":{"minecraft:custom_name":"x"}}}"#,
+            ),
+            (
+                "offset_block",
+                r#""predicate":{"block":{"blocks":"minecraft:oak_log"}},"offsetY":1"#,
+            ),
+        ] {
+            let data = table(name, condition);
+            assert!(
+                !drops(&data, block_place("minecraft:oak_log", &[])),
+                "{name}"
+            );
+        }
+
+        let no_origin = table("no_origin", r#""predicate":{"position":{"y":64.0}}"#);
+        assert!(!drops(
+            &no_origin,
+            LootPlace {
+                origin: None,
+                ..place()
+            }
+        ));
     }
 }
 
@@ -3574,6 +4509,14 @@ impl LootData {
                             .is_some_and(|stack| self.item_matches(item, stack))
                     })
             }
+            // SlotsPredicate (EntitySlotsPredicate): every range must have an
+            // item matching its predicate.
+            "minecraft:slots" => v.as_object().into_iter().flatten().all(|(range, item)| {
+                slot_range_equipment(range).iter().any(|slot| {
+                    e.item(slot)
+                        .is_some_and(|stack| self.item_matches(item, stack))
+                })
+            }),
             "minecraft:components" => v.as_object().into_iter().flatten().all(|(c, want)| match c
                 .as_str()
             {
@@ -3763,5 +4706,70 @@ mod custom_data_predicate_tests {
         assert_eq!(doubled(Some("{h:1}")), ["orange", "light_gray"]);
         assert_eq!(doubled(Some("{entries:[]}")), ["lime", "light_gray"]);
         assert_eq!(doubled(None), ["light_gray"]);
+    }
+}
+
+#[cfg(test)]
+#[path = "loot_fill_tests.rs"]
+mod fill_tests;
+
+#[cfg(test)]
+mod slots_predicate_tests {
+    use super::*;
+
+    /// A one-pool table whose stone entry asks for `predicate` on `this`.
+    fn table(name: &str, predicate: &str) -> LootData {
+        let root = std::env::temp_dir().join(format!("loot-slots-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("data/minecraft/loot_table");
+        fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item","name":"minecraft:stone",
+                "condition":{{"type":"minecraft:entity_properties","entity":"this","predicate":{predicate}}}}}]}}]}}"#
+        );
+        fs::write(dir.join("test.json"), json).unwrap();
+        fs::write(root.join("items.json"), "{}").unwrap();
+        let defaults = crate::item_defaults::read(&root).unwrap();
+        let data = LootData::load(&root, &PackOverlay::NONE, &defaults).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        data
+    }
+
+    fn drops(data: &LootData, this: LootEntity) -> bool {
+        let params = EntityLootParams {
+            this,
+            ..Default::default()
+        };
+        !data
+            .roll_entity("minecraft:test", &mut LegacyRandom::new(1), &params)
+            .is_empty()
+    }
+
+    /// `SlotsPredicate` (the `minecraft:slots` entity predicate): every
+    /// range must hold an item matching its predicate, so a worn diamond
+    /// sword satisfies `weapon.mainhand` and an empty head fails
+    /// `armor.head`.
+    #[test]
+    fn a_slot_range_matches_its_equipment() {
+        let mut this = LootEntity::new("minecraft:zombie");
+        this.equipment = vec![(
+            "mainhand".to_owned(),
+            LootStack::new("minecraft:diamond_sword"),
+        )];
+        let sword = table(
+            "sword",
+            r#"{"minecraft:slots":{"weapon.mainhand":{"items":"minecraft:diamond_sword"}}}"#,
+        );
+        assert!(drops(&sword, this.clone()));
+        let axe = table(
+            "axe",
+            r#"{"minecraft:slots":{"weapon.mainhand":{"items":"minecraft:diamond_axe"}}}"#,
+        );
+        assert!(!drops(&axe, this.clone()));
+        let helmet = table(
+            "helmet",
+            r#"{"minecraft:slots":{"armor.head":{"items":"minecraft:diamond_helmet"}}}"#,
+        );
+        assert!(!drops(&helmet, this));
     }
 }

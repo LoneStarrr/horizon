@@ -22,11 +22,11 @@ pub struct RegisteredAttribute {
     pub name: String,
     pub definition: Definition,
     pub syncable: bool,
-    pub sentiment: super::Sentiment,
+    pub tooltip: super::Tooltip,
 }
 /// A mod's declared attribute type, as the game hands it to
 /// [`Catalog::with_attributes`]: the declaring mod's id (the sort key), the
-/// namespaced attribute id, its definition, sync flag and sentiment.
+/// namespaced attribute id, its definition, sync flag and tooltip style.
 #[derive(Clone, Debug)]
 pub struct AddedAttribute {
     /// The declaring mod's id (`mymod`).
@@ -37,14 +37,138 @@ pub struct AddedAttribute {
     pub definition: Definition,
     /// Whether the attribute joins the sync set.
     pub syncable: bool,
-    /// The tooltip sentiment of a rising or falling value.
-    pub sentiment: super::Sentiment,
+    /// How its tooltip lines read: sentiment, display and base modifier.
+    pub tooltip: super::Tooltip,
 }
+/// A mod's ask to widen an existing attribute's bounds, as the game hands it
+/// to [`Catalog::with_widened_bounds`] (arismoko/horizon#3728).
+#[derive(Clone, Debug)]
+pub struct WidenedBounds {
+    /// The asking mod's id, which a refusal names.
+    pub mod_id: String,
+    /// The attribute's namespaced id (`minecraft:max_health`).
+    pub id: String,
+    /// The asked lower bound.
+    pub min: f64,
+    /// The asked upper bound.
+    pub max: f64,
+}
+/// An ask `Catalog::with_widened_bounds` refused, naming the mod.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WidenBoundsError {
+    /// The catalog has no attribute with that id.
+    UnknownAttribute { mod_id: String, id: String },
+    /// The attribute's default is not inside the asked `[min, max]`.
+    DefaultOutside { mod_id: String, id: String },
+}
+impl fmt::Display for WidenBoundsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownAttribute { mod_id, id } => {
+                write!(
+                    f,
+                    "mod {mod_id} widens the bounds of {id}, which no attribute has"
+                )
+            }
+            Self::DefaultOutside { mod_id, id } => write!(
+                f,
+                "mod {mod_id} widens the bounds of {id} to a range its default is not inside"
+            ),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct WellKnown {
+    movement_speed: Option<AttributeId>,
+    gravity: Option<AttributeId>,
+    max_health: Option<AttributeId>,
+    max_absorption: Option<AttributeId>,
+    step_height: Option<AttributeId>,
+    scale: Option<AttributeId>,
+    entity_interaction_range: Option<AttributeId>,
+    block_interaction_range: Option<AttributeId>,
+    safe_fall_distance: Option<AttributeId>,
+    fall_damage_multiplier: Option<AttributeId>,
+    water_movement_efficiency: Option<AttributeId>,
+    movement_efficiency: Option<AttributeId>,
+    sneaking_speed: Option<AttributeId>,
+    jump_strength: Option<AttributeId>,
+    oxygen_bonus: Option<AttributeId>,
+    burning_time: Option<AttributeId>,
+    armor: Option<AttributeId>,
+    armor_toughness: Option<AttributeId>,
+    knockback_resistance: Option<AttributeId>,
+    attack_damage: Option<AttributeId>,
+    attack_speed: Option<AttributeId>,
+    luck: Option<AttributeId>,
+    block_break_speed: Option<AttributeId>,
+    mining_efficiency: Option<AttributeId>,
+    submerged_mining_speed: Option<AttributeId>,
+    sweeping_damage_ratio: Option<AttributeId>,
+    explosion_knockback_resistance: Option<AttributeId>,
+    camera_distance: Option<AttributeId>,
+    waypoint_transmit_range: Option<AttributeId>,
+    waypoint_receive_range: Option<AttributeId>,
+    tempt_range: Option<AttributeId>,
+    follow_range: Option<AttributeId>,
+    flying_speed: Option<AttributeId>,
+    attack_knockback: Option<AttributeId>,
+    spawn_reinforcements: Option<AttributeId>,
+    air_drag_modifier: Option<AttributeId>,
+}
+
+impl WellKnown {
+    fn from_ids(ids: &BTreeMap<String, AttributeId>) -> Self {
+        Self {
+            movement_speed: ids.get("minecraft:movement_speed").copied(),
+            gravity: ids.get("minecraft:gravity").copied(),
+            max_health: ids.get("minecraft:max_health").copied(),
+            max_absorption: ids.get("minecraft:max_absorption").copied(),
+            step_height: ids.get("minecraft:step_height").copied(),
+            scale: ids.get("minecraft:scale").copied(),
+            entity_interaction_range: ids.get("minecraft:entity_interaction_range").copied(),
+            block_interaction_range: ids.get("minecraft:block_interaction_range").copied(),
+            safe_fall_distance: ids.get("minecraft:safe_fall_distance").copied(),
+            fall_damage_multiplier: ids.get("minecraft:fall_damage_multiplier").copied(),
+            water_movement_efficiency: ids.get("minecraft:water_movement_efficiency").copied(),
+            movement_efficiency: ids.get("minecraft:movement_efficiency").copied(),
+            sneaking_speed: ids.get("minecraft:sneaking_speed").copied(),
+            jump_strength: ids.get("minecraft:jump_strength").copied(),
+            oxygen_bonus: ids.get("minecraft:oxygen_bonus").copied(),
+            burning_time: ids.get("minecraft:burning_time").copied(),
+            armor: ids.get("minecraft:armor").copied(),
+            armor_toughness: ids.get("minecraft:armor_toughness").copied(),
+            knockback_resistance: ids.get("minecraft:knockback_resistance").copied(),
+            attack_damage: ids.get("minecraft:attack_damage").copied(),
+            attack_speed: ids.get("minecraft:attack_speed").copied(),
+            luck: ids.get("minecraft:luck").copied(),
+            block_break_speed: ids.get("minecraft:block_break_speed").copied(),
+            mining_efficiency: ids.get("minecraft:mining_efficiency").copied(),
+            submerged_mining_speed: ids.get("minecraft:submerged_mining_speed").copied(),
+            sweeping_damage_ratio: ids.get("minecraft:sweeping_damage_ratio").copied(),
+            explosion_knockback_resistance: ids
+                .get("minecraft:explosion_knockback_resistance")
+                .copied(),
+            camera_distance: ids.get("minecraft:camera_distance").copied(),
+            waypoint_transmit_range: ids.get("minecraft:waypoint_transmit_range").copied(),
+            waypoint_receive_range: ids.get("minecraft:waypoint_receive_range").copied(),
+            tempt_range: ids.get("minecraft:tempt_range").copied(),
+            follow_range: ids.get("minecraft:follow_range").copied(),
+            flying_speed: ids.get("minecraft:flying_speed").copied(),
+            attack_knockback: ids.get("minecraft:attack_knockback").copied(),
+            spawn_reinforcements: ids.get("minecraft:spawn_reinforcements").copied(),
+            air_drag_modifier: ids.get("minecraft:air_drag_modifier").copied(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Catalog {
     attributes: Vec<RegisteredAttribute>,
     ids: BTreeMap<String, AttributeId>,
     defaults: BTreeMap<String, Arc<[Option<f64>]>>,
+    well_known: WellKnown,
 }
 /// A row `Catalog::with_entity_row` or `Catalog::with_entity_additions`
 /// refused: an override names an attribute the catalog does not know, or the
@@ -128,9 +252,9 @@ impl Catalog {
                 syncable: a["syncable"]
                     .as_bool()
                     .ok_or_else(|| invalid("missing attribute sync flag"))?,
-                // The vanilla export carries no sentiment: vanilla's own
-                // colors stay where the tooltip reads them.
-                sentiment: super::Sentiment::default(),
+                // The vanilla export carries no tooltip style: vanilla's own
+                // colors and formats stay where the tooltip reads them.
+                tooltip: super::Tooltip::default(),
             });
         }
         let mut defaults = BTreeMap::new();
@@ -150,10 +274,12 @@ impl Catalog {
             }
             defaults.insert(entity.clone(), Arc::from(bases));
         }
+        let well_known = WellKnown::from_ids(&ids);
         Ok(Self {
             attributes,
             ids,
             defaults,
+            well_known,
         })
     }
     /// The entity type's supplier base of an attribute, if the type has it.
@@ -222,12 +348,12 @@ impl Catalog {
         )
     }
     /// A copy of the catalog with new attribute types appended
-    /// (`Registrar::declare_attribute`, #812): after every attribute the
+    /// (`Registrar::declare_attribute`, arismoko/horizon#812): after every attribute the
     /// export listed, in order sorted by declaring mod id, then attribute id
     /// — the network order every side running the same mods builds, since
     /// [`AttributeId::registry_id`](Self::attribute)'s number is the index.
     /// Vanilla ids never shift. Every entity's default row grows to the new
-    /// width, so a row resolved later (#845's `with_entity_row`, #846's
+    /// width, so a row resolved later (arismoko/horizon#845's `with_entity_row`, arismoko/horizon#846's
     /// additions) may name an attribute a mod added. A duplicate id — one
     /// the export already listed, or one two mods declared — refuses,
     /// naming the id.
@@ -253,7 +379,7 @@ impl Catalog {
                 name: attribute.id.clone(),
                 definition: attribute.definition,
                 syncable: attribute.syncable,
-                sentiment: attribute.sentiment,
+                tooltip: attribute.tooltip.clone(),
             });
         }
         let defaults = self
@@ -265,10 +391,43 @@ impl Catalog {
                 (entity.clone(), Arc::from(grown))
             })
             .collect();
+        let well_known = WellKnown::from_ids(&ids);
         Ok(Catalog {
             attributes,
             ids,
             defaults,
+            well_known,
+        })
+    }
+    /// A copy of the catalog with the bounds mods asked to widen
+    /// (`Registrar::widen_attribute_bounds`, arismoko/horizon#3728): each attribute's bounds
+    /// become the union of its own and every ask's, whatever their order, so
+    /// an ask narrower than the result changes nothing. Defaults, ids and
+    /// entity rows stay. An unknown attribute, or an ask whose range leaves
+    /// the attribute's default out, refuses, naming the mod.
+    pub fn with_widened_bounds(&self, asks: &[WidenedBounds]) -> Result<Catalog, WidenBoundsError> {
+        let mut attributes = self.attributes.clone();
+        for ask in asks {
+            let Some(id) = self.ids.get(ask.id.as_str()) else {
+                return Err(WidenBoundsError::UnknownAttribute {
+                    mod_id: ask.mod_id.clone(),
+                    id: ask.id.clone(),
+                });
+            };
+            let definition = &mut attributes[id.0].definition;
+            if !(ask.min..=ask.max).contains(&definition.default_value()) {
+                return Err(WidenBoundsError::DefaultOutside {
+                    mod_id: ask.mod_id.clone(),
+                    id: ask.id.clone(),
+                });
+            }
+            *definition = definition.widened(ask.min, ask.max);
+        }
+        Ok(Catalog {
+            attributes,
+            ids: self.ids.clone(),
+            defaults: self.defaults.clone(),
+            well_known: self.well_known,
         })
     }
     /// A copy of the catalog whose `entity` row is `start` with `overrides`
@@ -296,13 +455,59 @@ impl Catalog {
             attributes: self.attributes.clone(),
             ids: self.ids.clone(),
             defaults,
+            well_known: self.well_known,
         })
     }
     pub fn id(&self, name: &str) -> Option<AttributeId> {
-        self.ids.get(name).copied()
+        match name {
+            "minecraft:movement_speed" => self.well_known.movement_speed,
+            "minecraft:gravity" => self.well_known.gravity,
+            "minecraft:max_health" => self.well_known.max_health,
+            "minecraft:max_absorption" => self.well_known.max_absorption,
+            "minecraft:step_height" => self.well_known.step_height,
+            "minecraft:scale" => self.well_known.scale,
+            "minecraft:entity_interaction_range" => self.well_known.entity_interaction_range,
+            "minecraft:block_interaction_range" => self.well_known.block_interaction_range,
+            "minecraft:safe_fall_distance" => self.well_known.safe_fall_distance,
+            "minecraft:fall_damage_multiplier" => self.well_known.fall_damage_multiplier,
+            "minecraft:water_movement_efficiency" => self.well_known.water_movement_efficiency,
+            "minecraft:movement_efficiency" => self.well_known.movement_efficiency,
+            "minecraft:sneaking_speed" => self.well_known.sneaking_speed,
+            "minecraft:jump_strength" => self.well_known.jump_strength,
+            "minecraft:oxygen_bonus" => self.well_known.oxygen_bonus,
+            "minecraft:burning_time" => self.well_known.burning_time,
+            "minecraft:armor" => self.well_known.armor,
+            "minecraft:armor_toughness" => self.well_known.armor_toughness,
+            "minecraft:knockback_resistance" => self.well_known.knockback_resistance,
+            "minecraft:attack_damage" => self.well_known.attack_damage,
+            "minecraft:attack_speed" => self.well_known.attack_speed,
+            "minecraft:luck" => self.well_known.luck,
+            "minecraft:block_break_speed" => self.well_known.block_break_speed,
+            "minecraft:mining_efficiency" => self.well_known.mining_efficiency,
+            "minecraft:submerged_mining_speed" => self.well_known.submerged_mining_speed,
+            "minecraft:sweeping_damage_ratio" => self.well_known.sweeping_damage_ratio,
+            "minecraft:explosion_knockback_resistance" => {
+                self.well_known.explosion_knockback_resistance
+            }
+            "minecraft:camera_distance" => self.well_known.camera_distance,
+            "minecraft:waypoint_transmit_range" => self.well_known.waypoint_transmit_range,
+            "minecraft:waypoint_receive_range" => self.well_known.waypoint_receive_range,
+            "minecraft:tempt_range" => self.well_known.tempt_range,
+            "minecraft:follow_range" => self.well_known.follow_range,
+            "minecraft:flying_speed" => self.well_known.flying_speed,
+            "minecraft:attack_knockback" => self.well_known.attack_knockback,
+            "minecraft:spawn_reinforcements" => self.well_known.spawn_reinforcements,
+            "minecraft:air_drag_modifier" => self.well_known.air_drag_modifier,
+            _ => self.ids.get(name).copied(),
+        }
     }
     pub fn attribute(&self, id: AttributeId) -> &RegisteredAttribute {
         &self.attributes[id.0]
+    }
+    /// The definition (default and bounds) of the attribute named `name`, if
+    /// the catalog has it: what every clamp and check of its value reads.
+    pub fn definition(&self, name: &str) -> Option<Definition> {
+        self.id(name).map(|id| self.attributes[id.0].definition)
     }
     pub fn attributes(&self) -> impl Iterator<Item = (AttributeId, &RegisteredAttribute)> {
         self.attributes
@@ -487,8 +692,61 @@ mod row_tests {
         .unwrap()
     }
 
+    /// arismoko/horizon#3728: asks to widen bounds join as their union, in either order; a
+    /// narrower ask changes nothing; the default stays; an unknown attribute
+    /// or a range without the default refuses, naming the mod.
+    #[test]
+    fn widened_bounds_are_the_union_of_every_ask() {
+        let catalog = catalog();
+        let ask = |mod_id: &str, id: &str, min: f64, max: f64| WidenedBounds {
+            mod_id: mod_id.into(),
+            id: id.into(),
+            min,
+            max,
+        };
+        let health = |c: &Catalog| c.definition("minecraft:max_health").unwrap();
+        let small = ask("alpha", "minecraft:max_health", 1.0, 1e5);
+        let large = ask("beta", "minecraft:max_health", 1.0, 1e6);
+        let narrow = ask("gamma", "minecraft:max_health", 5.0, 100.0);
+        for asks in [
+            [small.clone(), large.clone(), narrow.clone()],
+            [narrow.clone(), large.clone(), small.clone()],
+        ] {
+            let widened = catalog.with_widened_bounds(&asks).unwrap();
+            assert_eq!(health(&widened).bounds(), Some((1.0, 1e6)));
+            assert_eq!(health(&widened).default_value(), 20.0);
+            assert_eq!(health(&widened).sanitize(5000.0), 5000.0);
+        }
+        assert_eq!(health(&catalog).sanitize(5000.0), 1024.0, "vanilla's stay");
+        let lower = catalog
+            .with_widened_bounds(&[ask("alpha", "minecraft:luck", -1e4, 0.0)])
+            .unwrap();
+        assert_eq!(
+            lower.definition("minecraft:luck").unwrap().bounds(),
+            Some((-1e4, 1024.0))
+        );
+        assert_eq!(
+            catalog
+                .with_widened_bounds(&[ask("alpha", "minecraft:mana", 0.0, 1.0)])
+                .unwrap_err(),
+            WidenBoundsError::UnknownAttribute {
+                mod_id: "alpha".into(),
+                id: "minecraft:mana".into()
+            }
+        );
+        assert_eq!(
+            catalog
+                .with_widened_bounds(&[ask("alpha", "minecraft:follow_range", 40.0, 1e4)])
+                .unwrap_err(),
+            WidenBoundsError::DefaultOutside {
+                mod_id: "alpha".into(),
+                id: "minecraft:follow_range".into()
+            }
+        );
+    }
+
     /// A declared row starts from its template's, as a content row does and
-    /// `Zombie.createAttributes` does for the event's supplier (#845).
+    /// `Zombie.createAttributes` does for the event's supplier (arismoko/horizon#845).
     #[test]
     fn a_declared_row_starts_from_its_templates() {
         let catalog = catalog();
@@ -550,7 +808,7 @@ mod row_tests {
     }
 
     /// Additions put attributes on a type's own row
-    /// (`EntityAttributeModificationEvent.add`, #846): one it lacks joins the
+    /// (`EntityAttributeModificationEvent.add`, arismoko/horizon#846): one it lacks joins the
     /// row, with its base or the attribute's default; one it has takes the
     /// new base; the rest of the row stays.
     #[test]
@@ -585,7 +843,7 @@ mod row_tests {
     }
 
     /// Mod attributes append after every vanilla attribute, sorted by
-    /// declaring mod id then attribute id (#812): the order is the network
+    /// declaring mod id then attribute id (arismoko/horizon#812): the order is the network
     /// id's, the same whatever order the mods declared in, and vanilla ids
     /// never shift.
     #[test]
@@ -597,7 +855,10 @@ mod row_tests {
             id: id.into(),
             definition: Definition::ranged(1.0, 0.0, 10.0).unwrap(),
             syncable,
-            sentiment: Sentiment::Neutral,
+            tooltip: super::super::Tooltip {
+                sentiment: Sentiment::Neutral,
+                ..Default::default()
+            },
         };
         // Declared in the order the mods happen to register: the catalog
         // sorts them by mod id, then attribute id.

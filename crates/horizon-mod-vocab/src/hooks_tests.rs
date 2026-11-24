@@ -210,19 +210,42 @@ fn movement_input_writes_back_all_fields() {
             event.strafe = 0.25;
             event.jump = true;
             event.sneak = true;
+            assert!(!event.forward_key);
+            assert!(event.backward_key);
+            assert!(!event.left_key);
+            assert!(event.right_key);
+            assert!(!event.sprint);
+            event.forward_key = true;
+            event.backward_key = false;
+            event.left_key = true;
+            event.right_key = false;
+            event.sprint = true;
         }
     }
     let mods = [ModEntry::new("movement", Box::new(Movement))];
     install(mods.into());
     let (mut forward, mut strafe, mut jump, mut sneak) = (1.0, 0.0, false, false);
+    let (mut forward_key, mut backward_key, mut left_key, mut right_key, mut sprint) =
+        (false, true, false, true, false);
     dispatch_movement_input(
         &FakeHost::new(),
-        &mut forward,
-        &mut strafe,
-        &mut jump,
-        &mut sneak,
+        crate::__private::MovementInputCall {
+            forward: &mut forward,
+            strafe: &mut strafe,
+            jump: &mut jump,
+            sneak: &mut sneak,
+            forward_key: &mut forward_key,
+            backward_key: &mut backward_key,
+            left_key: &mut left_key,
+            right_key: &mut right_key,
+            sprint: &mut sprint,
+        },
     );
     assert_eq!((forward, strafe, jump, sneak), (-0.5, 0.25, true, true));
+    assert_eq!(
+        (forward_key, backward_key, left_key, right_key, sprint),
+        (true, false, true, false, true),
+    );
 }
 
 #[test]
@@ -338,14 +361,25 @@ fn living_death_post_hears_the_entity_the_blow_and_the_attacker() {
 #[test]
 fn render_frame_pre_and_post_hear_their_own_moment_with_the_frames_time() {
     use std::{sync::Mutex, time::Duration};
-    struct Frames(Arc<Mutex<Vec<(&'static str, Duration)>>>);
+    type FrameReading = (&'static str, Duration, f32, f32);
+    struct Frames(Arc<Mutex<Vec<FrameReading>>>);
     #[mod_api::__subscriptions]
     impl Hooks for Frames {
         fn render_frame_pre(&self, _: &mut dyn ClientHost, event: &mut RenderFramePreEvent) {
-            self.0.lock().unwrap().push(("pre", event.elapsed));
+            self.0.lock().unwrap().push((
+                "pre",
+                event.elapsed,
+                event.world_partial_tick,
+                event.partial_tick,
+            ));
         }
         fn render_frame_post(&self, _: &mut dyn ClientHost, event: &mut RenderFramePostEvent) {
-            self.0.lock().unwrap().push(("post", event.elapsed));
+            self.0.lock().unwrap().push((
+                "post",
+                event.elapsed,
+                event.world_partial_tick,
+                event.partial_tick,
+            ));
         }
     }
     let heard = Arc::new(Mutex::new(Vec::new()));
@@ -353,12 +387,15 @@ fn render_frame_pre_and_post_hear_their_own_moment_with_the_frames_time() {
         vec![ModEntry::new("frames", Box::new(Frames(heard.clone())))].into(),
         || {
             let frame = Duration::from_millis(16);
-            dispatch_render_frame_pre(&mut FakeHost::new(), frame);
-            dispatch_render_frame_post(&mut FakeHost::new(), frame);
+            dispatch_render_frame_pre(&mut FakeHost::new(), frame, 0.25, 0.5);
+            dispatch_render_frame_post(&mut FakeHost::new(), frame, 0.25, 0.5);
         },
     );
     let frame = Duration::from_millis(16);
-    assert_eq!(*heard.lock().unwrap(), [("pre", frame), ("post", frame)]);
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [("pre", frame, 0.25, 0.5), ("post", frame, 0.25, 0.5)]
+    );
 }
 
 #[test]
@@ -626,6 +663,16 @@ fn clock_time_takes_a_host(host: &dyn Host, level: LevelRef) -> Option<i64> {
     level.clock_time(host)
 }
 
+/// Compile-only: a mod reads when a level's own clock next reaches a time marker.
+#[allow(dead_code)]
+fn clock_marker_time_takes_a_host(
+    host: &dyn Host,
+    level: LevelRef,
+    marker: &crate::Identifier,
+) -> Option<i64> {
+    level.clock_marker_time(host, marker)
+}
+
 /// Compile-only: a mod reads a level's sea level from a handle on a shared host.
 #[allow(dead_code)]
 fn sea_level_takes_a_host(host: &dyn Host, level: LevelRef) -> Option<i32> {
@@ -636,6 +683,18 @@ fn sea_level_takes_a_host(host: &dyn Host, level: LevelRef) -> Option<i32> {
 #[allow(dead_code)]
 fn client_heights_take_a_client_host(host: &dyn ClientHost) -> Result<Vec<Option<i32>>, String> {
     host.client_surface_heights(&[(0, 0), (16, -16)], Heightmap::MotionBlocking)
+}
+
+/// Compile-only: a corner HUD asks whether F3 takes its corner.
+#[allow(dead_code)]
+fn corner_hud_asks_for_its_corner(host: &dyn ClientHost) -> bool {
+    host.native_corner_shown(Corner::TopLeft)
+}
+
+/// Compile-only: an official extra's port reads its old `horizon-extras.txt` settings.
+#[allow(dead_code)]
+fn extra_port_reads_its_old_settings(host: &dyn ClientHost) -> Vec<(String, String)> {
+    host.official_extra_settings()
 }
 
 /// Compile-only: a client mod moves the view onto an entity and back through the `&mut dyn ClientHost`
@@ -673,6 +732,10 @@ fn world_data_and_tick_queries_take_their_hosts(
     let _: bool = level.block_tick(server, [0, 64, 0]);
     let _: bool = level.block_random_tick(server, [0, 64, 0]);
     let _: Option<[i32; 3]> = level.lightning_target(server, [0, 64, 0]);
+    let _: bool = level.has_water_ticket(read, [0, 64, 0]);
+    if let Some(ticket) = level.add_water_ticket(server, [0, 64, 0], [5, 65, 5]) {
+        let _: bool = ticket.remove(server);
+    }
 }
 
 /// Compile-only: the level queries as a mod calls them, the reads on any host and the drop
@@ -723,6 +786,20 @@ fn entity_queries_take_a_shared_host(read: &dyn Host, entity: EntityRef) {
     let _: Option<ClipHit> = entity.pick(read, 4.5);
     let _: Option<bool> = entity.is_multipart(read);
     let _: Option<Vec<EntityRef>> = entity.parts(read);
+}
+
+/// Compile-only: what a spawn-control mod's rules read, the entity type's class, the sky from
+/// below water and an unspawned mob's age, all on a shared host.
+#[allow(dead_code)]
+fn spawn_rule_reads_take_a_shared_host(
+    read: &dyn Host,
+    level: LevelRef,
+    mob: crate::UnspawnedMobRef,
+) {
+    let _: bool = read.entity_type_is_enemy("minecraft:zombie");
+    let _: bool = read.entity_type_is_animal("minecraft:cow");
+    let _: Option<bool> = level.can_see_sky_from_below_water(read, [0, 40, 0]);
+    let _: Result<bool, crate::UnspawnedMobError> = mob.baby(read);
 }
 
 /// Compile-only: an entity is sent to another dimension from a server host.
@@ -807,11 +884,72 @@ fn spawn_policy_writes_take_a_server_host(
     let _: Option<SpawnFlags> = level.spawn_flags(read);
     let _: Option<bool> = level.can_spawn_entities_in_chunk(read, [0, 0]);
     let _: bool = level.set_spawn_limits(server, SpawnLimits::VANILLA);
+    let _: bool = level.set_spawn_limit(server, MobCategory::Creature, 3);
+    let _: bool = level.set_ticks_per_spawn(server, MobCategory::Creature, 400);
     let _: bool = level.set_spawn_flags(server, SpawnFlags::default());
     let _: Option<EntityRef> = level.spawn_mob(
         server,
         "minecraft:zombie",
         [0.5, 64.0, 0.5],
         SpawnReason::Command,
+    );
+}
+
+/// Compile-only: a passage is registered and removed through its level on a server host.
+#[allow(dead_code)]
+fn passages_take_a_server_host(server: &mut dyn ServerHost, level: LevelRef, passage: Passage) {
+    let id: Result<PassageId, PassageRegistrationError> = level.register_passage(server, passage);
+    let _: bool = level.remove_passage(server, id.unwrap());
+}
+
+#[test]
+fn player_item_mend_lets_a_listener_change_repair_and_experience() {
+    struct Bonus;
+    #[mod_api::__subscriptions]
+    impl Hooks for Bonus {
+        fn player_item_mend(&self, _: &mut dyn ServerHost, event: &mut PlayerItemMendEvent<'_>) {
+            event.repair += 3;
+            event.experience += 2;
+        }
+    }
+
+    testing::with_dispatch(
+        vec![ModEntry::new("mend_bonus", Box::new(Bonus))].into(),
+        || {
+            let mut repair = 14;
+            let mut experience = 7;
+            dispatch_player_item_mend(
+                &mut FakeHost::new(),
+                1,
+                "Alex",
+                "minecraft:diamond_pickaxe",
+                &mut repair,
+                &mut experience,
+            );
+            assert_eq!(repair, 17);
+            assert_eq!(experience, 9);
+        },
+    );
+}
+
+/// Literal values: one category's limit changes, the others stay vanilla's, and Misc is refused.
+#[test]
+fn set_spawn_limit_changes_one_category_and_refuses_misc() {
+    let mut limits = SpawnLimits::VANILLA;
+    assert!(limits.set(MobCategory::Creature, 3));
+    assert_eq!(
+        limits,
+        SpawnLimits {
+            creature: 3,
+            ..SpawnLimits::VANILLA
+        }
+    );
+    assert!(!limits.set(MobCategory::Misc, 1));
+    assert_eq!(
+        limits,
+        SpawnLimits {
+            creature: 3,
+            ..SpawnLimits::VANILLA
+        }
     );
 }

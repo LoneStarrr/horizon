@@ -20,6 +20,11 @@ fn stops_movers(m: &Mob) -> bool {
 }
 
 impl Game<'_> {
+    /// Whether any entity stops movers at all (`stand_entity_collisions` would not be empty): a
+    /// boat, a living shulker, a held-still happy ghast.
+    pub(in crate::game) fn stand_obstacles_exist(&self) -> bool {
+        !self.boats.is_empty() || self.mobs.iter().any(stops_movers)
+    }
     /// Client `EntityGetter.getEntityCollisions` for the player: the
     /// entities that `canBeCollidedWith` it, solid happy ghasts, living
     /// shulkers (`Shulker.canBeCollidedWith`) and boats
@@ -107,24 +112,30 @@ impl Game<'_> {
             self.mob_equip_event(id, [pos.x, pos.y, pos.z], true);
             return true;
         }
-        // Equippable.canBeSheared: shears take the harness off again.
+        // Entity.interact: shears take the harness off again
+        // (`Equippable.canBeSheared`), not from a ridden ghast
+        // (`canShearEquipment`) nor by a sneaking player.
         if item == "minecraft:shears"
-            && harnessed
             && !sneaking
-            && let Some(harness) = self.mobs[index].take_body_equipment()
+            && self.mount_passenger_count(m.id) == 0
+            && let Some(harness) = m.extra.body_stack()
+            && !self.kept_on(harness)
         {
-            self.audio
-                .play("minecraft:entity.happy_ghast.unequip", Some(at), 1.0, 1.0);
-            self.spawn_item(harness, at, [0.0, 0.2, 0.0], 10);
-            self.damage_held_tool();
-            let id = self.mobs[index].id;
-            let pos = self.mobs[index].position;
-            self.mob_equip_event(id, [pos.x, pos.y, pos.z], false);
+            self.shear_equipment(
+                index,
+                horizon_items::equipment::BODY,
+                "minecraft:entity.happy_ghast.unequip",
+            );
             return true;
         }
         if harnessed && !sneaking {
-            // doPlayerRide.
+            // doPlayerRide: `player.startRiding(this)`, which keeps the
+            // rider's view (`ServerPlayer.startRiding`'s `Relative.ROTATION`).
             let id = self.mobs[index].id;
+            let species = self.mobs[index].species();
+            if self.mount_passenger_count(id) >= Self::mount_capacity(species) {
+                return false;
+            }
             if !self.native_may_board(id) {
                 return true;
             }
@@ -133,7 +144,6 @@ impl Game<'_> {
             // addPassenger: the rider is not standing on top, so no still
             // timeout.
             self.mobs[index].extra.counter = 0;
-            self.yaw = self.mobs[index].yaw;
             self.mount.reset_jump();
             if was_empty {
                 let down = happy_ghast::goggles(true, &self.mobs[index]);
@@ -182,7 +192,7 @@ impl Game<'_> {
             Some("west") => 90.0,
             _ => 0.0,
         };
-        if let Some(id) = self.spawn_mob_raw("minecraft:happy_ghast", at, true)
+        if let Some(id) = self.spawn_mob_raw("minecraft:happy_ghast", at, false)
             && let Some(m) = self.mobs.iter_mut().find(|m| m.id == id)
         {
             // DriedGhastBlock.spawnGhastling sets the baby age before
@@ -205,6 +215,33 @@ impl Game<'_> {
 }
 
 #[cfg(test)]
+mod ghastling_hatch_tests {
+    #[test]
+    #[ignore = "daily"]
+    fn hatched_ghastling_spawns_non_persistent() {
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let dried = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:dried_ghast")
+                .expect("minecraft:dried_ghast state");
+            game.spawn_ghastling([4, 64, 4], dried);
+            let hatched = game
+                .mobs
+                .iter()
+                .find(|m| m.kind.id == "minecraft:happy_ghast")
+                .expect("hatched ghastling should spawn");
+            assert!(
+                !hatched.persistent,
+                "DriedGhastBlock.spawnGhastling must not mark hatched ghastlings persistent"
+            );
+            assert!(hatched.is_baby(), "hatched ghastling should start as a baby");
+        });
+    }
+}
+
+#[cfg(test)]
 mod item_collision_tests {
     use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
     use horizon_client::chunk::Chunk;
@@ -214,7 +251,7 @@ mod item_collision_tests {
     /// An item dropped onto a minecart falls through it to the floor, and one
     /// dropped onto a boat rests on the boat (`canBeCollidedWith`).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dropped_item_rests_on_a_boat_but_falls_through_a_minecart() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -268,6 +305,7 @@ mod item_collision_tests {
         game.block_ticks
             .add_empty_chunk(ChunkPos::new(0, 0))
             .unwrap();
+        game.load_ticking_neighbourhood(0, 0);
         assert!(game.run_command("forceload add 0 0"));
         assert!(game.run_command("summon minecart 4.5 200 4.5"));
         assert!(game.run_command("summon oak_boat 10.5 200 10.5"));

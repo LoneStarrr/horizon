@@ -59,7 +59,7 @@ fn snapshot(game: &mut Game<'_>) -> Vec<i32> {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn chunk_loaded_families_keep_vanilla_lookup_and_save_order() {
     with_game(|game| {
         let a = (0, 0);
@@ -110,21 +110,22 @@ fn chunk_loaded_families_keep_vanilla_lookup_and_save_order() {
             ),
             saved("minecraft:snowball", 12, [21.5, 70.0, 2.5], vec![]),
         ];
-        game.world.loaded_entities.push((a, first));
-        game.world.loaded_entities.push((b, second));
+        game.world.queue_entity_nbt(a, first);
+        game.world.queue_entity_nbt(b, second);
         game.spawn_loaded_entities();
         let mut lookup = vec![snapshot(game)];
         // The chunk unloads with what it stores, then loads that again.
         let unloaded = game.entity_chunks(&HashSet::from([a]), true);
         let unload = saved_order(&unloaded);
         lookup.push(snapshot(game));
-        game.world.loaded_entities.extend(unloaded);
+        for (key, tags) in unloaded {
+            game.world.queue_entity_nbt(key, tags);
+        }
         game.spawn_loaded_entities();
         lookup.push(snapshot(game));
         // The pig leaves through a portal and comes back.
         let pig = game.mob_by_uuid([2703, 0, 0, 2]).unwrap();
-        let tag = game.vehicle_tree_nbt(pig).unwrap();
-        let state = game.capture_vehicle_tree_state(pig).unwrap();
+        let (tag, state) = game.take_vehicle_tree_transfer(pig).unwrap();
         game.remove_vehicle_tree(pig);
         lookup.push(snapshot(game));
         game.restore_vehicle_tree_state(tag, state).unwrap();
@@ -151,5 +152,57 @@ fn chunk_loaded_families_keep_vanilla_lookup_and_save_order() {
                 vec![1, 0, 9, 10, 13, 11, 12]
             ]
         );
+    });
+}
+
+#[test]
+#[ignore = "daily"]
+fn orbs_keep_their_section_entry_order_after_reload() {
+    use crate::game::item_entities::touching_orbs;
+    use horizon_core::geometry::Aabb;
+
+    with_game(|game| {
+        let chunk = (0, 0);
+        game.world
+            .chunks
+            .insert(chunk, Arc::new(Chunk::empty(0, 0)));
+        let orb = |name, y, value| {
+            saved(
+                "minecraft:experience_orb",
+                name,
+                [2.5, y, 2.5],
+                vec![("Value", Tag::Short(value)), ("Count", Tag::Int(1))],
+            )
+        };
+        game.world.queue_entity_nbt(
+            chunk,
+            vec![
+                orb(1, 63.75, 7),
+                saved("minecraft:armor_stand", 2, [4.5, 64.5, 4.5], vec![]),
+                orb(3, 64.5, 1),
+                saved("minecraft:tnt", 4, [5.5, 64.5, 5.5], vec![]),
+            ],
+        );
+        game.spawn_loaded_entities();
+        assert_eq!(lookup_order(game), [1, 2, 3, 4]);
+        game.orbs[0].set_position(Vec3::new(2.5, 64.25, 2.5));
+
+        let area = Aabb::new(Vec3::new(1.0, 64.0, 1.0), Vec3::new(4.0, 66.0, 4.0));
+        let pickup_order = |game: &Game<'_>| {
+            touching_orbs(&game.orbs, area)
+                .into_iter()
+                .map(|i| game.orbs[i].value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pickup_order(game), [1, 7]);
+
+        let unloaded = game.entity_chunks(&HashSet::from([chunk]), true);
+        assert_eq!(saved_order(&unloaded), [vec![0, 0, 3, 2, 1, 4]]);
+        assert!(game.orbs.is_empty());
+        for (chunk, tags) in unloaded {
+            game.world.queue_entity_nbt(chunk, tags);
+        }
+        game.spawn_loaded_entities();
+        assert_eq!(pickup_order(game), [1, 7]);
     });
 }

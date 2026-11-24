@@ -57,7 +57,7 @@ pub fn open(mode: Mode, cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(760.), px(520.))),
             titlebar: Some(titlebar::options()),
-            app_id: Some(horizon_launcher::identity::APP_ID.into()),
+            app_id: Some("horizon-launcher".into()),
             ..Default::default()
         },
         |window, cx| cx.new(|cx| Setup::new(mode, window, cx)),
@@ -278,7 +278,7 @@ impl Setup {
             Stage::Welcome if self.mode == Mode::Install => {
                 body = body
                     .child(text(night::UI, c(n.ink_soft)).child(
-                        tr(if cfg!(horizon_fork_launcher) { "Installs Horizon Fork Launcher (arismoko) for this account. No administrator needed." } else { "Installs Horizon Launcher for this account. No administrator needed." })
+                        tr("Installs Horizon Launcher for this account. No administrator needed.")
                             .to_string(),
                     ))
                     .child(self.folder_row(cx))
@@ -307,7 +307,7 @@ impl Setup {
             Stage::Welcome => {
                 body = body
                     .child(text(night::UI, c(n.ink_soft)).child(
-                        tr(if cfg!(horizon_fork_launcher) { "Removes Horizon Fork Launcher (arismoko) from this computer. Your worlds and the game's folder stay." } else { "Removes Horizon Launcher from this computer. Your worlds and the game's folder stay." })
+                        tr("Removes Horizon Launcher from this computer. Your worlds and the game's folder stay.")
                             .to_string(),
                     ))
                     .child(self.toggle(
@@ -346,18 +346,8 @@ impl Setup {
             }
             Stage::Done { left } => {
                 let said = match self.mode {
-                    Mode::Install => tr(if cfg!(horizon_fork_launcher) {
-                        "Horizon Fork Launcher (arismoko) is installed."
-                    } else {
-                        "Horizon Launcher is installed."
-                    })
-                    .to_string(),
-                    Mode::Uninstall => tr(if cfg!(horizon_fork_launcher) {
-                        "Horizon Fork Launcher (arismoko) was removed."
-                    } else {
-                        "Horizon Launcher was removed."
-                    })
-                    .to_string(),
+                    Mode::Install => tr("Horizon Launcher is installed.").to_string(),
+                    Mode::Uninstall => tr("Horizon Launcher was removed.").to_string(),
                 };
                 body = body.child(text(night::TITLE, c(n.ink)).child(said));
                 if !left.is_empty() {
@@ -378,17 +368,10 @@ impl Setup {
                 if self.mode == Mode::Install {
                     body = body.child(
                         div().flex().items_center().justify_end().child(
-                            crate::button(
-                                "launch",
-                                tr(if cfg!(horizon_fork_launcher) {
-                                    "Launch Horizon Fork Launcher (arismoko)"
-                                } else {
-                                    "Launch Horizon"
-                                }),
-                                Kind::Primary,
-                                &t,
-                            )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx))),
+                            crate::button("launch", tr("Launch Horizon"), Kind::Primary, &t)
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| this.launch(cx)),
+                                ),
                         ),
                     );
                 }
@@ -413,9 +396,7 @@ impl Setup {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(
-                text(night::DISPLAY, c(n.ink)).child(tr(horizon_launcher::identity::WINDOW_TITLE)),
-            )
+            .child(text(night::DISPLAY, c(n.ink)).child(tr("Horizon Launcher")))
             .child(body)
     }
 }
@@ -461,10 +442,14 @@ impl Render for Setup {
         let sky = if t.dark {
             self.scene.clone().into_any_element()
         } else {
+            crate::sky::frost(&t.night, (viewport.width.into(), viewport.height.into()));
+            // The setup has no rail or top bar to keep particles off ([`crate::frame::keep_clear`]
+            // is the launcher's layout): they drift everywhere, as they did before areas were kept.
             let (sky, next) = self.sky.render(
                 &t.night,
                 (viewport.width.into(), viewport.height.into()),
                 window.scale_factor(),
+                crate::rain::Keep::default(),
                 window.is_window_active(),
                 Instant::now(),
             );

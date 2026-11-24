@@ -86,6 +86,8 @@ pub(super) struct Pads {
     pub(super) device: Option<Device>,
     /// Controllers that came and went at this game's own reader since the last poll.
     connections: Vec<Connection>,
+    /// The right stick's turn still easing out under the cinematic camera.
+    look: gamepad::SmoothLook,
     /// The cursor the pad drives in menus.
     pub(super) menu: super::pad_menu::MenuCursor,
     /// The radial menu while its opener is held, and the page it stays on.
@@ -225,7 +227,14 @@ mod hardware {
         }
         pub(in crate::game) fn lend_output(&mut self, _: &mut Pads, _: PadId) {}
         pub(in crate::game) fn reclaim_output(&mut self, _: &mut Pads) {}
-        pub(in crate::game) fn play_rumbles(&mut self, _: &mut Pads, _: Option<PadId>) {}
+        pub(in crate::game) fn play_rumbles(
+            &mut self,
+            _: &mut Pads,
+            _: Option<PadId>,
+            _: bool,
+            _: bool,
+        ) {
+        }
         pub(in crate::game) fn report_status(&self, _: &mut Pads, _: Option<PadId>) {}
         pub(in crate::game) fn connected(&self, _: PadId) -> bool {
             false
@@ -386,7 +395,9 @@ impl Game<'_> {
             self.pad.state = PadState::default();
             self.pad.in_use = false;
             // The keyboard's menu focus follows its widget all the same.
-            self.pad_menu_frame(event_loop);
+            if !self.loading_overlay_preview_active() {
+                self.pad_menu_frame(event_loop);
+            }
             return;
         }
         let hardware = match self.pad.feed {
@@ -423,6 +434,25 @@ impl Game<'_> {
         self.ui.options.pad_glyphs = Glyphs::of(&self.settings.controller, self.pad.style);
         self.ui.options.pad_driving = self.pad.in_use && self.pad_focus_mode();
         let mut state = hardware.merge(&self.pad.injected);
+        for button in std::mem::take(&mut self.pad.taps) {
+            self.pad.injected.set(button, false);
+        }
+        let threshold = self.settings.controller.trigger_threshold;
+        if self.loading_overlay_preview_active() {
+            self.pad.state = state;
+            self.pad_cancel_inputs(event_loop);
+            let edges = self.pad.edges.update(&state, threshold);
+            // A press that began here must not act when the underlying screen returns.
+            self.pad.edges.cancel();
+            if self.pad_focused()
+                && edges
+                    .into_iter()
+                    .any(|(button, down)| down && matches!(button, Button::East | Button::Start))
+            {
+                self.dismiss_loading_overlay_preview();
+            }
+            return;
+        }
         let activity = self.pad.activity.observe(&state, &self.settings.controller);
         for (i, (stick, deadzone)) in [
             (&mut state.left, self.settings.controller.move_deadzone),
@@ -439,10 +469,6 @@ impl Game<'_> {
                 self.pad.peaks[i] = [0.0; 2];
             }
         }
-        for button in std::mem::take(&mut self.pad.taps) {
-            self.pad.injected.set(button, false);
-        }
-        let threshold = self.settings.controller.trigger_threshold;
         let edges = self.pad.edges.update(&state, threshold);
         if activity && self.pad_focused() {
             self.last_input = Instant::now();
@@ -483,6 +509,10 @@ impl Game<'_> {
                 radial_play::PollStep::Edge(button, down) => (button, down),
             };
             self.pad_edge(event_loop, button, down);
+            if self.loading_overlay_preview_active() {
+                self.pad_cancel_inputs(event_loop);
+                return;
+            }
             let context = self.pad_context();
             if let Some(old) = self.pad.context.filter(|old| *old != context) {
                 if old.screen != context.screen {
@@ -817,16 +847,19 @@ impl Game<'_> {
             return;
         }
         // A long frame (a hitch) must not spin the view.
-        let (yaw, pitch) = gamepad::look_delta(
+        let seconds = seconds.min(0.1);
+        let turn = gamepad::look_delta(
             self.pad.state.right,
             settings,
-            seconds.min(0.1),
-            self.scoping(),
+            seconds,
+            self.camera_type.is_first_person() && self.scoping(),
         );
+        // The cinematic camera eases the stick's turn in and out, as it does the mouse's.
+        let (yaw, pitch) = self.pad.look.turn(turn, seconds, self.smooth_camera);
         if yaw == 0.0 && pitch == 0.0 {
             return;
         }
-        self.look_turn(f64::from(yaw / 0.15), f64::from(pitch / 0.15));
+        self.look_turn(yaw / 0.15, pitch / 0.15);
     }
 
     /// Vibrate the active pad, when vibration is on and the pad is the one
@@ -835,6 +868,12 @@ impl Game<'_> {
         let settings = &self.settings.controller;
         if !settings.enabled || !settings.vibration || !self.pad.in_use {
             return;
+        }
+        // Bedrock's own switch, off for a player who doesn't want every block to tick. It
+        // covers the split's buzz too: both are the same Bedrock-like feedback.
+        match rumble {
+            Rumble::BlockBroken | Rumble::ItemStackSplit if !settings.block_vibration => return,
+            _ => {}
         }
         let Some(pulse) = rumble.pulse() else {
             return;
@@ -910,7 +949,8 @@ impl Game<'_> {
                     "enabled": self.settings.controller.enabled,
                     "glyphs": self.pad.style.name(),
                     "last_rumble": self.pad.last_rumble.map(|(why, p)| json!({
-                        "reason": why, "strong": p.strong, "weak": p.weak, "ms": p.millis,
+                        "reason": why, "strong": p.strong, "weak": p.weak,
+                        "triggers": p.triggers, "ms": p.millis,
                     })),
                     "in_use": self.pad.in_use,
                     "notice": self.split_hud.notice.showing().map(|(title, body)| {

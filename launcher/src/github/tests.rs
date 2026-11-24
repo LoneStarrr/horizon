@@ -11,7 +11,8 @@ fn scratch(name: &str) -> PathBuf {
 const T0: u64 = 1_800_000_000;
 const LATER: u64 = T0 + FRESH_SECS;
 
-const RELEASES: &str = "https://api.github.com/repos/arismoko/horizon/releases?per_page=100";
+const RELEASES: &str = "https://api.github.com/repos/horizon-rust/horizon/releases?per_page=100";
+const FORK_RELEASES: &str = "https://api.github.com/repos/arismoko/horizon/releases?per_page=100";
 
 fn list(tag: &str) -> serde_json::Value {
     serde_json::json!([{ "tag_name": tag }])
@@ -26,27 +27,27 @@ fn mirror_serves_only_horizons_repository() {
     let base = "https://mcp.example/github/public";
     assert_eq!(
         mirror_url_with(RELEASES, base).as_deref(),
-        Some("https://mcp.example/github/public/repos/arismoko/horizon/releases?per_page=100")
+        Some("https://mcp.example/github/public/repos/horizon-rust/horizon/releases?per_page=100")
     );
     assert_eq!(
         mirror_url_with(
-            "https://api.github.com/repos/arismoko/horizon/releases/tags/launcher@0.2.33",
+            "https://api.github.com/repos/horizon-rust/horizon/releases/tags/launcher@0.2.33",
             &format!("{base}/")
         )
         .as_deref(),
-        Some("https://mcp.example/github/public/repos/arismoko/horizon/releases/tags/launcher@0.2.33")
+        Some("https://mcp.example/github/public/repos/horizon-rust/horizon/releases/tags/launcher@0.2.33")
     );
     assert_eq!(
         mirror_url_with("https://api.github.com/repos/someone/mod/commits/abc", base),
         None
     );
     assert_eq!(
-        mirror_url_with("https://github.com/arismoko/horizon/releases", base),
+        mirror_url_with("https://github.com/horizon-rust/horizon/releases", base),
         None
     );
     for url in [
-        "https://api.github.com/repos/horizon-rust/horizon/releases",
-        "https://api.github.com/repos/arismoko/horizon-extra/releases",
+        "https://api.github.com/repos/arismoko/horizon/releases",
+        "https://api.github.com/repos/horizon-rust/horizon-extra/releases",
     ] {
         assert_eq!(mirror_url_with(url, base), None);
     }
@@ -61,17 +62,24 @@ fn mirror_serves_only_horizons_repository() {
 fn a_saved_upstream_list_cannot_answer_a_fork_check() {
     let cache = scratch("repository-scope");
     json_with(
-        "https://api.github.com/repos/horizon-rust/horizon/releases?per_page=100",
+        RELEASES,
         &cache,
         T0,
         |_, _| Answer::Fresh(list("upstream"), None),
         no_mirror,
     )
     .unwrap();
-    let absent = json_with(RELEASES, &cache, T0, |_, _| Answer::NotFound, no_mirror).unwrap();
+    let absent = json_with(
+        FORK_RELEASES,
+        &cache,
+        T0,
+        |_, _| Answer::NotFound,
+        no_mirror,
+    )
+    .unwrap();
     assert_eq!(absent, None);
     let error = json_with(
-        RELEASES,
+        FORK_RELEASES,
         &cache,
         T0,
         |_, _| Answer::Failed("offline".into()),
@@ -148,7 +156,7 @@ fn etag_is_kept_and_a_304_reads_the_saved_copy() {
     );
     assert_eq!(back.unwrap(), Some(list("v9")));
     // Another URL doesn't read this one's copy.
-    let other = "https://api.github.com/repos/arismoko/horizon/releases/latest";
+    let other = "https://api.github.com/repos/horizon-rust/horizon/releases/latest";
     let etag_sent = RefCell::new(Some(String::new()));
     let _ = json_with(
         other,
@@ -183,7 +191,7 @@ fn rate_limited_reads_go_through_the_mirror() {
         .borrow()
         .as_deref()
         .unwrap()
-        .ends_with("/github/public/repos/arismoko/horizon/releases?per_page=100"));
+        .ends_with("/github/public/repos/horizon-rust/horizon/releases?per_page=100"));
     // The mirror's answer is kept like GitHub's.
     let kept = json_with(RELEASES, &cache, T0 + 1, |_, _| panic!("fresh"), no_mirror);
     assert_eq!(kept.unwrap(), Some(list("nightly")));
@@ -202,7 +210,7 @@ fn rate_limited_reads_go_through_the_mirror() {
 #[test]
 fn a_404_is_not_retried_on_the_mirror() {
     let cache = scratch("404");
-    let latest = "https://api.github.com/repos/arismoko/horizon/releases/latest";
+    let latest = "https://api.github.com/repos/horizon-rust/horizon/releases/latest";
     let absent = json_with(
         latest,
         &cache,
@@ -346,5 +354,91 @@ fn a_corrupt_or_foreign_copy_is_ignored() {
         no_mirror,
     );
     assert_eq!(got.unwrap(), Some(list("v2")));
+    let _ = fs::remove_dir_all(cache);
+}
+
+/// A local source that takes the request, waits `silent`, then sends its headers and a 16-byte
+/// JSON body a byte every 200 ms.
+fn slow_source(silent: std::time::Duration) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/list", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.read(&mut [0; 4096]);
+        std::thread::sleep(silent);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n"
+        );
+        for byte in format!("[{:14}]", "").bytes() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if stream.write_all(&[byte]).is_err() {
+                return;
+            }
+        }
+    });
+    url
+}
+
+/// A source that says nothing gives up once [`HEADERS`] have passed, so a release list isn't
+/// held for minutes (#18074); one that answers and sends its body slowly is read to its end,
+/// past that wait, so a slow line still gets the list.
+#[test]
+fn a_silent_source_gives_up_and_a_slow_one_is_read_whole() {
+    let started = std::time::Instant::now();
+    let silent = slow_source(std::time::Duration::from_secs(30));
+    assert!(matches!(mirror(&silent), Answer::Failed(_)));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    let started = std::time::Instant::now();
+    match mirror(&slow_source(std::time::Duration::ZERO)) {
+        Answer::Fresh(body, None) => assert_eq!(body, serde_json::json!([])),
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() > HEADERS * 2);
+}
+
+/// A read that must be current never takes the copy on disk: not a fresh one, and not one
+/// standing in when both sources fail.
+#[test]
+fn a_network_only_read_never_answers_from_the_kept_copy() {
+    let cache = scratch("network-only");
+    let fresh = |_: &str, _: Option<&str>| Answer::Fresh(list("kept"), None);
+    json_with(RELEASES, &cache, T0, fresh, no_mirror).unwrap();
+    let asked = RefCell::new(false);
+    let got = json_with_mode(
+        RELEASES,
+        &cache,
+        T0 + 1,
+        true,
+        |_, _| {
+            *asked.borrow_mut() = true;
+            Answer::Fresh(list("new"), None)
+        },
+        no_mirror,
+    );
+    assert!(*asked.borrow(), "a fresh copy is not the answer");
+    assert_eq!(got.unwrap(), Some(list("new")));
+    let failed = json_with_mode(
+        RELEASES,
+        &cache,
+        LATER,
+        true,
+        |_, _| Answer::Failed("offline".into()),
+        |_| Answer::Failed("offline".into()),
+    );
+    assert!(failed.is_err(), "the kept copy doesn't stand in");
+    // An ordinary read still falls back to it.
+    let kept = json_with(
+        RELEASES,
+        &cache,
+        LATER,
+        |_, _| Answer::Failed("offline".into()),
+        |_| Answer::Failed("offline".into()),
+    );
+    assert_eq!(kept.unwrap(), Some(list("new")));
     let _ = fs::remove_dir_all(cache);
 }

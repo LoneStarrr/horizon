@@ -3,7 +3,7 @@
 /// `AbstractMinecart.getMaxSpeed`, which `MinecartFurnace` halves, and
 /// `comeOffTrack` clamps with it too.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_furnace_cart_is_capped_at_half_the_rule_speed_under_the_new_physics() {
     super::super::native_entity_refs::tests::with_game(|game| {
         let mut features = game.level.enabled_features.to_vec();
@@ -113,7 +113,7 @@ fn cart_index_finds_what_a_scan_finds() {
 /// The cart index hands a cart every mob a scan finds in its box, and
 /// knows whether a mob rides it, however the mob list changed since.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cart_index_finds_the_mobs_a_scan_finds() {
     use super::{CartIndex, CartKind, Minecart};
     use horizon_client::mobs::Mob;
@@ -491,8 +491,8 @@ fn a_wither_never_rides_a_cart() {
 #[test]
 fn a_cart_seat_matches_the_player_offset() {
     let at = Vec3::new(1.0, 10.0, 2.0);
-    assert!((cart_seat(at, 0.0).y - 10.1875).abs() < 1e-12);
-    assert!((cart_seat(at, 0.6).y - (10.0 + SEAT)).abs() < 1e-12);
+    assert!((cart_seat(at, PASSENGER_Y).y - 10.1875).abs() < 1e-12);
+    assert!((cart_seat(at, SEAT).y - (10.0 + SEAT)).abs() < 1e-12);
     assert_eq!(cart_seat(at, 0.0).x, 1.0);
     assert_eq!(cart_seat(at, 0.0).z, 2.0);
 }
@@ -597,4 +597,109 @@ fn a_furnace_saves_its_push_without_y() {
     assert_eq!(saved.get("PushZ"), Some(&Tag::Double(0.25f64.to_bits())));
     let loaded = Minecart::from_nbt(&saved, 1, CartKind::Furnace).unwrap();
     assert_eq!(loaded.push, Vec3::new(0.5, 0.0, 0.25));
+}
+
+/// A shulker beside the rail is picked up although `Mob::pushable` leaves it out.
+#[test]
+fn a_cart_picks_up_a_shulker_but_not_a_dead_one() {
+    assert!(offered_pickup(false, Species::Shulker, true));
+    assert!(!offered_pickup(false, Species::Shulker, false));
+    assert!(!offered_pickup(false, Species::Bat, true));
+    assert!(offered_pickup(true, Species::Cow, true));
+    assert!(pickup_instead_of_push(Species::Shulker, false, false));
+    assert!(can_ride_cart(Species::Shulker, 0));
+}
+
+/// A shulker already riding a boat is no pickup candidate and `Shulker.push` is a no-op.
+#[test]
+fn a_mounted_shulker_does_not_push_a_cart() {
+    assert!(!pickup_instead_of_push(Species::Shulker, true, false));
+    assert!(!takes_push_from_cart(Species::Shulker));
+    assert!(takes_push_from_cart(Species::Cow));
+}
+
+/// A pass over loose carts, some of them TNT carts that blow up in the middle of it (the list shrinks
+/// under the pass), plays the same with the boxes taken at the start of each tick as without them.
+#[test]
+#[ignore = "daily"]
+fn a_pass_with_carts_blowing_up_plays_the_same_with_and_without_the_boxes_taken_at_the_start() {
+    use super::near_carts::tests_support::{NEAR_CARTS_ANSWERS, NEAR_CARTS_OFF};
+    // Opt in to the seed uniquifier only in a fresh child, as the other seeded tests do.
+    if crate::game::native_entity_refs::tests::run_fresh_cases(
+        "game::minecarts::tests::a_pass_with_carts_blowing_up_plays_the_same_with_and_without_the_boxes_taken_at_the_start",
+        "HORIZON_TEST_SEEDS",
+        &["1"],
+    ) {
+        return;
+    }
+    type Snapshot = Vec<(u32, [f64; 3], [f64; 3])>;
+    fn play(off: bool) -> (Vec<Snapshot>, u32) {
+        let mut ticks = Vec::new();
+        let mut answers = 0;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            horizon_client::random_source::set_thread_uniquifier(777).unwrap();
+            NEAR_CARTS_OFF.set(off);
+            NEAR_CARTS_ANSWERS.set(0);
+            game.build_registries();
+            game.set_allow_commands(true);
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            game.block_ticks
+                .add_empty_chunk(horizon_core::position::ChunkPos::new(0, 0))
+                .unwrap();
+            assert!(game.run_command("forceload add 0 0"));
+            for k in 0..40u32 {
+                let at = horizon_core::geometry::Vec3::new(
+                    2.0 + f64::from(k % 8) * 0.9,
+                    80.0 + f64::from(k / 8) * 1.3,
+                    2.0 + f64::from((k * 5) % 7) * 0.8,
+                );
+                let tnt = k % 9 == 4;
+                let mut cart = super::Minecart::new(
+                    k + 1,
+                    if tnt {
+                        super::CartKind::Tnt
+                    } else {
+                        super::CartKind::Rideable
+                    },
+                    at,
+                );
+                if tnt {
+                    cart.fuse = 4 + (k % 5) as i32;
+                }
+                game.carts.push(cart);
+            }
+            for _ in 0..30 {
+                game.tick_carts();
+                ticks.push(
+                    game.carts
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.id,
+                                [c.position.x, c.position.y, c.position.z],
+                                [c.velocity.x, c.velocity.y, c.velocity.z],
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            answers = NEAR_CARTS_ANSWERS.get();
+        });
+        NEAR_CARTS_OFF.set(false);
+        (ticks, answers)
+    }
+    let (without, none) = play(true);
+    let (with, taken) = play(false);
+    assert_eq!(none, 0);
+    assert!(
+        taken > 100,
+        "the boxes taken at the start answered {taken} times"
+    );
+    // The pass really changed under itself: carts went, and the rest moved.
+    assert!(with.first().unwrap().len() > with.last().unwrap().len());
+    assert_ne!(with.first(), with.last());
+    assert_eq!(without, with);
 }

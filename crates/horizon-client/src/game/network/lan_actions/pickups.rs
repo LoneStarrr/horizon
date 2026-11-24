@@ -3,7 +3,7 @@ use super::*;
 impl Game<'_> {
     /// Dropped items touching a guest go into their inventory
     /// (`ItemEntity.playerTouch`, then `ServerPlayer.onItemPickup`).
-    pub(super) fn guest_pickups(&mut self, gi: usize) {
+    pub(in crate::game) fn guest_pickups(&mut self, gi: usize) {
         let Some(host) = self.lan.as_ref() else {
             return;
         };
@@ -56,9 +56,8 @@ impl Game<'_> {
                 continue;
             };
             let answer = if listens {
-                let stack = self.dropped[i].stack.clone();
                 let answer = self
-                    .as_guest(conn, |g| g.native_pickup_answer(&stack))
+                    .as_guest(conn, |g| g.native_pickup_answer(item_id))
                     .unwrap_or_default();
                 // Only a dispatched callback can invalidate the original index.
                 let Some(at) = self.dropped.iter().position(|d| d.id == item_id) else {
@@ -84,6 +83,22 @@ impl Game<'_> {
             // removed it.
             let after = match rest {
                 Some(rest) if rest.count >= before => continue,
+                // `item_picked_up_partial`: the remainder is the entity's while mods hear it, and
+                // the count after comes from the entity.
+                Some(rest)
+                    if mod_api::__private::listened(mod_api::HookId::ItemPickedUpPartial) =>
+                {
+                    self.dropped[i].stack = rest.clone();
+                    let told = self.as_guest(conn, |g| g.native_pickup_partial(&stack, rest));
+                    let at = self.dropped.iter().position(|d| d.id == item_id);
+                    if let (Some(at), Some(remaining)) = (at, told) {
+                        match remaining {
+                            Some(remaining) => self.dropped[at].stack = remaining,
+                            None => self.dropped[at].stack.count = 0,
+                        }
+                    }
+                    at
+                }
                 Some(rest) => {
                     self.dropped[i].stack = rest;
                     Some(i)
@@ -93,7 +108,7 @@ impl Game<'_> {
                 None if mod_api::__private::listened(mod_api::HookId::ItemPickedUpPost) => {
                     self.dropped[i].stack.count = 0;
                     let raised = self
-                        .as_guest(conn, |g| g.native_pickup_post(&stack))
+                        .as_guest(conn, |g| g.native_pickup_post(item_id, &stack))
                         .flatten();
                     let at = self.dropped.iter().position(|d| d.id == item_id);
                     if let (Some(at), Some(raised)) = (at, raised) {
@@ -246,50 +261,38 @@ impl Game<'_> {
         if let Some(cooldown) = cooldown {
             self.native_player_exp_cooldown_change(player, &name, cooldown);
         }
-        if unable || delayed {
+        if unable {
             return;
         }
         let area = match vehicle.and_then(|v| self.guest_target_box(gi, v as i32)) {
             Some(vehicle) => own.union_bounds(vehicle).inflate(Vec3::new(1.0, 0.0, 1.0)),
             None => own.inflate(Vec3::new(1.0, 0.5, 1.0)),
         };
-        let (min, max) = (
-            [
-                area.min_position().x,
-                area.min_position().y,
-                area.min_position().z,
-            ],
-            [
-                area.max_position().x,
-                area.max_position().y,
-                area.max_position().z,
-            ],
-        );
-        let touching: Vec<usize> = self
-            .orbs
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| {
-                o.position.x + 0.25 > min[0]
-                    && o.position.x - 0.25 < max[0]
-                    && o.position.y + 0.5 > min[1]
-                    && o.position.y < max[1]
-                    && o.position.z + 0.25 > min[2]
-                    && o.position.z - 0.25 < max[2]
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let touching = crate::game::item_entities::touching_orbs(&self.orbs, area);
         if touching.is_empty() {
             return;
         }
-        // Util.getRandom(orbs, random).
+        // Player.aiStep draws before ExperienceOrb.playerTouch checks the cooldown.
+        let pick =
+            |player: &mut PlayerMotion| player.random.next_int_bound(touching.len() as i32).ok();
         let pick = self
-            .world
-            .random
-            .next_int_bound(touching.len() as i32)
-            .unwrap_or(0) as usize;
+            .lan
+            .as_mut()
+            .and_then(|host| {
+                host.hub
+                    .update_guest(conn, |g| g.motion.as_deref_mut().and_then(pick))
+                    .flatten()
+            })
+            .or_else(|| {
+                // A guest whose body has yet to be initialized gets it on their first turn.
+                self.as_guest(conn, |game| game.player.as_mut().and_then(pick))
+                    .flatten()
+            });
+        let Some(pick) = pick.filter(|_| !delayed) else {
+            return;
+        };
         // A merged orb gives its value once per count and goes at zero.
-        let index = touching[pick];
+        let index = touching[pick as usize];
         let mut orb = self.orbs[index].clone();
         let mut canceled = false;
         // Swapping the guest in costs: only when a mod hears the pickup.
@@ -329,7 +332,8 @@ impl Game<'_> {
             host.hub.take_item(orb.id as i32, id, 1, at);
         }
         // ClientPacketListener.handleTakeItemEntity's sound, at the orb.
-        let pitch = (self.world.random.next_float() - self.world.random.next_float()) * 0.35 + 0.9;
+        let mut random = horizon_client::random_source::create(); // the listener's own stream
+        let pitch = (random.next_float() - random.next_float()) * 0.35 + 0.9;
         let p = orb.position;
         self.audio.play(
             "minecraft:entity.experience_orb.pickup",
@@ -350,3 +354,7 @@ impl Game<'_> {
 #[cfg(test)]
 #[path = "tests/pickup_post_tests.rs"]
 mod pickup_post_tests;
+
+#[cfg(test)]
+#[path = "tests/orb_merge_contract_tests.rs"]
+mod orb_merge_contract_tests;

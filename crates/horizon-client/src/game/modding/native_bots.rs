@@ -6,10 +6,14 @@ use super::Game;
 use horizon_client::collisions::SceneCollisions;
 use horizon_client::motion::{MotionWorld, PlayerMotion};
 use horizon_client::sprint::Keys;
-use horizon_core::geometry::{Aabb, Vec3};
-use horizon_world::block_collision_scan::BlockCollisionScan;
+use horizon_core::geometry::{Aabb, Vec3, VoxelShape};
+use horizon_core::position::{BlockPos, ChunkPos};
+use horizon_world::block_collision_scan::{
+    BlockCollisionScan, BlockCollisionWorld, CollisionBlock,
+};
 use horizon_world::collision_context::CollisionContext;
 use mod_api::{PlayerInput, SimulatedMove};
+use std::io;
 use std::ops::ControlFlow;
 
 /// The most block cells `native_collision_boxes` looks at: a box of about 100 blocks a side.
@@ -33,6 +37,7 @@ fn input_keys(input: &PlayerInput) -> Option<Keys> {
         shift: input.sneak,
         sprint: input.sprint,
         analog: (!key(forward) || !key(strafe)).then_some([strafe, forward]),
+        ..Keys::default()
     })
 }
 
@@ -83,8 +88,7 @@ impl Game<'_> {
             return None;
         }
         let keys = input_keys(&input)?;
-        self.player_name(player)?;
-        let mut body = self.native_bot_body(player.uuid())?;
+        let mut body = self.native_bot_body(player)?;
         body.yaw = input.yaw;
         body.pitch = input.pitch.clamp(-90.0, 90.0);
         if let Some([x, y, z]) = input.velocity {
@@ -117,10 +121,11 @@ impl Game<'_> {
         Some(result)
     }
 
-    /// A copy of the body of server player `uuid` in the level in place, as it stands now: the
+    /// A copy of the body of server player `player` in the level in place, as it stands now: the
     /// acting player's swapped in, or a guest's as `lan_actions` swaps it in.
-    fn native_bot_body(&self, uuid: u128) -> Option<PlayerMotion> {
-        if self.lan_acting_uuid == Some(uuid) {
+    fn native_bot_body(&self, player: mod_api::PlayerRef) -> Option<PlayerMotion> {
+        (self.native_lifecycle.epoch()? == player.entity().epoch()).then_some(())?;
+        if self.native_acting_player() == Some(player) {
             self.lan_acting?;
             let p = self.player.as_ref()?;
             return (p.health.health() > 0.0 && !p.spectator && self.riding.is_none())
@@ -129,14 +134,17 @@ impl Game<'_> {
         if self.lan_acting.is_some() {
             return None;
         }
-        let g = self.lan.as_ref()?.hub.guests.iter().find(|g| {
-            g.placed
-                && !g.dead
-                && g.uuid == uuid
-                && g.dimension == self.dim.id()
-                && g.vehicle.is_none()
-                && !g.spectator()
-        })?;
+        let guests = &self.lan.as_ref()?.hub.guests;
+        let g = guests.get(guests.identity_index(player.uuid(), player.entity().id())?)?;
+        if !g.participates_online()
+            || !g.placed
+            || g.dead
+            || g.dimension != self.dim.id()
+            || g.vehicle.is_some()
+            || g.spectator()
+        {
+            return None;
+        }
         let mut body = g.motion.as_deref()?.clone();
         body.position = Vec3::new(g.position[0], g.position[1], g.position[2]);
         body.ground.on_ground = g.on_ground;
@@ -151,12 +159,13 @@ impl Game<'_> {
     }
 
     /// The block collision boxes in `aabb` (`[min_x, min_y, min_z, max_x, max_y, max_z]`) of the
-    /// level `dimension`, as `Level.getBlockCollisions(null, aabb)` gives them: each block's
+    /// level `dimension`, as `CollisionGetter.getBlockCollisions(null, aabb)` gives them: each block's
     /// collision shape that shares volume with the box, as world-space boxes (a stair gives two,
     /// a fence its post), under the empty collision context (no entity: scaffolding and powder
     /// snow as for nothing standing on them). Entities and the world border are not in it. For a
-    /// bot's own collision checks and pathfinding. Empty off a server, for another level than the
-    /// one in place, a box that isn't a box (not numbers, or min past max), and one over about a
+    /// bot's own collision checks and pathfinding. None as for `scan_block_collisions`: on a
+    /// server another level than the one in place, on a client a level it neither shows nor
+    /// views, a box that isn't a box (not numbers, or min past max), and one over about a
     /// million blocks. API @API:player_bots@.
     pub(super) fn level_collision_boxes(
         &self,
@@ -192,8 +201,10 @@ impl Game<'_> {
     }
 
     /// `Level.getBlockCollisions(null, aabb)`'s walk, each block's world-space boxes to `visit`
-    /// until it breaks. None for another level than the one in place, a box that isn't one,
-    /// one over `COLLISION_CELLS` and a read error.
+    /// until it breaks. None for a box that isn't one, one over `COLLISION_CELLS` and a read
+    /// error; on a server for another level than the one in place, on a client for a level
+    /// `client_view_world` doesn't name and a walk that reaches a column the client doesn't
+    /// hold (vanilla's walk passes a missing chunk as empty).
     fn scan_block_collisions(
         &self,
         level: mod_api::LevelRef,
@@ -201,13 +212,18 @@ impl Game<'_> {
         mut visit: impl FnMut(&[Aabb]) -> ControlFlow<()>,
     ) -> Option<()> {
         let bounds = aabb_of(aabb)?;
-        if !self.level_in_place(level) {
-            return None;
-        }
-        let mut scene = SceneCollisions {
-            world: &self.world,
-            binding: self.collision,
-            subject: None,
+        let (world, refuse_missing) = if self.is_logical_server() {
+            (self.level_in_place(level).then_some(&self.world)?, false)
+        } else {
+            (self.client_view_world(level)?, true)
+        };
+        let mut scene = ScanColumns {
+            scene: SceneCollisions {
+                world,
+                binding: self.collision,
+                subject: None,
+            },
+            refuse_missing,
         };
         let Ok(scan) = BlockCollisionScan::new(
             &mut scene,
@@ -227,6 +243,54 @@ impl Game<'_> {
             }
         }
         Some(())
+    }
+}
+
+/// The world a collision scan walks: a client's columns refuse the walk where one is missing,
+/// since the client cannot know what the server holds there.
+struct ScanColumns<'w, 'r> {
+    scene: SceneCollisions<'w, 'r>,
+    refuse_missing: bool,
+}
+
+impl<'w> BlockCollisionWorld for ScanColumns<'w, '_> {
+    type Error = io::Error;
+    type Chunk = &'w horizon_client::chunk::Chunk;
+    fn collision_chunk(&mut self, p: ChunkPos) -> io::Result<Option<Self::Chunk>> {
+        match self.scene.collision_chunk(p)? {
+            None if self.refuse_missing => Err(io::Error::other(
+                "collision scan reached a column the client does not hold",
+            )),
+            chunk => Ok(chunk),
+        }
+    }
+    fn collision_block(&mut self, chunk: Self::Chunk, p: BlockPos) -> io::Result<CollisionBlock> {
+        self.scene.collision_block(chunk, p)
+    }
+    fn is_suffocating(
+        &mut self,
+        chunk: Self::Chunk,
+        block: CollisionBlock,
+        p: BlockPos,
+    ) -> io::Result<bool> {
+        self.scene.is_suffocating(chunk, block, p)
+    }
+    fn context_shape(
+        &mut self,
+        block: CollisionBlock,
+        p: BlockPos,
+        context: &CollisionContext<'_>,
+    ) -> io::Result<VoxelShape> {
+        self.scene.context_shape(block, p, context)
+    }
+    fn may_reach_out(&mut self, chunk: Self::Chunk, section_y: i32) -> io::Result<bool> {
+        self.scene.may_reach_out(chunk, section_y)
+    }
+    fn section_is_empty(&mut self, chunk: Self::Chunk, section_y: i32) -> io::Result<bool> {
+        self.scene.section_is_empty(chunk, section_y)
+    }
+    fn missing_chunks_stay_missing(&self) -> bool {
+        self.scene.missing_chunks_stay_missing()
     }
 }
 
@@ -279,6 +343,131 @@ mod tests {
         assert!(sprints(&i));
         i.sprint = false;
         assert!(!sprints(&i));
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn player_simulation_uses_exact_identity_and_preserves_eligibility() {
+        use super::super::native_guest_turn_tests::with_guests;
+        use horizon_client::{
+            chunk::Chunk,
+            lan::guest::{Guest, SPECTATOR},
+            motion::PlayerMotion,
+        };
+        use horizon_core::geometry::Vec3;
+        use std::sync::Arc;
+
+        fn edit_guest(game: &mut Game<'_>, conn: u32, edit: impl FnOnce(&mut Guest)) {
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .update_guest(conn, edit)
+                .unwrap();
+        }
+
+        with_guests(|game| {
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+            let player = game.player(12).unwrap();
+            let other = game.player(13).unwrap();
+            let mut motion = PlayerMotion::new(game.motion, Vec3::new(3.0, 64.0, 5.0)).unwrap();
+            motion.ground.on_ground = true;
+            edit_guest(game, 12, |guest| {
+                guest.motion = Some(Box::new(motion));
+                guest.on_ground = true;
+            });
+            let other_position = Vec3::new(11.0, 64.0, 13.0);
+            let mut other_motion = PlayerMotion::new(game.motion, other_position).unwrap();
+            other_motion.ground.on_ground = true;
+            edit_guest(game, 13, |guest| {
+                guest.position = other_position.components();
+                guest.motion = Some(Box::new(other_motion));
+                guest.on_ground = true;
+            });
+
+            let before = {
+                let guest = game.lan.as_ref().unwrap().hub.guest(12).unwrap();
+                let motion = guest.motion.as_deref().unwrap();
+                (
+                    guest.position,
+                    guest.on_ground,
+                    guest.yaw,
+                    guest.pitch,
+                    guest.sprinting,
+                    motion.position,
+                    motion.velocity,
+                )
+            };
+            let result = game.player_simulate_move(player, input(0.0, 0.0)).unwrap();
+            assert_eq!(result.position[0], 3.0);
+            assert_eq!(result.position[2], 5.0);
+            assert!(result
+                .position
+                .iter()
+                .chain(result.velocity.iter())
+                .all(|value| value.is_finite()));
+            let after = {
+                let guest = game.lan.as_ref().unwrap().hub.guest(12).unwrap();
+                let motion = guest.motion.as_deref().unwrap();
+                (
+                    guest.position,
+                    guest.on_ground,
+                    guest.yaw,
+                    guest.pitch,
+                    guest.sprinting,
+                    motion.position,
+                    motion.velocity,
+                )
+            };
+            assert_eq!(after, before, "simulation must not change the guest");
+
+            let stale = mod_api::__private::game::player_ref(
+                mod_api::EntityRef::new(
+                    mod_api::WorldEpoch::new(player.entity().epoch().get() + 1),
+                    player.entity().id(),
+                ),
+                player.uuid(),
+            );
+            let wrong_entity = mod_api::__private::game::player_ref(other.entity(), player.uuid());
+            assert!(game.player_simulate_move(stale, input(0.0, 0.0)).is_none());
+            assert!(game
+                .player_simulate_move(wrong_entity, input(0.0, 0.0))
+                .is_none());
+
+            let level = game.level(game.dim.id()).unwrap();
+            let fake = game.fake_player(level, 999, "bot_fake").unwrap();
+            assert!(game.player_simulate_move(fake, input(0.0, 0.0)).is_none());
+
+            edit_guest(game, 12, |guest| guest.placed = false);
+            assert!(game.player_simulate_move(player, input(0.0, 0.0)).is_none());
+            edit_guest(game, 12, |guest| guest.placed = true);
+            edit_guest(game, 12, |guest| guest.dead = true);
+            assert!(game.player_simulate_move(player, input(0.0, 0.0)).is_none());
+            edit_guest(game, 12, |guest| guest.dead = false);
+            edit_guest(game, 12, |guest| guest.dimension = "minecraft:the_nether".into());
+            assert!(game.player_simulate_move(player, input(0.0, 0.0)).is_none());
+            let dimension = game.dim.id().to_owned();
+            edit_guest(game, 12, |guest| guest.dimension = dimension);
+            edit_guest(game, 12, |guest| guest.vehicle = Some(500));
+            assert!(game.player_simulate_move(player, input(0.0, 0.0)).is_none());
+            edit_guest(game, 12, |guest| guest.vehicle = None);
+            edit_guest(game, 12, |guest| guest.game_mode = SPECTATOR);
+            assert!(game.player_simulate_move(player, input(0.0, 0.0)).is_none());
+            edit_guest(game, 12, |guest| guest.game_mode = 0);
+
+            let (acting, outer) = game
+                .as_guest(12, |game| {
+                    (
+                        game.player_simulate_move(player, input(0.0, 0.0)),
+                        game.player_simulate_move(other, input(0.0, 0.0)),
+                    )
+                })
+                .unwrap();
+            assert!(acting.is_some(), "the acting guest uses its swapped-in body");
+            assert!(outer.is_none(), "a displaced outer guest remains unavailable");
+        });
     }
 
     #[test]

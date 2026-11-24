@@ -60,7 +60,7 @@ Whoever moves the work (the orchestrator on each heartbeat, or anyone in their p
    contributors, with its pull requests. `build` puts it into roadmap/roadmap.json, which the website reads from main; the hub's Journal tab
    shows it among the releases, and `/data/journal.json` carries it to Kira's #updates and to X.
    In the same pass, `python3 tools/parity_gaps.py readme --write` refreshes the parity headline: the
-   player-visible gaps still open in the port ledger's ten lists (#3512 to #3521), on the README and the website.
+   player-visible gaps still open in the port ledger's ten lists (#3512 to #3521), on the status page (docs/status.md) and the website.
 6. Suggestions come only from #horizon-ideas posts on Discord: Kira sends each one to the maintainers' private
    channel. A good one becomes an item in a normal pull request; none is published automatically.
 
@@ -81,7 +81,8 @@ merged pull request, release, shipped item and weekly summary, newest first, the
 { "format": "horizon-journal", "version": 2, "generated": "…", "url": "https://playhorizon.dev/hub#journal",
   "entries": [
     { "id": "pr-1234", "kind": "merge", "date": "…", "title": "the pull request's title", "url": "…",
-      "number": 1234, "item": "example", "item_title": "Example" },
+      "number": 1234, "item": "example", "item_title": "Example",
+      "author": "…", "merged_by": "…", "labels": ["…"] },
     { "id": "release-v0.2.57", "kind": "release", "date": "…", "title": "…", "plain": "one line", "url": "…",
       "tag": "v0.2.57" },
     { "id": "shipped-server-resource-packs", "kind": "shipped", "date": "the release's", "title": "…",
@@ -92,7 +93,9 @@ merged pull request, release, shipped item and weekly summary, newest first, the
 ```
 
 - An `id` never changes: readers post each one once. `merge` entries are the pull requests players see (no
-  `skip-release` label), plus any that moves a roadmap item; `item` is absent when none does.
+  `skip-release` label), plus any that moves a roadmap item; `item` is absent when none does. `author` and
+  `merged_by` are GitHub logins (`merged_by` can be `null`) and `labels` lists the pull request's label names. All
+  three are optional: older entries do not have them, and readers must cope without.
 - `announce: true` (the item's `announce` key) asks Kira to post the shipped item on X too, with `post`.
 - `https://playhorizon.dev/data/roadmap.json` is `roadmap.toml` as JSON (`areas`, `items` with every key above,
   `overview`, the weekly summaries); an item's page is `https://playhorizon.dev/hub#<id>`.

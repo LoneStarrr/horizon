@@ -49,10 +49,7 @@ impl Game<'_> {
         };
         let before = place;
         let mut cancel = false;
-        let mut draw = crate::game::host::draw::GameDrawContext {
-            game: self,
-            surface: batch,
-        };
+        let mut draw = crate::game::host::draw::GameDrawContext::new(self, batch);
         self.native_render_tooltip_pre(mod_api::__private::RenderTooltipPreCall {
             draw: &mut draw,
             stack: stack.as_ref(),
@@ -330,7 +327,7 @@ fn layout(sizes: &[[f32; 2]], extra_space: bool) -> ([f32; 2], Vec<f32>) {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn rendered_image_callback_receives_whole_box() {
         use mod_api::{
             ClientHost, Hooks, ItemPart, ModEntry, Mods, Registrar,

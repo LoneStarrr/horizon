@@ -9,12 +9,12 @@ pub(super) enum MenuOpen {
 
 /// Per-guest state of the gameplay code that lives outside `Guest`.
 #[derive(Default)]
-pub(super) struct GuestPlay {
+pub(in crate::game) struct GuestPlay {
     mining: Option<Mining>,
     destroy_delay: u32,
     using: Option<(usize, u32)>,
     use_duration: i32,
-    use_ticks_set: bool,
+    use_start: super::using_item::UseStart,
     use_delay: u32,
     /// The shield's ItemCooldowns entry: an axe disabled it for this many ticks.
     pub(super) shield_cooldown: u32,
@@ -46,7 +46,7 @@ pub(super) struct GuestPlay {
     /// The block that clock is for (ServerPlayerGameMode.destroyPos). A START is the only writer
     /// that names one (death, a new ServerPlayerGameMode, clears it), so an abort, or a STOP that
     /// arrives out of reach, leaves it: the STOP of a dig resumed on the same block is still
-    /// measured from the first START's ticks (#4124).
+    /// measured from the first START's ticks (arismoko/horizon#4124).
     destroy_pos: Option<[i32; 3]>,
     /// A block the client stopped digging before the server's time was up: it breaks once
     /// its progress since `dig_start` is complete (ServerPlayerGameMode.hasDelayedDestroy).
@@ -59,16 +59,10 @@ pub(super) struct GuestPlay {
     mount: super::mounts::MountState,
     /// The trading screen the guest has open.
     pub(super) merchant: Option<super::lan_trading::GuestMerchant>,
-    /// The inventory menu and the crafting table the guest crafts in.
-    pub(super) crafting: super::lan_crafting::GuestCrafting,
-    /// The workstation menu the guest has open (game/network/lan_stations.rs).
-    pub(super) station: MenuOwner<Option<super::lan_stations::GuestStation>>,
     /// The mount inventory the guest has open (game/network/lan_mount_menu.rs).
     pub(super) mount_window: Option<super::lan_mount_menu::GuestMount>,
     /// The lectern the guest reads (game/network/lan_stations.rs).
     pub(super) lectern: Option<super::lan_stations::GuestLectern>,
-    /// The menu the mods last heard this guest open (`tick_player_menus`).
-    pub(super) menu_heard: Option<super::native_menus::HeardMenu>,
     /// The equipment the mods last heard this guest wear (`native_players_equipment`), by
     /// `EquipmentSlot`: main hand, off hand, feet, legs, chest, head.
     pub(super) equipment_heard: Option<Box<[Option<crate::items::ItemStack>; 6]>>,
@@ -82,7 +76,7 @@ pub(super) struct GuestPlay {
     /// `Stats.LEAVE_GAME` is counted: a guest is saved more than once on the
     /// way out, the statistic is awarded once (`Game::award_leave_game`).
     pub(super) left_game: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     /// `ServerPlayer.levitationStartPos` and `levitationStartTime`.
     levitation: Option<([f64; 3], u64)>,
     /// The fall, lava ride, Nether trip and blast the guest's advancements track.
@@ -177,7 +171,7 @@ pub(super) struct GuestSwap {
     destroy_delay: u32,
     using: Option<(usize, u32)>,
     use_duration: i32,
-    use_ticks_set: bool,
+    use_start: super::using_item::UseStart,
     use_delay: u32,
     pub(super) shield_cooldown: u32,
     /// The guest's item cooldowns (`Game::cooldowns` for its turn).
@@ -201,7 +195,7 @@ pub(super) struct GuestSwap {
     message: Option<(String, std::time::Instant)>,
     host_ender: Option<(i32, i32, i32)>,
     adv_loaded: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     levitation: Option<([f64; 3], u64)>,
     marks: super::advancements::TravelMarks,
     death_cause: Option<String>,
@@ -246,6 +240,15 @@ impl GuestPlay {
     pub(in crate::game) fn attack_ticks(&self) -> u32 {
         self.attack_ticks
     }
+    /// Fresh play state for a scoped fake-player action: starts with a full attack charge
+    /// (100 ticks, matching a local player's initial `attack_ticks`) so weapon attacks deal
+    /// full damage.
+    pub(in crate::game) fn scoped() -> Self {
+        Self {
+            attack_ticks: 100,
+            ..Self::default()
+        }
+    }
     /// The main-hand item of the guest's last tick (`Game.attack_item`).
     pub(in crate::game) fn attack_item(&self) -> Option<&str> {
         self.attack_item.as_deref()
@@ -268,14 +271,14 @@ impl GuestPlay {
     }
     /// The `ServerPlayerGameMode.destroyProgressStart` a STOP on `pos` is measured from: the clock
     /// belongs to the block the START named (`destroyPos`), and only a START writes either, so a
-    /// dig resumed after a fall still runs on the first START's ticks (#4124).
+    /// dig resumed after a fall still runs on the first START's ticks (arismoko/horizon#4124).
     fn dig_start_for(&self, pos: [i32; 3]) -> Option<u64> {
         (self.destroy_pos == Some(pos)).then_some(self.dig_start)
     }
     /// A dig that ends without a break, an abort or a STOP from out of reach: the guest holds
     /// attack no more (`digging` is `as_guest`'s left button and `tick_mining`'s `forced_hit`),
     /// while the clock `destroy_pos` names stays for the STOP that comes when the guest is back
-    /// in reach (#4124).
+    /// in reach (arismoko/horizon#4124).
     fn dig_ended(&mut self) {
         self.digging = None;
         self.mining = None;
@@ -285,6 +288,7 @@ impl GuestPlay {
 struct ItemRules<'a>(
     &'a horizon_client::items::Items,
     &'a horizon_client::enchant::Enchantments,
+    Option<&'a dyn horizon_client::menu::SlotRules>,
 );
 impl Rules for ItemRules<'_> {
     fn items(&self) -> &horizon_client::items::Items {
@@ -295,6 +299,9 @@ impl Rules for ItemRules<'_> {
     }
     fn max_stack(&self, item: &str) -> u32 {
         self.0.get(item).map_or(64, |i| i.max_stack)
+    }
+    fn slot_rules(&self) -> Option<&dyn horizon_client::menu::SlotRules> {
+        self.2
     }
 }
 
@@ -316,17 +323,6 @@ pub(super) fn guest_within_entity_range(
     let range = if g.creative() { 5.0 } else { 3.0 } + buffer;
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < range * range
 }
-fn direction(face: i32) -> [i32; 3] {
-    match face {
-        0 => [0, -1, 0],
-        1 => [0, 1, 0],
-        2 => [0, 0, -1],
-        3 => [0, 0, 1],
-        4 => [-1, 0, 0],
-        _ => [1, 0, 0],
-    }
-}
-
 fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
     BuildingPlayer {
         conn: Some(g.conn),
@@ -341,57 +337,97 @@ fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
     }
 }
 
+use horizon_client::lan::guest_list::GuestList;
+
 thread_local! {
     /// The hub's bodies for the turns of one `tick_guests`, built once instead
-    /// of for every turn (players x turns a tick). A guest's entry is refreshed
-    /// when its turn ends ([`refresh_building_player`]), so the turns after it
-    /// see it where it went (a pearl, a death, spectator mode).
-    static BUILDING_CACHE: std::cell::RefCell<Option<HubBodies>> =
+    /// of for every turn (players x turns a tick), with the guest list's layout
+    /// they were built for. A guest's entry is refreshed when its turn ends
+    /// ([`refresh_building_player`]), so the turns after it see it where it went
+    /// (a pearl, a death, spectator mode).
+    static BUILDING_CACHE: std::cell::RefCell<Option<(u64, HubBodies)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The bodies of the simulation guests as they are now.
+pub(super) fn built_bodies(guests: &GuestList) -> (u64, HubBodies) {
+    guests.drain_written(|_, _| {});
+    (
+        guests.layout(),
+        shared(guests.simulation_iter().map(building_player)),
+    )
+}
+
+/// The cached bodies, if they were built for these guests as they are laid out, else bodies
+/// built afresh from the guests.
+pub(super) fn bodies_of(
+    guests: &GuestList,
+    cache: Option<&(u64, HubBodies)>,
+) -> HubBodies {
+    match cache {
+        Some((built_for, bodies)) if *built_for == guests.layout() => bodies.clone(),
+        _ => shared(guests.simulation_iter().map(building_player)),
+    }
+}
+
+/// Copies every guest written since the last time into the cached bodies (none when the guests
+/// were laid out differently since: [`bodies_of`] builds afresh then).
+pub(super) fn refresh_bodies(guests: &GuestList, (built_for, bodies): &(u64, HubBodies)) {
+    if *built_for == guests.layout() {
+        guests.drain_written(|place, g| bodies[place].set(building_player(g)));
+    }
 }
 
 /// The hub's current bodies, across dimensions. A borrowed ancestor's
 /// live body takes precedence over this saved state until its turn returns.
 fn building_players(host: &LanHost) -> HubBodies {
-    let guests: Vec<_> = host.hub.guests.simulation_iter().collect();
-    let kept = BUILDING_CACHE.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|list| {
-                list.len() == guests.len()
-                    && list
-                        .iter()
-                        .zip(&guests)
-                        .all(|(p, g)| p.get().conn == Some(g.conn))
-            })
-            .cloned()
-    });
-    kept.unwrap_or_else(|| shared(guests.into_iter().map(building_player)))
+    BUILDING_CACHE.with(|c| bodies_of(&host.hub.guests, c.borrow().as_ref()))
 }
 
 /// Builds the hub's bodies once for the turns to come (`Some`), or drops them.
 pub(super) fn building_cache(host: Option<&LanHost>) {
-    let bodies = host.map(|host| shared(host.hub.guests.simulation_iter().map(building_player)));
+    let bodies = host.map(|host| built_bodies(&host.hub.guests));
     BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
 }
 
 /// The cached bodies as they are now in the hub, after `conn`'s turn (or its
-/// death step). Every entry, not only the actor's: a turn can move, kill or
-/// change another guest too (`/tp`, an attack, an explosion), and the turns
-/// after it must see that guest where it is now, as a list built afresh would.
-/// Copies into the shared cells, no allocation.
+/// death step): every guest written since the last refresh, not only the
+/// actor, as a turn can move, kill or change another guest too (`/tp`, an
+/// attack, an explosion), and the turns after it must see that guest where
+/// it is now, as a list built afresh would. The guest list notes each write
+/// (`drain_written`), so the work follows the guests that changed,
+/// not their number. Copies into the shared cells, no allocation.
 fn refresh_building_player(host: &LanHost, _conn: u32) {
     BUILDING_CACHE.with(|c| {
-        if let Some(list) = c.borrow().as_ref()
-            && list.len() == host.hub.guests.simulation_iter().count()
-        {
-            for (p, g) in list.iter().zip(host.hub.guests.simulation_iter()) {
-                if p.get().conn == Some(g.conn) {
-                    p.set(building_player(g));
-                }
+        if let Some(cache) = c.borrow().as_ref() {
+            #[cfg(test)]
+            if REFRESH_EVERY_GUEST.get() {
+                return refresh_every_guest(&host.hub.guests, cache);
             }
+            refresh_bodies(&host.hub.guests, cache);
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: refresh every guest's body after each turn, as the code did before the guest
+    /// list noted its writes. The tests that compare the two run a scenario under each.
+    static REFRESH_EVERY_GUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test only: the refresh of every body, whatever was written.
+#[cfg(test)]
+fn refresh_every_guest(
+    guests: &GuestList,
+    (built_for, bodies): &(u64, HubBodies),
+) {
+    if *built_for == guests.layout() {
+        for (cell, g) in bodies.iter().zip(guests.simulation_iter()) {
+            cell.set(building_player(g));
+        }
+        guests.drain_written(|_, _| {});
+    }
 }
 
 /// Kept at LAN action scope to preserve its derived internals point identity.
@@ -454,7 +490,7 @@ enum StopDig {
 
 /// The STOP branch's decision: a STOP is measured from the START that named its block
 /// (`destroyPos`, which an abort or a STOP from out of reach leaves alone), whose ticks times
-/// `getDestroyProgress` decide between the break and the delayed dig (#4124).
+/// `getDestroyProgress` decide between the break and the delayed dig (arismoko/horizon#4124).
 fn stop_dig(play: &GuestPlay, pos: [i32; 3], air: bool, ticks: u64, per_tick: f32) -> StopDig {
     match play.dig_start_for(pos) {
         None => StopDig::Other,
@@ -517,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn menu_rules_match_guest_packets_and_prediction() {
         use horizon_client::{
             chunk::Chunk,
@@ -533,11 +569,7 @@ mod tests {
         struct Part;
         #[mod_api::horizon_part]
         impl MenuPart for Part {
-            fn menu_slot_rules(
-                &self,
-                _: &dyn mod_api::LoopContext,
-                event: &mut MenuSlotRulesEvent<'_>,
-            ) {
+            fn menu_slot_rules(&self, _: &dyn mod_api::Host, event: &mut MenuSlotRulesEvent<'_>) {
                 if mod_api::__private::item_key_id(event.stack.item()).unwrap()
                     == "minecraft:granite"
                     && event.stack.count() < 8
@@ -911,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn crafting_guest_self_swap_keeps_eight_items() {
         use horizon_client::chunk::Chunk;
         use horizon_protocol::packets::play::{ContainerClick, Serverbound};
@@ -936,7 +968,7 @@ mod tests {
                 .lan
                 .as_ref()
                 .unwrap()
-                .play
+                .menus
                 .get(&12)
                 .unwrap()
                 .crafting
@@ -971,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn block_menu_handle_and_use_each_count_the_guest_once() {
         use horizon_client::chunk::Chunk;
         use mod_api::BlockUpdateFlags;
@@ -1086,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn block_menu_click_keeps_spent_action_on_cancellation() {
         use horizon_client::{chunk::Chunk, lan::guest::GuestKind};
         use mod_api::BlockUpdateFlags;
@@ -1122,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn block_parts_pick_and_use_on_the_server_and_for_a_guest() {
         use super::super::{lan::LanSettings, native_entity_refs::tests::with_game};
         use horizon_client::{
@@ -1132,8 +1164,8 @@ mod tests {
         use horizon_protocol::packets::{configuration::ClientInformation, play};
         use mod_api::InteractionResult as Answer;
         use mod_api::{
-            self, BlockPart, CloneItemStackEvent, Flow, Hooks, Host, ItemPart, ItemStack,
-            Registrar, ServerHost, UseItemOnEvent, UseOnEvent, UseWithoutItemEvent,
+            self, BlockPart, CloneItemStackEvent, Hooks, Host, ItemPart, ItemStack, Registrar,
+            ServerHost, UseItemOnEvent, UseOnEvent, UseWithoutItemEvent,
         };
         use std::sync::{
             Arc, Mutex,
@@ -1215,10 +1247,10 @@ mod tests {
         // The held items' own `Item.useOn`, counted, taking the click.
         #[mod_api::horizon_part]
         impl ItemPart for User {
-            fn use_on(&self, _: &mut dyn ServerHost, _: &mut UseOnEvent<'_>) -> Flow {
+            fn use_on(&self, _: mod_api::HostSide<'_>, _: &mut UseOnEvent<'_>) -> Option<Answer> {
                 self.item_uses
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Flow::Cancel
+                Some(Answer::SuccessServer)
             }
         }
         struct Mod {
@@ -1311,6 +1343,7 @@ mod tests {
                     max_players: 2,
                     integrated: true,
                     levels: game.level_shapes,
+                    level_seeds: game.levels.runtime.seeds(),
                 };
                 game.lan_host(settings, net, config).unwrap();
                 let (tx, _rx) = std::sync::mpsc::channel();
@@ -1447,6 +1480,7 @@ mod tests {
                             ticks: 0,
                             playing: false,
                             song_clock_present: false,
+                            loaded_clock: false,
                         },
                     ),
                 );
@@ -1805,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn block_part_use_item_on_consumes_once() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
@@ -1873,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn replacing_empty_note_block_use_does_not_award_vanilla_stats() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
@@ -1943,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn fake_body_does_not_count_toward_sleep() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(
@@ -1975,7 +2009,7 @@ mod tests {
         assert_eq!(copied_respawn_point(true, Some([0.5, 64.0, 0.5])), None);
     }
 
-    /// #4124: a STOP is measured from the START that named its block (`destroyPos`) — an abort, or
+    /// arismoko/horizon#4124: a STOP is measured from the START that named its block (`destroyPos`) — an abort, or
     /// a STOP from out of reach, ends the dig the guest's button held but leaves that clock — and
     /// breaks the block at 70 % of the dig, or the server finishes it alone from the same START.
     /// A guest that reaches a block only at a jump's apex keeps its dig this way, and no other
@@ -2017,7 +2051,7 @@ mod tests {
         assert_eq!(stop_dig(&play, pos, false, 1015, 0.05), StopDig::Other);
     }
 
-    /// #3684: a player shrunk to `minecraft:scale` 0.1 who stands 0.05 from a
+    /// arismoko/horizon#3684: a player shrunk to `minecraft:scale` 0.1 who stands 0.05 from a
     /// wall has eyes 0.048 wide, which don't reach into it: they don't
     /// suffocate there, as a full-sized player 0.3 from the wall doesn't.
     #[test]
@@ -2153,7 +2187,7 @@ mod hotbar_tests {
     /// player by UUID and entity id; the same slot again fires neither, and a cancelled pre
     /// keeps the old slot with no post.
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn a_hotbar_switch_fires_pre_then_post_and_pre_can_keep_the_slot() {
         let heard = Heard::default();
         let mods = vec![ModEntry::new("hotbar", Box::new(Hotbar(heard.clone())))].into();
@@ -2224,7 +2258,7 @@ mod respawn_position_tests {
     /// player's handle, and its new point, facing and copy choice are what
     /// the player gets.
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn a_mod_moves_a_respawn_and_drops_the_point() {
         let heard = Heard::default();
         let mods = vec![ModEntry::new("east", Box::new(East(heard.clone())))].into();
@@ -2274,7 +2308,7 @@ mod respawn_position_tests {
     /// point facing the respawn direction, not the way it died, and keeps
     /// the point.
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn a_listening_mod_leaves_the_respawn_as_it_was() {
         let heard = Arc::default();
         let mods = vec![ModEntry::new(
@@ -2315,7 +2349,39 @@ mod pickup_xp_tests {
     use super::super::native_entity_refs::tests::with_game;
     use super::super::native_item_places::tests::{guest, open_to_lan};
     use horizon_client::entities::ExperienceOrb;
-    use horizon_core::geometry::Vec3;
+    use horizon_core::{geometry::Vec3, random::RandomSource};
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_guest_picks_an_orb_with_their_own_random() {
+        with_game(|game| {
+            open_to_lan(game);
+            let mut g = guest(1);
+            g.loaded = true;
+            g.position = [16.0, 70.0, 0.5];
+            game.lan.as_mut().unwrap().hub.guests.push(g);
+            game.as_guest(1, |game| game.player.as_mut().unwrap().random.set_seed(0))
+                .unwrap();
+
+            // Section 0 comes before section 1 even though its orb joined second.
+            let right = Vec3::new(16.5, 70.0, 0.5);
+            let left = Vec3::new(15.5, 70.0, 0.5);
+            game.orbs.push(ExperienceOrb::new(41, right, Vec3::ZERO, 7));
+            game.orbs.push(ExperienceOrb::new(40, left, Vec3::ZERO, 1));
+            game.guest_orbs(0);
+            game.guest_orbs(0);
+
+            let guest = &game.lan.as_ref().unwrap().hub.guests[0];
+            assert_eq!(guest.xp_total, 7);
+            assert_eq!(game.orbs.len(), 1);
+            assert_eq!(game.orbs[0].id, 40);
+            // Seed 0 after nextInt(2) and the cooldown tick's nextInt(1).
+            assert_eq!(
+                guest.motion.as_ref().unwrap().random.clone().next_int(),
+                1_033_096_058
+            );
+        });
+    }
 
     /// Listens to `pickup_xp`, canceling it when told to.
     struct Listen(bool);
@@ -2349,6 +2415,7 @@ mod pickup_xp_tests {
                 attachment_lifetime: Default::default(),
                 rotation: [0.0, 0.0],
                 join: Default::default(),
+                section_order: 0,
                 id: 40,
                 position: p,
                 previous: p,
@@ -2357,6 +2424,7 @@ mod pickup_xp_tests {
                 age: 0,
                 on_ground: true,
                 count: 1,
+                fire_ticks: 0,
                 ticks: 0,
                 air: 300,
                 health: 5,
@@ -2374,7 +2442,7 @@ mod pickup_xp_tests {
     /// `PlayerXpEvent.PickupXp` through the shared `listened` probe: a pickup goes the
     /// same with no listener and with one that changes nothing, and a cancel keeps the orb.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn pickup_xp_is_the_same_with_and_without_a_listener() {
         let none = take_orb();
         assert_eq!(none, (false, 7));
@@ -2395,7 +2463,7 @@ mod respawn_world_point_tests {
 
     /// PlayerList.respawn sends world respawn data, independently of the personal landing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn guest_respawn_keeps_world_information_distinct_from_personal_landing() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -2464,6 +2532,7 @@ mod respawn_world_point_tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -2550,7 +2619,7 @@ mod swing_echo_tests {
     /// placed (SUCCESS) is the client's own swing, a bed's use
     /// (SUCCESS_SERVER) is not (#9887).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn only_a_server_only_use_swings_back_to_the_player() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -2630,6 +2699,7 @@ mod swing_echo_tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -2793,7 +2863,7 @@ mod guest_close_listener_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn ordinary_guest_final_close_posts_to_actual_listener() {
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
@@ -2865,6 +2935,7 @@ mod guest_close_listener_tests {
                 max_players: 4,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -3134,6 +3205,7 @@ mod item_on_block_cooldown_tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -3282,17 +3354,17 @@ mod item_on_block_cooldown_tests {
         }
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn failed_stick_use_keeps_group_available_for_placement() {
         placement_control(None);
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn actual_guest_placement_starts_its_cooldown() {
         placement_control(Some(true));
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn actual_guest_second_placement_is_rejected() {
         placement_control(Some(false));
     }
@@ -3313,6 +3385,10 @@ mod bundle_slot_tests;
 #[cfg(test)]
 #[path = "tests/crack_feedback_tests.rs"]
 mod crack_feedback_tests;
+
+#[cfg(test)]
+#[path = "tests/interaction_target_box_tests.rs"]
+mod interaction_target_box_tests;
 
 #[cfg(test)]
 #[path = "tests/menu_still_valid_tests.rs"]

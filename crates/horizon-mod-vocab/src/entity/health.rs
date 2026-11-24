@@ -158,6 +158,23 @@ impl DamageContainer {
     pub fn set_post_attack_invulnerability_ticks(&mut self, value: i32) {
         self.0.post_attack_invulnerability_ticks = value;
     }
+    /// Scale the hit's damage by `factor`, as Paper's `EntityDamageEvent#setDamage` does for a
+    /// multiple: `original` and `new_damage` are both multiplied, so 0.5 halves the hit and 2.0
+    /// doubles it. The reductions already taken and `blocked` keep their amounts; `health_damage`
+    /// is the value the engine computes at its application point. A factor that is not finite is
+    /// refused with [`ScaleRefusal::NotFinite`], a negative one with [`ScaleRefusal::Negative`]:
+    /// this API refuses them and changes nothing.
+    pub fn scale_original(&mut self, factor: f32) -> Result<(), ScaleRefusal> {
+        if !factor.is_finite() {
+            return Err(ScaleRefusal::NotFinite);
+        }
+        if factor < 0.0 {
+            return Err(ScaleRefusal::Negative);
+        }
+        self.0.original *= factor;
+        self.0.new_damage *= factor;
+        Ok(())
+    }
     /// The amount taken by one reduction kind.
     pub fn reduction(&self, reduction: Reduction) -> f32 {
         self.0.reduction(reduction)
@@ -182,6 +199,20 @@ pub struct HurtSource<'a> {
     pub direct: i32,
     pub position: Option<[f64; 3]>,
 }
+/// Which entry of vanilla's `LivingEntity.knockback` a push came through, as
+/// `living_knockback` tells its listener. The short entry (power, direction) only delegates to
+/// the full one (which also takes whether the push comes from an effect), so one push through
+/// the short entry reaches the hook once, as `Short`; a call of the full entry itself is `Full`.
+/// A listener that changes the strength where a mixin on both entries would change it twice
+/// for a short-entry call and once for a full-entry call applies its change twice on `Short`.
+// exhaustive: vanilla has exactly these two entries, `knockback(power, x, z)` and the full one
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, horizon_mod_api_macros::Wire)]
+pub enum KnockbackEntry {
+    /// The push entered through `knockback(power, x, z)`, which then calls the full entry.
+    Short,
+    /// The push entered the full entry directly.
+    Full,
+}
 /// Where the entity a hit lands on stands and looks (`getViewVector`), for
 /// `HURT_SERVER`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -191,7 +222,7 @@ pub struct Victim {
     pub position: [f64; 3],
     pub view: [f64; 3],
 }
-/// What a player's raised blocking item does to a hit, as `native_living_shield_block`
+/// What a player's raised blocking item does to a hit, as `living_shield_block`
 /// may change it (`LivingShieldBlockEvent`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 // exhaustive: the game builds it with a literal; mods only read it
@@ -206,4 +237,50 @@ pub struct ShieldBlock {
     /// vanilla's `ItemDamageFunction` of the final `blocked_damage` applies.
     /// The damage sequence's `shield_damage` value.
     pub shield_damage: i32,
+}
+
+/// Why [`DamageContainer::scale_original`] refused a factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum ScaleRefusal {
+    /// The factor is NaN or infinite.
+    NotFinite,
+    /// The factor is below zero.
+    Negative,
+}
+
+#[cfg(test)]
+mod scale_original_tests {
+    use super::*;
+
+    #[test]
+    fn halves_original_and_new_damage_and_keeps_blocked() {
+        let mut container = DamageContainer::new(10.0);
+        container.set_new_damage(6.0);
+        assert_eq!(container.scale_original(0.5), Ok(()));
+        assert_eq!(container.original(), 5.0);
+        assert_eq!(container.new_damage(), 3.0);
+        assert_eq!(container.blocked(), 0.0);
+    }
+
+    #[test]
+    fn doubles_a_hit_and_allows_zero() {
+        let mut container = DamageContainer::new(4.0);
+        assert_eq!(container.scale_original(2.0), Ok(()));
+        assert_eq!(container.original(), 8.0);
+        assert_eq!(container.new_damage(), 8.0);
+        assert_eq!(container.scale_original(0.0), Ok(()));
+        assert_eq!(container.new_damage(), 0.0);
+    }
+
+    #[test]
+    fn refuses_non_finite_and_negative_factors_without_change() {
+        let mut container = DamageContainer::new(10.0);
+        assert_eq!(container.scale_original(f32::NAN), Err(ScaleRefusal::NotFinite));
+        assert_eq!(container.scale_original(f32::INFINITY), Err(ScaleRefusal::NotFinite));
+        assert_eq!(container.scale_original(-1.0), Err(ScaleRefusal::Negative));
+        assert_eq!(container.original(), 10.0);
+        assert_eq!(container.new_damage(), 10.0);
+    }
 }

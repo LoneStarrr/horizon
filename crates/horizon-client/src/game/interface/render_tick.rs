@@ -1,11 +1,9 @@
 //! Per-tick client visuals: the particle engine, `ClientLevel.animateTick`,
 //! campfire smoke and rain splashes (`ClientLevel.tickWeatherEffects`).
-use super::{Dim, Game, host::draw::GameCameraDrawContext};
+use super::{Game, host::draw::GameCameraDrawContext};
 use horizon_client::assets::Properties;
 use horizon_client::camera::NearPlane;
-use horizon_client::fog::{
-    FogData, FogInputs, FogType, fog_type, settle_rain_fog, update_rain_fog,
-};
+use horizon_client::fog::{FogData, FogInputs, FogType, settle_rain_fog, update_rain_fog};
 use horizon_client::{
     animate_tick::{AnimateContext, animate_tick, campfire_particles, marker_particle_target},
     biome::Biomes,
@@ -160,6 +158,12 @@ impl Game<'_> {
             height.max(1) as f32,
         )
     }
+    /// Camera submersion fog type (`Camera.getFluidInCamera`), checked with native mods.
+    pub(super) fn camera_submersion(&self, camera: [f64; 3]) -> FogType {
+        let mut fog_type = self.camera_fog_type(camera);
+        self.native_camera_submersion(camera, &mut fog_type);
+        fog_type
+    }
     /// `FogRenderer.setupFog` for the frame's camera, and Horizon's Fog option.
     pub(super) fn frame_fog(
         &self,
@@ -170,7 +174,7 @@ impl Game<'_> {
     ) -> FogData {
         let forward = self.forward();
         let at = [camera.x, camera.y, camera.z];
-        let fog_type = fog_type(&self.world, self.res.facts(), at, &self.near_plane());
+        let fog_type = self.camera_submersion(at);
         let (rain, thunder) = self.view_weather(self.clock.fraction() as f32);
         let title_fog = horizon_client::fog::FogTables::default();
         let tables = if self.title.is_some() {
@@ -310,12 +314,7 @@ impl Game<'_> {
         };
         self.overworld_skybox()
             && camera.y < horizon
-            && fog_type(
-                &self.world,
-                self.res.facts(),
-                [camera.x, camera.y, camera.z],
-                &self.near_plane(),
-            ) != FogType::Water
+            && self.camera_submersion([camera.x, camera.y, camera.z]) != FogType::Water
     }
     /// `ScreenEffectRenderer` + `Hud` camera overlays for this frame.
     /// `scale` is the player's `LivingEntity.getScale`.
@@ -425,10 +424,7 @@ impl Game<'_> {
                     pos,
                     partial_tick: partial,
                     hide_gui: self.ui.hide_gui,
-                    draw: &mut GameCameraDrawContext {
-                        game: self,
-                        surface: &mut quads,
-                    },
+                    draw: &mut GameCameraDrawContext::new(self, &mut quads),
                     replace_vanilla: &mut replace_vanilla,
                 },
             );
@@ -523,8 +519,7 @@ impl Game<'_> {
                 }
             }
         }
-        let in_water =
-            fog_type(&self.world, self.res.facts(), eye, &self.near_plane()) == FogType::Water;
+        let in_water = self.camera_submersion(eye) == FogType::Water;
         let eye_block = eye.map(|c| c.floor() as i32);
         let water = in_water
             && !spectator
@@ -594,7 +589,9 @@ impl Game<'_> {
         let packed = self.world.light(b[0], b[1], b[2]);
         let sky = i32::from(packed >> 4) - self.sky_darken();
         let raw = sky.max(i32::from(packed & 15)).clamp(0, 15) as u8;
-        lightmap_brightness(if self.dim == Dim::Nether { 0.1 } else { 0.0 }, raw)
+        // `Lightmap.getBrightness`: the dimension type's `ambientLight` (0 in the
+        // overworld, 0.1 in the nether, 0.25 in the end).
+        lightmap_brightness(self.dimension_type().ambient_light, raw)
     }
     /// What `Minecraft` ticks outside the level's own tick: `GameRenderer.tick` runs the light
     /// flicker whenever the game is not paused, frozen or not, while `TextureManager.tick`
@@ -645,9 +642,25 @@ impl Game<'_> {
         Some((TrackingTarget::Entity(id), mob_tracking_body(mob)))
     }
 
+    /// The particle tick. A server has no window: it drops its pickups and ticks only the
+    /// engine, so its fireworks' and drips' sounds still play and reach the guests. A window
+    /// also spawns what the level shows around the camera.
     pub(super) fn tick_particles(&mut self) {
+        if self.is_logical_server() {
+            self.particles.particle_level = self.settings.particles;
+            self.pickups.clear();
+            self.tick_particle_engine();
+            return;
+        }
         // A client mod's `clear_particles`, before this tick adds any.
         self.apply_mod_particle_clear();
+        self.tick_particle_spawns();
+        self.tick_particle_engine();
+    }
+
+    /// The screen effects and fog, then what the level spawns around the camera
+    /// (`ClientLevel.animateTick`, rain splashes, campfire smoke).
+    pub(super) fn tick_particle_spawns(&mut self) {
         self.update_animation_inputs();
         let mut laps = horizon_client::spans::laps();
         let eye = self.eye_position();
@@ -663,8 +676,7 @@ impl Game<'_> {
             let nausea = self.potions.effects.get("nausea").map(nausea_has_effect);
             self.screen_fx.tick_spinning(nausea);
             // LocalPlayer water vision and AtmosphericFogEnvironment rain fog.
-            let in_water =
-                fog_type(&self.world, self.res.facts(), e, &self.near_plane()) == FogType::Water;
+            let in_water = self.camera_fog_type(e) == FogType::Water;
             self.fog.tick(in_water, self.spectator());
             let (rain, sky_light, rains) = self.rain_fog_inputs(e);
             update_rain_fog(&mut self.fog, rain, sky_light, rains, 1.0);
@@ -714,6 +726,7 @@ impl Game<'_> {
         // Level.isThundering: a thunder level above 0.9 where the sky is open.
         let thundering = self.can_have_weather() && world.weather.levels(1.0).1 > 0.9;
         let ctx = AnimateContext {
+            enchant_power: &self.ambience.enchant_power,
             world,
             facts,
             collision: self.collision,
@@ -835,6 +848,24 @@ impl Game<'_> {
             );
         }
         laps.lap("tp_rain_campfire");
+    }
+
+    /// A server's client's `ParticleEngine.tick`, while the level runs normally: in
+    /// `Minecraft.tick` it follows `ClientLevel.tickEntities`, so what the entities
+    /// spawned (the spark of a rocket boosting the moved player) is drawn from this
+    /// tick on, not the next (#16175).
+    pub(super) fn tick_remote_particle_engine(&mut self) {
+        if self.clock.runs_normally() {
+            self.tick_particle_engine();
+        }
+    }
+
+    /// `ParticleEngine.tick`: the live particles tick, then the ones added since
+    /// join them unticked.
+    fn tick_particle_engine(&mut self) {
+        let mut laps = horizon_client::spans::laps();
+        let world = &self.world;
+        let facts = self.res.facts();
         // SpellParticle.isCloseToScopingPlayer: the eye of a local player looking
         // through a spyglass in first person.
         let scope_eye = self
@@ -929,6 +960,13 @@ impl Game<'_> {
     /// `Util.getMillis` for what the frame shows (the world border's scroll, the hearts' blink,
     /// the glint's under the switch): under `HORIZON_STILL`, the world's ticks in milliseconds.
     pub(super) fn visual_millis(&self) -> i64 {
+        self.export.as_ref().map_or_else(
+            || self.visual_offset + self.base_visual_millis(),
+            super::export::Session::visual_millis,
+        )
+    }
+
+    pub(super) fn base_visual_millis(&self) -> i64 {
         if self.clock.still() {
             self.visual_ticks() as i64 * 50
         } else {
@@ -969,13 +1007,17 @@ impl Game<'_> {
 }
 
 #[cfg(test)]
+#[path = "render_tick/end_light_tests.rs"]
+mod end_light_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{BlockScreenEffects, Properties, World, splash_height};
     use horizon_client::chunk::Chunk;
     use horizon_world::registry::BlockStateId;
     use std::sync::Arc;
 
-    /// #3810: under a stone roof more than 64 blocks above the camera, as in a
+    /// arismoko/horizon#3810: under a stone roof more than 64 blocks above the camera, as in a
     /// deep excavation, MOTION_BLOCKING is the roof, so no rain splash lands on
     /// the floor; with the roof gone, it does.
     #[test]
@@ -1012,7 +1054,7 @@ mod tests {
     /// leaves the frame's block overlays as they are with no block there, the fire overlay
     /// included; dirt in the same place keeps its overlay.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mod_cancels_the_screen_effect_of_one_block() {
         use horizon_core::{geometry::Vec3, position::BlockPos};
         use mod_api::{

@@ -12,16 +12,7 @@ use mod_api::{EntityRef, SoundSource};
 /// `Monster`s: `Hoglin`, `Ghast`, `Phantom`, `Shulker` and the slimes
 /// (`AbstractCubeMob`).
 pub(super) fn hostile_species(species: Species) -> bool {
-    horizon_client::mobs::ai::is_monster(species)
-        || matches!(
-            species,
-            Species::Hoglin
-                | Species::Ghast
-                | Species::Phantom
-                | Species::Shulker
-                | Species::Slime
-                | Species::MagmaCube
-        )
+    horizon_client::mobs::ai::hostile_species(species)
 }
 
 impl Game<'_> {
@@ -174,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn sound_sources_follow_the_entity_class() {
         with_game(|game| {
             let cow = spawn(game, 10, "minecraft:cow");
@@ -206,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn play_sound_queues_at_the_entity_in_its_source() {
         super::super::native_guest_turn_tests::with_guests(|game| {
             let cow = spawn(game, 10, "minecraft:cow");
@@ -238,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn game_and_entity_events_come_from_the_entity() {
         with_game(|game| {
             let cow = spawn(game, 10, "minecraft:cow");
@@ -260,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn only_a_spectator_player_is_a_spectator() {
         with_game(|game| {
             let cow = spawn(game, 10, "minecraft:cow");

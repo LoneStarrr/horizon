@@ -1,17 +1,17 @@
-//! The entries of the datapack registries mods declared, as one world loads them
-//! (arismoko/horizon#811, stage 3): a candidate built from the winning pack files and checked
+//! The entries of the datapack registries mods declared, as one world loads them:
+//! a candidate built from the winning pack files and checked
 //! as a whole, then published as a set with a session and a generation, and read through
 //! handles that check both. Nothing here touches the world; the game builds a candidate before
 //! it commits any table and keeps the old set when building fails. See
-//! `docs/modding/src/concepts/mod-datapack-registries.md`.
+//! `docs/design/mod-api/mod-datapack-registries.md`.
 use super::datapack_registry::{
     DatapackDecodeError, DatapackEntry, DatapackFieldKind, DatapackRegistryDeclaration,
     DatapackValue, valid_namespaced,
 };
 use super::datapack_snapshot::{
-    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ENTRIES, MAX_SNAPSHOT_REGISTRIES, snapshot_fits,
+    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ENTRIES, MAX_SNAPSHOT_REGISTRIES, snapshot_size,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The most bytes one entry's winning file may take.
 pub const MAX_DATAPACK_ENTRY_BYTES: usize = 1 << 20;
@@ -28,7 +28,7 @@ pub enum DatapackLoadReason {
     TooManyRegistries,
     /// The winning file is more than [`MAX_DATAPACK_ENTRY_BYTES`].
     EntryTooLarge,
-    /// The registry has more entries than [`MAX_SNAPSHOT_ENTRIES`]; `entry` is the first one over.
+    /// A registry has more entries, tags, or members of one tag than [`MAX_SNAPSHOT_ENTRIES`].
     TooManyEntries,
     /// The winning files of the whole candidate are more than [`MAX_SNAPSHOT_BYTES`]; `entry` is
     /// the first one over.
@@ -41,6 +41,13 @@ pub enum DatapackLoadReason {
     InvalidEntryId,
     /// The file did not decode against the registry's schema.
     Decode(DatapackDecodeError),
+    /// A resolved tag has an invalid name or names an entry outside its accepted registry.
+    InvalidTag {
+        /// The tag's canonical name.
+        tag: String,
+        /// The invalid member, or empty when the tag name or registry is invalid.
+        member: String,
+    },
     /// A reference names an entry of a declared registry that no pack defines.
     UnresolvedReference {
         /// The referring field.
@@ -76,6 +83,9 @@ pub struct DatapackLoadError {
 // exhaustive: built only by [`DatapackCandidate::build`]
 pub struct DatapackCandidate {
     pub(super) registries: BTreeMap<String, BTreeMap<String, DatapackEntry>>,
+    pub(super) tags: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    pub(super) snapshot_bytes: usize,
+    pub(super) synchronized: BTreeSet<String>,
 }
 
 /// The id of the entry in `file` (`data/addon/example/spell/fire.json` is `addon:fire`), when
@@ -186,7 +196,7 @@ impl DatapackCandidate {
             }
             error
         })?;
-        if !snapshot_fits(declarations, &registries) {
+        let Some(snapshot_bytes) = snapshot_size(declarations, &registries, |_| true) else {
             return Err(Box::new(DatapackLoadError {
                 registry: String::new(),
                 entry: String::new(),
@@ -194,8 +204,94 @@ impl DatapackCandidate {
                 pack: String::new(),
                 reason: DatapackLoadReason::SnapshotTooLarge,
             }));
+        };
+        Ok(Self {
+            registries,
+            tags: BTreeMap::new(),
+            snapshot_bytes,
+            synchronized: declarations
+                .iter()
+                .filter(|d| d.sync != super::datapack_registry::DatapackRegistrySync::ServerOnly)
+                .map(|d| d.key.clone())
+                .collect(),
+        })
+    }
+
+    /// The accepted entry names of a registry, sorted, before publication.
+    pub fn entries(&self, registry: &str) -> Result<Vec<&str>, DatapackReadError> {
+        Ok(self
+            .registries
+            .get(registry)
+            .ok_or(DatapackReadError::UnknownRegistry)?
+            .keys()
+            .map(String::as_str)
+            .collect())
+    }
+
+    /// Bind the engine's fully resolved tags atomically against accepted entries.
+    /// Invalid names, missing members and snapshots over the existing bounds are refused.
+    pub fn bind_tags(
+        &mut self,
+        registry: &str,
+        tags: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), Box<DatapackLoadError>> {
+        let fail = |reason| {
+            Box::new(DatapackLoadError {
+                registry: registry.to_owned(),
+                entry: String::new(),
+                file: String::new(),
+                pack: String::new(),
+                reason,
+            })
+        };
+        let entries = self.registries.get(registry).ok_or_else(|| {
+            fail(DatapackLoadReason::InvalidTag {
+                tag: String::new(),
+                member: String::new(),
+            })
+        })?;
+        if tags.len() > MAX_SNAPSHOT_ENTRIES
+            || tags
+                .values()
+                .any(|members| members.len() > MAX_SNAPSHOT_ENTRIES)
+        {
+            return Err(fail(DatapackLoadReason::TooManyEntries));
         }
-        Ok(Self { registries })
+        for (tag, members) in &tags {
+            if !valid_namespaced(tag) {
+                return Err(fail(DatapackLoadReason::InvalidTag {
+                    tag: tag.clone(),
+                    member: String::new(),
+                }));
+            }
+            if let Some(member) = members.iter().find(|id| !entries.contains_key(*id)) {
+                return Err(fail(DatapackLoadReason::InvalidTag {
+                    tag: tag.clone(),
+                    member: member.clone(),
+                }));
+            }
+        }
+        let encoded_len = |map: &BTreeMap<String, Vec<String>>| {
+            let mut out = crate::wire::Writer::new();
+            out.limit(MAX_SNAPSHOT_BYTES);
+            out.put(map);
+            out.error().is_none().then(|| out.bytes().len())
+        };
+        let new_size =
+            encoded_len(&tags).ok_or_else(|| fail(DatapackLoadReason::SnapshotTooLarge))?;
+        let snapshot_bytes = if self.synchronized.contains(registry) {
+            let old_size = self.tags.get(registry).and_then(encoded_len).unwrap_or(4);
+            self.snapshot_bytes
+                .checked_sub(old_size)
+                .and_then(|size| size.checked_add(new_size))
+                .filter(|size| *size <= MAX_SNAPSHOT_BYTES)
+                .ok_or_else(|| fail(DatapackLoadReason::SnapshotTooLarge))?
+        } else {
+            self.snapshot_bytes
+        };
+        self.tags.insert(registry.to_owned(), tags);
+        self.snapshot_bytes = snapshot_bytes;
+        Ok(())
     }
 }
 
@@ -255,32 +351,58 @@ pub(super) fn resolve_references(
     for declaration in declarations {
         for (entry, decoded) in &registries[&declaration.key] {
             for field in &declaration.fields {
-                let DatapackFieldKind::Reference { registry } = &field.kind else {
+                let Some(value) = decoded.get(&field.name) else {
                     continue;
                 };
-                let Some(targets) = registries.get(registry) else {
+                let Some((path, registry, target)) =
+                    dangling_reference(&field.kind, value, &field.name, registries)
+                else {
                     continue;
                 };
-                let Some(DatapackValue::Text(target)) = decoded.get(&field.name) else {
-                    continue;
-                };
-                if !targets.contains_key(target) {
-                    return Err(Box::new(DatapackLoadError {
-                        registry: declaration.key.clone(),
-                        entry: entry.clone(),
-                        file: declaration.entry_file(entry).unwrap_or_default(),
-                        pack: String::new(),
-                        reason: DatapackLoadReason::UnresolvedReference {
-                            field: field.name.clone(),
-                            registry: registry.clone(),
-                            target: target.clone(),
-                        },
-                    }));
-                }
+                return Err(Box::new(DatapackLoadError {
+                    registry: declaration.key.clone(),
+                    entry: entry.clone(),
+                    file: declaration.entry_file(entry).unwrap_or_default(),
+                    pack: String::new(),
+                    reason: DatapackLoadReason::UnresolvedReference {
+                        field: path,
+                        registry: registry.to_owned(),
+                        target: target.to_owned(),
+                    },
+                }));
             }
         }
     }
     Ok(())
+}
+
+/// The first reference in `value`, nested lists and objects included, whose declared registry
+/// lacks its target: `(field path, registry, target)`, the path named as the decoder names it
+/// (`tags[0]`, `display.spell`).
+fn dangling_reference<'a>(
+    kind: &'a DatapackFieldKind,
+    value: &'a DatapackValue,
+    path: &str,
+    registries: &BTreeMap<String, BTreeMap<String, DatapackEntry>>,
+) -> Option<(String, &'a str, &'a str)> {
+    match (kind, value) {
+        (DatapackFieldKind::Reference { registry }, DatapackValue::Text(target)) => registries
+            .get(registry)
+            .is_some_and(|targets| !targets.contains_key(target))
+            .then(|| (path.to_owned(), registry.as_str(), target.as_str())),
+        (DatapackFieldKind::List { element, .. }, DatapackValue::List(values)) => {
+            values.iter().enumerate().find_map(|(index, value)| {
+                dangling_reference(element, value, &format!("{path}[{index}]"), registries)
+            })
+        }
+        (DatapackFieldKind::Object { fields, .. }, DatapackValue::Object(values)) => {
+            values.iter().find_map(|(name, value)| {
+                let field = fields.iter().find(|field| field.name == *name)?;
+                dangling_reference(&field.kind, value, &format!("{path}.{name}"), registries)
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Why a set could not move to a new generation.
@@ -300,6 +422,9 @@ pub struct DatapackRegistrySet {
     pub(super) session: u64,
     pub(super) generation: u64,
     pub(super) registries: BTreeMap<String, BTreeMap<String, DatapackEntry>>,
+    pub(super) tags: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// None on a server; on a client, exactly the registries in its accepted snapshot.
+    pub(super) received_registries: Option<BTreeSet<String>>,
 }
 
 impl DatapackRegistrySet {
@@ -309,6 +434,8 @@ impl DatapackRegistrySet {
             session,
             generation: 1,
             registries: candidate.registries,
+            tags: candidate.tags,
+            received_registries: None,
         }
     }
 
@@ -326,12 +453,23 @@ impl DatapackRegistrySet {
                 .checked_add(1)
                 .ok_or(DatapackGenerationExhausted::Exhausted)?,
             registries: candidate.registries,
+            tags: candidate.tags,
+            received_registries: None,
         })
     }
 
     /// The generation, from 1.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether generic reads may access this registry. Typed reads retain their existing
+    /// empty defaults for omitted declarations; a received empty registry is still available.
+    pub fn registry_available(&self, registry: &str) -> bool {
+        self.received_registries.as_ref().map_or_else(
+            || self.registries.contains_key(registry),
+            |received| received.contains(registry),
+        )
     }
 
     /// A handle to `entry` of `registry` in this set.
@@ -364,6 +502,23 @@ impl DatapackRegistrySet {
             .get(registry)
             .ok_or(DatapackReadError::UnknownRegistry)?;
         Ok(entries.keys().map(String::as_str).collect())
+    }
+
+    /// Whether the current set contains this entry, without constructing an owned handle.
+    /// Unknown registries and missing entries both return false.
+    pub fn contains_entry(&self, registry: &str, id: &str) -> bool {
+        self.lookup(registry, id).is_ok()
+    }
+
+    /// Current merged-tag membership. None for an unknown registry or entry; absent tags are false.
+    pub fn tag_contains(&self, registry: &str, entry: &str, tag: &str) -> Option<bool> {
+        self.lookup(registry, entry).ok()?;
+        Some(
+            self.tags
+                .get(registry)
+                .and_then(|tags| tags.get(tag))
+                .is_some_and(|members| members.iter().any(|member| member == entry)),
+        )
     }
 
     fn lookup(&self, registry: &str, entry: &str) -> Result<&DatapackEntry, DatapackReadError> {
@@ -431,6 +586,9 @@ mod tests {
         assert_eq!(set.generation(), 1);
         assert_eq!(power(&set, "example:fire"), DatapackValue::Int(7));
         assert_eq!(set.entries("example:spell").unwrap(), ["example:fire"]);
+        assert!(set.contains_entry("example:spell", "example:fire"));
+        assert!(!set.contains_entry("example:spell", "example:missing"));
+        assert!(!set.contains_entry("example:unknown", "example:fire"));
     }
 
     /// An entry in another mod's namespace sits in that namespace's folder; nested paths work;
@@ -590,6 +748,74 @@ mod tests {
         );
     }
 
+    /// A reference inside a list or an object is resolved too, and the refusal names its path.
+    #[test]
+    fn nested_references_resolve_and_name_their_path() {
+        let slot = DatapackRegistryDeclaration {
+            mod_id: "example".into(),
+            key: "example:slot".into(),
+            fields: vec![
+                DatapackField::with_default(
+                    "spells",
+                    DatapackFieldKind::List {
+                        element: Box::new(DatapackFieldKind::Reference {
+                            registry: "example:spell".into(),
+                        }),
+                        max_len: 4,
+                    },
+                    DatapackValue::List(Vec::new()),
+                ),
+                DatapackField::with_default(
+                    "display",
+                    DatapackFieldKind::Object {
+                        fields: vec![DatapackField::with_default(
+                            "spell",
+                            DatapackFieldKind::Reference {
+                                registry: "example:spell".into(),
+                            },
+                            DatapackValue::Text("example:fire".into()),
+                        )],
+                        max_len: 256,
+                    },
+                    DatapackValue::Object(vec![(
+                        "spell".into(),
+                        DatapackValue::Text("example:fire".into()),
+                    )]),
+                ),
+            ],
+            sync: DatapackRegistrySync::ServerOnly,
+        };
+        let fire = file("data/example/example/spell/fire.json", &[r#"{"power": 1}"#]);
+        let build = |slot_json: &str| {
+            let files = [
+                fire.clone(),
+                file("data/example/example/slot/ring.json", &[slot_json]),
+            ];
+            DatapackCandidate::build(&[spell(), slot.clone()], &files)
+                .map(|_| ())
+                .map_err(|error| error.reason)
+        };
+        assert_eq!(
+            build(r#"{"spells": ["example:fire"], "display": {"spell": "example:fire"}}"#),
+            Ok(())
+        );
+        let unresolved = |field: &str| {
+            Err(DatapackLoadReason::UnresolvedReference {
+                field: field.into(),
+                registry: "example:spell".into(),
+                target: "addon:ice".into(),
+            })
+        };
+        assert_eq!(
+            build(r#"{"spells": ["example:fire", "addon:ice"]}"#),
+            unresolved("spells[1]")
+        );
+        assert_eq!(
+            build(r#"{"display": {"spell": "addon:ice"}}"#),
+            unresolved("display.spell")
+        );
+    }
+
     /// A reference to a registry no declaration covers (a vanilla one) is not checked here.
     #[test]
     fn a_reference_to_an_undeclared_registry_is_left_to_its_owner() {
@@ -692,6 +918,7 @@ mod tests {
 
     /// 65,536 entries in a registry are accepted; one more refuses the candidate.
     #[test]
+    #[ignore = "daily"]
     fn a_registry_over_65536_entries_refuses_the_candidate() {
         let mut files: Vec<_> = (0..65_536)
             .map(|n| match n {
@@ -710,6 +937,7 @@ mod tests {
 
     /// Exactly 67,108,864 source bytes fit; one extra byte refuses the candidate.
     #[test]
+    #[ignore = "daily"]
     fn a_candidate_over_64_mib_refuses_the_candidate() {
         let full = padded(1_048_576);
         let mut files: Vec<_> = (0..63)

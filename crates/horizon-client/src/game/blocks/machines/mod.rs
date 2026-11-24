@@ -2,7 +2,8 @@
 //! transfer cooldowns), `DispenserBlock` / `DropperBlock.dispenseFrom` with
 //! the vanilla dispense behaviours Horizon has entities for, and container
 //! comparator signals (`AbstractContainerMenu.getRedstoneSignalFromContainer`).
-use super::{Game, spill, storage::is_shulker_box};
+mod loot_access;
+use super::{Game, composter::is_composter, spill, storage::is_shulker_box};
 use horizon_core::nbt::Tag;
 use mod_api::__private::game::*;
 
@@ -13,22 +14,26 @@ mod crafter;
 pub(in crate::game) mod native_energy;
 pub(in crate::game) mod native_fluids;
 pub(in crate::game) mod native_items;
+mod screen;
 #[cfg(test)]
 mod tank_reopen_tests;
 use horizon_client::{
     Result,
+    block_contact::sweep_movement_segments,
     containers::{BlockEntity, HOPPER_SLOTS, ModContainer},
+    fast_hash::FxHashMap,
     items::{ItemStack, Items},
     mobs::Mob,
     save,
     world::World,
 };
 use horizon_core::{
-    geometry::{Aabb, Direction, Vec3},
+    geometry::{Aabb, Direction, Vec3, sweep_intersected_blocks},
     position::BlockPos,
     random::RandomSource,
 };
 use horizon_world::{
+    entity_move::MovementRecord,
     level::{Behaviours, LevelAccess},
     registry::BlockStateId,
 };
@@ -174,7 +179,7 @@ impl View {
     /// bookshelf's books and a jukebox's disc, else vanilla's default.
     fn slot_limit(&self) -> u32 {
         match self.kind {
-            Kind::Bookshelf | Kind::Jukebox => 1,
+            Kind::Bookshelf | Kind::Jukebox | Kind::Composter(_) => 1,
             _ => 99,
         }
     }
@@ -184,9 +189,6 @@ impl View {
         } else {
             Slots::Range(0..self.len())
         }
-    }
-    fn slots_for_face(&self, face: Option<Direction>) -> Vec<usize> {
-        self.slots_for_face_iter(face).collect()
     }
     #[cfg(test)]
     fn slots_to_add(&self, face: Option<Direction>) -> Vec<usize> {
@@ -277,18 +279,23 @@ impl Containers<'_> {
     fn name(&self, state: BlockStateId) -> &str {
         self.registry.state(state).map_or("", |s| s.name.as_str())
     }
-    /// `ItemStack.getMaxStackSize`: its component, else the item's.
+    /// `ItemStack.getMaxStackSize`: its component (a removed one being
+    /// vanilla's default of 1), else the item's.
     pub(super) fn max_stack(&self, stack: &ItemStack) -> u32 {
-        if let Some(horizon_core::nbt::Tag::Int(n)) = stack
-            .data()
-            .and_then(|d| d.other("minecraft:max_stack_size"))
-        {
-            return (*n).clamp(1, 99) as u32;
-        }
-        self.items
-            .get(&stack.item)
-            .map_or(64, |i| i.max_stack)
-            .max(1)
+        stack.max_stack_size(self.items).max(1)
+    }
+    /// `Container.getMaxStackSize(stack)` of a container: the container's own
+    /// limit, at most the item's. `ComposterBlock.InputContainer` (levels 0 to
+    /// 6) and `OutputContainer` (level 8, `READY`), `JukeboxBlockEntity` and
+    /// `ChiseledBookShelfBlockEntity` override `getMaxStackSize` to 1; every
+    /// other container keeps the `Container` default of 99. A composter's
+    /// level 7 is `EmptyContainer` (99), which takes nothing through a face.
+    fn max_stack_in(&self, view: &View, stack: &ItemStack) -> u32 {
+        let container = match view.kind {
+            Kind::Composter(0..=6) | Kind::Composter(8) | Kind::Jukebox | Kind::Bookshelf => 1,
+            _ => 99,
+        };
+        container.min(self.max_stack(stack))
     }
     /// `HopperBlockEntity.getBlockContainer` (double chests combined, right half
     /// first). `blocked_chests`: `ChestBlock.getContainer(.., false)` returns
@@ -297,7 +304,7 @@ impl Containers<'_> {
     fn view(&self, pos: Pos, blocked_chests: bool) -> Option<View> {
         let state = self.world.block(pos.0, pos.1, pos.2);
         let name = self.name(state);
-        if name == "minecraft:composter" {
+        if is_composter(name) {
             let level = self.prop(state, "level").and_then(|l| l.parse().ok())?;
             return Some(View {
                 parts: vec![(pos, usize::from(level != 7))],
@@ -306,19 +313,6 @@ impl Containers<'_> {
             });
         }
         let entity = self.world.block_entities.get(&pos)?;
-        // A beehive keeps bees, not items, a campfire cooks its own and
-        // suspicious sand or gravel hides its loot: none is a `Container`
-        // (HopperBlockEntity.getContainerAt), so a dropper drops in front of
-        // them and a hopper leaves them alone.
-        if matches!(
-            entity,
-            BlockEntity::Beehive(_)
-                | BlockEntity::Campfire(_)
-                | BlockEntity::Brushable(_)
-                | BlockEntity::EndPortal
-        ) {
-            return None;
-        }
         // A mod's block entity is a container when its block says so. The one
         // ticking now is out of the world (an empty id marks its place): what
         // went into its place would be lost when it comes back.
@@ -333,6 +327,14 @@ impl Containers<'_> {
                 container: Some(container),
             });
         }
+        // Non-container block entities (signs, banners, beacons, skulls, etc.,
+        // or beehives/campfires/brushables) are not `Container`s
+        // (HopperBlockEntity.getContainerAt), so a dropper drops in front of
+        // them and a hopper leaves them alone.
+        let size = entity.slots().len();
+        if size == 0 {
+            return None;
+        }
         let kind = match (entity, name) {
             (BlockEntity::Furnace(_), _) => Kind::Furnace,
             (BlockEntity::Crafter(_), _) => Kind::Crafter,
@@ -343,7 +345,6 @@ impl Containers<'_> {
             (_, n) if is_shulker_box(n) => Kind::Shulker,
             _ => Kind::Generic,
         };
-        let size = entity.slots().len();
         if horizon_client::containers::is_chest_block(name) {
             let is_blocked = |p: Pos| {
                 let above = self.world.block(p.0, p.1 + 1, p.2);
@@ -424,9 +425,7 @@ impl Containers<'_> {
         if view.kind == Kind::Pot {
             let (pos, _) = view.locate(slot)?;
             let tag = spill::saved_entity(self.world, [pos.0, pos.1, pos.2])?;
-            return tag
-                .get("item")
-                .and_then(save::item_from_nbt)
+            return pot_item(&tag, self.items)
                 .filter(|stack| stack.count > 0)
                 .map(Cow::Owned);
         }
@@ -454,9 +453,40 @@ impl Containers<'_> {
     /// empty: the item rule of the slot, whatever it holds now.
     fn accepts(&self, view: &View, slot: usize, stack: &ItemStack) -> bool {
         if let Some(c) = &view.container {
-            return c.inputs.contains(&slot);
+            if !c.inputs.contains(&slot) {
+                return false;
+            }
+            if !mod_api::__private::has_part_hook(mod_api::HookId::CanPlaceItem) {
+                return true;
+            }
+            let Some((pos, index)) = view.locate(slot) else {
+                return false;
+            };
+            let Some(BlockEntity::Mod(entity)) = self.world.block_entities.get(&pos) else {
+                return true;
+            };
+            let mut allowed = None;
+            if let Ok(api) = crate::game::api_values::TryIntoApi::try_into_api(entity.as_ref()) {
+                Game::native_can_place_item(
+                    [pos.0, pos.1, pos.2],
+                    &api,
+                    index as u32,
+                    stack,
+                    &mut allowed,
+                );
+            }
+            return allowed.unwrap_or(true);
         }
         match view.kind {
+            // ComposterBlock.InputContainer.canPlaceItemThroughFace; output never accepts.
+            Kind::Composter(level) => {
+                level < 7
+                    && slot == 0
+                    && self
+                        .items
+                        .get(&stack.item)
+                        .is_some_and(|i| i.compostable.is_some())
+            }
             // ShulkerBoxBlockEntity.canPlaceItemThroughFace
             Kind::Shulker => !is_shulker_box(&stack.item),
             Kind::Crafter => match self.world.block_entities.get(&view.parts[0].0) {
@@ -592,12 +622,6 @@ impl Containers<'_> {
             || matches!(&*stack.item, "minecraft:water_bucket" | "minecraft:bucket")
     }
     /// `HopperBlockEntity.isFullContainer`.
-    fn is_full(&self, view: &View, face: Direction) -> bool {
-        view.slots_for_face_iter(Some(face)).all(|i| {
-            self.insertion_item(view, i)
-                .is_some_and(|s| s.count >= self.max_stack(&s))
-        })
-    }
     /// `AbstractContainerMenu.getRedstoneSignalFromContainer`.
     fn signal(&self, view: &View) -> i32 {
         if view.kind == Kind::Crafter {
@@ -745,19 +769,33 @@ pub(super) fn cat_sitting_above(mobs: &[Mob], key: Pos) -> bool {
 /// Comparator input from a container block entity (0 when there is none):
 /// `ChestBlock.getContainer(.., false)`, whose blocked check sees the level's
 /// cats (`isCatSittingOnChest`).
-pub(super) fn container_signal(level: &super::GameLevel<'_>, pos: BlockPos) -> i32 {
+pub(super) fn container_signal(level: &mut super::GameLevel<'_>, pos: BlockPos) -> i32 {
     let c = Containers {
         world: &*level.world,
         behaviours: level.behaviours,
         items: level.items,
         registry: level.registry,
         brewing: None,
-        mobs: level.entities.mobs,
+        mobs: level.entities().mobs,
     };
-    c.view((pos.x, pos.y, pos.z), true)
+    let view = c
+        .view((pos.x, pos.y, pos.z), true)
         .filter(|v| !matches!(v.kind, Kind::Composter(_)))
-        .or_else(|| c.saved_pot_view((pos.x, pos.y, pos.z)))
-        .map_or(0, |v| c.signal(&v))
+        .or_else(|| c.saved_pot_view((pos.x, pos.y, pos.z)));
+    if let Some(view) = &view {
+        for &(key, _) in &view.parts {
+            level.unpack_loot(super::container_loot::LootTarget::Block(key), None);
+        }
+    }
+    let c = Containers {
+        world: &*level.world,
+        behaviours: level.behaviours,
+        items: level.items,
+        registry: level.registry,
+        brewing: None,
+        mobs: level.entities().mobs,
+    };
+    view.map_or(0, |v| c.signal(&v))
 }
 
 /// `ChiseledBookShelfBlock.getAnalogOutputSignal` and
@@ -799,6 +837,15 @@ pub(super) fn shelf_signal(
             .map(|(slot, item)| i32::from(item.is_some()) << slot)
             .sum(),
     )
+}
+
+/// A decorated pot's item, which the pot keeps as saved NBT, as the world takes it in
+/// (`ItemStack.CODEC`: `applyPatch` against the world's item prototypes), so it stacks
+/// with the hopper's and the player's stacks as they do.
+pub(super) fn pot_item(tag: &Tag, items: &Items) -> Option<ItemStack> {
+    let mut stack = tag.get("item").and_then(save::item_from_nbt)?;
+    horizon_client::item_data::clean_stack(&mut stack, &items.component_defaults);
+    Some(stack)
 }
 
 impl Game<'_> {
@@ -916,7 +963,9 @@ impl Game<'_> {
         if !c.can_place(view, slot, &stack) {
             return (Some(stack), false);
         }
-        let was_empty = (0..view.len()).all(|i| c.insertion_item(view, i).is_none());
+        self.unpack_inventory_slot(view, slot);
+        let was_empty = self.inventory_is_empty(view);
+        let c = self.containers();
         let vanilla_max = c.max_stack(&stack);
         let override_limit = view
             .locate(slot)
@@ -936,7 +985,7 @@ impl Game<'_> {
             else {
                 return (Some(stack), false);
             };
-            let item = tag.get("item").and_then(save::item_from_nbt);
+            let item = pot_item(&tag, self.items());
             Some((tag, item))
         } else {
             None
@@ -1050,7 +1099,7 @@ impl Game<'_> {
     /// `ContainerSingleItem.removeItem(0, 1)` on a decorated pot's saved slot.
     fn pot_take_one(&mut self, pos: Pos) -> Option<ItemStack> {
         let mut tag = spill::saved_entity(&self.world, [pos.0, pos.1, pos.2])?;
-        let mut item = tag.get("item").and_then(save::item_from_nbt)?;
+        let mut item = pot_item(&tag, self.items())?;
         if item.count == 0 {
             return None;
         }
@@ -1067,7 +1116,7 @@ impl Game<'_> {
         let Some(mut tag) = spill::saved_entity(&self.world, [pos.0, pos.1, pos.2]) else {
             return;
         };
-        let item = match tag.get("item").and_then(save::item_from_nbt) {
+        let item = match pot_item(&tag, self.items()) {
             Some(mut current) => {
                 current.count += one.count;
                 current
@@ -1156,15 +1205,13 @@ impl Game<'_> {
             return;
         }
         self.native_prepare_hopper_transfer([pos.0, pos.1, pos.2]);
+        self.unpack_loot(super::container_loot::LootTarget::Block(pos), None);
         let c = self.containers();
         let mut changed = false;
         if !c.is_empty(&view) {
             changed = self.hopper_eject(pos, &view);
         }
-        let c = self.containers();
-        let full =
-            (0..view.len()).all(|i| c.get(&view, i).is_some_and(|s| s.count == c.max_stack(s)));
-        if !full {
+        if !self.hopper_is_stacked(&view) {
             changed |= self.hopper_suck(pos, &view);
         }
         if changed {
@@ -1173,10 +1220,10 @@ impl Game<'_> {
         }
     }
     /// `HopperBlockEntity.entityInside` for the item entities that moved this
-    /// tick: an item whose box meets the hopper's bowl (`Hopper.INSIDE`) and
-    /// its suck area runs `tryMoveItems` with that item as the pickup, in the
-    /// entity phase, before the hopper's own tick counts its cooldown down.
-    pub(super) fn hoppers_catch_items(&mut self) {
+    /// tick: an item whose box meets `Hopper.SUCK_AABB` runs `tryMoveItems`
+    /// with that item as the pickup, in the entity phase, before the hopper's
+    /// own tick counts its cooldown down.
+    pub(super) fn hoppers_catch_items(&mut self, original_moves: &FxHashMap<u32, Vec3>) {
         let mut i = 0;
         while i < self.dropped.len() {
             let item = &self.dropped[i];
@@ -1188,42 +1235,51 @@ impl Game<'_> {
                 i += 1;
                 continue;
             }
-            let b = item.bounds();
-            let (lo, hi) = (b.min_position(), b.max_position());
-            let mut found = None;
-            'blocks: for x in lo.x.floor() as i32..=hi.x.floor() as i32 {
-                for y in lo.y.floor() as i32..=hi.y.floor() as i32 {
-                    for z in lo.z.floor() as i32..=hi.z.floor() as i32 {
-                        let state = self.world.block(x, y, z);
-                        if horizon_client::block_entity_types::factory_block(
-                            &self.res.facts().get(state).name,
-                        ) != "minecraft:hopper"
-                        {
-                            continue;
-                        }
-                        // Hopper.INSIDE: the bowl, 2..14 wide and from 11/16 up.
-                        let (fx, fy, fz) = (f64::from(x), f64::from(y), f64::from(z));
-                        if lo.x < fx + 0.875
-                            && hi.x > fx + 0.125
-                            && lo.y < fy + 1.0
-                            && hi.y > fy + 11.0 / 16.0
-                            && lo.z < fz + 0.875
-                            && hi.z > fz + 0.125
-                        {
-                            found = Some((x, y, z));
-                            break 'blocks;
-                        }
-                    }
-                }
-            }
-            let Some(pos) = found else {
-                i += 1;
-                continue;
+            let bounds = item.bounds();
+            let movement = MovementRecord {
+                from: item.previous,
+                to: item.position,
+                original: original_moves.get(&item.id).copied(),
             };
-            if self.hopper_take_item(pos, i) {
-                continue; // the item left the list; `i` is the next one
+            let epsilon = f64::from(1.0e-5_f32);
+            let deflation = Vec3::new(epsilon, epsilon, epsilon);
+            // Axis segments and the final-box retry share the visited hoppers.
+            let mut tried = Vec::new();
+            let mut visit = |pos: BlockPos| {
+                let state = self.world.block(pos.x, pos.y, pos.z);
+                // Hopper.SUCK_AABB is tested against the item's actual box,
+                // while the block visitor uses the deflated movement box.
+                let suction = Aabb::new(Vec3::new(0.0, 11.0 / 16.0, 0.0), Vec3::new(1.0, 2.0, 1.0))
+                    .move_by(Vec3::from_block(pos));
+                if horizon_client::block_entity_types::factory_block(
+                    &self.res.facts().get(state).name,
+                ) == "minecraft:hopper"
+                    && bounds.intersects(suction)
+                    && !tried.contains(&pos)
+                {
+                    tried.push(pos);
+                    return !self.hopper_take_item((pos.x, pos.y, pos.z), i);
+                }
+                true
+            };
+            let still_dropped = sweep_movement_segments(movement, |from, to, budget| {
+                let segment_box = bounds.move_by(to.subtract(movement.to)).deflate(deflation);
+                let mut iterations = 0;
+                let mut taken = false;
+                let _ = sweep_intersected_blocks(from, to, segment_box, 1_000_000, |pos, step| {
+                    if step >= budget {
+                        return false;
+                    }
+                    iterations = step;
+                    taken = !visit(pos);
+                    !taken
+                });
+                if taken { Err(()) } else { Ok(iterations + 1) }
+            })
+            .is_ok();
+            if still_dropped {
+                i += 1;
             }
-            i += 1;
         }
     }
     /// `tryMoveItems(…, () -> addItem(hopper, itemEntity))`; true when the
@@ -1240,15 +1296,14 @@ impl Game<'_> {
         let Some(view) = c.view(pos, false) else {
             return false;
         };
+        self.unpack_loot(super::container_loot::LootTarget::Block(pos), None);
+        let c = self.containers();
         let mut changed = false;
         if !c.is_empty(&view) {
             changed = self.hopper_eject(pos, &view);
         }
-        let c = self.containers();
-        let full =
-            (0..view.len()).all(|n| c.get(&view, n).is_some_and(|s| s.count == c.max_stack(s)));
         let mut taken = false;
-        if !full {
+        if !self.hopper_is_stacked(&view) {
             let stack = self.dropped[i].stack.clone();
             let allowed = self.with_level(|_, level, _| {
                 level.allow_hopper_pickup_item(
@@ -1276,9 +1331,8 @@ impl Game<'_> {
         }
         taken
     }
-    /// The item handler a mod's provider gives for the mod block entity at `pos` through
-    /// `side`, where it comes before the game's own slots or the game has none there. With no
-    /// item provider registered, one table check.
+    /// A mod's item handler through `side`. Vanilla containers and container providers keep
+    /// their direct automation path even when a capability overrides their public storage.
     pub(super) fn item_part_at(
         &mut self,
         pos: Pos,
@@ -1290,6 +1344,9 @@ impl Game<'_> {
             side: Some(side),
         };
         let providers = mod_api::block_providers(&mod_api::ITEMS, self, at)?;
+        if self.vanilla_automation_container(pos) {
+            return None;
+        }
         let game = self.container_size(at).is_some();
         providers.ask(self, game)
     }
@@ -1319,13 +1376,6 @@ impl Game<'_> {
         })
         .unwrap_or(0)
     }
-    /// Takes one item from `slot` of `view`, as it is now, journaled for the transaction.
-    fn take_one_journaled(&mut self, view: &View, slot: usize) -> Option<()> {
-        for &(pos, _) in &view.parts {
-            self.journal_block_entity(pos);
-        }
-        self.take_one(view, slot).map(drop)
-    }
     /// `InventoryMoveItemEvent` for `item` going from `source` to `destination`, where one end
     /// is a capability part: whether a mod canceled the move.
     fn part_move_canceled(&mut self, source: [i32; 3], destination: [i32; 3], item: &str) -> bool {
@@ -1333,41 +1383,66 @@ impl Game<'_> {
         self.native_inventory_move_item(source, destination, item, &mut cancel);
         cancel
     }
-    /// `ejectItems` into a capability part, looked up through the side it faces: the first hopper item
-    /// one of its slots takes, one item, as a hopper moves, in a transaction. A part taking
-    /// more than the one is a mod bug, and the move is undone.
+    /// `HopperBlockEntity.ejectItems`: one root attempt across source slots, restoring each
+    /// refused slot directly. Only the caller's final cooldown mark changes the hopper.
     fn eject_into_part(
         &mut self,
         hopper: &View,
         part: &Capability<dyn ResourceHandler<ItemResource>>,
         at: [i32; 3],
     ) -> bool {
-        let from = self.container_world_pos(hopper);
-        for slot in 0..hopper.len() {
-            let Some(stack) = self.containers().get(hopper, slot).cloned() else {
-                continue;
-            };
-            if self.part_move_canceled(from, at, &stack.item) {
-                continue;
-            }
-            let one = ItemStack { count: 1, ..stack };
-            if self.put_into_part(part, at, &one, |game, _| {
-                game.take_one_journaled(hopper, slot)
-            }) == 1
-            {
-                return true;
-            }
+        if (0..part.size(self)).all(|slot| {
+            part.resource(self, slot).is_some_and(|resource| {
+                part.amount(self, slot) >= part.capacity(self, slot, &resource)
+            })
+        }) {
+            return false;
         }
-        false
+        let from = self.container_world_pos(hopper);
+        mod_api::run_transaction(self, |game, tx| {
+            use super::api_values::TryIntoApi;
+            for slot in 0..hopper.len() {
+                let Some(snapshot) = game
+                    .containers()
+                    .get(hopper, slot)
+                    .and_then(|stack| stack.try_into_api().ok())
+                else {
+                    continue;
+                };
+                let resource = ItemResource::of(&snapshot);
+                let item = mod_api::__private::item_key_id(snapshot.item()).unwrap();
+                if game.part_move_canceled(from, at, item) {
+                    continue;
+                }
+                let (source, index) = hopper.locate(slot).ok_or(())?;
+                game.journal_block_entity_slot(source, index);
+                let Some(mut one) = game.take_one(hopper, slot) else {
+                    continue;
+                };
+                let went = part.insert_any(game, tx, &resource, 1);
+                let accepted = part.checked(went, 1, &at);
+                if accepted == Some(1) {
+                    return Ok(());
+                }
+                one.count = snapshot.count();
+                *game.slot_mut_at(hopper, slot).ok_or(())? = Some(one);
+                accepted.ok_or(())?;
+            }
+            Err(())
+        })
+        .is_ok()
     }
-    /// `suckInItems` from a capability part through its bottom: one item from the first of its
-    /// slots that gives one the hopper has room for, in a transaction, as `eject_into_part`.
+    /// `HopperBlockEntity.suckInItems`: extract before choosing the first receptive hopper
+    /// slot. Each nonempty storage index gets its own commit or abort.
     fn suck_from_part(
         &mut self,
         part: &Capability<dyn ResourceHandler<ItemResource>>,
         at: [i32; 3],
         hopper: &View,
     ) -> bool {
+        if self.hopper_is_stacked(hopper) {
+            return false;
+        }
         let into = self.container_world_pos(hopper);
         for slot in 0..part.size(self) {
             let Some(resource) = part.resource(self, slot) else {
@@ -1377,10 +1452,7 @@ impl Game<'_> {
             let Ok(one) = resource.as_stack().try_into_engine(self.items()) else {
                 continue;
             };
-            let c = self.containers();
-            if !(0..hopper.len()).any(|s| c.fits(hopper, s, &one) > 0)
-                || self.part_move_canceled(at, into, &one.item)
-            {
+            if part.amount(self, slot) == 0 || self.part_move_canceled(at, into, &one.item) {
                 continue;
             }
             let moved = mod_api::run_transaction(self, |game, tx| {
@@ -1389,10 +1461,12 @@ impl Game<'_> {
                 if part.checked(came, 1, &at) != Some(1) {
                     return Err(());
                 }
-                for &(pos, _) in &hopper.parts {
-                    game.journal_block_entity(pos);
-                }
-                game.add_item(None, hopper, one, None)
+                let target = (0..hopper.len())
+                    .find(|&slot| game.containers().fits(hopper, slot, &one) > 0)
+                    .ok_or(())?;
+                let (pos, slot) = hopper.locate(target).ok_or(())?;
+                game.journal_block_entity_slot(pos, slot);
+                game.try_move_in_item(None, hopper, one, target)
                     .map_or(Ok(()), |_| Err(()))
             });
             if moved.is_ok() {
@@ -1495,7 +1569,8 @@ impl Game<'_> {
     }
     /// The rest of `HopperBlockEntity.ejectItems`: one item into `target`.
     fn eject_into(&mut self, pos: Pos, hopper: &View, target: &View, face: Direction) -> bool {
-        if self.containers().is_full(target, face) {
+        self.unpack_inventory_slot(hopper, 0);
+        if self.inventory_is_full(target, face) {
             return false;
         }
         for slot in 0..hopper.len() {
@@ -1565,8 +1640,8 @@ impl Game<'_> {
     /// (`getSourceContainerOrHandler`). `None` when there is no container. A capability part
     /// above takes the container's place.
     fn suck_from_container(&mut self, above: Pos, at: [f64; 3], hopper: &View) -> Option<bool> {
+        let (x, y, z) = hopper.parts[0].0;
         if let Some(part) = self.item_part_at(above, Direction::Down) {
-            let (x, y, z) = hopper.parts[0].0;
             let above = [above.0, above.1, above.2];
             self.native_hopper_inventory_search([x, y, z], Some(above), None);
             return Some(self.suck_from_part(&part, above, hopper));
@@ -1574,7 +1649,6 @@ impl Game<'_> {
         let c = self.containers();
         let Some(source) = c.hopper_insertion_view(above) else {
             let found = self.automation_entity_at(at, Direction::Down)?;
-            let (x, y, z) = hopper.parts[0].0;
             return match found {
                 AutomationEntity::Container(id) => {
                     self.native_hopper_inventory_search([x, y, z], None, Some(id));
@@ -1588,15 +1662,7 @@ impl Game<'_> {
                 }
             };
         };
-        self.native_hopper_inventory_search(
-            [
-                hopper.parts[0].0.0,
-                hopper.parts[0].0.1,
-                hopper.parts[0].0.2,
-            ],
-            Some([above.0, above.1, above.2]),
-            None,
-        );
+        self.native_hopper_inventory_search([x, y, z], Some([above.0, above.1, above.2]), None);
         if let Kind::Composter(level) = source.kind {
             if level != 8 {
                 return Some(false);
@@ -1636,7 +1702,9 @@ impl Game<'_> {
         source: &View,
         hopper: &View,
     ) -> bool {
+        let mut prepared = None;
         for slot in source.slots_for_face_iter(Some(Direction::Down)) {
+            self.unpack_next_inventory_part(source, slot, &mut prepared);
             {
                 let c = self.containers();
                 let Some(stack) = c.insertion_item(source, slot).map(Cow::into_owned) else {
@@ -1713,9 +1781,7 @@ impl Game<'_> {
     /// The entity item automation reaches around `at` from `side`, through `ENTITY_AUTOMATION`: one of
     /// the container entities the game has there, and, once a mod registered a provider for it,
     /// the entities whose mod provider answers it, picked at random as `getEntityContainer` picks, the one draw.
-    /// A game container entity a mod provider answers ahead of the game is reached through
-    /// that answer. With no mod providing `ENTITY_AUTOMATION`, only vanilla containers are
-    /// considered: nothing more is looked up.
+    /// Vanilla container entities always keep their direct path, even with a provider.
     fn automation_entity_at(&mut self, at: [f64; 3], side: Direction) -> Option<AutomationEntity> {
         let vanilla = self.container_entities_at(at);
         if !mod_api::has_entity_providers(&ENTITY_AUTOMATION) {
@@ -1728,13 +1794,7 @@ impl Game<'_> {
             let providers = mod_api::entity_providers(&ENTITY_AUTOMATION, &*game, entity, context)?;
             providers.ask(game, has_game_answer)
         };
-        for &id in &vanilla {
-            let entity = self.entity(id);
-            match entity.and_then(|entity| Some((entity, ask(self, entity, true)?))) {
-                Some((entity, part)) => found.push(AutomationEntity::Part(entity, part)),
-                None => found.push(AutomationEntity::Container(id)),
-            }
-        }
+        found.extend(vanilla.iter().copied().map(AutomationEntity::Container));
         if let Some(level) = self.native_level_here() {
             let min = [at[0] - 0.5, at[1] - 0.5, at[2] - 0.5];
             let max = [at[0] + 0.5, at[1] + 0.5, at[2] + 0.5];
@@ -1760,7 +1820,7 @@ impl Game<'_> {
         if let Some(part) = self.item_part_at(pos, side) {
             return Some(f(self, ContainerTarget::Part(part)));
         }
-        if let Some(view) = self.containers().view(pos, false) {
+        if let Some(view) = self.containers().hopper_insertion_view(pos) {
             return Some(f(self, ContainerTarget::View(&view)));
         }
         let centre = [
@@ -1784,6 +1844,7 @@ impl Game<'_> {
         f: impl FnOnce(&mut Self, &View) -> R,
     ) -> Option<R> {
         let mut items = if let Some(i) = self.carts.iter().position(|c| c.id == id) {
+            self.unpack_loot(super::container_loot::LootTarget::Cart(id), None);
             self.carts.update(i, |c| std::mem::take(&mut c.items))
         } else {
             let i = self.boats.iter().position(|b| b.id == id)?;
@@ -1900,12 +1961,24 @@ impl Game<'_> {
         }
         self.suck_item_entities(None, hopper, min, max)
     }
+    /// `MinecartHopper.tick`'s `tryConsumeItems` for whichever path ticks the
+    /// cart. `ServerLevel.tickNonPassenger` ticks the vehicle, then its
+    /// passengers, so a ridden cart pulls too; Horizon ticks that one in its
+    /// rider's turn (`tick_cart_riding`). `alive` is `isAlive` after the move.
+    pub(super) fn hopper_cart_tick(&mut self, cart: &mut super::minecarts::Minecart, alive: bool) {
+        if alive && cart.kind == super::minecarts::CartKind::Hopper && cart.enabled {
+            self.hopper_cart_suck(cart);
+        }
+    }
     /// `MinecartHopper.tick`'s `tryConsumeItems` (`suckInItems`) for an enabled
     /// hopper minecart: one item from the container above, else the item
     /// entities over it or touching it, each tick without a cooldown.
     /// `consumedItemThisFrame` in 26.3 caps a tick at one item: the tick tries
     /// once, and `makeStepAlongTrack` may try again, but only one succeeds.
     pub(super) fn hopper_cart_suck(&mut self, cart: &mut super::minecarts::Minecart) {
+        if !self.unpack_ticked_cart_loot(cart) {
+            return;
+        }
         // The cart's slots are edited as a container under the placeholder key
         // its menu uses; when that menu is open the placeholder is the live copy.
         let key = (i32::MAX - 15, super::minecarts::CART_KEY_Y, cart.id as i32);
@@ -1957,6 +2030,7 @@ impl Game<'_> {
         let Some(view) = self.containers().view(key, false) else {
             return Ok(());
         };
+        self.unpack_loot(super::container_loot::LootTarget::Block(key), None);
         // DispenserBlockEntity.getRandomSlot
         let mut slot = None;
         let mut odds = 1;
@@ -1987,7 +2061,7 @@ impl Game<'_> {
         else {
             return Ok(());
         };
-        let Some(mut stack) = self.containers().get(&view, slot).cloned() else {
+        let Some(stack) = self.containers().get(&view, slot).cloned() else {
             return Ok(());
         };
         let target = offset(key, facing);
@@ -2006,12 +2080,8 @@ impl Game<'_> {
                     ControlFlow::Continue(inserted)
                 }
                 ContainerTarget::Part(part) => {
-                    // `dropperInsertHook`: the handler's writes and taking one from the
-                    // live source slot share a transaction, including feedback into it.
-                    stack.count = 1;
-                    game.put_into_part(&part, [target.0, target.1, target.2], &stack, |game, _| {
-                        game.take_one_journaled(&view, slot)
-                    });
+                    let at = [target.0, target.1, target.2];
+                    game.dropper_into_part(&part, &stack, at, &view, slot);
                     ControlFlow::Break(())
                 }
             });
@@ -2121,71 +2191,6 @@ impl Game<'_> {
             _ => return None,
         })
     }
-    /// HopperScreen / DispenserScreen background and labels; false for other containers.
-    pub(super) fn draw_machine_screen(
-        &self,
-        batch: &mut horizon_client::hud::HudBatch,
-        ox: f32,
-        oy: f32,
-    ) -> bool {
-        let Some(screen) = self.machine_screen() else {
-            return false;
-        };
-        let atlas = &self.gui.atlas;
-        let key_is_cart = self
-            .container
-            .is_some_and(|k| k.1 == super::minecarts::CART_KEY_Y);
-        let (texture, height, key, fallback) = match screen {
-            Screen::Hopper if key_is_cart => (
-                "gui/container/hopper",
-                133.0,
-                "entity.minecraft.hopper_minecart",
-                "Minecart with Hopper",
-            ),
-            Screen::Hopper => (
-                "gui/container/hopper",
-                133.0,
-                "container.hopper",
-                "Item Hopper",
-            ),
-            Screen::Dispenser => (
-                "gui/container/dispenser",
-                166.0,
-                "container.dispenser",
-                "Dispenser",
-            ),
-            Screen::Dropper => (
-                "gui/container/dispenser",
-                166.0,
-                "container.dropper",
-                "Dropper",
-            ),
-        };
-        if let Some(mut r) = atlas.sprites.get(texture).copied() {
-            let dv = (r.v1 - r.v0) / r.h as f32;
-            let du = (r.u1 - r.u0) / r.w as f32;
-            r.u1 = r.u0 + 176.0 * du;
-            r.v1 = r.v0 + height * dv;
-            batch.rect_uv(ox, oy, 176.0, height, r, u32::MAX);
-        }
-        let grey = horizon_client::hud::rgba(64, 64, 64, 255);
-        let title = &self.remote_menu_title().unwrap_or_else(|| {
-            horizon_client::text::Text::literal(
-                self.container_title(self.translate_with_fallback(key, fallback)),
-            )
-            .resolve_legacy()
-        });
-        super::screen_info::name_container(|| title.plain());
-        let title_x = if screen == Screen::Hopper {
-            8.0
-        } else {
-            (176.0 - atlas.font.width_text(title)) / 2.0
-        };
-        batch.text_styled(atlas, title, ox + title_x, oy + 6.0, grey, false);
-        let inventory = self.translate_with_fallback("container.inventory", "Inventory");
-        batch.text(atlas, &inventory, ox + 8.0, oy + height - 94.0, grey, false);
-        true
-    }
 }
 
 #[cfg(test)]
@@ -2193,6 +2198,8 @@ mod brewing_fuel_transfer_tests {
     use super::*;
     use crate::game::native_entity_refs::tests::with_game;
     use horizon_client::brewing::BrewingStand;
+    use horizon_client::entities::ItemEntity;
+
     use mod_api::HostTransaction;
 
     struct PrepareProbe {
@@ -2286,19 +2293,180 @@ mod brewing_fuel_transfer_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn empty_hopper_dispatches_prepare_transfer() {
         check_prepare_transfer(false);
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn prepare_transfer_inventory_write_is_ejected() {
         check_prepare_transfer(true);
     }
 
+    /// `HopperBlockEntity.entityInside` uses `Hopper.SUCK_AABB`, the full-width
+    /// column, not the old 12-wide bowl: with a solid block above (so the
+    /// block-tick pickup refuses), an item on the outer rim still goes in.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn a_hopper_catches_an_item_on_its_outer_rim() {
+        with_game(|game| {
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            let (x, y, z) = (8, 64, 8);
+            let hopper = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:hopper")
+                .unwrap();
+            let stone = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            game.world.set(x, y, z, hopper).unwrap();
+            game.world.set(x, y + 1, z, stone).unwrap();
+            game.hoppers
+                .insert((x, y, z), super::HopperState::default());
+            game.world
+                .block_entities
+                .insert((x, y, z), BlockEntity::Chest(vec![None; 5]));
+            let mut item = ItemEntity::new(
+                2,
+                ItemStack::new("minecraft:stone", 1),
+                Vec3::new(f64::from(x) - 0.05, f64::from(y) + 0.7, f64::from(z) + 0.5),
+                Vec3::ZERO,
+                0.0,
+            );
+            item.previous = Vec3::new(f64::from(x) - 0.1, f64::from(y) + 0.7, f64::from(z) + 0.5);
+            game.dropped.push(item);
+            game.hoppers_catch_items(&FxHashMap::default());
+            assert!(game.dropped.is_empty(), "the rim item was not taken");
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn an_enabled_hopper_catches_an_item_overlapping_a_disabled_hopper() {
+        check_adjacent_hopper_pickup(false, 8.93);
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_westbound_item_between_hoppers_goes_into_the_east_hopper() {
+        check_adjacent_hopper_pickup(true, 9.05);
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_rising_item_clears_the_hoppers_cell_before_crossing_its_edge() {
+        with_game(|game| {
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+            let hopper = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:hopper")
+                .unwrap();
+            let cases = [
+                (2, Vec3::new(8.75, 64.8, 8.5), Vec3::new(0.24, 0.25, 0.0)),
+                // A straight sweep visits the hopper cell in this case.
+                (3, Vec3::new(8.85, 64.65, 10.5), Vec3::new(0.14, 0.4, 0.0)),
+            ];
+            for (id, start, velocity) in cases {
+                let pos = (9, 64, start.z as i32);
+                game.world.set(pos.0, pos.1, pos.2, hopper).unwrap();
+                game.world
+                    .block_entities
+                    .insert(pos, BlockEntity::Chest(vec![None; HOPPER_SLOTS]));
+                let mut item = ItemEntity::new(
+                    id,
+                    ItemStack::new("minecraft:stone", 1),
+                    start,
+                    velocity,
+                    0.0,
+                );
+                item.no_gravity = true;
+                game.ticked_entities_through = id;
+                game.dropped.push(item);
+            }
+
+            let original_moves = game.tick_items();
+            for (id, start, velocity) in cases {
+                assert_eq!(original_moves.get(&id), Some(&velocity));
+                let item = game.dropped.iter().find(|item| item.id == id).unwrap();
+                assert_eq!(item.position, start.add_vector(velocity));
+            }
+            // Y resolves first, so the item's box clears y=65 before x enters the hopper cell.
+            game.hoppers_catch_items(&original_moves);
+
+            assert_eq!(game.dropped.len(), cases.len());
+            let containers = game.containers();
+            for (_, start, _) in cases {
+                let view = containers.view((9, 64, start.z as i32), false).unwrap();
+                assert!(containers.is_empty(&view));
+            }
+        });
+    }
+
+    fn check_adjacent_hopper_pickup(west_enabled: bool, previous_x: f64) {
+        with_game(|game| {
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+            let west = (8, 64, 8);
+            let east = (9, 64, 8);
+            let registry = &game.pack.assets.registry;
+            let enabled = registry.default_state("minecraft:hopper").unwrap();
+            let west_state = if west_enabled {
+                enabled
+            } else {
+                let mut disabled = registry.state(enabled).unwrap().clone();
+                disabled.properties.insert("enabled".into(), "false".into());
+                registry.id(&disabled).unwrap()
+            };
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            for ((x, y, z), state) in [(west, west_state), (east, enabled)] {
+                game.world.set(x, y, z, state).unwrap();
+                game.world.set(x, y + 1, z, stone).unwrap();
+                game.hoppers.insert((x, y, z), HopperState::default());
+                game.world
+                    .block_entities
+                    .insert((x, y, z), BlockEntity::Chest(vec![None; HOPPER_SLOTS]));
+            }
+            // The item overlaps both pickup boxes and reaches into the west hopper's old bowl.
+            let mut item = ItemEntity::new(
+                2,
+                ItemStack::new("minecraft:stone", 1),
+                Vec3::new(8.95, 64.7, 8.5),
+                Vec3::ZERO,
+                0.0,
+            );
+            item.previous = Vec3::new(previous_x, 64.7, 8.5);
+            let original_moves =
+                FxHashMap::from_iter([(item.id, item.position.subtract(item.previous))]);
+            game.dropped.push(item);
+            game.hoppers_catch_items(&original_moves);
+
+            assert!(game.dropped.is_empty());
+            let containers = game.containers();
+            let stayed_empty = containers.view(west, false).unwrap();
+            assert!(containers.is_empty(&stayed_empty));
+            let collected = containers.view(east, false).unwrap();
+            let stack = containers.get(&collected, 0).unwrap();
+            assert_eq!(stack.item.as_ref(), "minecraft:stone");
+            assert_eq!(stack.count, 1);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn hopper_brewing_fuel_transfer_respects_stack_components() {
         with_game(|game| {
             game.world.chunks.insert(
@@ -2377,7 +2545,9 @@ mod item_column_tests {
         ItemEntity {
             attachment_lifetime: Default::default(),
             fall_distance: 0.0,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
             rotation: [0.0, 0.0],
             join: Default::default(),
             no_gravity: false,
@@ -2718,7 +2888,7 @@ mod part_front_tests {
     /// A crafter facing west into a pipe that hands on east, back into the crafter: the four
     /// sticks land in its grid, and using up the planks takes none of them.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_part_handing_a_crafters_output_back_into_its_grid_loses_none() {
         let Some(root) = declared_part_root(
             "game::machines::part_front_tests::a_part_handing_a_crafters_output_back_into_its_grid_loses_none",
@@ -2779,7 +2949,7 @@ mod part_front_tests {
     /// A dropper facing west into a pipe that hands on east, back into the dropper: the item
     /// goes round, and taking it from its slot as it is then keeps both.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_part_handing_a_droppers_item_back_into_it_loses_none() {
         let Some(root) = declared_part_root(
             "game::machines::part_front_tests::a_part_handing_a_droppers_item_back_into_it_loses_none",
@@ -2837,7 +3007,7 @@ mod part_front_tests {
     /// they put out in a container's place; a part answering more than it was offered has its
     /// move undone, so the dropper keeps its item and the crafter's result is dispensed.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dropper_and_a_crafter_put_into_a_mod_part_in_front_of_them() {
         let Some(root) = declared_part_root(
             "game::machines::part_front_tests::a_dropper_and_a_crafter_put_into_a_mod_part_in_front_of_them",
@@ -2938,6 +3108,10 @@ mod part_front_tests {
 }
 
 #[cfg(test)]
+#[path = "hopper_cart_rider_tests.rs"]
+mod hopper_cart_rider_tests;
+
+#[cfg(test)]
 mod hopper_cart_transfer_tests {
     use super::super::{
         boats::Boat,
@@ -2950,13 +3124,13 @@ mod hopper_cart_transfer_tests {
     use horizon_core::nbt::Tag;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn chest_boat_automation_does_not_award_player_loot() {
         use horizon_client::advancements::Tree;
         use horizon_world::loot::PackOverlay;
         use std::sync::Arc;
 
-        with_game(|game| {
+        crate::game::native_guest_turn_tests::with_guests(|game| {
             game.options.dedicated = None;
             let files = vec![(
             "advancement/parity:boat_loot".into(),
@@ -2987,18 +3161,21 @@ mod hopper_cart_transfer_tests {
                     ]),
                 );
                 let i = game.boats.len() - 1;
-                game.unpack_boat_loot(i, player);
-                assert_eq!(game.adv.progress.done(&game.adv.tree.list[ai]), player);
-                // Opening a container automation already unpacked awards nothing.
-                game.unpack_boat_loot(i, true);
-                assert_eq!(game.adv.progress.done(&game.adv.tree.list[ai]), player);
+                game.as_guest(12, |game| {
+                    game.unpack_boat_loot(i, player);
+                    assert_eq!(game.adv.progress.done(&game.adv.tree.list[ai]), player);
+                    // Opening a container automation already unpacked awards nothing.
+                    game.unpack_boat_loot(i, true);
+                    assert_eq!(game.adv.progress.done(&game.adv.tree.list[ai]), player);
+                })
+                .unwrap();
             }
         });
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn chest_boat_slot_access_fills_only_empty_slots_once() {
+    #[ignore = "daily"]
+    fn chest_boat_with_items_drops_pending_table_without_rolling() {
         with_game(|game| {
             let sentinel = Some(ItemStack::new("minecraft:diamond", 17));
             for open in [false, true] {
@@ -3046,22 +3223,14 @@ mod hopper_cart_transfer_tests {
                         })
                         .unwrap();
                     assert_eq!(items[12], sentinel);
-                    if occupied == 27 {
-                        assert!(items.iter().all(|item| item == &sentinel));
-                    } else if occupied == 24 {
-                        // Pinned 26.3 LootTable.fill, seed 73, only these slots empty.
-                        for (slot, item, count) in
-                            [(0, "stick", 1), (13, "salmon", 1), (26, "acacia_log", 2)]
-                        {
-                            assert_eq!(
-                                items[slot],
-                                Some(ItemStack::new(&format!("minecraft:{item}"), count))
-                            );
-                        }
-                        assert_eq!(items.iter().filter(|item| *item == &sentinel).count(), 24);
-                    } else {
-                        assert!(items.iter().flatten().count() > 1, "pending loot was lost");
-                    }
+                    // Horizon-only mixed state: never fill even the free slots.
+                    assert_eq!(items.iter().flatten().count(), occupied);
+                    assert!(
+                        items
+                            .iter()
+                            .flatten()
+                            .all(|item| Some(item) == sentinel.as_ref())
+                    );
                     assert!(game.persist.raw[&id].get("LootTable").is_none());
                     assert!(game.persist.raw[&id].get("LootTableSeed").is_none());
                     assert_eq!(game.boats.last().unwrap().items, items);
@@ -3098,7 +3267,7 @@ mod hopper_cart_transfer_tests {
     /// tick (the old behaviour) or a block hopper's eight-tick cooldown both
     /// fail this.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn hopper_cart_takes_one_item_a_tick() {
         with_game(|game| {
             game.options.dedicated = Some(Vec::new());
@@ -3185,7 +3354,7 @@ mod pot_hopper_insertion_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn actual_hopper_ticks_insert_into_the_saved_pot_slot() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -3269,7 +3438,7 @@ mod pot_hopper_insertion_tests {
         );
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn actual_hopper_pulls_from_the_saved_pot_slot() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -3302,6 +3471,71 @@ mod pot_hopper_insertion_tests {
         let tag = spill::saved_entity(&game.world, [5, 201, 4]).expect("saved pot");
         assert!(tag.get("item").is_none(), "the pot is empty");
     }
+    /// A pot's saved item is taken in against the world's item prototypes, as the
+    /// hopper's slots are: a hopper full of ore saved with a value equal to the
+    /// prototype (`max_stack_size:64`) still pulls the pot's ore saved the same way,
+    /// and a broken pot spills it as the same stack.
+    #[test]
+    #[ignore = "daily"]
+    fn a_pots_redundant_saved_value_stacks_with_the_hoppers() {
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.block_ticks
+            .add_empty_chunk(BlockPos::new(0, 0, 0).chunk())
+            .unwrap();
+        assert!(game.run_command("fill 0 199 0 15 199 15 stone"));
+        let ore = r#"id:"minecraft:iron_ore",components:{"minecraft:max_stack_size":64}"#;
+        let plain = |count| ItemStack::new("minecraft:iron_ore", count);
+        assert!(game.run_command(&format!(
+            "setblock 5 201 4 decorated_pot{{item:{{{ore},count:2}}}}"
+        )));
+        let tag = spill::saved_entity(&game.world, [5, 201, 4]).expect("saved pot");
+        assert_eq!(pot_item(&tag, game.items()), Some(plain(2)));
+        let slots = (0..5)
+            .map(|slot| format!("{{Slot:{slot}b,{ore},count:10}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(game.run_command(&format!(
+            "setblock 5 200 4 hopper[facing=down,enabled=true]{{Items:[{slots}],TransferCooldown:0}}"
+        )));
+        let start = game.world.game_time;
+        for elapsed in 1..=9 {
+            game.world.game_time = start + elapsed;
+            game.tick_hopper((5, 200, 4));
+        }
+        let Some(BlockEntity::Chest(slots)) = game.world.block_entities.get(&(5, 200, 4)) else {
+            panic!("hopper inventory missing");
+        };
+        assert!(
+            slots
+                .iter()
+                .flatten()
+                .all(|s| s.same_item_same_components(&plain(1)))
+        );
+        let held: u32 = slots.iter().flatten().map(|s| s.count).sum();
+        assert_eq!(held, 52, "the hopper took both of the pot's ore");
+        // A pot broken with ore saved in it spills the world's stack.
+        assert!(game.run_command(&format!(
+            "setblock 7 200 4 decorated_pot{{item:{{{ore},count:3}}}}"
+        )));
+        assert!(game.run_command("setblock 7 200 4 air destroy"));
+        let spilled: Vec<ItemStack> = game
+            .spill
+            .spawns
+            .iter()
+            .map(|s| s.stack.clone())
+            .chain(game.dropped.iter().map(|e| e.stack.clone()))
+            .filter(|s| &*s.item == "minecraft:iron_ore")
+            .collect();
+        assert!(!spilled.is_empty(), "the pot's ore spilled");
+        assert!(
+            spilled
+                .iter()
+                .all(|s| s.same_item_same_components(&plain(1)))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3316,7 +3550,7 @@ mod tests {
     /// `ShelfBlockEntity.setChanged` (no arguments) posts `BLOCK_ACTIVATE`:
     /// a container writing a shelf's slot is a block activation.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_container_writing_a_shelf_posts_block_activate() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -3366,7 +3600,7 @@ mod can_take_tests {
     /// `ChiseledBookShelfBlockEntity.canTakeItem`: a hopper takes a book only
     /// when it has a free slot or a matching stack with room.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_full_hopper_cannot_take_a_book_from_a_chiseled_shelf() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -3417,5 +3651,232 @@ mod can_take_tests {
                 .can_take_into(&shelf_view, 0, &book, Direction::Down, &empty_hopper),
             "an empty hopper takes the book"
         );
+    }
+
+    /// A non-container block entity above a hopper (such as a sign holding lava)
+    /// has no slots, so `view` returns `None`. The hopper does not treat it as a
+    /// container, allowing item entities resting on the rim to be picked up.
+    #[test]
+    #[ignore = "daily"]
+    fn non_container_block_entity_above_hopper_does_not_block_item_suction() {
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        let hopper_pos = (2, 4, 3);
+        let sign_pos = (2, 5, 3);
+        let hopper_state = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:hopper")
+            .unwrap();
+        let sign_state = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:oak_sign")
+            .unwrap();
+        game.world
+            .set(hopper_pos.0, hopper_pos.1, hopper_pos.2, hopper_state)
+            .unwrap();
+        game.world
+            .set(sign_pos.0, sign_pos.1, sign_pos.2, sign_state)
+            .unwrap();
+        game.world
+            .block_entities
+            .insert(hopper_pos, BlockEntity::Chest(vec![None; 5]));
+        game.world
+            .block_entities
+            .insert(sign_pos, BlockEntity::Sign(Default::default()));
+
+        assert!(
+            game.containers().view(sign_pos, false).is_none(),
+            "a sign is not a container"
+        );
+        assert!(
+            game.containers().hopper_insertion_view(sign_pos).is_none(),
+            "a sign has no hopper insertion view"
+        );
+        let hopper_view = game
+            .containers()
+            .view(hopper_pos, false)
+            .expect("hopper view");
+        assert!(
+            game.suck_from_container(sign_pos, [2.5, 5.5, 3.5], &hopper_view)
+                .is_none(),
+            "suck_from_container returns None so hopper falls through to suck_item_entities"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stack_size_tests {
+    use super::*;
+    use crate::game::native_machines::tests::server_game;
+
+    /// Stone with its own `max_stack_size`, or with the component removed
+    /// (`!minecraft:max_stack_size`, vanilla's `getOrDefault` default of one).
+    fn stone(size: Option<i32>, count: u32) -> ItemStack {
+        let mut stack = ItemStack::new("minecraft:stone", count);
+        let data = stack.data_mut();
+        match size {
+            Some(n) => data.set_other("minecraft:max_stack_size", Some(Tag::Int(n))),
+            None => data.set_other(
+                "!minecraft:max_stack_size",
+                Some(Tag::Compound(Default::default())),
+            ),
+        };
+        stack.tidy();
+        stack
+    }
+
+    /// `HopperBlockEntity.tryMoveInItem` fills a slot up to the incoming
+    /// stack's `ItemStack.getMaxStackSize` (`itemStack.getMaxStackSize() -
+    /// current.getCount()`), its own `max_stack_size`, not the item's default.
+    #[test]
+    fn a_hopper_stops_at_the_stacks_own_max_stack_size() {
+        if std::env::var_os("HORIZON_TEST_RESOURCES").is_none() {
+            return;
+        }
+        let mut game = server_game();
+        let chest = (2, 4, 3);
+        let state = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:chest")
+            .unwrap();
+        game.world.set(chest.0, chest.1, chest.2, state).unwrap();
+        // One slot, so what does not fit comes back as the remainder.
+        let transfer = |game: &mut Game<'_>, slots: Vec<Option<ItemStack>>, stack: ItemStack| {
+            game.world
+                .block_entities
+                .insert(chest, BlockEntity::Chest(slots));
+            let view = game
+                .containers()
+                .view(chest, false)
+                .expect("the chest's view");
+            let rest = game.add_item(None, &view, stack, Some(Direction::Down));
+            let count = game.containers().get(&view, 0).map(|s| s.count);
+            (rest.map(|s| s.count), count)
+        };
+        // The slot takes four and holds two: two of the five go in.
+        assert_eq!(
+            transfer(&mut game, vec![Some(stone(Some(4), 2))], stone(Some(4), 5)),
+            (Some(3), Some(4))
+        );
+        // A removed component holds one, so nothing merges into it.
+        assert_eq!(
+            transfer(&mut game, vec![Some(stone(None, 1))], stone(None, 2)),
+            (Some(2), Some(1))
+        );
+    }
+
+    /// `BlockEntityPart::can_place_item` gates shared container insertion paths
+    /// (`/loot insert` via `block_can_place`, hopper/dropper via `add_item`, and the
+    /// `ITEMS` capability via `container_capacity`).
+    #[test]
+    fn can_place_item_gates_hopper_loot_and_capability_insertion() {
+        if std::env::var_os("HORIZON_TEST_RESOURCES").is_none() {
+            return;
+        }
+        use crate::game::api_values::install_parts;
+        use horizon_client::containers::{ModBlockEntity, ModContainer};
+        use mod_api::{
+            BlockEntityPart, BlockPart, CanPlaceItemEvent, Hooks, ItemKey, ModEntry, Mods,
+            Registrar, RegistrationContext,
+        };
+        use std::sync::Arc;
+
+        struct SmelterFilter(ItemKey);
+        #[mod_api::horizon_part]
+        impl BlockPart for SmelterFilter {}
+        #[mod_api::horizon_part]
+        impl BlockEntityPart for SmelterFilter {
+            fn can_place_item(&self, event: &mut CanPlaceItemEvent<'_>) -> Option<bool> {
+                match event.slot {
+                    0 => Some(event.stack.item() == self.0),
+                    1 => None,
+                    _ => Some(false),
+                }
+            }
+        }
+
+        struct TestMod;
+        #[mod_api::__subscriptions]
+        impl Hooks for TestMod {
+            fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+                let iron_ore = r.item_key("minecraft:iron_ore");
+                let kind = r.block_entity_type("smelter").blocks(&[]).build();
+                r.block_entity_part(&kind, SmelterFilter(iron_ore)).unwrap();
+            }
+        }
+
+        let mods: Mods = vec![ModEntry::new("testmod", Box::new(TestMod))].into();
+        mod_api::testing::with_parts_scope(|| {
+            mod_platform::testing::with_mods(mods.clone(), || {
+                let mut game = server_game();
+                install_parts(&mods).unwrap();
+                let pos = (2, 4, 3);
+                let state = game
+                    .pack
+                    .assets
+                    .registry
+                    .default_state("minecraft:stone")
+                    .unwrap();
+                game.world.set(pos.0, pos.1, pos.2, state).unwrap();
+                let mut faces: [Vec<usize>; 6] = Default::default();
+                faces[Direction::Up as usize] = vec![0];
+                faces[Direction::North as usize] = vec![1];
+                let container = Arc::new(ModContainer {
+                    slots: 3,
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                    faces,
+                    ..Default::default()
+                });
+                game.world
+                    .block_entities
+                    .set_mod_containers([(state.0, container)].into_iter().collect());
+                game.world.block_entities.insert(
+                    pos,
+                    BlockEntity::Mod(Box::new(ModBlockEntity::new(
+                        "testmod:smelter".into(),
+                        Default::default(),
+                    ))),
+                );
+
+                let ore = ItemStack::new("minecraft:iron_ore", 2);
+                let dirt = ItemStack::new("minecraft:dirt", 2);
+
+                // `/loot insert` (`block_can_place`)
+                assert!(game.block_can_place([pos.0, pos.1, pos.2], 0, &ore));
+                assert!(!game.block_can_place([pos.0, pos.1, pos.2], 0, &dirt));
+                assert!(game.block_can_place([pos.0, pos.1, pos.2], 1, &dirt));
+                assert!(!game.block_can_place([pos.0, pos.1, pos.2], 2, &ore));
+
+                // `ITEMS` capability (`container_capacity`)
+                let level = <dyn mod_api::Host>::level(&game, "minecraft:overworld").unwrap();
+                let top = BlockSide {
+                    level,
+                    pos: [pos.0, pos.1, pos.2],
+                    side: Some(Direction::Up),
+                };
+                assert_eq!(game.container_capacity(top, 0, &dirt), 0);
+                assert_eq!(game.container_capacity(top, 0, &ore), 64);
+
+                // Hopper / dropper insertion through top face (slot 0 only)
+                let view = game.containers().view(pos, false).expect("mod view");
+                let rejected = game.add_item(None, &view, dirt.clone(), Some(Direction::Up));
+                assert_eq!(rejected.as_ref().map(|s| s.count), Some(2));
+                assert!(game.containers().get(&view, 0).is_none());
+
+                let accepted = game.add_item(None, &view, ore, Some(Direction::Up));
+                assert!(accepted.is_none());
+                assert_eq!(
+                    game.containers().get(&view, 0).map(|s| (&*s.item, s.count)),
+                    Some(("minecraft:iron_ore", 2))
+                );
+            });
+        });
     }
 }

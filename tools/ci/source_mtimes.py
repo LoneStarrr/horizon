@@ -5,6 +5,11 @@ Run after restoring target and before Cargo. Preserve an input's old mtime only
 when its Git object (including its mode) is identical. Tree objects cover directory
 inputs to build scripts, including additions and deletions. Commit dates alone are
 not safe: a newly merged change can have an older author or committer date.
+
+Every job that builds in a shared persistent target must run this first, or its
+artifacts outlive a snapshot that no longer describes them. The snapshot's name
+carries a version: renaming it discards every runner's old snapshot once, so
+targets left with another tree's artifacts are judged afresh.
 """
 
 import argparse
@@ -15,6 +20,22 @@ import subprocess
 import time
 
 
+def load(snapshot):
+    """The last snapshot, or none: a partly restored or damaged one (a cache entry cut short) restores nothing, so
+    every input is dated now and Cargo rebuilds what it must, but the job goes on."""
+    try:
+        previous = json.loads(snapshot.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        previous = None
+    if isinstance(previous, dict) and all(isinstance(old, list) and len(old) == 2 and isinstance(old[0], str)
+                                          and isinstance(old[1], int) for old in previous.values()):
+        return previous
+    print(f"::warning::{snapshot.name} is damaged: ignored, every source file is dated now")
+    return {}
+
+
 def restore_and_snapshot(root, snapshot):
     # The object IDs describe the checkout only while its tracked inputs are clean.
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], cwd=root,
@@ -22,7 +43,7 @@ def restore_and_snapshot(root, snapshot):
     entries = subprocess.check_output(
         ["git", "ls-tree", "-r", "-t", "-z", "HEAD"], cwd=root,
     )
-    previous = json.loads(snapshot.read_text()) if snapshot.exists() else {}
+    previous = load(snapshot)
     current = {}
     restored = 0
     for entry in entries.split(b"\0"):

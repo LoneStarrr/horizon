@@ -57,7 +57,7 @@ fn cracks(rx: &mpsc::Receiver<Out>) -> Vec<(i32, [i32; 3], u8)> {
 /// Exercise actual packet handling, dig feedback, and encoded observer packets without
 /// starting a listener, a server loop, a window, or audio output.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn crack_packets_follow_start_clock_and_strict_observer_radius() {
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let settings = Settings::default();
@@ -130,6 +130,7 @@ fn crack_packets_follow_start_clock_and_strict_observer_radius() {
             max_players: 6,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         },
     )
     .unwrap();

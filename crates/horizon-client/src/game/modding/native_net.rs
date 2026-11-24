@@ -11,6 +11,12 @@ pub(super) struct NativeNet {
     pub(super) book_request: u64,
     pub(super) book_ready: bool,
     pub(super) book_retry_at: Option<std::time::Instant>,
+    /// A mod's `disconnect` (its reason, if any), carried out at the end of the frame.
+    pub(super) leave: Option<super::native_disconnect::LeaveRequest>,
+    /// Payloads staged from a shared (`&dyn ClientHost`) hook, drained each client tick
+    /// by `Game::flush_shared_payloads`.
+    pub(super) shared_payloads:
+        super::payload_transport::SharedQueue<super::payload_transport::Deferred>,
 }
 
 impl Game<'_> {
@@ -84,7 +90,7 @@ mod tests {
     /// A joined flag cannot manufacture a physical transport. Packet codec,
     /// reservation, and framing cases live in net::mod_packet_tests.
     #[test]
-    #[ignore = "needs private prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mod_packets_require_joined_player_and_physical_transport() {
         if run_fresh_cases(
             "game::native_net::tests::mod_packets_require_joined_player_and_physical_transport",

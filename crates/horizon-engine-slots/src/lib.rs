@@ -1,8 +1,5 @@
-//! Engine-owned load-time seal: the one boundary after which no more listeners register.
-//! The host installs the provider that finishes registration; listener types, ordering and
-//! dispatch belong to that provider, not this crate.
-#![forbid(unsafe_code)]
-
+//! Engine-owned registration sockets: the seal of load-time registration and the platform's
+//! services.
 use std::sync::Mutex;
 
 // Process state: the provider and final registration boundary belong to this game process.

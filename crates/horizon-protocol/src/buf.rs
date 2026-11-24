@@ -6,15 +6,10 @@ use horizon_core::{nbt, nbt::Tag};
 use std::marker::PhantomData;
 
 /// Vanilla's default NBT quota for network tags (NbtAccounter.defaultQuota).
-pub const NBT_QUOTA: usize = 2_097_152;
-/// The least `NbtAccounter` charges for one tag: `EndTag`'s `SELF_SIZE_IN_BYTES`, the smallest
-/// tag's (every other tag costs more: `ByteTag` 9 bytes, a compound 48 plus its entries).
-const MIN_TAG_COST: usize = 8;
-/// The most tags one network NBT value can hold within [`NBT_QUOTA`]: vanilla charges each at least
-/// [`MIN_TAG_COST`] of its estimated heap, so a value with more tags is one vanilla refuses too. A
-/// byte count alone let a crafted server send ~1 M byte tags in 1 MB that vanilla refuses and that
-/// take ~32 bytes each here; capped, one value's tags take at most ~8 MiB.
-pub const NBT_MAX_TAGS: usize = NBT_QUOTA / MIN_TAG_COST;
+pub const NBT_QUOTA: usize = nbt::Limits::network().max_bytes;
+/// The most tags one network NBT value can hold within [`NBT_QUOTA`], using
+/// vanilla's minimum eight-byte per-tag heap charge.
+pub const NBT_MAX_TAGS: usize = nbt::Limits::network().max_nodes;
 
 /// Whether a peer can read `tag` as network NBT: written within [`NBT_QUOTA`], then read back by
 /// [`Reader::nbt`] under the receiver's own limits (`NbtAccounter.defaultQuota` and its tag count).
@@ -181,7 +176,7 @@ impl<'a> Reader<'a> {
     /// String (UTF-16 units: a character outside the BMP counts twice).
     pub fn string(&mut self, max: usize) -> Result<String> {
         let len = self.count(max.saturating_mul(3))?;
-        let s = packet_utf8(self.bytes(len)?);
+        let s = java_utf8(self.bytes(len)?);
         if s.encode_utf16().count() > max {
             return Err(Error::new(format!("string longer than {max} chars")));
         }
@@ -196,11 +191,10 @@ impl<'a> Reader<'a> {
     }
     /// A network NBT tag (NbtIo.readAnyTag without a root name); `End` means none.
     pub fn nbt(&mut self) -> Result<Tag> {
-        let limits = nbt::Limits {
-            max_bytes: NBT_QUOTA,
-            max_nodes: NBT_MAX_TAGS,
-            ..nbt::Limits::default()
-        };
+        self.nbt_within(nbt::Limits::network())
+    }
+    /// [`Self::nbt`] within `limits`, for a codec whose writer uses the same ones.
+    pub fn nbt_within(&mut self, limits: nbt::Limits) -> Result<Tag> {
         let (tag, used) = nbt::read_network(&self.data[self.pos..], limits)
             .map_err(|e| Error::new(format!("NBT: {e}")))?;
         self.pos += used;
@@ -218,10 +212,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Java's UTF-8 replacement decoder, as used by Utf8String.read. Most malformed
+/// Java's UTF-8 replacement decoder, as used by Utf8String.read and by a reader
+/// opened on a UTF-8 file (Guava's `Files.newReader`). Most malformed
 /// sequences have Rust's maximal-subpart grouping, but Java consumes an encoded
 /// surrogate (including its truncated two-byte prefix) as one replacement.
-fn packet_utf8(mut bytes: &[u8]) -> String {
+pub fn java_utf8(mut bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len());
     loop {
         match std::str::from_utf8(bytes) {
@@ -321,10 +316,9 @@ impl Writer {
         self.data.extend_from_slice(&v.to_be_bytes());
     }
     pub fn nbt(&mut self, tag: &Tag) {
-        match nbt::write_network(tag, nbt::Limits::default()) {
-            Ok(bytes) => self.data.extend_from_slice(&bytes),
-            // Unencodable tags (too deep) are sent as "no tag".
-            Err(_) => self.data.push(0),
+        // An unencodable tag is rolled back and sent as "no tag".
+        if nbt::write_network_into(tag, nbt::Limits::default(), &mut self.data).is_err() {
+            self.data.push(0);
         }
     }
     pub fn long_array(&mut self, v: &[i64]) {
@@ -522,6 +516,26 @@ impl<T, C: Codec<T>> Codec<Vec<T>> for List<C> {
             C::write(e, w);
         }
     }
+    fn validate(v: &Vec<T>) -> Result<()> {
+        for e in v {
+            C::validate(e)?;
+        }
+        Ok(())
+    }
+}
+/// ByteBufCodecs.list(N): as [`List`], at most N elements.
+pub struct ListN<C, const N: usize>(PhantomData<C>);
+impl<T, C: Codec<T>, const N: usize> Codec<Vec<T>> for ListN<C, N> {
+    fn read(r: &mut Reader) -> Result<Vec<T>> {
+        let n = r.count(N)?;
+        (0..n).map(|_| C::read(r)).collect()
+    }
+    fn write(v: &Vec<T>, w: &mut Writer) {
+        List::<C>::write(v, w)
+    }
+    fn validate(v: &Vec<T>) -> Result<()> {
+        List::<C>::validate(v)
+    }
 }
 /// ByteBufCodecs.optional(): a boolean presence flag.
 pub struct Opt<C>(PhantomData<C>);
@@ -539,16 +553,26 @@ impl<T, C: Codec<T>> Codec<Option<T>> for Opt<C> {
             C::write(v, w);
         }
     }
+    fn validate(v: &Option<T>) -> Result<()> {
+        if let Some(v) = v {
+            C::validate(v)?;
+        }
+        Ok(())
+    }
 }
 /// ByteBufCodecs.OPTIONAL_VAR_INT: 0 = empty, otherwise value + 1.
 pub struct OptVarInt;
 impl Codec<Option<i32>> for OptVarInt {
     fn read(r: &mut Reader) -> Result<Option<i32>> {
         let v = r.varint()?;
-        Ok(if v == 0 { None } else { Some(v - 1) })
+        Ok(if v == 0 {
+            None
+        } else {
+            Some(v.wrapping_sub(1))
+        })
     }
     fn write(v: &Option<i32>, w: &mut Writer) {
-        w.varint(v.map_or(0, |v| v + 1))
+        w.varint(v.map_or(0, |v| v.wrapping_add(1)))
     }
 }
 /// Vec3i.STREAM_CODEC: three var ints.
@@ -742,6 +766,11 @@ macro_rules! packet {
             fn write(v: &$name, w: &mut $crate::buf::Writer) {
                 $(<$codec as $crate::buf::Codec<$ty>>::write(&v.$field, w);)*
             }
+            #[allow(unused_variables)]
+            fn validate(v: &$name) -> $crate::Result<()> {
+                $(<$codec as $crate::buf::Codec<$ty>>::validate(&v.$field)?;)*
+                Ok(())
+            }
         }
     };
 }
@@ -749,6 +778,34 @@ macro_rules! packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_optional_var_int_wraps_as_java_does() {
+        let mut w = Writer::new();
+        w.varint(i32::MIN);
+        assert_eq!(
+            OptVarInt::read(&mut Reader::new(&w.data)).unwrap(),
+            Some(i32::MAX)
+        );
+        let mut w = Writer::new();
+        OptVarInt::write(&Some(i32::MAX), &mut w);
+        assert_eq!(Reader::new(&w.data).varint().unwrap(), i32::MIN);
+    }
+
+    #[test]
+    fn a_capped_list_refuses_one_more() {
+        let mut w = Writer::new();
+        List::<VarInt>::write(&(0..17).collect(), &mut w);
+        assert!(ListN::<VarInt, 16>::read(&mut Reader::new(&w.data)).is_err());
+        let mut w = Writer::new();
+        List::<VarInt>::write(&(0..16).collect(), &mut w);
+        assert_eq!(
+            ListN::<VarInt, 16>::read(&mut Reader::new(&w.data))
+                .unwrap()
+                .len(),
+            16
+        );
+    }
 
     /// A network NBT list of `n` byte tags: one root list plus `n` elements.
     fn byte_list(n: usize) -> Vec<u8> {
@@ -778,6 +835,20 @@ mod tests {
         );
         let refused = Reader::new(&over).nbt().unwrap_err().to_string();
         assert!(refused.contains("node limit"), "{refused}");
+    }
+
+    #[test]
+    fn over_limit_writer_nbt_is_one_end_byte_between_packet_fields() {
+        let mut tag = Tag::List(Vec::new());
+        for _ in 0..nbt::Limits::default().max_depth {
+            tag = Tag::List(vec![tag]);
+        }
+        let mut w = Writer::new();
+        w.varint(300);
+        w.nbt(&tag);
+        w.nbt(&Tag::Byte(5));
+        w.i16(0x1234);
+        assert_eq!(w.data, [0xac, 0x02, 0, 1, 5, 0x12, 0x34]);
     }
 
     fn round<T: PartialEq + std::fmt::Debug, C: Codec<T>>(v: T) -> Vec<u8> {

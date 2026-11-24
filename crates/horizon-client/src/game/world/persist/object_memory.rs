@@ -43,7 +43,7 @@ impl Game<'_> {
             .and_then(OffLevel::as_mob_mut)
     }
 
-    /// A boat object, resident or retained as the root of a passenger graph.
+    /// A boat object, resident or retained by a passenger graph.
     /// Selectors, tracking and ticking keep iterating `boats` instead.
     pub(in crate::game) fn boat_object(&self, id: u32) -> Option<&crate::game::boats::Boat> {
         self.boats
@@ -52,7 +52,7 @@ impl Game<'_> {
             .or_else(|| self.persist.off_level.get(&id).and_then(OffLevel::as_boat))
     }
 
-    /// A minecart object, resident or retained as the root of a passenger graph.
+    /// A minecart object, resident or retained by a passenger graph.
     /// Selectors, tracking and ticking keep iterating `carts` instead.
     pub(in crate::game) fn cart_object(
         &self,
@@ -80,11 +80,12 @@ impl Game<'_> {
     ) {
         self.next_entity += 1;
         // `ItemEntity(EntityType, Level)` first: its own random draws UUID, bobOffs and yaw.
-        let mut own = random_source::entity();
+        let mut own = horizon_core::random::EntityRandom::own(random_source::entity());
         let fresh = horizon_client::save::insecure_uuid(&mut own);
         let bob = own.next_float() * std::f32::consts::PI * 2.0;
         own.next_float();
         if let Some(mut e) = entity_nbt::item_entity_from_nbt(&tag, self.next_entity, bob) {
+            self.clean_stack(&mut e.stack);
             e.random = own;
             if let Some(state) = transferred {
                 self.adopt_transferred_entity_state(e.id, state);
@@ -132,6 +133,7 @@ impl Game<'_> {
         {
             if let Some(a) = p.arrow.as_mut() {
                 a.last_state = in_block.and_then(|t| self.state_from_nbt(&t));
+                self.clean_stack(&mut a.pickup_item);
             }
             self.claim_owner(&mut p);
             // An arrow that came through a portal keeps its
@@ -243,7 +245,8 @@ impl Game<'_> {
             let uuid = self.uuid_for(self.next_entity);
             self.falling.push(FallingBlock {
                 attachment_lifetime: Default::default(),
-                rotation: [0.0, 0.0],
+                // Entity.load: the saved Rotation, as the save writes it back.
+                rotation: entity_nbt::loaded_rotation(&tag),
                 join: Default::default(),
                 id: self.next_entity,
                 state,
@@ -281,6 +284,7 @@ impl Game<'_> {
         if let Some(n) = entity_nbt::trident_from_nbt(&tag) {
             let mut t =
                 crate::game::trident::ThrownTrident::from_nbt(n, &tag, self.pack.assets.registry);
+            t.read_loyalty(&world_stations!(self).enchantments, &mut self.world.random);
             t.id = self.take_entity_id();
             // One that came through a portal keeps its cooldown.
             let id = t.id;
@@ -319,20 +323,47 @@ impl Game<'_> {
         uuid: Option<[i32; 4]>,
         transferred: Option<crate::game::entity_initialization::TransferredEntityState>,
     ) {
+        self.load_tnt_with_portal(tag, uuid, transferred, false);
+    }
+
+    pub(in crate::game) fn load_tnt_with_portal(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<crate::game::entity_initialization::TransferredEntityState>,
+        used_portal: bool,
+    ) {
         if uuid.is_some_and(|u| self.target_with_uuid(u).is_some()) {
             return;
         }
         let mut tag = tag;
-        let riders = self.take_mob_passengers(&mut tag);
+        let riders = passenger_graph::take_passengers(&mut tag);
         if let Some(position) = entity_nbt::position(&tag) {
             self.next_entity += 1;
             let id = self.next_entity;
             // getShortOr uses NumericTag.shortValue: floor floating values
             // to int before short narrowing; integer tags narrow directly.
             let fuse = tnt_fuse(&tag);
+            // A fresh load: Entity.load's angles. A portal arrival:
+            // teleportSetPosition's `setYRot`/`setXRot` of the turned angles,
+            // with no `% 360` on the yaw.
+            let rotation = if used_portal {
+                let [yaw, pitch] = entity_nbt::rotation(&tag);
+                [
+                    if yaw.is_finite() { yaw } else { 0.0 },
+                    if pitch.is_finite() {
+                        (pitch % 360.0).clamp(-90.0, 90.0)
+                    } else {
+                        0.0
+                    },
+                ]
+            } else {
+                entity_nbt::loaded_rotation(&tag)
+            };
             self.tnts.push(crate::game::tnt::PrimedTnt {
+                used_portal,
                 attachment_lifetime: Default::default(),
-                rotation: [0.0, 0.0],
+                rotation,
                 join: Default::default(),
                 no_gravity: entity_nbt::flag(&tag, "NoGravity"),
                 id,
@@ -353,13 +384,15 @@ impl Game<'_> {
                     .get("block_state")
                     .and_then(|v| entity_nbt::state_from_nbt(self.pack.assets.registry, v)),
             });
-            // `Entity.load`: the `PortalCooldown` of one that just came through.
+            // `Entity.load`: the `PortalCooldown` of one that just came through,
+            // which `handlePortal` counts down every tick.
+            self.restore_portal_cooldown(id, &tag);
             if let Some(state) = transferred {
                 self.adopt_transferred_entity_state(id, state);
             }
             self.remember(id, uuid, tag);
-            for rider in riders {
-                self.load_mob(rider, Some(id));
+            if let Some(riders) = riders {
+                self.load_passengers(id, riders);
             }
         }
     }
@@ -380,7 +413,7 @@ impl Game<'_> {
         let refused = transferred.is_some() && self.uuid_admission_refused(uuid);
         if let Some((position, velocity, yaw)) = entity_nbt::boat_from_nbt(&tag) {
             let mut tag = tag;
-            let riders = self.take_mob_passengers(&mut tag);
+            let riders = passenger_graph::take_passengers(&mut tag);
             self.next_entity += 1;
             let id = self.next_entity;
             let (wood, chest) = crate::game::boats::any_boat_wood(k).unwrap_or(("oak", false));
@@ -399,6 +432,10 @@ impl Game<'_> {
                     tag.get("Items"),
                     crate::game::boats::CHEST_SLOTS,
                 );
+                b.items
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|stack| self.clean_stack(stack));
             }
             b.velocity = velocity;
             // AbstractBoat.readAdditionalSaveData: the lead's holder.
@@ -413,8 +450,8 @@ impl Game<'_> {
                 self.bind_saved_entity_attachments(id, &mut b.attachment_lifetime);
                 self.boats.push(b);
             }
-            for rider in riders {
-                self.load_mob(rider, Some(id));
+            if let Some(riders) = riders {
+                self.load_passengers(id, riders);
             }
             return Some(id);
         }
@@ -435,13 +472,16 @@ impl Game<'_> {
         let refused = transferred.is_some() && self.uuid_admission_refused(uuid);
         let kind = crate::game::minecarts::CartKind::from_id(k).unwrap();
         let mut tag = tag;
-        let riders = self.take_mob_passengers(&mut tag);
+        let riders = passenger_graph::take_passengers(&mut tag);
         let id = self.next_entity + 1;
         if let Some(mut c) = crate::game::minecarts::Minecart::from_nbt(&tag, id, kind) {
+            c.items
+                .iter_mut()
+                .flatten()
+                .for_each(|stack| self.clean_stack(stack));
             crate::game::minecarts::forget_unreadable_display(&mut c, |t| {
                 self.state_from_nbt(t).is_some()
             });
-            self.roll_cart_loot(&mut c, &tag);
             self.next_entity = id;
             if let Some(state) = transferred {
                 self.adopt_transferred_entity_state(id, state);
@@ -453,8 +493,8 @@ impl Game<'_> {
                 self.bind_saved_entity_attachments(id, &mut c.attachment_lifetime);
                 self.carts.push(c);
             }
-            for rider in riders {
-                self.load_mob(rider, Some(id));
+            if let Some(riders) = riders {
+                self.load_passengers(id, riders);
             }
             return Some(id);
         }
@@ -493,7 +533,7 @@ impl Game<'_> {
         if let Tag::Compound(c) = &mut tag {
             finalize = c.remove(&"horizon:finalize".into()).is_some();
         }
-        let riders = self.take_mob_passengers(&mut tag);
+        let riders = passenger_graph::take_passengers(&mut tag);
         // The mob's own random makes its UUID, kept unless the tag has one.
         let (own, fresh) = horizon_client::mobs::living_random();
         let uuid = Some(uuid.unwrap_or(fresh));
@@ -504,6 +544,7 @@ impl Game<'_> {
             Some(self.pack.assets.registry),
             own,
         )?;
+        m.clean_saved_stacks(&tag, &self.items().component_defaults);
         self.resolve_loaded_profession(&mut m);
         if horizon_client::mobs::camel::is_camel(m.species()) {
             horizon_client::mobs::camel::finish_load(&mut m, self.world.game_time);
@@ -550,6 +591,8 @@ impl Game<'_> {
                 &difficulty,
                 horizon_client::mobs::spawn_rules::Reason::Structure,
             );
+            // `Shulker.finalizeSpawn` ends in yaw 0 here as on the other spawn paths.
+            horizon_client::mobs::shulker::finalize_spawn(&mut m);
         }
         horizon_client::mobs::armor::prepare(&m, &self.motion.attributes);
         let id = m.id;
@@ -558,8 +601,12 @@ impl Game<'_> {
         // are still considered individually in preorder.
         let refused = self.uuid_admission_refused(uuid);
 
-        if let Some(state) = transferred {
+        if let Some(mut state) = transferred {
+            state.restore_mob(&mut m);
             self.adopt_transferred_entity_state(id, state);
+        } else if m.health <= 0.0 {
+            // A saved dying body has already passed die; loading only resumes tickDeath.
+            self.died.insert(id);
         }
         self.remember(id, uuid, tag);
         if refused {
@@ -571,43 +618,10 @@ impl Game<'_> {
         if !refused && restore_target {
             self.native_restore_loaded_target(id, anger_uuid);
         }
-        for rider in riders {
-            if let Some(r) = self.load_mob(rider, Some(id))
-                && let Some(vehicle) = self.mob_object_mut(id)
-            {
-                vehicle.extra.rider.get_or_insert(r);
-            }
+        if let Some(riders) = riders {
+            self.load_passengers(id, riders);
         }
         Some(id)
-    }
-
-    /// The mobs under an entity's `Passengers`, taken out of it; the
-    /// passengers Horizon doesn't simulate stay. An entry no entity loads
-    /// from goes (`EntityType.loadPassengersRecursive` mounts only a loaded
-    /// one): not a compound, or no registered type (`EntityType.by`).
-    pub(super) fn take_mob_passengers(&mut self, tag: &mut Tag) -> Vec<Tag> {
-        self.load_entity_types();
-        // Without the registry nothing can be told apart: keep every entry.
-        let registry = self.entity_types_loaded();
-        let mut riders = Vec::new();
-        if let Tag::Compound(c) = tag
-            && let Some(Tag::List(list)) = c.remove(&"Passengers".into())
-        {
-            let mut unknown = Vec::new();
-            for p in list {
-                let loads = matches!(p, Tag::Compound(_))
-                    && entity_nbt::kind(&p).is_some_and(|k| self.entity_type_exists(&k));
-                if self.loads_as_rider(&p) {
-                    riders.push(p);
-                } else if loads || !registry {
-                    unknown.push(p);
-                }
-            }
-            if !unknown.is_empty() {
-                c.insert("Passengers".into(), Tag::List(unknown));
-            }
-        }
-        riders
     }
 
     /// `Entity.shouldBeSaved`: the mobs riding entity `id` under `tag`'s
@@ -652,39 +666,60 @@ impl Game<'_> {
             .collect()
     }
 
-    /// Capture after tree serialization and before source removal. This consumes
-    /// each object's runtime ownership once, independently of duplicate UUIDs.
-    pub(in crate::game) fn capture_vehicle_tree_state(
+    /// `Entity.teleportCrossDimension`: pair each serialized node with that
+    /// exact object's runtime ownership in one walk, never by UUID or Vec order.
+    pub(in crate::game) fn take_vehicle_tree_transfer(
         &mut self,
         root: u32,
-    ) -> Option<TransferredVehicleTree> {
-        let (kind, name) = if let Some(mob) = self.mob_object(root) {
-            (
-                VehicleTreeKind::Mob,
-                horizon_client_core::identifier::normalize_id(&mob.kind.id)?,
-            )
-        } else if let Some(boat) = self.boat_object(root) {
-            (VehicleTreeKind::Boat, boat.entity_type())
+    ) -> Option<(Tag, TransferredVehicleTree)> {
+        let (kind, mut tag) = if let Some(object) = self.mob_object_slot(root) {
+            (VehicleTreeKind::Mob, self.mob_object_nbt(object))
+        } else if self.boat_object(root).is_some() {
+            let uuid = self.uuid_for(root);
+            let mut tag = self.boat_object(root)?.to_nbt(uuid, self.persist.raw.get(&root));
+            if let Some(index) = self.boats.iter().position(|boat| boat.id == root) {
+                self.write_boat_leash(&mut tag, index);
+            }
+            self.save_portal_cooldown(root, &mut tag);
+            (VehicleTreeKind::Boat, tag)
+        } else if self.cart_object(root).is_some() {
+            let uuid = self.uuid_for(root);
+            let mut tag = self.cart_object(root)?.to_nbt(uuid, self.persist.raw.get(&root));
+            self.save_portal_cooldown(root, &mut tag);
+            (VehicleTreeKind::Cart, tag)
         } else {
-            let cart = self.cart_object(root)?;
-            (VehicleTreeKind::Cart, cart.kind.id().to_owned())
+            let target = self.level_entity(root as i32)?;
+            (VehicleTreeKind::Other, self.command_target_nbt(target)?)
         };
-        let children: Vec<_> = self
-            .mob_passenger_objects(root)
-            .into_iter()
-            .map(|object| self.mob_at(object).id)
-            .collect();
-        let passengers = children
-            .into_iter()
-            .map(|id| self.capture_vehicle_tree_state(id))
-            .collect::<Option<Vec<_>>>()?;
-        Some(TransferredVehicleTree {
-            source_id: root,
-            kind,
-            name,
-            state: self.take_transferred_entity_state(root),
-            passengers,
-        })
+        let name = entity_nbt::kind(&tag)?;
+        passenger_graph::take_passengers(&mut tag);
+        write_attachments(&mut tag, root, &self.entity_attachments);
+        let mut tags = Vec::new();
+        let mut passengers = Vec::new();
+        for slot in self.ordered_passenger_slots(root) {
+            match slot {
+                PassengerSlot::Live(id) => {
+                    let (tag, state) = self.take_vehicle_tree_transfer(id)?;
+                    tags.push(tag);
+                    passengers.push(Some(state));
+                }
+                PassengerSlot::Saved(tag) => {
+                    tags.push(tag);
+                    passengers.push(None);
+                }
+            }
+        }
+        add_passengers(&mut tag, tags);
+        Some((
+            tag,
+            TransferredVehicleTree {
+                source_id: root,
+                kind,
+                name,
+                state: self.take_transferred_entity_state(root),
+                passengers,
+            },
+        ))
     }
 
     pub(super) fn prepare_vehicle_transfer(
@@ -698,7 +733,10 @@ impl Game<'_> {
             );
             return None;
         }
-        let tags = self.take_mob_passengers(&mut tag);
+        let tags = match passenger_graph::take_passengers(&mut tag) {
+            Some(Tag::List(tags)) => tags,
+            _ => Vec::new(),
+        };
         if tags.len() != tree.passengers.len() {
             log::warn!(
                 "Horizon: transferred vehicle topology does not match its captured object state"
@@ -708,7 +746,12 @@ impl Game<'_> {
         let passengers = tags
             .into_iter()
             .zip(tree.passengers)
-            .map(|(tag, child)| self.prepare_vehicle_transfer(tag, child))
+            .map(|(tag, child)| match child {
+                Some(child) => self
+                    .prepare_vehicle_transfer(tag, child)
+                    .map(PreparedVehiclePassenger::Object),
+                None => Some(PreparedVehiclePassenger::Saved(tag)),
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(PreparedVehicleTransfer {
             source_id: tree.source_id,
@@ -749,18 +792,21 @@ impl Game<'_> {
         } = tree;
         let riders = passengers
             .into_iter()
-            .map(|child| self.restore_vehicle_transfer(child, by_source))
+            .map(|child| match child {
+                PreparedVehiclePassenger::Object(child) => self
+                    .restore_vehicle_transfer(child, by_source)
+                    .map(PassengerSlot::Live),
+                PreparedVehiclePassenger::Saved(tag) => Some(PassengerSlot::Saved(tag)),
+            })
             .collect::<Option<Vec<_>>>()?;
         let root = self.restore_vehicle_object(tag, kind, &name, state)?;
-        for (order, &id) in riders.iter().enumerate() {
-            if let Some(mob) = self.mob_object_mut(id) {
-                mob.extra.mount = Some(root);
-                mob.extra.passenger = true;
-                mob.extra.vehicle_order = order as i64;
+        for slot in riders {
+            match slot {
+                PassengerSlot::Live(id) => self.link_loaded_passenger(id, root),
+                // A slot with no source object still takes ordinary admission in
+                // the destination, as main's NBT reconstruction did.
+                PassengerSlot::Saved(tag) => self.load_passengers(root, Tag::List(vec![tag])),
             }
-        }
-        if let Some(mob) = self.mob_object_mut(root) {
-            mob.extra.rider = riders.first().copied();
         }
         by_source.insert(source_id, root);
         Some(root)
@@ -778,6 +824,12 @@ impl Game<'_> {
             VehicleTreeKind::Mob => self.load_mob_transferred(tag, None, Some(state)),
             VehicleTreeKind::Boat => self.load_boat_transferred(tag, uuid, name, Some(state)),
             VehicleTreeKind::Cart => self.load_cart_transferred(tag, uuid, name, Some(state)),
+            VehicleTreeKind::Other => {
+                let before = self.next_entity;
+                self.load_listed_transferred(name, uuid, self.level.player_uuid, tag, state)
+                    .ok()?;
+                ((before + 1)..=self.next_entity).find(|id| self.passenger_object_present(*id))
+            }
         }
     }
 
@@ -807,8 +859,26 @@ impl Game<'_> {
     pub(super) fn mob_object_tree_nbt(&mut self, object: MobObject) -> Tag {
         let id = self.mob_at(object).id;
         let mut tag = self.mob_object_nbt(object);
-        self.put_mob_passengers(&mut tag, id);
+        self.put_riding(&mut tag, object, id);
         tag
+    }
+
+    /// `Entity.saveWithoutId`'s riding parts for a mob object (id `id`): a passenger saves `Pos`
+    /// at its vehicle's x and z with its own y, then the mobs riding it go under `Passengers`.
+    /// Resident and off-level mobs, and riders saved through their mount, all come here.
+    fn put_riding(&mut self, tag: &mut Tag, object: MobObject, id: u32) {
+        use crate::game::commands::Target;
+        let vehicle = self.passenger_vehicle_target(Target::Mob(id));
+        if let (Some(at), Tag::Compound(c)) =
+            (vehicle.and_then(|v| self.target_position(v)), &mut *tag)
+        {
+            let pos = [at[0], self.mob_at(object).position.y, at[2]];
+            c.insert(
+                "Pos".into(),
+                Tag::List(pos.map(|v| Tag::Double(v.to_bits())).into()),
+            );
+        }
+        self.put_mob_passengers(tag, id);
     }
 
     pub(super) fn mob_object_nbt(&mut self, object: MobObject) -> Tag {
@@ -899,6 +969,8 @@ impl Game<'_> {
         }
         self.write_leash(&mut tag, id);
         write_attachments(&mut tag, id, &self.entity_attachments);
+        // A mod's AI pause beside the mods' attachments, whose map would drop it.
+        entity_nbt::write_ai_paused(self.mob_at(object).ai.ai_paused, &mut tag);
         tag
     }
 
@@ -915,6 +987,19 @@ impl Game<'_> {
             {
                 links.entry(mob.id).or_default().push(vehicle);
                 links.entry(vehicle).or_default().push(mob.id);
+            }
+        }
+        for (&vehicle, slots) in &self.persist.passenger_slots {
+            for slot in slots {
+                if let PassengerSlot::Live(id) = slot
+                    && self.passenger_object_vehicle(*id) == Some(vehicle)
+                    && (self.persist.off_level.contains_key(id)
+                        || self.persist.off_level.contains_key(&vehicle)
+                        || self.persist.removed_vehicles.contains_key(&vehicle))
+                {
+                    links.entry(*id).or_default().push(vehicle);
+                    links.entry(vehicle).or_default().push(*id);
+                }
             }
         }
         for vehicle in self.riding.into_iter().chain(
@@ -973,15 +1058,14 @@ mod namespace_review_tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn captured_content_vehicle_type_matches_its_actual_save_id() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             let mut kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
             Arc::make_mut(&mut kind).id = "example:mob".into();
             game.mobs.push(Mob::new(151, kind, Vec3::ZERO, 0.0));
-            let tag = game.mob_tree_nbt(0);
+            let (tag, tree) = game.take_vehicle_tree_transfer(151).unwrap();
             assert_eq!(entity_nbt::kind(&tag).as_deref(), Some("example:mob"));
-            let tree = game.capture_vehicle_tree_state(151).unwrap();
             assert_eq!(tree.name, "example:mob");
             assert!(game.prepare_vehicle_transfer(tag, tree).is_some());
         });

@@ -6,6 +6,7 @@
 //! copy serves them all; each test still builds its own `World` over it.
 use crate::{
     assets::{Assets, RenderAssets},
+    blocks::BlockFacts,
     motion::MotionResources,
 };
 use horizon_world::block_collision::BlockCollisionRegistry;
@@ -15,8 +16,11 @@ use std::{
 };
 
 pub(crate) struct Vanilla {
+    /// The root everything below was read from: additional test data uses the same root.
+    pub root: PathBuf,
     pub assets: Assets,
     pub render: RenderAssets,
+    pub facts: BlockFacts,
     pub collision: BlockCollisionRegistry<'static>,
     pub motion: MotionResources,
 }
@@ -43,9 +47,12 @@ pub(crate) fn vanilla() -> Option<&'static Vanilla> {
                     root.clone(),
                 ))
                 .unwrap();
+            let facts = BlockFacts::load(&root, assets.registry).unwrap();
             let collision = crate::collisions::load(&root, assets.registry).unwrap();
             let motion = MotionResources::load(&root, &assets).unwrap();
             Some(Vanilla {
+                root,
+                facts,
                 assets,
                 render,
                 collision,
@@ -71,11 +78,14 @@ pub(crate) fn report_missing() {
     let name = thread.name().unwrap_or("<unnamed test>");
     let mut skipped = SKIPPED.lock().unwrap();
     if skipped.insert(name.to_owned()) {
-        writeln!(
-            std::io::stderr().lock(),
-            "skipped: no vanilla data; test={name}; skipped tests={}",
+        // One write, so concurrent tests never split the line that run_test_binaries.py reads.
+        let line = format!(
+            "skipped: no vanilla data; test={name}; skipped tests={}\n",
             skipped.len()
-        )
-        .expect("writing missing-data skip report");
+        );
+        std::io::stderr()
+            .lock()
+            .write_all(line.as_bytes())
+            .expect("writing missing-data skip report");
     }
 }

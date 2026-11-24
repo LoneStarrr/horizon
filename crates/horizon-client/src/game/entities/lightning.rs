@@ -10,6 +10,7 @@ use super::{
     entity::{
         Entity as _, EntityHandle, ThunderHit, entity_lists_of, for_each_entity, with_entity,
     },
+    minecarts::CartHit,
 };
 use horizon_client::advancements::EntityView;
 use horizon_client::mobs::{Damage, DamageKind, Species};
@@ -18,7 +19,7 @@ use horizon_client::random_source;
 use horizon_core::{
     geometry::{Aabb, Vec3},
     position::BlockPos,
-    random::{LegacyRandom, RandomSource},
+    random::{EntityRandom, RandomSource},
 };
 use horizon_world::level::Ticks;
 
@@ -31,7 +32,7 @@ pub(super) struct Bolt {
     seed: i64,
     /// The bolt's own random (`Entity.random`): its seed, flashes, flash
     /// timing, fire spots and thunder pitch draw from it, never the level's.
-    random: LegacyRandom,
+    random: EntityRandom,
     visual_only: bool,
     /// Mooshrooms and copper golems change once per bolt.
     converted: Vec<u32>,
@@ -63,6 +64,54 @@ fn thunder_strike_column(ticks: &mut Ticks, cx: i32, cz: i32) -> (i32, i32) {
     let r = ticks.block_random_pos(cx * 16, 0, cz * 16, 15);
     (r.x, r.z)
 }
+
+/// The players `findLightningTargetAround` may strike in the column at `x`,
+/// `z` whose top is `top`: the block of each of `players` that is alive
+/// (`isAlive`: spectators too), 3 blocks around the column, no lower than 3
+/// below its top, under open sky (`sees_sky`). `players` are the level's
+/// (`level_players_iter`): a server has none of its own.
+fn players_to_strike(
+    players: impl IntoIterator<Item = super::natural_spawning::LevelPlayer>,
+    [x, top, z]: [i32; 3],
+    sees_sky: impl Fn([i32; 3]) -> bool,
+) -> Vec<[i32; 3]> {
+    players
+        .into_iter()
+        .filter(|p| p.alive)
+        .map(|p| {
+            [
+                p.position.x.floor() as i32,
+                p.position.y.floor() as i32,
+                p.position.z.floor() as i32,
+            ]
+        })
+        .filter(|p| (p[0] - x).abs() <= 3 && (p[2] - z).abs() <= 3 && p[1] >= top - 3)
+        .filter(|p| sees_sky(*p))
+        .collect()
+}
+
+#[cfg(test)]
+impl Bolt {
+    /// A spent bolt at `at`, for tests that call `thunder_hit` directly.
+    pub(in crate::game) fn struck_at(id: u32, at: [f64; 3]) -> Self {
+        Self {
+            id,
+            at,
+            life: 0,
+            flashes: 0,
+            seed: 0,
+            random: EntityRandom::own(horizon_core::random::LegacyRandom::new(0)),
+            visual_only: false,
+            converted: Vec::new(),
+            hit: Vec::new(),
+            hit_items: Vec::new(),
+            spared: Vec::new(),
+            fires: 0,
+            cause: None,
+        }
+    }
+}
+
 impl Game<'_> {
     /// `ServerChunkCache.tickSpawningChunk`: one `tickThunder` roll per
     /// spawning chunk (within 128 blocks of a player) that is in entity
@@ -218,24 +267,13 @@ impl Game<'_> {
             .filter(|p| (p[0] - x).abs() <= 3 && (p[2] - z).abs() <= 3 && p[1] >= top.y - 3)
             .filter(|p| sees_sky(self, *p))
             .collect();
-        if let Some(p) = self
-            .player
-            .as_ref()
-            .filter(|p| !p.health.dead_or_dying())
-            .map(|p| {
-                [
-                    p.position.x.floor() as i32,
-                    p.position.y.floor() as i32,
-                    p.position.z.floor() as i32,
-                ]
-            })
-            && (p[0] - x).abs() <= 3
-            && (p[2] - z).abs() <= 3
-            && p[1] >= top.y - 3
-            && sees_sky(self, p)
-        {
-            candidates.push(p);
-        }
+        // The players are living entities too: every one in the level, as a
+        // server has no player of its own, only the ones it serves.
+        candidates.extend(players_to_strike(
+            self.level_players_iter(),
+            [x, top.y, z],
+            |p| sees_sky(self, p),
+        ));
         if !candidates.is_empty() {
             let i = self
                 .world
@@ -247,12 +285,12 @@ impl Game<'_> {
         Some([x, top.y, z])
     }
     pub(super) fn spawn_bolt(&mut self, at: [f64; 3], visual_only: bool) {
-        if !visual_only {
-            let ctx = horizon_client::sculk::Context::default();
-            self.post_game_event("minecraft:lightning_strike", at, ctx);
-        }
+        // LightningBolt.tick: the LIGHTNING_STRIKE game event is posted for
+        // every server bolt; visualOnly only suppresses the fire it spawns.
+        let ctx = horizon_client::sculk::Context::default();
+        self.post_game_event("minecraft:lightning_strike", at, ctx);
         // The LightningBolt constructor: `seed`, then `flashes`.
-        let mut random = random_source::entity();
+        let mut random = EntityRandom::own(random_source::entity());
         let seed = random.next_long();
         let flashes = random.next_int_bound(3).unwrap_or(0) + 1;
         self.lightning_seen[0] += 1;
@@ -288,7 +326,7 @@ impl Game<'_> {
     pub(super) fn spawn_remote_bolt(&mut self, id: u32, at: [f64; 3]) {
         self.bolts.retain(|b| b.id != id);
         // The client's own copy, constructed as on the server.
-        let mut random = random_source::entity();
+        let mut random = EntityRandom::own(random_source::entity());
         let seed = random.next_long();
         let flashes = random.next_int_bound(3).unwrap_or(0) + 1;
         self.lightning_seen[0] += 1;
@@ -312,7 +350,7 @@ impl Game<'_> {
     /// (from the bolt's own `random`), wherever `BaseFireBlock.getState` fire
     /// can survive, when a player is within the fire-spread radius. Returns how
     /// many blocks it set on fire.
-    fn bolt_fire(&mut self, at: [f64; 3], extra: i32, random: &mut LegacyRandom) -> i32 {
+    fn bolt_fire(&mut self, at: [f64; 3], extra: i32, random: &mut EntityRandom) -> i32 {
         let mut set = 0;
         let base = [
             at[0].floor() as i32,
@@ -551,7 +589,7 @@ impl Game<'_> {
     /// `CHANNELED_LIGHTNING` counts them. Boats, minecarts and experience
     /// orbs are hit too (`VehicleEntity.hurtServer` adds 5 x 10 > 40 and
     /// destroys them; an orb has 5 health).
-    fn thunder_hit(&mut self, b: &mut Bolt) -> Vec<EntityView> {
+    pub(in crate::game) fn thunder_hit(&mut self, b: &mut Bolt) -> Vec<EntityView> {
         let at = b.at;
         let strike = Aabb::new(
             Vec3::new(at[0] - 3.0, at[1] - 3.0, at[2] - 3.0),
@@ -603,7 +641,10 @@ impl Game<'_> {
                     keep_equipment: false,
                     preserve_can_pick_up_loot: old.species() == Species::Pig,
                 };
-                if self.convert_to(&old, outcome, params, |_, _| {}).is_some() {
+                if self
+                    .convert_to(&old, outcome, params, false, |_, _| {})
+                    .is_some()
+                {
                     continue;
                 }
             }
@@ -715,7 +756,7 @@ impl Game<'_> {
                     };
                     let vanilla = self.saved_refuses_damage(id, "minecraft:lightning_bolt", false);
                     if !self.native_nonliving_invulnerable(id, kind, source, vanilla) {
-                        self.hurt_cart(i, 5.0, false, false);
+                        self.hurt_cart(i, 5.0, false, false, CartHit::default());
                     }
                 }
                 EntityHandle::Orb(i) => {
@@ -760,7 +801,7 @@ impl Game<'_> {
         };
         strike_players(self);
         self.each_guest_hit(strike_players);
-        // Dropped items burn up (ItemEntity health 5), save fire-resistant ones.
+        // Items run Entity.thunderHit, then the shared ItemEntity hurt path.
         let mut left = self.thunder_count(strike, ThunderHit::Item);
         for h in self.entity_handles_rev() {
             if left == 0 {
@@ -776,10 +817,24 @@ impl Game<'_> {
             if !self.lightning_may_strike(e.id, bolt) {
                 continue;
             }
-            let e = &self.dropped[i];
-            if !(e.stack.item.contains("netherite") || (e.age < 20 && b.spared.contains(&e.id))) {
-                self.dropped.remove(i);
+            let e = &mut self.dropped[i];
+            e.fire_ticks += 1;
+            if e.fire_ticks == 0 {
+                e.fire_ticks = 160;
             }
+            // Cushion spare stands in for vanilla's invulnerableTime window.
+            if e.age < 20 && b.spared.contains(&e.id) {
+                continue;
+            }
+            let id = e.id;
+            self.hurt_item_entity(
+                id,
+                5.0,
+                "minecraft:lightning_bolt",
+                Some(Target::Other(bolt)),
+                None,
+                Some(at),
+            );
         }
         self.native_leaves_flush();
         struck
@@ -836,12 +891,13 @@ mod tests {
     use horizon_client::mobs::{Anim, Brain, Mob, MobType, Part, Species};
     use horizon_core::geometry::Vec3;
     use mod_api::{self, ServerHost};
+    use horizon_core::random::LegacyRandom;
     use std::sync::Arc;
 
     /// `LightningBolt.spawnFire` places nothing, and draws no extra sources,
     /// unless `canSpreadFireAround` passes at the bolt (#11376).
     #[test]
-    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    #[ignore = "daily"]
     fn a_bolt_away_from_players_starts_no_fire() {
         use horizon_client::gamerules::Value;
         super::super::native_entity_refs::tests::with_game(|game| {
@@ -879,7 +935,7 @@ mod tests {
                     .unwrap(),
                 );
                 let random = game.world.random.clone();
-                let mut bolt_random = LegacyRandom::new(0);
+                let mut bolt_random = EntityRandom::own(LegacyRandom::new(0));
                 let set = game.bolt_fire(bolt, 4, &mut bolt_random);
                 let burning = game.world.block(8, 65, 8) != air;
                 assert_eq!((set > 0, burning), (fires, fires), "radius {radius}");
@@ -897,7 +953,7 @@ mod tests {
     /// in front of the rod whether or not redstone experiments are on (#14371):
     /// a wire beside that block is strongly powered by the struck rod.
     #[test]
-    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    #[ignore = "daily"]
     fn a_struck_rod_updates_the_wire_beside_the_block_behind_it() {
         let mut resources = None;
         let mut game = crate::game::game_tests::tests::server_game(&mut resources);
@@ -942,8 +998,45 @@ mod tests {
         assert!(!in_viewer_box(bolt, [15.5, 64.0, 0.0]));
     }
 
+    /// `findLightningTargetAround` picks among the living entities in the
+    /// column, players included. A server has no player of its own, so a
+    /// player it serves, standing in the open beside the column, must be a
+    /// target, or natural lightning never strikes a player there. A dead one,
+    /// one under a roof, one 4 blocks off and one more than 3 below the
+    /// column's top are not.
     #[test]
-    #[ignore = "needs prepared resources"]
+    fn lightning_can_strike_the_players_a_server_serves() {
+        use super::super::natural_spawning::LevelPlayer;
+        let served = |x: f64, y: f64, alive: bool| {
+            let position = Vec3::new(x, y, 0.5);
+            LevelPlayer {
+                uuid: 1,
+                position,
+                bounds: Aabb::new(position, position),
+                alive,
+                creative: false,
+                spectator: false,
+            }
+        };
+        // The column at (0, 0) tops out at 64; a roof covers (1, 64, 0).
+        let open = |p: [i32; 3]| p != [1, 64, 0];
+        let column = [0, 64, 0];
+        assert_eq!(
+            players_to_strike([served(2.5, 64.0, true)], column, open),
+            vec![[2, 64, 0]]
+        );
+        let players = [
+            served(2.5, 64.0, false),
+            served(1.5, 64.0, true),
+            served(4.5, 64.0, true),
+            served(0.5, 60.0, true),
+            served(-2.5, 61.0, true),
+        ];
+        assert_eq!(players_to_strike(players, column, open), vec![[-3, 61, 0]]);
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn conversion_post_reads_original_and_lightning_outcome() {
         use mod_api::{
             EntityJoinLevelEvent, EquipmentSlot, Flow, Hooks, LivingConversionPostEvent,
@@ -995,7 +1088,7 @@ mod tests {
             ) {
                 let old = host
                     .entity(event.entity)
-                    .and_then(|entity| entity.kind(host));
+                    .and_then(|entity| entity.kind(host).map(|kind| kind.id(host)));
                 let outcome = host.entity(event.converted);
                 let weapon = outcome
                     .and_then(|entity| host.living(entity))
@@ -1022,7 +1115,7 @@ mod tests {
                     .count();
                 self.seen.lock().unwrap().push(SeenConversion {
                     old,
-                    outcome: outcome.and_then(|entity| entity.kind(host)),
+                    outcome: outcome.and_then(|entity| entity.kind(host).map(|kind| kind.id(host))),
                     weapon,
                     mushrooms,
                 });
@@ -1060,6 +1153,7 @@ mod tests {
                     &old,
                     "minecraft:zombified_piglin",
                     horizon_client::mobs::conversion::Params::KEEP_ALL,
+                    false,
                     |_, _| {},
                 )
                 .unwrap();
@@ -1088,7 +1182,7 @@ mod tests {
                 life: 0,
                 flashes: 0,
                 seed: 0,
-                random: LegacyRandom::new(0),
+                random: EntityRandom::own(LegacyRandom::new(0)),
                 visual_only: false,
                 converted: Vec::new(),
                 hit: Vec::new(),
@@ -1150,6 +1244,7 @@ mod tests {
                     &old,
                     "minecraft:cow",
                     horizon_client::mobs::conversion::Params::KEEP_ALL,
+                    false,
                     |_, _| {}
                 )
                 .is_none()
@@ -1204,6 +1299,7 @@ mod tests {
     fn a_baby_pig_hit_by_lightning_becomes_a_baby_zombified_piglin() {
         let make_pig = |baby: bool| {
             let kind = Arc::new(MobType {
+                shadow: None,
                 id: "minecraft:pig".into(),
                 species: Species::Pig,
                 width: 0.9,
@@ -1223,6 +1319,7 @@ mod tests {
                 jump_strength: 0.42,
                 attributes: Default::default(),
                 item_stack_limits: Default::default(),
+                attribute_bounds: Default::default(),
                 gravity: 0.08,
                 safe_fall_distance: 3.0,
                 fall_damage_multiplier: 1.0,
@@ -1302,7 +1399,7 @@ mod tests {
     /// the spared one stays a pig, the other becomes a zombified piglin, and
     /// both still count as hit.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_mod_spares_one_pig_from_the_bolt() {
         let heard = Arc::default();
         let (spared, struck) = (900, 901);
@@ -1326,7 +1423,7 @@ mod tests {
                     life: 0,
                     flashes: 0,
                     seed: 0,
-                    random: LegacyRandom::new(0),
+                    random: EntityRandom::own(LegacyRandom::new(0)),
                     visual_only: false,
                     converted: Vec::new(),
                     hit: Vec::new(),
@@ -1359,3 +1456,8 @@ mod tests {
         });
     }
 }
+
+// A conversion keeps the old mob's state; lives here for the lightning's.
+#[cfg(test)]
+#[path = "tests/mob_conversion_state_tests.rs"]
+mod mob_conversion_state_tests;

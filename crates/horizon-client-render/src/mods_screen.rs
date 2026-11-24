@@ -1,4 +1,4 @@
-//! The Mods screen, laid out as NeoForge's `ModListScreen`: a searchable, sortable list of the
+//! The Mods screen, based on NeoForge's `ModListScreen`: a searchable, sortable list of the
 //! mods on the left and, for the selected one, a scrollable panel with its name, id, version,
 //! license, authors, credits and description over Homepage, Issues and Config buttons. There is
 //! no switch on it: which mods run is the launcher's choice, as the loader's is in NeoForge.
@@ -12,15 +12,17 @@ use crate::{
     screen_draw::{self as d, Draw, Measure, TextField},
     text::{Style, Text},
 };
+use horizon_hooks::mod_links::{self, Links};
 use std::{cell::Cell, collections::HashMap, sync::Arc};
 
 /// `HeaderAndFooterLayout(8, 38)`: the room above and below the content.
 const HEADER_H: i32 = 8;
 const FOOTER_H: i32 = 38;
-/// The sidebar's and the info panel's width, and the controls' height.
+/// The sidebar's width and the controls' sizes.
 const SIDEBAR_W: i32 = 150;
 const SORT_W: i32 = 50;
 const CONTROL_H: i32 = 20;
+/// The preferred width of the info panel's contents.
 const PANEL_W: i32 = 250;
 /// How far the panel's frame reaches beyond its contents.
 const FRAME_PAD: i32 = 2;
@@ -32,13 +34,14 @@ const BANNER_H: i32 = 50;
 /// The panel's button row.
 const BUTTONS_H: i32 = 26;
 const MAIN_PAD: i32 = 4;
-/// The sidebar and the panel overlap by 3 px (`columnSpacing(-3)`).
-const TOTAL_W: i32 = SIDEBAR_W - 3 + PANEL_W;
+/// The preferred width of both columns, including the info panel's frame.
+const TOTAL_W: i32 = SIDEBAR_W + PANEL_W + 2 * FRAME_PAD;
 const SCROLLBAR_W: i32 = 6;
 const WHEEL_STEP: f64 = 18.0;
 const ROWS: usize = 1000;
 const WHITE_TEXT: u32 = 0xFFFFFF;
 const RED: u32 = 0xFF5555;
+const GOLD: u32 = 0xFFAA00;
 
 /// What a click on the screen asks the game to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +78,9 @@ struct Entry {
     index: Option<usize>,
     /// It has a settings page for Config to open.
     config: bool,
-    /// Why it is not running, or that it is not on.
+    /// Why it is not running, or that it is not on; stays above the scroller.
+    status: Option<Text>,
+    /// Dependency-policy notices, independently scrollable below the status.
     note: Option<Text>,
 }
 impl Entry {
@@ -87,8 +92,6 @@ impl Entry {
             authors: "Mojang Studios".into(),
             license: "Minecraft EULA".into(),
             license_url: Some("https://aka.ms/MinecraftEULA".into()),
-            homepage: Some("https://minecraft.net".into()),
-            issues: Some("https://bugs.mojang.com".into()),
             ..Self::default()
         }
     }
@@ -99,9 +102,6 @@ impl Entry {
             version: horizon_core::release::VERSION.into(),
             authors: "Ludovic Marie and the Horizon contributors".into(),
             license: "MIT".into(),
-            license_url: Some("https://github.com/horizon-rust/horizon/blob/main/LICENSE".into()),
-            homepage: Some("https://playhorizon.dev".into()),
-            issues: Some("https://github.com/horizon-rust/horizon/issues".into()),
             description: crate::lang::get("horizon.mods.screen.horizon.description"),
             ..Self::default()
         }
@@ -125,7 +125,7 @@ impl Scroll {
     /// The scroller's height.
     fn bar(content: i32, view: i32) -> i32 {
         let bar = ((view * view) as f32 / content.max(1) as f32) as i32;
-        bar.clamp(32, (view - 8).max(32))
+        bar.clamp(32, (view - 8).max(32)).min(view.max(0))
     }
     /// `AbstractScrollArea.mouseDragged` while the scrollbar is held.
     fn drag(&mut self, y: f64, top: i32, content: i32, view: i32) {
@@ -195,6 +195,9 @@ enum Kind {
         lines: Vec<(Text, i32)>,
         centered: bool,
     },
+    Notice {
+        lines: Vec<(Text, i32)>,
+    },
     Subtitle(Vec<Piece>),
     License {
         text: Text,
@@ -249,13 +252,33 @@ pub struct ModsScreen {
     panel: Scroll,
     /// The panel's contents' height as last drawn, for scrolling.
     panel_content: Cell<i32>,
+    panel_pinned: Cell<i32>,
 }
 
 impl ModsScreen {
     /// `ModListScreen.init`: Minecraft, Horizon, then the installed mods.
     pub fn new(width: i32, height: i32, in_world: bool, mods: &ModList) -> Self {
+        Self::with_links(width, height, in_world, mods, mod_links::engine::all())
+    }
+
+    fn with_links(
+        width: i32,
+        height: i32,
+        in_world: bool,
+        mods: &ModList,
+        links: &[&Links],
+    ) -> Self {
         let mut icons = HashMap::new();
         let mut entries = vec![Entry::minecraft(), Entry::horizon()];
+        for entry in &mut entries {
+            if let Some(links) = links.iter().find(|links| links.id == entry.id) {
+                if let Some(license) = links.license {
+                    entry.license_url = Some(license.into());
+                }
+                entry.homepage = links.homepage.map(str::to_owned);
+                entry.issues = links.issues.map(str::to_owned);
+            }
+        }
         for (index, installed) in mods.installed.iter().enumerate() {
             let info = mods.info.get(&installed.id);
             let key = format!("mod/{index}/icon");
@@ -266,13 +289,25 @@ impl ModsScreen {
             if let Some(png) = png {
                 icons.insert(key.clone(), png);
             }
-            let note = if let Some(problem) = &installed.problem {
+            let status = if let Some(problem) = &installed.problem {
                 Some(Text::literal(problem.clone()).with_color(RED))
             } else if !mods.is_on(index) {
                 Some(tr("horizon.mods.screen.off").with_color(d::GRAY))
             } else {
                 None
             };
+            let mut notes = Vec::new();
+            // Status does not hide load notices. Every applied override and
+            // discouraged pair remains readable in this row's scrollable panel.
+            if let Some(info) = info {
+                for (key, args) in &info.warnings {
+                    let args: Vec<_> = args.iter().map(|arg| Text::literal(arg.clone())).collect();
+                    notes.push(Text::translate(key, &args).with_color(GOLD));
+                }
+            }
+            let note = notes
+                .into_iter()
+                .reduce(|left, right| left.append(Text::literal("\n\n")).append(right));
             entries.push(Entry {
                 id: installed.id.clone(),
                 name: info.map_or_else(|| installed.title.clone(), |i| i.name.clone()),
@@ -290,6 +325,7 @@ impl ModsScreen {
                     .native
                     .as_ref()
                     .is_some_and(|page| !page.settings.is_empty()),
+                status,
                 note,
             });
         }
@@ -310,6 +346,7 @@ impl ModsScreen {
             list_focused: false,
             panel: Scroll::default(),
             panel_content: Cell::new(0),
+            panel_pinned: Cell::new(0),
         };
         screen.place();
         screen.refresh();
@@ -318,26 +355,32 @@ impl ModsScreen {
 
     fn geo(&self) -> Geo {
         let content = (self.height - HEADER_H - FOOTER_H).max(0);
-        let left = ((self.width - TOTAL_W) / 2).max(0);
+        let columns_w = self.width.clamp(0, TOTAL_W);
+        let left = (self.width - columns_w) / 2;
         let top = HEADER_H - FRAME_PAD;
-        let panel_x = left + SIDEBAR_W - 3;
+        // At very small GUI sizes, reserve at least half the width for the panel.
+        let sidebar_w = SIDEBAR_W.min(columns_w / 2);
+        let sort_w = SORT_W.min(sidebar_w / 3);
+        let search_w = (sidebar_w - sort_w - 4).max(0);
+        let panel_x = left + sidebar_w + FRAME_PAD;
+        let panel_w = (columns_w - sidebar_w - 2 * FRAME_PAD).max(0);
         let view = (content - BUTTONS_H).max(0);
-        let button_w = PANEL_W / 3 - 1;
-        let gap = (PANEL_W + 2 * FRAME_PAD - 3 * button_w) / 4;
+        let button_w = (panel_w / 3 - 1).max(0);
+        let gap = (panel_w + 2 * FRAME_PAD - 3 * button_w) / 4;
         let button_y = HEADER_H + view + (BUTTONS_H - CONTROL_H);
         let footer_w = ((self.width - 4) / 2).clamp(1, 150);
         let footer_x = (self.width - (2 * footer_w + 4)) / 2;
         let footer_y = self.height - FOOTER_H + 6 + 5;
         Geo {
-            search: [left, top, SIDEBAR_W - SORT_W - 4, CONTROL_H],
-            sort: [left + SIDEBAR_W - SORT_W, top, SORT_W, CONTROL_H],
+            search: [left, top, search_w, CONTROL_H],
+            sort: [left + sidebar_w - sort_w, top, sort_w, CONTROL_H],
             list: [
                 left,
                 top + CONTROL_H + 6,
-                SIDEBAR_W,
+                sidebar_w,
                 (content - CONTROL_H - 5).max(0),
             ],
-            panel: [panel_x, HEADER_H, PANEL_W, view],
+            panel: [panel_x, HEADER_H, panel_w, view],
             buttons: [0, 1, 2].map(|i| {
                 [
                     panel_x - FRAME_PAD + gap + i * (button_w + gap),
@@ -460,7 +503,7 @@ impl ModsScreen {
     }
 
     /// What the panel holds for `e`, each item's place below the panel's top, and the height.
-    fn items(&self, m: &Measure, e: &Entry, width: i32) -> (Vec<Placed>, i32) {
+    fn items(&self, m: &Measure, e: &Entry, width: i32) -> (Vec<Placed>, i32, i32) {
         let lines = |text: Text| d::label_lines(m, &text, width, ROWS, &Style::default());
         let mut out = Vec::new();
         let mut y = FRAME_PAD;
@@ -534,17 +577,27 @@ impl ModsScreen {
         });
         // Room for an update notice, and its spacer.
         y += 9 + 10;
-        if let Some(note) = &e.note {
-            let note = lines(note.clone());
-            let rows = note.len() as i32;
+        if let Some(status) = &e.status {
+            let status = lines(status.clone());
+            let rows = status.len() as i32;
             out.push(Placed {
                 y,
                 kind: Kind::Lines {
-                    lines: note,
+                    lines: status,
                     centered: true,
                 },
             });
-            y += 9 * rows + MAIN_PAD;
+            y += 9 * rows + 9;
+        }
+        let pinned = y;
+        if let Some(note) = &e.note {
+            let note = d::label_lines(m, note, width - 12, usize::MAX, &Style::default());
+            let rows = note.len() as i32;
+            out.push(Placed {
+                y,
+                kind: Kind::Notice { lines: note },
+            });
+            y += 9 * rows + 9;
         }
         let license = if e.license.is_empty() {
             crate::lang::get("horizon.mods.screen.license.none")
@@ -607,18 +660,26 @@ impl ModsScreen {
             });
             y += 9 * rows;
         }
-        (out, y + FRAME_PAD)
+        (out, y + FRAME_PAD, pinned)
     }
     /// The panel's items for the selected mod, narrower by the scrollbar when they need one.
-    fn panel_items(&self, m: &Measure, e: &Entry) -> (Vec<Placed>, i32, i32) {
-        let view = self.geo().panel[3];
-        let (items, content) = self.items(m, e, PANEL_W);
+    fn panel_items(&self, m: &Measure, e: &Entry) -> (Vec<Placed>, i32, i32, i32) {
+        let [_, _, panel_w, view] = self.geo().panel;
+        let (items, content, pinned) = self.items(m, e, panel_w);
         if content <= view {
-            return (items, content, PANEL_W);
+            return (items, content, panel_w, pinned);
         }
-        let width = PANEL_W - SCROLLBAR_W;
-        let (items, content) = self.items(m, e, width);
-        (items, content, width)
+        let width = (panel_w - SCROLLBAR_W).max(0);
+        let (items, content, pinned) = self.items(m, e, width);
+        // Keep at least three body lines and a third of the view useful.
+        // Otherwise the whole pane scrolls, including an unusually tall status.
+        let minimum_body = 27.max(view / 3);
+        let pinned = if pinned + minimum_body <= view {
+            pinned
+        } else {
+            0
+        };
+        (items, content, width, pinned)
     }
 
     /// A left click: what it asks of the game, and whether it sounds as a button.
@@ -639,7 +700,7 @@ impl ModsScreen {
         if hit(g.search, x, y) {
             self.search.focused = true;
             self.list_focused = false;
-            self.search.click(m, x, false);
+            self.search.click(m, x, false, false);
             return (Action::None, false);
         }
         self.search.focused = false;
@@ -690,18 +751,24 @@ impl ModsScreen {
             return (Action::None, false);
         }
         let e = e.clone();
-        let (items, content, _) = self.panel_items(m, &e);
+        let (items, content, _, pinned) = self.panel_items(m, &e);
         self.panel_content.set(content);
-        let view = g.panel[3];
+        self.panel_pinned.set(pinned);
+        let [panel_x, panel_y, panel_w, view] = g.panel;
         if Scroll::max(content, view) > 0
-            && x >= f64::from(g.panel[0] + PANEL_W + FRAME_PAD - SCROLLBAR_W)
+            && y >= f64::from(panel_y + pinned)
+            && x >= f64::from(panel_x + panel_w + FRAME_PAD - SCROLLBAR_W)
         {
             self.panel.held = Some(y);
             return (Action::None, false);
         }
-        let top = g.panel[1] - self.panel.amount as i32;
         for placed in &items {
-            let row = |left: i32, w: i32| [g.panel[0] + left, top + placed.y, w, 9];
+            let fixed = placed.y < pinned;
+            if !fixed && y < f64::from(panel_y + pinned) {
+                continue;
+            }
+            let top = panel_y - if fixed { 0 } else { self.panel.amount as i32 };
+            let row = |left: i32, w: i32| [panel_x + left, top + placed.y, w, 9];
             match &placed.kind {
                 Kind::Subtitle(pieces) => {
                     for piece in pieces {
@@ -727,8 +794,13 @@ impl ModsScreen {
         let g = self.geo();
         let content = self.list_content();
         self.list.drag(y, g.list[1], content, g.list[3]);
-        self.panel
-            .drag(y, g.panel[1], self.panel_content.get(), g.panel[3]);
+        let pinned = self.panel_pinned.get();
+        self.panel.drag(
+            y,
+            g.panel[1] + pinned,
+            self.panel_content.get() - pinned,
+            g.panel[3] - pinned,
+        );
     }
     pub fn release(&mut self) {
         self.list.held = None;
@@ -745,7 +817,7 @@ impl ModsScreen {
             [
                 g.panel[0] - FRAME_PAD,
                 g.panel[1],
-                PANEL_W + 2 * FRAME_PAD,
+                g.panel[2] + 2 * FRAME_PAD,
                 g.panel[3],
             ],
             x,
@@ -791,6 +863,11 @@ impl ModsScreen {
         crate::widgets::widget_cursor(sort_hover, true);
         let sort = if self.descending { "z_to_a" } else { "a_to_z" };
         let name = format!("horizon.mods.screen.sort.{sort}");
+        crate::widgets::record(
+            &tr(&name).plain(),
+            [sx as f32, sy as f32, sw as f32, sh as f32],
+            true,
+        );
         d::button(
             &mut out,
             m,
@@ -806,12 +883,10 @@ impl ModsScreen {
         if sort_hover {
             tooltip = Some(tr(&format!("{name}.hover")));
         }
-        // The info panel's frame, under the list so the list's scrollbar stays on top where
-        // the two overlap.
-        let [px, py, _, view] = g.panel;
+        let [px, py, panel_w, view] = g.panel;
         // `BackgroundWithPipingWidget`: the list's background and separators, with the frame's
         // 2 px inset on every side for the separators and the scrolling contents between them.
-        let frame_w = PANEL_W + 2 * FRAME_PAD;
+        let frame_w = panel_w + 2 * FRAME_PAD;
         d::blit(
             &mut out,
             &format!("textures/gui/{prefix}menu_list_background.png"),
@@ -830,20 +905,32 @@ impl ModsScreen {
         // The info panel's contents.
         let selected = self.current();
         if let Some(e) = selected {
-            let (items, content, width) = self.panel_items(m, e);
+            let (items, content, width, pinned) = self.panel_items(m, e);
             self.panel_content.set(content);
+            self.panel_pinned.set(pinned);
             let scroll = self.panel.amount.min(f64::from(Scroll::max(content, view))) as i32;
             out.push(Draw::Scissor {
                 x0: px - FRAME_PAD,
                 y0: py,
-                x1: px + PANEL_W + FRAME_PAD,
-                y1: py + view,
+                x1: px + panel_w + FRAME_PAD,
+                y1: py + pinned.min(view),
             });
+            let mut body = false;
             for placed in &items {
-                let y = py + placed.y - scroll;
+                if !body && placed.y >= pinned {
+                    out.push(Draw::NoScissor);
+                    out.push(Draw::Scissor {
+                        x0: px - FRAME_PAD,
+                        y0: py + pinned.min(view),
+                        x1: px + panel_w + FRAME_PAD,
+                        y1: py + view,
+                    });
+                    body = true;
+                }
+                let y = py + placed.y - if body { scroll } else { 0 };
                 match &placed.kind {
                     Kind::Image { texture, size } => {
-                        let x = px + (PANEL_W - size) / 2;
+                        let x = px + (panel_w - size) / 2;
                         d::blit(
                             &mut out,
                             texture,
@@ -859,6 +946,18 @@ impl ModsScreen {
                         for (i, (line, w)) in lines.iter().enumerate() {
                             let x = if *centered { px + (width - w) / 2 } else { px };
                             d::text(&mut out, line.clone(), x, y + 9 * i as i32, d::WHITE, true);
+                        }
+                    }
+                    Kind::Notice { lines } => {
+                        for (i, (line, _)) in lines.iter().enumerate() {
+                            d::text(
+                                &mut out,
+                                line.clone(),
+                                px + 6,
+                                y + 9 * i as i32,
+                                d::WHITE,
+                                true,
+                            );
                         }
                     }
                     Kind::Subtitle(pieces) => {
@@ -898,10 +997,10 @@ impl ModsScreen {
             out.push(Draw::NoScissor);
             self.panel.draw(
                 &mut out,
-                px + PANEL_W + FRAME_PAD - SCROLLBAR_W,
-                py,
-                content,
-                view,
+                px + panel_w + FRAME_PAD - SCROLLBAR_W,
+                py + pinned,
+                content - pinned,
+                view - pinned,
             );
         }
         let e = selected;
@@ -915,6 +1014,11 @@ impl ModsScreen {
             let hover = d::inside(mouse, r[0], r[1], r[2], r[3]);
             crate::widgets::widget_cursor(hover, active);
             let text = tr(&format!("horizon.mods.screen.{label}"));
+            crate::widgets::record(
+                &text.plain(),
+                [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32],
+                active,
+            );
             d::button(
                 &mut out,
                 m,
@@ -941,6 +1045,11 @@ impl ModsScreen {
                     true,
                 );
             }
+            crate::widgets::record(
+                &label.plain(),
+                [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32],
+                true,
+            );
             d::button(
                 &mut out, m, label, r[0], r[1], r[2], r[3], true, hover, now_ms,
             );
@@ -1093,6 +1202,37 @@ mod tests {
         assert_eq!(pixels[(7 * 4) + 3], 255, "the cube's top point is drawn");
     }
 
+    #[test]
+    fn built_in_links_come_from_the_product_and_keep_the_first_registration() {
+        let mods = ModList::default();
+        let plain = ModsScreen::with_links(427, 240, false, &mods, &[]);
+        assert!(
+            plain
+                .entries
+                .iter()
+                .all(|entry| { entry.homepage.is_none() && entry.issues.is_none() })
+        );
+        assert_eq!(
+            plain.entries[0].license_url.as_deref(),
+            Some("https://aka.ms/MinecraftEULA")
+        );
+        let first = Links {
+            id: "horizon",
+            license: Some("https://example.org/LICENSE"),
+            homepage: Some("https://example.org"),
+            issues: Some("https://example.org/issues"),
+        };
+        let second = Links {
+            homepage: Some("https://other.example.org"),
+            ..first
+        };
+        let product = ModsScreen::with_links(427, 240, false, &mods, &[&first, &second]);
+        let entry = &product.entries[1];
+        assert_eq!(entry.license_url.as_deref(), first.license);
+        assert_eq!(entry.homepage.as_deref(), first.homepage);
+        assert_eq!(entry.issues.as_deref(), first.issues);
+    }
+
     fn atlas() -> HudAtlas {
         HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
             std::path::PathBuf::from("/nonexistent/horizon-test-assets"),
@@ -1174,6 +1314,113 @@ mod tests {
     }
 
     #[test]
+    fn the_mod_list_and_its_panel_fit_and_keep_separate_hit_targets() {
+        let atlas = atlas();
+        let m = Measure(&atlas.font);
+        let page = NativePage {
+            settings: vec![crate::mod_list::NativeSetting {
+                key: "open".into(),
+                label: "Open".into(),
+                tooltip: None,
+                value: crate::mod_list::NativeSettingValue::Toggle(true),
+            }],
+            ..NativePage::default()
+        };
+        let (installed, mut info) = installed("zoom", "Zoom", Some(page));
+        info.issues = Some("https://example.org/issues".into());
+        let mods = mods(&[(installed, info)]);
+        let [unicode_width, unicode_height] = crate::window::GuiSize::new([320, 240], 1, true)
+            .size
+            .map(|pixels| pixels as i32);
+        for (width, height, frame_width) in [
+            (unicode_width, unicode_height, 80),
+            (320, 240, 170),
+            (427, 240, 254),
+            (640, 360, 254),
+        ] {
+            let mut screen = ModsScreen::new(width, height, true, &mods);
+            let g = screen.geo();
+            let [lx, ly, lw, lh] = g.list;
+            let fits = |[x, y, w, h]: [i32; 4]| {
+                w > 0 && h > 0 && x >= 0 && x + w <= width && y >= 0 && y + h <= height
+            };
+            assert!(fits(g.search) && fits(g.sort) && fits(g.list));
+            let row = screen
+                .shown
+                .iter()
+                .position(|&i| screen.entries[i].id == "zoom")
+                .unwrap();
+            let row_top = ly + 2 + row as i32 * ROW_H;
+            if row_top + ROW_H > ly + lh {
+                screen.scroll(f64::from(lx + 20), f64::from(ly + 1), -10.0);
+            }
+            let row_y = row_top - screen.list.amount as i32;
+            screen.click(&m, f64::from(lx + 20), f64::from(row_y + ROW_H / 2));
+            let draws = screen.draw(&m, (0, 0), 0, 0);
+            let backgrounds: Vec<_> = draws
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Blit {
+                        texture,
+                        x,
+                        y,
+                        w,
+                        h,
+                        ..
+                    } if texture == "textures/gui/inworld_menu_list_background.png" => {
+                        Some([*x, *y, *w, *h])
+                    }
+                    _ => None,
+                })
+                .collect();
+            let [frame, list] = backgrounds.as_slice() else {
+                panic!("expected two column backgrounds")
+            };
+            assert_eq!(*list, g.list);
+            assert!(
+                lx + lw <= frame[0],
+                "{width}x{height}: list ends at {}, panel starts at {}",
+                lx + lw,
+                frame[0]
+            );
+            assert_eq!(frame[2], frame_width);
+            assert!(fits(*frame), "{width}x{height}: panel exceeds viewport");
+            assert!(
+                draws.iter().any(|draw| matches!(draw,
+                    Draw::Fill {y0, x1, y1, color: -1, ..}
+                        if *y0 == row_y && *y1 == row_y + ROW_H && *x1 <= frame[0]
+                )),
+                "{width}x{height}: the selected row should have a visible outline"
+            );
+
+            let expected = [
+                Action::Link("https://example.org/zoom".into()),
+                Action::Link("https://example.org/issues".into()),
+                Action::Config(0),
+                Action::OpenFolder,
+                Action::Back,
+            ];
+            for (bounds, action) in g.buttons.into_iter().chain(g.footer).zip(expected) {
+                assert!(
+                    fits(bounds),
+                    "{width}x{height}: button {bounds:?} exceeds viewport"
+                );
+                let [x, y, w, h] = bounds;
+                assert!(draws.iter().any(
+                    |draw| matches!(draw, Draw::Sprite { sprite, x: bx, y: by, w: bw, h: bh, .. }
+                        if sprite == "widget/button" && (*bx, *by, *bw, *bh) == (x, y, w, h)
+                    )
+                ));
+                assert_eq!(
+                    screen.click(&m, f64::from(x) + 0.5, f64::from(y + h / 2)),
+                    (action, true),
+                    "{width}x{height}: action should work just inside the left edge",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_panel_buttons_follow_the_selected_mod() {
         let atlas = atlas();
         let m = Measure(&atlas.font);
@@ -1190,7 +1437,13 @@ mod tests {
             installed("zoom", "Zoom", Some(page)),
             installed("plain", "Plain", None),
         ]);
-        let mut screen = ModsScreen::new(427, 240, false, &list);
+        let links = Links {
+            id: "minecraft",
+            license: None,
+            homepage: Some("https://minecraft.net"),
+            issues: Some("https://bugs.mojang.com"),
+        };
+        let mut screen = ModsScreen::with_links(427, 240, false, &list, &[&links]);
         let click_row = |screen: &mut ModsScreen, name: &str| {
             let g = screen.geo();
             let at = screen
@@ -1311,14 +1564,157 @@ mod tests {
             .entries
             .iter()
             .find(|e| e.id == "broken")
-            .and_then(|e| e.note.as_ref())
+            .and_then(|e| e.status.as_ref())
             .map(Text::plain);
         assert_eq!(note.as_deref(), Some("Not loaded: boom"));
         // Without a problem, a mod that is not on says that instead.
         let (idle, info) = installed("idle", "Idle", None);
         let screen = ModsScreen::new(427, 240, false, &mods(&[(idle, info)]));
         let idle = screen.entries.iter().find(|e| e.id == "idle").unwrap();
-        assert!(idle.note.is_some());
+        assert!(idle.status.is_some());
+    }
+
+    #[test]
+    fn a_loading_warning_shows_in_the_players_language_without_failing_the_row() {
+        let (mut row, mut info) = installed("warns", "Warns", None);
+        row.dev = true;
+        info.warnings = vec![("test.warn.optional".into(), vec!["jei".into()])];
+        let note = |language| {
+            crate::lang::scoped(language, || {
+                let screen =
+                    ModsScreen::new(427, 240, false, &mods(&[(row.clone(), info.clone())]));
+                let entry = screen.entries.iter().find(|e| e.id == "warns").unwrap();
+                entry.note.as_ref().map(Text::plain)
+            })
+            .0
+        };
+        let english = crate::lang::Language::of(
+            "en_us",
+            [(
+                "test.warn.optional".to_owned(),
+                "No %s: recipes hidden".to_owned(),
+            )],
+        );
+        assert_eq!(note(english).as_deref(), Some("No jei: recipes hidden"));
+        let missing = crate::lang::Language::of("en_us", Vec::<(String, String)>::new());
+        assert_eq!(note(missing).as_deref(), Some("test.warn.optional"));
+    }
+
+    #[test]
+    fn all_loading_notices_remain_visible_beside_failed_and_off_status() {
+        let language = crate::lang::Language::of(
+            "en_us",
+            [
+                (
+                    "horizon.mods.screen.off".to_owned(),
+                    "Off for this launch".to_owned(),
+                ),
+                ("test.first".to_owned(), "First warning: %s".to_owned()),
+                ("test.second".to_owned(), "Second override: %s".to_owned()),
+            ],
+        );
+        let _ = crate::lang::scoped(language, || {
+            for problem in [None, Some("Refused fixture")] {
+                let (mut row, mut info) = installed("warns", "Warns", None);
+                row.problem = problem.map(str::to_owned);
+                info.warnings = vec![
+                    ("test.first".into(), vec!["other".into()]),
+                    ("test.second".into(), vec!["third".into()]),
+                ];
+                let screen = ModsScreen::new(427, 240, false, &mods(&[(row, info)]));
+                let entry = screen
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == "warns")
+                    .unwrap();
+                assert_eq!(
+                    entry.status.as_ref().unwrap().plain(),
+                    problem.unwrap_or("Off for this launch")
+                );
+                assert_eq!(
+                    entry.note.as_ref().unwrap().plain(),
+                    "First warning: other\n\nSecond override: third"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn scrolling_long_notices_keeps_the_selected_mod_and_failure_status_fixed() {
+        let language = crate::lang::Language::of(
+            "en_us",
+            [
+                (
+                    "horizon.mods.screen.off".to_owned(),
+                    "Off for this launch".to_owned(),
+                ),
+                ("test.long".to_owned(), "%s".to_owned()),
+            ],
+        );
+        let _ = crate::lang::scoped(language, || {
+            let atlas = atlas();
+            let m = Measure(&atlas.font);
+            for problem in [None, Some("Refused fixture")] {
+                let (mut row, mut info) = installed("warns", "Warns", None);
+                row.problem = problem.map(str::to_owned);
+                info.warnings = vec![(
+                    "test.long".into(),
+                    vec!["A complete warning sentence. ".repeat(100)],
+                )];
+                let mut screen = ModsScreen::new(427, 240, false, &mods(&[(row, info)]));
+                screen.select(
+                    screen
+                        .entries
+                        .iter()
+                        .position(|entry| entry.id == "warns")
+                        .unwrap(),
+                );
+                let [px, py, _, view] = screen.geo().panel;
+                let at = |draws: &[Draw], expected: &str| {
+                    draws.iter().find_map(|draw| match draw {
+                        Draw::Text { text, x, y, .. } if *x >= px && text.plain() == expected => {
+                            Some((*x, *y))
+                        }
+                        _ => None,
+                    })
+                };
+                let before = screen.draw(&m, (0, 0), 0, 0);
+                assert!(screen.panel_content.get() > view);
+                screen.scroll(f64::from(px + 20), f64::from(py + view - 1), -100.0);
+                assert!(screen.panel.amount > 0.0);
+                let after = screen.draw(&m, (0, 0), 0, 0);
+                for text in [
+                    "Warns",
+                    "warns",
+                    "1.0",
+                    problem.unwrap_or("Off for this launch"),
+                ] {
+                    assert!(at(&before, text).is_some(), "missing header: {text}");
+                    assert_eq!(
+                        at(&before, text),
+                        at(&after, text),
+                        "scrolled header: {text}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_tall_failure_status_leaves_the_whole_small_pane_scrollable() {
+        let atlas = atlas();
+        let m = Measure(&atlas.font);
+        let (mut row, mut info) = installed("failed", "Failed", None);
+        row.problem = Some("A complete refusal sentence. ".repeat(12));
+        info.warnings = vec![(
+            "test.long".into(),
+            vec!["An overflowing warning. ".repeat(100)],
+        )];
+        let mut screen = ModsScreen::new(427, 100, false, &mods(&[(row, info)]));
+        screen.select(0);
+        screen.draw(&m, (0, 0), 0, 0);
+        assert_eq!(screen.panel_pinned.get(), 0);
+        assert!(screen.panel_content.get() > screen.geo().panel[3]);
     }
 
     /// `BackgroundWithPipingWidget`: the info panel is framed like the list, 2 px beyond its
@@ -1359,10 +1755,8 @@ mod tests {
         ));
     }
 
-    /// The panel's frame reaches 5 px into the list's scrollbar at 427 px wide, so it is drawn
-    /// first and the list, scrollbar included, goes over it.
     #[test]
-    fn the_panel_frame_is_drawn_under_the_list() {
+    fn the_panel_frame_is_drawn_before_the_list() {
         let atlas = atlas();
         let m = Measure(&atlas.font);
         let screen = ModsScreen::new(427, 240, false, &ModList::default());

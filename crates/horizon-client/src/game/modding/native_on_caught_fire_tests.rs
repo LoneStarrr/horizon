@@ -1,4 +1,4 @@
-//! `on_caught_fire` heard by a block Part (#3185): the listener gets the burned block's old state
+//! `on_caught_fire` heard by a block Part (arismoko/horizon#3185): the listener gets the burned block's old state
 //! and the face toward the fire, and what it writes through its level is in the world.
 use super::native_entity_refs::tests::with_game;
 use horizon_core::{geometry::Direction, position::BlockPos};
@@ -40,7 +40,7 @@ impl Hooks for EmberMod {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_block_part_hears_it_burned_and_writes_the_level() {
     use horizon_client::chunk::Chunk;
     use std::sync::Arc;

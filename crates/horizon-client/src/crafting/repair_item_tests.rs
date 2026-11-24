@@ -35,14 +35,15 @@ fn run(item: &str, maxes: [Option<i32>; 2], damages: [u32; 2], remove: bool) -> 
         );
     }
     let input = Input::of(&cells, 2).unwrap();
-    if !Special::RepairItem.matches(&ctx, &input) {
+    let stacks = InputStacks::from_input(&input);
+    if !Special::RepairItem.matches(&ctx, &input, stacks.as_slice()) {
         return None;
     }
-    Special::RepairItem.assemble(&ctx, &input)
+    Special::RepairItem.assemble(&ctx, &input, stacks.as_slice())
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_overridden_durability() {
     let out = run(
         "minecraft:diamond_pickaxe",
@@ -56,7 +57,7 @@ fn repair_overridden_durability() {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_added_durability() {
     let out = run(
         "minecraft:totem_of_undying",
@@ -73,13 +74,13 @@ fn repair_added_durability() {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_removed_durability() {
     assert!(run("minecraft:diamond_pickaxe", [None, None], [0, 0], true).is_none());
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_plain_pickaxes() {
     let out = run(
         "minecraft:diamond_pickaxe",
@@ -88,12 +89,16 @@ fn repair_plain_pickaxes() {
         false,
     )
     .unwrap();
-    assert_eq!(out.max_damage(None), 1561);
+    // The prototype's 1561 is no part of the result's patch (`set` leaves it out).
+    assert!(
+        out.data()
+            .is_none_or(|d| d.other("minecraft:max_damage").is_none())
+    );
     assert_eq!(out.damage, 561);
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_takes_the_larger_maximum() {
     // remaining = (100 - 60) + (200 - 150) + 200 * 5 / 100 = 40 + 50 + 10 = 100
     let out = run(
@@ -108,7 +113,7 @@ fn repair_takes_the_larger_maximum() {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn repair_clamps_damage_above_the_maximum() {
     // Both stacks claim damage 150 of 100: each counts as fully broken, so remaining = 0 + 0 + 100 * 5 / 100 = 5.
     let out = run(

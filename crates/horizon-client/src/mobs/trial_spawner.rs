@@ -216,6 +216,14 @@ pub fn load_registry(root: &Path) {
 pub fn registry_config(id: &str) -> Option<TrialConfig> {
     REGISTRY.get()?.get(id).cloned()
 }
+/// The accepted, decoded trial-spawner registry identities, without cloning configurations.
+pub fn registry_contains(id: &str) -> Option<bool> {
+    Some(REGISTRY.get()?.contains_key(id))
+}
+/// The identities of the same immutable registry gameplay reads.
+pub fn registry_ids() -> Option<Vec<&'static str>> {
+    Some(REGISTRY.get()?.keys().map(String::as_str).collect())
+}
 
 fn float(t: &Tag) -> Option<f32> {
     Some(match t {
@@ -468,7 +476,7 @@ pub trait TrialSpawnerExt: Sized {
         pos: [i32; 3],
         state: TrialState,
         ominous: bool,
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         eject: &mut dyn FnMut(&str, &mut R) -> bool,
         events: &mut Vec<TrialEvent>,
     ) -> TrialState;
@@ -480,7 +488,7 @@ pub trait TrialSpawnerExt: Sized {
         random: &mut R,
         pos: [i32; 3],
         state: TrialState,
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         eject: &mut dyn FnMut(&str, &mut R) -> bool,
         events: &mut Vec<TrialEvent>,
     ) -> TrialState;
@@ -490,7 +498,7 @@ pub trait TrialSpawnerExt: Sized {
         l: &L,
         random: &mut R,
         pos: [i32; 3],
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         events: &mut Vec<TrialEvent>,
     ) -> Option<Uuid>;
 }
@@ -516,19 +524,25 @@ impl TrialSpawnerExt for TrialSpawner {
             ..Self::default()
         };
         // FullConfig.MAP_CODEC, partial result kept: a field that fails to
-        // decode takes its default.
+        // decode takes its default, and an inline config equal to
+        // `TrialSpawnerConfig.DEFAULT` is omitted on save (`optionalFieldOf`).
         let slot = |k: &str| -> ConfigSlot {
-            let config = match tag.get(k) {
-                Some(Tag::String(id)) => {
-                    spawner::normalize_id(&id.to_string_lossy()).and_then(|id| registry(&id))
-                }
-                Some(t) => TrialConfig::decode(t),
-                None => None,
-            };
-            config.map_or_else(ConfigSlot::default, |config| ConfigSlot {
-                saved: tag.get(k).cloned(),
-                config,
-            })
+            match tag.get(k) {
+                Some(Tag::String(id)) => spawner::normalize_id(&id.to_string_lossy())
+                    .and_then(|id| {
+                        let config = registry(&id)?;
+                        Some(ConfigSlot {
+                            saved: Some(Tag::String(id.as_str().into())),
+                            config,
+                        })
+                    })
+                    .unwrap_or_default(),
+                Some(t) => TrialConfig::decode(t).map_or_else(ConfigSlot::default, |config| {
+                    let saved = (config != TrialConfig::default()).then(|| config.encode());
+                    ConfigSlot { saved, config }
+                }),
+                None => ConfigSlot::default(),
+            }
         };
         let int = |k: &str, default: i32, lo: i32, hi: i32| {
             spawner::number(tag.get(k))
@@ -887,7 +901,7 @@ impl TrialSpawnerExt for TrialSpawner {
         pos: [i32; 3],
         state: TrialState,
         ominous: bool,
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         eject: &mut dyn FnMut(&str, &mut R) -> bool,
         events: &mut Vec<TrialEvent>,
     ) -> TrialState {
@@ -913,7 +927,7 @@ impl TrialSpawnerExt for TrialSpawner {
         random: &mut R,
         pos: [i32; 3],
         state: TrialState,
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         eject: &mut dyn FnMut(&str, &mut R) -> bool,
         events: &mut Vec<TrialEvent>,
     ) -> TrialState {
@@ -1044,7 +1058,7 @@ impl TrialSpawnerExt for TrialSpawner {
         l: &L,
         random: &mut R,
         pos: [i32; 3],
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<Uuid>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<Uuid>,
         events: &mut Vec<TrialEvent>,
     ) -> Option<Uuid> {
         let data = self.next_or_create(random, events).clone();
@@ -1114,7 +1128,7 @@ impl TrialSpawnerExt for TrialSpawner {
             equipment: data.equipment.as_ref(),
             trial: true,
         };
-        let uuid = spawn(l, &request, random)?;
+        let uuid = spawn(l, random, &request)?;
         let flame = i32::from(self.is_ominous);
         events.push(TrialEvent::LevelEvent(3011, pos, flame));
         events.push(TrialEvent::LevelEvent(3012, block, flame));
@@ -1237,6 +1251,26 @@ mod tests {
         assert_eq!(c.spawn_range, 4);
         assert_eq!(c.total_mobs, 3.0);
         assert_eq!(c.spawn_potentials.len(), 1);
+    }
+
+    #[test]
+    fn inline_config_omits_default_and_normalizes_non_default() {
+        let default_inline = TrialSpawner::load_with(
+            &tag(r#"{normal_config:{spawn_range:4,total_mobs:6.0f}}"#),
+            &|_| None,
+        );
+        assert_eq!(default_inline.normal, ConfigSlot::default());
+        assert!(default_inline.save().is_empty());
+
+        let custom_inline = TrialSpawner::load_with(
+            &tag(r#"{normal_config:{spawn_range:5,total_mobs:6.0f}}"#),
+            &|_| None,
+        );
+        assert_eq!(custom_inline.normal.config.spawn_range, 5);
+        assert_eq!(
+            custom_inline.save(),
+            vec![("normal_config", tag(r#"{spawn_range:5}"#))]
+        );
     }
 
     #[test]

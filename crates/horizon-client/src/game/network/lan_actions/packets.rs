@@ -33,7 +33,7 @@ impl Game<'_> {
         };
         let dx = pos[0].abs_diff(spawn[0]);
         let dz = pos[2].abs_diff(spawn[2]);
-        dimension == "minecraft:overworld" && dx.max(dz) <= radius as u32
+        dimension == self.level.spawn_dimension() && dx.max(dz) <= radius as u32
     }
 
     /// ServerPlayer.sendSpawnProtectionMessage.
@@ -130,6 +130,12 @@ impl Game<'_> {
 
     /// A packet from a guest that the hub does not handle itself.
     pub(in crate::game) fn lan_guest_packet(&mut self, conn: u32, packet: S) {
+        // A crossing the hub's move check passed; a dead player's is refused, not dropped.
+        if let S::CustomPayload(p) = &packet
+            && p.channel == horizon_protocol::passage_sync::CROSS_CHANNEL
+        {
+            return self.guest_passage_cross(conn, &p.data);
+        }
         let Some(host) = self.lan.as_ref() else {
             return;
         };
@@ -138,7 +144,9 @@ impl Game<'_> {
         };
         // A dead player acts no more, but the death screen still respawns and chats: its
         // commands run as anyone's (ServerGamePacketListenerImpl.handleChatCommand doesn't
-        // look at the player's health).
+        // look at the player's health). Resource-pack answers are connection status, not an
+        // action, and ServerCommonPacketListenerImpl.handleResourcePackResponse accepts them
+        // regardless of health.
         if host.hub.guests[gi].dead
             && !matches!(
                 packet,
@@ -146,6 +154,7 @@ impl Game<'_> {
                     | S::ChatCommand(_)
                     | S::ChatCommandSigned(_)
                     | S::CustomClickAction(_)
+                    | S::ResourcePack(_)
             )
         {
             return;
@@ -197,7 +206,7 @@ impl Game<'_> {
                     {
                         return;
                     }
-                    let face = direction(i32::from(a.direction));
+                    let face = crate::game::hit::direction(i32::from(a.direction));
                     // Native mods, once the dig may start: a canceled click
                     // attacks, digs and breaks nothing (the ack puts the
                     // block back on the client).
@@ -213,7 +222,7 @@ impl Game<'_> {
                     // ServerPlayerGameMode.handleBlockBreakAction: a creative START
                     // destroys the block at once (destroyAndAck "creative destroy"),
                     // so a UseItemOn sent behind it in the same tick (both buttons
-                    // at once, #3006) replaces the air it left. A survival START
+                    // at once, arismoko/horizon#3006) replaces the air it left. A survival START
                     // attacks the block at once, so a tap released in the same tick
                     // still plays a note. The dig is marked begun for tick_mining.
                     let pos = a.pos;
@@ -297,7 +306,7 @@ impl Game<'_> {
                         // Too far (handleBlockBreakAction's "too far"): the ack has the client
                         // undo its prediction, and only the dig drops — `destroy_pos` and the
                         // ticks since its START stay, so a STOP for the same block after the
-                        // guest comes back into reach counts them (#4124).
+                        // guest comes back into reach counts them (arismoko/horizon#4124).
                         host.play.entry(conn).or_default().dig_ended();
                         return;
                     }
@@ -309,13 +318,9 @@ impl Game<'_> {
                     };
                     host.hub.ack(conn, a.sequence);
                     // ServerPlayerGameMode.abortDestroyBlock clears the dig and the crack; the
-                    // clock `destroy_pos` names is left to the next START (#4124).
+                    // clock `destroy_pos` names is left to the next START (arismoko/horizon#4124).
                     host.play.entry(conn).or_default().dig_ended();
-                    let state = self.world.block(a.pos[0], a.pos[1], a.pos[2]).0 as i32;
-                    host.hub.send_to(
-                        conn,
-                        &C::BlockUpdate(play::BlockUpdate { pos: a.pos, state }),
-                    );
+                    host.hub.send_block_correction(conn, &self.world, a.pos);
                     self.guest_crack_progress(conn, a.pos, -1);
                     let Some(host) = self.lan.as_ref() else {
                         return;
@@ -340,34 +345,47 @@ impl Game<'_> {
                 // SWAP_ITEM_WITH_OFFHAND: the hands swap and the item in use stops
                 // (ServerGamePacketListenerImpl.handlePlayerAction), not for spectators.
                 7 if !spectator => {
-                    // The mods hear the swap first, and may stop it: the
-                    // client, which swapped at once, gets its slots back.
-                    let (uuid, name) = {
+                    // The mods hear the swap first (LivingSwapItemsEvent.Hands):
+                    // they may stop it, and the client is sent its slots again,
+                    // or change what each hand gets. The
+                    // stacks are copied only for a listener: `heard` holds the
+                    // vanilla (to main hand, to off hand), the old off and main.
+                    let (uuid, name, heard) = {
                         let Some(host) = self.lan.as_ref() else {
                             return;
                         };
                         let g = &host.hub.guests[gi];
-                        (g.uuid, g.name.clone())
+                        let heard = mod_api::__private::listened(mod_api::HookId::PlayerSwapHands)
+                            .then(|| (g.offhand.clone(), g.inventory[g.selected].clone()));
+                        (g.uuid, g.name.clone(), heard)
                     };
                     // With the player's state swapped in, so that the helpers
                     // reach them.
-                    let cancel = self
-                        .as_guest(conn, |g| {
-                            let mut cancel = false;
-                            g.native_player_swap_hands(uuid, &name, &mut cancel);
-                            cancel
-                        })
-                        .unwrap_or(false);
-                    if cancel {
-                        let Some(host) = self.lan.as_mut() else {
-                            return;
-                        };
-                        host.hub.send_inventory(gi);
-                        return;
-                    }
+                    let mut chosen = heard.clone();
+                    let cancel = match chosen.as_mut() {
+                        Some((to_main, to_off)) => self
+                            .as_guest(conn, |g| {
+                                let mut cancel = false;
+                                g.native_player_swap_hands(
+                                    uuid,
+                                    &name,
+                                    to_main,
+                                    to_off,
+                                    &mut cancel,
+                                );
+                                cancel
+                            })
+                            .unwrap_or(false),
+                        None => false,
+                    };
                     let Some(host) = self.lan.as_mut() else {
                         return;
                     };
+                    if cancel {
+                        host.hub.send_inventory(gi);
+                        return;
+                    }
+                    let changed = chosen != heard;
                     let used =
                         host.play
                             .get(&conn)
@@ -383,12 +401,23 @@ impl Game<'_> {
                     let (offhand, main) = host.hub.guests.update(gi, |g| {
                         let slot = g.selected;
                         std::mem::swap(&mut g.inventory[slot], &mut g.offhand);
+                        if let Some((to_main, to_off)) = chosen {
+                            (g.inventory[slot], g.offhand) = (to_main, to_off);
+                        }
                         (g.offhand.clone(), g.inventory[slot].clone())
                     });
-                    // setItemInHand: the off hand, then the main hand.
+                    // A mod's stacks differ from vanilla's swap: both slots go to the client.
+                    if changed {
+                        host.hub.send_inventory(gi);
+                    }
+                    // setItemInHand: the off hand, then the main hand, from what each held.
+                    let (old_off, old_main) = match &heard {
+                        Some((old_off, old_main)) => (old_off.as_ref(), old_main.as_ref()),
+                        None => (main.as_ref(), offhand.as_ref()),
+                    };
                     self.as_guest(conn, |g| {
-                        g.player_on_equip("offhand", main.as_ref(), offhand.as_ref());
-                        g.player_on_equip("mainhand", offhand.as_ref(), main.as_ref());
+                        g.player_on_equip("offhand", old_off, offhand.as_ref());
+                        g.player_on_equip("mainhand", old_main, main.as_ref());
                         match used {
                             Some(stack) => g.stop_using_item(&stack),
                             None => g.using = None,
@@ -497,16 +526,7 @@ impl Game<'_> {
                     return;
                 };
                 host.hub.ack(conn, p.sequence);
-                let hit = Hit {
-                    pos: p.pos,
-                    face: direction(p.face),
-                    point: [
-                        f64::from(p.pos[0]) + f64::from(p.cursor[0]),
-                        f64::from(p.pos[1]) + f64::from(p.cursor[1]),
-                        f64::from(p.pos[2]) + f64::from(p.cursor[2]),
-                    ],
-                    inside: p.inside,
-                };
+                let hit = Hit::from_use_item_on(&p);
                 let hand = if p.hand == 1 { Hand::Off } else { Hand::Main };
                 let _ = self.guest_use_item_on(conn, gi, hit, hand);
             }
@@ -530,16 +550,18 @@ impl Game<'_> {
             // handleSetCreativeModeSlot's drop: a slot below 0 is a stack thrown out of the
             // creative screen (`handleCreativeModeItemDrop`), dropped from the player's hand.
             S::SetCreativeModeSlot(p) if p.slot < 0 => {
-                let Some(host) = self.lan.as_ref() else {
-                    return;
-                };
-                if !host.hub.guests[gi].creative() {
-                    return;
-                }
+                // The codec's count range is read before the handler's own checks, so the stack is
+                // validated before the creative and slot filters below.
                 let Some(stack) = self.item_from_network(&p.item) else {
                     return;
                 };
                 if !self.creative_stack_valid(gi, &stack) {
+                    return;
+                }
+                let Some(host) = self.lan.as_ref() else {
+                    return;
+                };
+                if !host.hub.guests[gi].creative() {
                     return;
                 }
                 if !self.guest_may_set_creative_slot(conn, i32::from(p.slot), Some(&stack)) {
@@ -561,18 +583,19 @@ impl Game<'_> {
             }
             S::SetCreativeModeSlot(p) => {
                 // Slot 0 is the crafting result: not a slot to set.
+                let item = self.item_from_network(&p.item);
+                // As above: the codec's count range comes before the creative and slot filters.
+                if item
+                    .as_ref()
+                    .is_some_and(|s| !self.creative_stack_valid(gi, s))
+                {
+                    return;
+                }
                 let Some(host) = self.lan.as_mut() else {
                     return;
                 };
                 let g = &host.hub.guests[gi];
                 if !g.creative() || !(1..46).contains(&p.slot) {
-                    return;
-                }
-                let item = self.item_from_network(&p.item);
-                if item
-                    .as_ref()
-                    .is_some_and(|s| !self.creative_stack_valid(gi, s))
-                {
                     return;
                 }
                 if !self.guest_may_set_creative_slot(conn, i32::from(p.slot), item.as_ref()) {
@@ -610,6 +633,8 @@ impl Game<'_> {
                     });
                 }
             }
+            // The mods' `container_click` first: a canceled click changes nothing.
+            S::ContainerClick(p) if self.lan_container_click_vetoed(conn, &p) => {}
             // AbstractContainerMenu.quickMoveStack of a mod container: the mods first.
             S::ContainerClick(p) if self.lan_mod_quick_move(conn, &p) => {}
             S::ContainerClick(p) if self.lan_merchant_click(conn, &p) => {}
@@ -631,6 +656,8 @@ impl Game<'_> {
                 });
             }
             S::PlayerCommand(p) if p.action == 6 => self.lan_start_gliding(conn),
+            // STOP_SLEEPING: `stopSleepInBed(false, true)`.
+            S::PlayerCommand(p) if p.action == 0 => self.wake_guest(gi, false, true),
             // START_RIDING_JUMP: the mount's handleStartJump.
             S::PlayerCommand(p) if p.action == 3 => {
                 self.lan_start_riding_jump(conn, p.data);
@@ -638,16 +665,20 @@ impl Game<'_> {
             // STOP_RIDING_JUMP: AbstractHorse and Camel handleStopJump do
             // nothing, and a nautilus' dash is not stopped this way.
             S::PlayerCommand(p) if p.action == 4 => {}
-            // ServerboundResourcePackPacket in play: the server has nothing to
-            // do with it (a declined required pack is handled on the connection).
+            // ServerboundResourcePackPacket in play: `resource_pack_status_v2` hears the answer
+            // even after death; `resource_pack_status` only while the player lives, as it always
+            // did (a declined server.properties required pack is handled on the connection).
             S::ResourcePack(r) => {
                 let Some(host) = self.lan.as_ref() else {
                     return;
                 };
                 let guest = &host.hub.guests[gi];
-                let (uuid, name) = (guest.uuid, guest.name.clone());
+                let (uuid, name, dead) = (guest.uuid, guest.name.clone(), guest.dead);
                 self.as_guest(conn, |g| {
-                    g.native_resource_pack_status(uuid, &name, r.action);
+                    g.native_resource_pack_status_v2(uuid, &name, r.id, r.action);
+                    if !dead {
+                        g.native_resource_pack_status(uuid, &name, r.action);
+                    }
                 });
             }
             // START_SPRINTING and STOP_SPRINTING: the hub has set the sprint
@@ -692,7 +723,7 @@ impl Game<'_> {
             }
             S::SelectBundleItem(p) => {
                 // ServerGamePacketListenerImpl.handleBundleItemSelectedPacket: the slot
-                // is the open menu's (#4436).
+                // is the open menu's (arismoko/horizon#4436).
                 let own = self
                     .lan_crafting_table_own_slots(conn)
                     .or_else(|| self.lan_station_own_slots(conn));
@@ -716,7 +747,6 @@ impl Game<'_> {
                 }
             }
             S::ContainerClick(p) => {
-                let rules = ItemRules(world_items!(self), &world_stations!(self).enchantments);
                 let Some(host) = self.lan.as_mut() else {
                     return;
                 };
@@ -726,7 +756,7 @@ impl Game<'_> {
                     .filter(|m| m.window == p.container)
                     .map(|m| m.slots);
                 let before = slots.and_then(|s| s.read(&self.world, &host.hub.guests[gi]));
-                let drops = host.hub.container_click(conn, &p, &mut self.world, &rules);
+                let drops = self.lan_hub_click(conn, &p);
                 // A click that changed the container's slots: BlockEntity.setChanged,
                 // so comparators read it again (a double chest's other half follows).
                 let Some(host) = self.lan.as_ref() else {
@@ -760,11 +790,11 @@ impl Game<'_> {
                         }
                         _ => None,
                     });
-                if host.hub.guests[gi]
+                let closing = host.hub.guests[gi]
                     .menu
                     .as_ref()
-                    .is_some_and(|m| m.window == p.container)
-                {
+                    .is_some_and(|m| m.window == p.container);
+                if closing {
                     self.guest_container_closed(conn);
                 }
                 if let Some(key) = vehicle {
@@ -775,6 +805,9 @@ impl Game<'_> {
                 };
                 host.hub.container_closed(conn, p.container);
                 self.guest_carried_back(gi);
+                if closing {
+                    self.player_menu_closing(conn);
+                }
             }
             S::ChatCommand(c) => self.guest_chat_command(conn, &c.command),
             S::CustomPayload(p) if p.channel == horizon_protocol::quiet::CHANNEL => {
@@ -1085,6 +1118,7 @@ impl Game<'_> {
                         .then(|| g.entity_pick_result(p.id))
                         .flatten()
                 });
+                self.guest_pick_avatar_profile(conn, p.id, p.include_data);
             }
             _ => {}
         }
@@ -1143,12 +1177,7 @@ impl Game<'_> {
             if cancel {
                 return None;
             }
-            horizon_client::pick_item::pick(
-                &mut g.inventory[..36],
-                &mut g.selected,
-                &stack,
-                infinite,
-            );
+            g.pick_into_inventory(&stack, infinite);
             Some(())
         });
         if picked.flatten().is_some()
@@ -1194,17 +1223,23 @@ impl Game<'_> {
         !cancel
     }
 
-    /// What ServerboundSetCreativeModeSlotPacket asks of a stack. Its codec
-    /// (`ItemStack.validatedStreamCodec`) encodes the stack with `ItemStack.CODEC`, whose count is
-    /// 1 to 99: more fails the packet and disconnects the player, as vanilla's decoder error does.
-    /// A native mod can raise an item's stack size past 99 (`item_defaults::MAX_STACK_SIZE`), so
-    /// the count is held to what the wire carries instead. handleSetCreativeModeSlot's `validData`
-    /// then ignores a stack beyond its own stack size.
+    /// What the codec of ServerboundSetCreativeModeSlotPacket accepts:
+    /// `ItemStack.validatedStreamCodec` encodes the stack with `ItemStack.CODEC`, whose count is
+    /// 1 to 99, so more fails the packet and disconnects the player, as vanilla's decoder error
+    /// does, whatever the slot or the game mode.
+    /// A native mod can raise an item's stack size past 99, and the bound follows it: an ordinary
+    /// item's 64 is still bounded to the wire's 99.
+    ///
+    /// handleSetCreativeModeSlot's `validData` is the second condition: a stack beyond its own stack
+    /// size is ignored there, not kicked. Neither condition reads the slot or the game mode, so both
+    /// are answered before the callers' filters — where vanilla's decoder stands, ahead of the
+    /// handler's `validSlot` and creative-mode checks.
     pub(super) fn creative_stack_valid(&mut self, gi: usize, s: &ItemStack) -> bool {
+        let item_max = self.stack_max_size(s);
+        let max = creative_stack_limit(item_max);
         let Some(host) = self.lan.as_mut() else {
             return false;
         };
-        let max = horizon_world::item_defaults::MAX_STACK_SIZE as u32;
         if s.count > max {
             let g = &host.hub.guests[gi];
             let conn = g.conn;
@@ -1214,7 +1249,7 @@ impl Game<'_> {
                 .kick(conn, horizon_protocol::text::literal(&reason));
             return false;
         }
-        s.count <= self.stack_max_size(s)
+        s.count <= item_max
     }
 
     pub(super) fn item_from_network(
@@ -1222,9 +1257,8 @@ impl Game<'_> {
         stack: &Option<horizon_protocol::item::Stack>,
     ) -> Option<ItemStack> {
         let s = stack.as_ref()?;
-        let mut out = self.lan.as_ref()?.hub.stack_from_network(s);
-        out.count = out.count.max(1);
-        Some(out)
+        let out = self.lan.as_ref()?.hub.stack_from_network(s);
+        (out.count > 0 && &*out.item != "minecraft:air").then_some(out)
     }
 
     /// `LivingEntity.tickDeath`: 20 ticks after dying the player is removed,
@@ -1274,3 +1308,17 @@ impl Game<'_> {
         host.hub.teleport(gi, Some(at));
     }
 }
+
+/// Vanilla's `ExtraCodecs.intRange(1, 99)`: the count `ItemStack.CODEC` carries, so the bound the
+/// packet's codec enforces.
+const CREATIVE_COUNT_LIMIT: u32 = 99;
+
+/// The count that codec accepts: vanilla's `1..=99`, raised by a stack size a native mod put above
+/// 99.
+fn creative_stack_limit(stack_max: u32) -> u32 {
+    stack_max.max(CREATIVE_COUNT_LIMIT)
+}
+
+#[cfg(test)]
+#[path = "tests/creative_stack_bound_tests.rs"]
+mod creative_stack_bound_tests;

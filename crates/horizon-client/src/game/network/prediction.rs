@@ -116,9 +116,9 @@ impl Game<'_> {
                     return None;
                 }
                 let replay = g.replay.as_deref_mut()?;
-                // Ticks no longer kept (a server that stalled for seconds): wait for the next teleport.
+                // Rebase missing or unplayable history, excused until the moves agree.
                 let Some(over) = replay.catch_up(record, server, tolerance, &mut run) else {
-                    g.replay = None;
+                    g.replay = Some(Box::new(Replay::rebased(server, g.position, record)));
                     return None;
                 };
                 if over.ticks == 0 || waiting {
@@ -178,10 +178,23 @@ fn excused(g: &Guest, world: &World, entities: &[EntityState], guests: &[Guest])
         .as_deref()
         .is_some_and(|m: &PlayerMotion| m.auto_spin_attack_ticks > 0);
     let entity = entity_near(entities, g.entity_id, at, slack);
-    let player = guests.iter().any(|o| {
-        o.conn != g.conn && o.placed && o.dimension == g.dimension && close(at, slack, o.position)
-    });
+    let player = player_near(g, guests, at, slack);
     unsent || pistons || unloaded || riptide || entity || player
+}
+
+/// Whether another player in guest `g`'s level is close to `at`. A spectator moves no one: it pushes
+/// no one (Player.tick sets its noPhysics, and Entity.push stops at a pusher that has it), no one
+/// stands on a player, and the server doesn't even show it to a client that isn't a spectator
+/// (ServerPlayer.broadcastToPlayer). A client that still had the player when it turned spectator
+/// lost an entity near it, which the replay excuses on its own (`Record::entity_gone`).
+fn player_near(g: &Guest, guests: &[Guest], at: [f64; 3], slack: f64) -> bool {
+    guests.iter().any(|o| {
+        o.conn != g.conn
+            && o.placed
+            && !o.spectator()
+            && o.dimension == g.dimension
+            && close(at, slack, o.position)
+    })
 }
 
 /// Whether `p` is in the box around `at` that a player's moves are excused for.
@@ -194,14 +207,26 @@ fn close(at: [f64; 3], slack: f64, p: [f64; 3]) -> bool {
 
 /// Whether an entity in `entities` other than the guest's own (`own`) is close to `at`. The
 /// distance test runs first: most entities are far, and the kind is a string compare. Items and
-/// experience orbs neither push nor hold anyone up; the list holds the player itself.
+/// experience orbs neither push nor hold anyone up, and neither do the entities that keep `Entity`'s
+/// `isPushable` and `canBeCollidedWith` (both false) and move no one on the client: paintings, item
+/// frames, markers, displays, interactions and leash knots. The list holds the player itself.
 fn entity_near(entities: &[EntityState], own: i32, at: [f64; 3], slack: f64) -> bool {
     entities.iter().any(|e| {
         close(at, slack, e.position)
             && e.id != own
             && !matches!(
                 e.kind.as_str(),
-                "minecraft:item" | "minecraft:experience_orb"
+                "minecraft:item"
+                    | "minecraft:experience_orb"
+                    | "minecraft:painting"
+                    | "minecraft:item_frame"
+                    | "minecraft:glow_item_frame"
+                    | "minecraft:marker"
+                    | "minecraft:block_display"
+                    | "minecraft:item_display"
+                    | "minecraft:text_display"
+                    | "minecraft:interaction"
+                    | "minecraft:leash_knot"
             )
     })
 }
@@ -277,6 +302,49 @@ mod tests {
         }
     }
 
+    fn guest(conn: u32, position: [f64; 3]) -> Guest {
+        use horizon_client::lan::{Joined, PlayerSender};
+        use std::sync::{Arc, atomic::AtomicI32, mpsc};
+        let (tx, _rx) = mpsc::channel();
+        let mut g = Guest::new(
+            Joined {
+                conn,
+                uuid: u128::from(conn),
+                name: format!("p{conn}"),
+                properties: Vec::new(),
+                info: horizon_protocol::packets::configuration::ClientInformation::new(2),
+                brand: "test".into(),
+                sender: PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            conn as i32,
+            position,
+            2,
+        );
+        g.placed = true;
+        g
+    }
+
+    /// Another player a block away excuses a guest's moves (it may push it), but not one in
+    /// spectator mode: a spectator pushes no one, and the guest's client doesn't even have it.
+    #[test]
+    fn a_spectator_near_a_player_excuses_nothing() {
+        use horizon_client::lan::guest::{SPECTATOR, SURVIVAL};
+        let at = [0.5, 64.0, 0.5];
+        let mut guests = vec![guest(1, at), guest(2, [1.5, 64.0, 0.5])];
+        assert!(player_near(&guests[0], &guests, at, 0.0));
+        guests[1].change_game_mode(SPECTATOR);
+        assert!(!player_near(&guests[0], &guests, at, 0.0));
+        guests[1].change_game_mode(SURVIVAL);
+        assert!(player_near(&guests[0], &guests, at, 0.0));
+        // Only another player counts, in the same level and placed.
+        assert!(!player_near(&guests[0], &guests[..1], at, 0.0));
+        guests[1].dimension = "minecraft:the_nether".into();
+        assert!(!player_near(&guests[0], &guests, at, 0.0));
+    }
+
     #[test]
     fn entity_near_matches_the_scan_it_replaced() {
         const SLACKS: [f64; 6] = [0.0, 0.25, 0.5, 1.5, 3.0, 16.0];
@@ -324,5 +392,49 @@ mod tests {
             ..zombie(2, [0.0, 0.0, 0.0])
         };
         assert!(!entity_near(&[item], 0, at, s));
+    }
+
+    /// An entity a vanilla client can neither be pushed by (`isPushable`) nor stand on
+    /// (`canBeCollidedWith`) can't move the player: beside one, the moves count. One that can, and a
+    /// firework (it boosts its glider on the client), still excuses them.
+    #[test]
+    fn only_entities_that_can_move_a_player_excuse_its_moves() {
+        let at = [0.0, 64.0, 0.0];
+        let near = |kind: &str| {
+            let e = EntityState {
+                id: 1,
+                kind: kind.to_string(),
+                position: [1.0, 64.0, 0.5],
+                ..Default::default()
+            };
+            entity_near(&[e], 0, at, 0.0)
+        };
+        for inert in [
+            "minecraft:painting",
+            "minecraft:item_frame",
+            "minecraft:glow_item_frame",
+            "minecraft:marker",
+            "minecraft:block_display",
+            "minecraft:item_display",
+            "minecraft:text_display",
+            "minecraft:interaction",
+            "minecraft:leash_knot",
+        ] {
+            assert!(!near(inert), "{inert} excused the moves beside it");
+        }
+        for moving in [
+            "minecraft:cow",
+            "minecraft:armor_stand",
+            "minecraft:oak_boat",
+            "minecraft:minecart",
+            "minecraft:shulker",
+            "minecraft:firework_rocket",
+            "minecraft:arrow",
+        ] {
+            assert!(
+                near(moving),
+                "{moving} no longer excuses the moves beside it"
+            );
+        }
     }
 }

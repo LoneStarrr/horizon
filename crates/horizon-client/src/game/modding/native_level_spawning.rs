@@ -1,5 +1,5 @@
 //! Mob spawning and a level's natural spawning policy through a `LevelRef`
-//! (docs/modding/src/how-to/spawning.md, "Spawning from a level"): a mob made
+//! (docs/modding/src/how-to/world/spawning.md, "Spawning from a level"): a mob made
 //! as `EntityType.spawn` makes one, the per-category limits and the flags
 //! natural spawning reads (`natural_spawning::SpawnPolicy`), and the chunk
 //! question it asks (`ServerLevel.canSpawnEntitiesInChunk`).
@@ -19,6 +19,9 @@ impl Game<'_> {
         pos: [f64; 3],
         reason: mod_api::SpawnReason,
     ) -> Option<EntityRef> {
+        if self.entity_ids_exhausted() {
+            return None;
+        }
         if !self.level_in_place(level) || !pos.iter().all(|v| v.is_finite()) {
             return None;
         }
@@ -46,6 +49,36 @@ impl Game<'_> {
     /// stale handle or on a client.
     pub(super) fn level_set_spawn_limits(&mut self, level: LevelRef, limits: SpawnLimits) -> bool {
         self.native_set_spawn_policy(level, |policy| policy.limits = limits)
+    }
+    /// Sets one category's natural spawning limit for the rest of the open. False for
+    /// `MobCategory::Misc`, a stale handle or a client, with nothing set.
+    pub(super) fn level_set_spawn_limit(
+        &mut self,
+        level: LevelRef,
+        category: mod_api::MobCategory,
+        limit: u32,
+    ) -> bool {
+        if category == mod_api::MobCategory::Misc {
+            return false;
+        }
+        self.native_set_spawn_policy(level, |policy| {
+            let _ = policy.limits.set(category, limit);
+        })
+    }
+
+    /// Sets one category's ticks between natural spawn passes for the rest of the open.
+    /// False for `MobCategory::Misc`, zero ticks, a stale handle or a client, with nothing set.
+    pub(super) fn level_set_ticks_per_spawn(
+        &mut self,
+        level: LevelRef,
+        category: mod_api::MobCategory,
+        ticks: u32,
+    ) -> bool {
+        let mut accepted = false;
+        let set = self.native_set_spawn_policy(level, |policy| {
+            accepted = policy.ticks.set(category, ticks);
+        });
+        set && accepted
     }
     /// Sets the level's natural spawning flags for the rest of the open. False as for
     /// `level_set_spawn_limits`.
@@ -115,7 +148,7 @@ mod tests {
     /// then finalized with the caller's reason, and it joins not persistent. Every refusal
     /// spawns nothing and tells no mod.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn a_level_spawns_a_mob_as_its_entity_type_does_and_refuses_the_rest() {
         let heard = Heard::default();
         let mods = vec![mod_api::ModEntry::new(
@@ -136,7 +169,10 @@ mod tests {
                         mod_api::SpawnReason::Command,
                     )
                     .unwrap();
-                assert_eq!(game.entity_kind(cow).as_deref(), Some("minecraft:cow"));
+                assert_eq!(
+                    game.entity_kind(cow).map(|kind| kind.id(game)).as_deref(),
+                    Some("minecraft:cow")
+                );
                 assert_eq!(game.entity_position(cow), Some([8.5, 64.0, 8.25]));
                 let mob = game.mobs.iter().find(|m| m.id == cow.id()).unwrap();
                 assert!(!mob.persistent);
@@ -193,7 +229,7 @@ mod tests {
             persistent: false,
         }];
         let level = game.natural_level();
-        let state = game.natural_spawn_state(&level, 289, player(), &zombie);
+        let state = game.natural_spawn_state(&level, 289, player(), Default::default(), &zombie);
         let categories = game.natural_categories(&state);
         (state, categories)
     }
@@ -203,7 +239,7 @@ mod tests {
     /// drop out; 2 lets them back. The flags take categories away, and the limits hold
     /// beside them. A stale handle and a client read nothing and set nothing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_levels_spawn_policy_changes_what_its_next_pass_spawns() {
         use Category as C;
         let friendly = [

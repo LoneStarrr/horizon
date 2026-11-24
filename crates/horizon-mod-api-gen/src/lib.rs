@@ -3,10 +3,12 @@ mod catalog;
 mod dispatch_fixtures;
 mod exports;
 mod game_modules;
-mod interface_cache;
 #[cfg(test)]
 mod interface_cache_tests;
-pub mod sdk_catalog;
+#[cfg(test)]
+mod listener_output_fixture;
+#[cfg(feature = "mixed-output-fixture")]
+mod mixed_output_fixture;
 #[doc(hidden)]
 pub use dispatch_fixtures::layout as dispatch_fixture_layout;
 pub use game_modules::materialize_game_modules;
@@ -15,7 +17,6 @@ mod host;
 mod layout;
 mod named_hooks;
 mod parts;
-pub mod wire_types;
 pub use catalog::DECLARATIONS;
 use catalog::{Catalog, Contract, DrawContext, Hook, HostAccess, PartKind, PhaseContext, Side};
 use heck::ToSnakeCase;
@@ -24,7 +25,7 @@ use quote::ToTokens;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
 };
 use syn::{FnArg, ImplItem, Item, Pat, Type, visit::Visit, visit_mut::VisitMut};
@@ -68,7 +69,7 @@ fn doc_comments(
     Ok(docs)
 }
 
-/// The handles of the mod API: its public `*Ref` and `*Key` structs, by their receiver name.
+/// The mod API's public `*Ref`, `*Key` and `*Ticket` handles, by their receiver name.
 struct ApiTypes {
     handles: BTreeMap<String, String>,
 }
@@ -87,7 +88,7 @@ fn api_types(source: &str) -> Result<ApiTypes, String> {
         let base = name
             .strip_suffix("Ref")
             .map(str::to_owned)
-            .or_else(|| name.ends_with("Key").then(|| name.clone()));
+            .or_else(|| (name.ends_with("Key") || name.ends_with("Ticket")).then(|| name.clone()));
         if let Some(base) = base.filter(|base| !base.is_empty()) {
             let receiver = base.to_snake_case();
             if handles.insert(receiver.clone(), name).is_some() {
@@ -165,27 +166,30 @@ struct EventLifetimes {
     in_mut: bool,
 }
 
+/// The primitive types a `&mut` argument crosses as a copied value — every one of them `Copy`.
+pub(crate) const PRIMITIVE_SCALARS: &[&str] = &[
+    "bool", "char", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
+    "usize", "f32", "f64",
+];
+
+/// Whether `ty` names one of [`PRIMITIVE_SCALARS`].
+pub(crate) fn is_primitive_scalar(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path)
+        if path.qself.is_none()
+            && path
+                .path
+                .get_ident()
+                .is_some_and(|ident| PRIMITIVE_SCALARS.contains(&ident.to_string().as_str())))
+}
+
 impl EventLifetimes {
     /// The field's type, and whether it is a scalar copied in and written back.
     fn field(&mut self, ty: &Type) -> (Type, bool) {
         let scalar = match ty {
-            Type::Reference(reference) if reference.mutability.is_some() => {
-                match &*reference.elem {
-                    Type::Path(path)
-                        if path.qself.is_none()
-                            && path.path.get_ident().is_some_and(|ident| {
-                                [
-                                    "bool", "char", "i8", "i16", "i32", "i64", "i128", "isize",
-                                    "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
-                                ]
-                                .iter()
-                                .any(|scalar| ident == scalar)
-                            }) =>
-                    {
-                        Some(&*reference.elem)
-                    }
-                    _ => None,
-                }
+            Type::Reference(reference)
+                if reference.mutability.is_some() && is_primitive_scalar(&reference.elem) =>
+            {
+                Some(&*reference.elem)
             }
             _ => None,
         };
@@ -466,8 +470,9 @@ fn rustfmt(code: &str) -> Result<Vec<u8>, String> {
 /// The doc of [`BlockPart`], the first part trait in the generated file.
 const PART_DOCS: &str = "/// A block's part: code attached through [`Registrar`] to one block, a mod's own or vanilla's.\n/// Its methods are the scoped hooks', asked only for the blocks it is attached to: a scoped\n/// hook has no [`Hooks`] method. They may run on the window's thread or the server thread.\n/// Annotate each part trait implementation with [`horizon_part`] to derive its subscriptions.\n";
 
-/// The doc of [`EntityPart`], the goal- and behavior-registering part trait (#1077, #824).
-const ENTITY_PART_DOCS: &str = "/// An entity type's part (arismoko/horizon#1077): code attached through\n/// `RegistrationContext::entity_part` to one entity type, a mod's own or vanilla's\n/// (`minecraft:zombie`). Its `register_goals` runs at every `Mob` construction of that\n/// type, spawned or loaded, right after the species' own goals — vanilla's `registerGoals`\n/// moment — and the goals it adds join the mob's two selectors beside vanilla's, same\n/// priorities and interruption. Its `register_behaviors` runs wherever a brain-driven\n/// species' brain is built (#824). Its `spawn_cluster_size` answers how large a spawn group of the\n/// type may grow. Annotate each part trait implementation with\n/// [`horizon_part`] to derive its subscriptions; entity parts carry no scoped hook yet, so\n/// their subscriptions stay empty whatever they override.\n";
+/// The doc of [`EntityPart`], the goal- and behavior-registering part trait (arismoko/horizon#1077, arismoko/horizon#824),
+/// which the general entity tick moment (arismoko/horizon#792) also scopes hooks to.
+const ENTITY_PART_DOCS: &str = "/// An entity type's part (arismoko/horizon#1077): code attached through\n/// `RegistrationContext::entity_part` to one entity type, a mod's own or vanilla's\n/// (`minecraft:zombie`). Its `register_goals` runs at every `Mob` construction of that\n/// type, spawned or loaded, right after the species' own goals — vanilla's `registerGoals`\n/// moment — and the goals it adds join the mob's two selectors beside vanilla's, same\n/// priorities and interruption. Its `register_behaviors` runs wherever a brain-driven\n/// species' brain is built (#824). Its `spawn_cluster_size` answers how large a spawn group of the\n/// type may grow. Its `general_entity_tick` runs for one general entity row's authoritative\n/// tick (#792). Annotate each part trait implementation with\n/// [`horizon_part`] to derive its subscriptions; the goal, behavior and spawn-size methods\n/// are not hooks, so they subscribe nothing whatever they override.\n";
 
 /// The crate whose generated sources are being built.
 #[derive(Clone, Copy)]
@@ -497,27 +502,13 @@ struct Sources {
     goal_view: String,
 }
 
-/// The hand-written sources, in deterministic order; `fire.rs` includes generated dispatch.
-fn native_hook_files(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let dir = root.join("crates/horizon-client/src/game/native_hooks");
-    let mut paths = fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .map(|entry| entry.map(|entry| entry.path()).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.retain(|path| {
-        path.extension().is_some_and(|ext| ext == "rs")
-            && path.file_name().is_some_and(|name| name != "fire.rs")
-    });
-    paths.sort();
-    Ok(paths)
-}
-
 /// Parse and validate the catalog and hook/helper signatures.
 fn sources(root: &Path, fill: FillMode) -> Result<Sources, String> {
-    let catalog = Catalog::load(root)?;
+    #[allow(unused_mut)]
+    let mut catalog = Catalog::load(root)?;
     let mut files = Vec::new();
     let mut methods = Vec::new();
-    for path in native_hook_files(root)? {
+    for path in horizon_game_discovery::native_hook_files(root)? {
         let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let file = syn::parse_file(&source).map_err(|e| e.to_string())?;
         let mut names = HashSet::new();
@@ -531,6 +522,8 @@ fn sources(root: &Path, fill: FillMode) -> Result<Sources, String> {
         }
         files.push((path, source, names));
     }
+    #[cfg(feature = "mixed-output-fixture")]
+    mixed_output_fixture::append(&mut catalog, &mut methods)?;
     let dispatch::HookSources {
         traits,
         dispatch,
@@ -540,6 +533,7 @@ fn sources(root: &Path, fill: FillMode) -> Result<Sources, String> {
         hook_ids,
         hook_constants,
         cancel_hooks,
+        client_hooks,
         hook_count,
         ..
     } = dispatch::emit(
@@ -556,12 +550,13 @@ fn sources(root: &Path, fill: FillMode) -> Result<Sources, String> {
     }
     let part = |name: &str| part_traits.get(name).map_or("", String::as_str);
     let code = format!(
-        "// @generated by cargo run -p xtask -- mod-api; do not edit.\nuse super::*;\n#[doc(hidden)]\n#[repr(usize)]\n#[derive(Clone, Copy, horizon_mod_api_macros::Wire)]\npub enum HookId {{ {hook_ids} }}\n#[doc(hidden)]\n#[allow(non_upper_case_globals)]\npub mod hook_ids {{ {hook_constants} }}\n#[doc(hidden)]\n#[allow(non_upper_case_globals)]\npub mod cancel_hooks {{ {cancel_hooks} }}\n/// How a trait mod's method listens, from its `#[listener]` attribute: a method without one has priority 0 and is not told of cancelled events.\n#[doc(hidden)]\n#[derive(Clone, Copy, horizon_mod_api_macros::Wire)]\npub struct Listener {{ pub hook: Option<HookId>, pub priority: i32, pub receive_cancelled: bool }}\npub(crate) const HOOK_COUNT: usize = {hook_count};\n/// The hooks a trait mod implements: one method per catalog hook, each documented from its `doc` field.\n/// Annotate the `impl` with `#[mod_api::horizon_mod]`, which subscribes the mod to just the methods it implements.\npub trait Hooks: std::any::Any + Send + Sync {{\n#[doc(hidden)] fn subscribed(&self) -> &'static [Option<HookId>];\n#[doc(hidden)] fn listeners(&self) -> &'static [Listener] {{ &[] }}\n/// Once, at startup: attach this mod's parts (`let shaft = r.block_key(\"mymod:shaft\"); r.block_part(shaft, Shaft)`).\nfn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {{ let _ = (r, cx); }}\n{traits}}}\n{PART_DOCS}pub trait BlockPart: Send + Sync + 'static {{\n#[doc(hidden)] fn block_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// A block's part that also answers for its block entity, and for the block like a [`BlockPart`].\npub trait BlockEntityPart: BlockPart {{\n#[doc(hidden)] fn block_entity_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// An item's part.\npub trait ItemPart: Send + Sync + 'static {{\n#[doc(hidden)] fn item_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// A mod menu type's part.\npub trait MenuPart: Send + Sync + 'static {{\n#[doc(hidden)] fn menu_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// A mod world fluid's part.\npub trait FluidPart: Send + Sync + 'static {{\n#[doc(hidden)] fn fluid_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n{ENTITY_PART_DOCS}pub trait EntityPart: Send + Sync + 'static {{\n#[doc(hidden)] fn entity_subscribed(&self) -> &'static [Option<HookId>] {{ &[] }}\n/// The mob's mod goals, added to its two selectors as `GoalSelector.addGoal`\n/// does in vanilla's `registerGoals`: fresh at every construction, so a goal's\n/// state is never saved. Branch on the mob with `goals.mob()`.\nfn register_goals(&self, goals: &mut GoalRegistrar<'_>) {{ let _ = goals; }}\n/// Native mods only: entity parts do not cross to wasm yet.\n/// The mob's mod brain behaviors, joined into the species' brain beside\n/// vanilla's (#824): built wherever the brain is built — its first tick and\n/// every rebuild — started and stopped in `Brain.tick`'s order, fresh state\n/// each build, nothing saved. Branch on the mob with `behaviors.mob()`.\nfn register_behaviors(&self, behaviors: &mut BehaviorRegistrar<'_>) {{ let _ = behaviors; }}\n/// How many mobs one spawn group of this mob's type may grow to (`Mob.getMaxSpawnClusterSize`), asked\n/// where the spawner has just added a mob to a group and compares the group's size with the limit:\n/// natural spawning's packs. `mob` is the mob just spawned, finalized and in\n/// no level yet, to read through `host`; `reason` and `spawner` say why and from what it spawned\n/// (`spawner` is none but for a spawner block's mobs); `vanilla` is the limit the species has. Answer\n/// `Some(limit)` to replace it and `None` to leave it to the next part and then to vanilla's. The\n/// first part to answer wins, in dispatch order, and the group stops growing once its size reaches\n/// the limit, so a limit of 0 or 1 ends it with the mob just spawned. The host is the read-only\n/// one: a listener runs on replayed ticks and must be a pure function of its inputs.\nfn spawn_cluster_size(&self, host: &dyn Host, mob: UnspawnedMobRef, reason: SpawnReason, spawner: Option<SpawnSource>, vanilla: u32) -> Option<u32> {{ let _ = (host, mob, reason, spawner, vanilla); None }}\n}}\n{dispatch}",
+        "// @generated by cargo run -p xtask -- mod-api; do not edit.\nuse super::*;\n#[doc(hidden)]\n#[repr(usize)]\n#[derive(Clone, Copy, horizon_mod_api_macros::Wire)]\npub enum HookId {{ {hook_ids} }}\n#[doc(hidden)]\n#[allow(non_upper_case_globals)]\npub mod hook_ids {{ {hook_constants} }}\n#[doc(hidden)]\n#[allow(non_upper_case_globals)]\npub mod cancel_hooks {{ {cancel_hooks} }}\n/// The client-side hooks, by name: what a `side = \"server\"` mod may not subscribe to.\n#[doc(hidden)]\npub const CLIENT_HOOKS: &[(HookId, &str)] = &[{client_hooks}];\n/// How a trait mod's method listens, from its `#[listener]` attribute: a method without one has priority 0 and is not told of cancelled events.\n#[doc(hidden)]\n#[derive(Clone, Copy, horizon_mod_api_macros::Wire)]\npub struct Listener {{ pub hook: Option<HookId>, pub priority: i32, pub receive_cancelled: bool }}\npub(crate) const HOOK_COUNT: usize = {hook_count};\n/// The hooks a trait mod implements: one method per catalog hook, each documented from its `doc` field.\n/// Annotate the `impl` with `#[mod_api::horizon_mod]`, which subscribes the mod to just the methods it implements.\npub trait Hooks: std::any::Any + Send + Sync {{\n#[doc(hidden)] fn subscribed(&self) -> &'static [Option<HookId>];\n#[doc(hidden)] fn listeners(&self) -> &'static [Listener] {{ &[] }}\n/// Once, at startup: attach this mod's parts (`let shaft = r.block_key(\"mymod:shaft\"); r.block_part(shaft, Shaft)`).\nfn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {{ let _ = (r, cx); }}\n{traits}}}\n{PART_DOCS}pub trait BlockPart: Send + Sync + 'static {{\n#[doc(hidden)] fn block_subscribed(&self) -> &'static [Option<HookId>];\n/// Whether this part's `explosion_resistance` answer depends only on the state and the explosion, not on the position or the level around it: then a batched read (`LevelRef::explosion_resistances`) asks it once a state per call instead of once a cell. False unless the part says so; the answer stays a pure function of its inputs either way.\nfn explosion_resistance_is_pure(&self) -> bool {{ false }}\n{}}}\n/// A block's part that also answers for its block entity, and for the block like a [`BlockPart`].\npub trait BlockEntityPart: BlockPart {{\n#[doc(hidden)] fn block_entity_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// An item's part.\npub trait ItemPart: Send + Sync + 'static {{\n#[doc(hidden)] fn item_subscribed(&self) -> &'static [Option<HookId>];\n#[doc(hidden)] fn __prepare_equip(&self, stack: &ItemStack, kinds: &[&str], reads: &[EquipReadRow]) -> Result<Option<Box<dyn std::any::Any>>, &'static str> {{ let _ = (stack,kinds,reads); Ok(None) }}\n{}}}\n/// A mod menu type's part.\npub trait MenuPart: Send + Sync + 'static {{\n#[doc(hidden)] fn menu_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n/// A mod world fluid's part.\npub trait FluidPart: Send + Sync + 'static {{\n#[doc(hidden)] fn fluid_subscribed(&self) -> &'static [Option<HookId>];\n{}}}\n{ENTITY_PART_DOCS}pub trait EntityPart: Send + Sync + 'static {{\n#[doc(hidden)] fn entity_subscribed(&self) -> &'static [Option<HookId>] {{ &[] }}\n{}\n/// The mob's mod goals, added to its two selectors as `GoalSelector.addGoal`\n/// does in vanilla's `registerGoals`: fresh at every construction, so a goal's\n/// state is never saved. Branch on the mob with `goals.mob()`.\nfn register_goals(&self, goals: &mut GoalRegistrar<'_>) {{ let _ = goals; }}\n/// Native mods only: entity parts do not cross to wasm yet.\n/// The mob's mod brain behaviors, joined into the species' brain beside\n/// vanilla's (#824): built wherever the brain is built — its first tick and\n/// every rebuild — started and stopped in `Brain.tick`'s order, fresh state\n/// each build, nothing saved. Branch on the mob with `behaviors.mob()`.\nfn register_behaviors(&self, behaviors: &mut BehaviorRegistrar<'_>) {{ let _ = behaviors; }}\n/// How many mobs one spawn group of this mob's type may grow to (`Mob.getMaxSpawnClusterSize`), asked\n/// where the spawner has just added a mob to a group and compares the group's size with the limit:\n/// natural spawning's packs. `mob` is the mob just spawned, finalized and in\n/// no level yet, to read through `host`; `reason` and `spawner` say why and from what it spawned\n/// (`spawner` is none but for a spawner block's mobs); `vanilla` is the limit the species has. Answer\n/// `Some(limit)` to replace it and `None` to leave it to the next part and then to vanilla's. The\n/// first part to answer wins, in dispatch order, and the group stops growing once its size reaches\n/// the limit, so a limit of 0 or 1 ends it with the mob just spawned. The host is the read-only\n/// one: a listener runs on replayed ticks and must be a pure function of its inputs.\nfn spawn_cluster_size(&self, host: &dyn Host, mob: UnspawnedMobRef, reason: SpawnReason, spawner: Option<SpawnSource>, vanilla: u32) -> Option<u32> {{ let _ = (host, mob, reason, spawner, vanilla); None }}\n/// Whether `entity` can be sheared now with `shears` (NeoForge's `IShearable.isShearable`), asked\n/// where a player's shears (`player` is who holds them) or a dispenser's (`player` none) meet it,\n/// before the `player_shear_entity` or `block_shear_entity` hook. The first part to answer wins, in\n/// dispatch order: `Some(true)` shears it through [`EntityPart::on_sheared`] in place of the\n/// species' own shearing, `Some(false)` leaves it unsheared (a player's click then does nothing),\n/// and `None` leaves it to the next part and then to the species. Server-side.\nfn is_shearable(&self, host: &dyn Host, entity: EntityRef, player: Option<PlayerRef>, shears: &ItemStack) -> Option<bool> {{ let _ = (host, entity, player, shears); None }}\n/// Shears `entity` (NeoForge's `IShearable.onSheared`): called on the part whose\n/// [`EntityPart::is_shearable`] said `Some(true)`, once the shear hooks let it through. Change\n/// the entity and play its sound here, and return the drops: the game spawns each as\n/// `spawnShearedDrop` does (one block above the entity's feet, with a small random push), posts\n/// the shear game event and damages the shears. Server-side.\nfn on_sheared(&self, host: &mut dyn ServerHost, entity: EntityRef, player: Option<PlayerRef>, shears: &ItemStack) -> Vec<ItemStack> {{ let _ = (host, entity, player, shears); Vec::new() }}\n}}\n{dispatch}",
         part("BlockPart"),
         part("BlockEntityPart"),
         part("ItemPart"),
         part("MenuPart"),
         part("FluidPart"),
+        part("EntityPart"),
     );
     let code = complete_hook_constants(code, "Hooks", "hook_ids", "HookId")?;
     let (host, goal_view) = host::generate(root)?;
@@ -639,7 +634,7 @@ thread_local! {
 
 /// Tracks the stager's stamp, `.horizon-source-staged`, only in a staged copy. Cargo reruns a build
 /// script on every build while a tracked path is missing, so tracking an absent stamp rebuilt
-/// horizon-mod-points, horizon-client and every crate above them on each `cargo` invocation of an
+/// horizon-client and every crate above it on each `cargo` invocation of an
 /// ordinary checkout. A stamp never appears in a tree that was already built: staging writes it
 /// first, into a fresh copy, and refuses a tree that already has one.
 pub(crate) fn rerun_if_staged(root: &std::path::Path) {
@@ -662,19 +657,20 @@ pub(crate) fn rerun_if_changed(path: &impl std::fmt::Display) {
     }
 }
 pub use wire::generate_host as generate_wire_host;
+pub mod functions;
 pub mod internals;
 pub mod internals_view;
 pub mod loops;
 pub mod notes;
 pub mod patch;
-pub mod points;
 pub mod replace;
 pub(crate) mod source;
 pub mod staging;
-pub use build::{generate, generate_points, generate_render, write_if_changed};
+pub mod surface;
+pub use build::{generate, generate_api_snapshot, generate_render, write_if_changed};
 pub use notes::generate as generate_hook_notes;
 mod staged;
-pub use staged::{MODS_STAGE, staged_mods};
+pub use staged::{MODS_STAGE, mob_turn, staged_mods};
 
 /// Generate the dispatch test fixture without preventing xtask from filling new placeholders.
 #[doc(hidden)]
@@ -701,7 +697,12 @@ mod tests {
             .iter()
             .find(|p| p.name == "render_frame_pre")
             .unwrap();
-        assert_eq!(frame.version, 1);
+        assert_eq!(frame.version, 2);
+        let post = points
+            .iter()
+            .find(|p| p.name == "render_frame_post")
+            .unwrap();
+        assert_eq!(post.version, 2);
         assert_eq!(
             frame.target,
             "horizon_client::game::native_hooks::render_frame_pre::Game<'_>::native_render_frame_pre"
@@ -716,6 +717,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn fragment_hooks_generate() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = super::Catalog::load(&root).unwrap();
@@ -885,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn only_a_game_hooks_placeholder_body_is_filled() {
         let fill = |body: &str, in_game: bool| {
             let method: syn::ItemFn = syn::parse_str(&format!(
@@ -938,6 +941,7 @@ mod tests {
     /// generator brings back the shipped file byte for byte with the generated
     /// code unchanged.
     #[test]
+    #[ignore = "daily"]
     fn new_hook_placeholder_is_reported_then_filled() {
         fn copy(from: &std::path::Path, to: &std::path::Path) {
             if from.is_dir() {
@@ -1013,9 +1017,9 @@ mod tests {
         std::fs::write(&first, original).unwrap();
         let hooks = root.join("crates/horizon-client/src/game/native_hooks/item_picked_up.rs");
         let shipped = std::fs::read_to_string(&hooks).unwrap();
-        let call = "self.fire_item_picked_up(player, item, count, can_pickup);";
+        let call = "self.fire_item_picked_up(player, item, can_pickup);";
         assert_eq!(shipped.matches(call).count(), 1);
-        let unfinished = shipped.replace(call, "let _ = (player, item, count);");
+        let unfinished = shipped.replace(call, "let _ = (player, item);");
         std::fs::write(&hooks, &unfinished).unwrap();
         assert!(
             super::fill_hooks(&root)
@@ -1023,7 +1027,7 @@ mod tests {
                 .starts_with("missing dispatch_item_picked_up call in native_item_picked_up: ")
         );
         assert_eq!(std::fs::read_to_string(&hooks).unwrap(), unfinished);
-        let placeholder = shipped.replace(call, "let _ = (player, item, count, can_pickup);");
+        let placeholder = shipped.replace(call, "let _ = (player, item, can_pickup);");
         std::fs::write(&hooks, &placeholder).unwrap();
         assert_eq!(
             super::sources(&root, super::FillMode::Require).unwrap_err(),
@@ -1071,14 +1075,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(decoy).unwrap(), decoy_source);
         assert_eq!(lf(&std::fs::read_to_string(&hooks).unwrap()), lf(&shipped));
-        assert_eq!(
-            super::sources(&root, super::FillMode::Require)
-                .unwrap()
-                .hooks,
-            super::sources(&real, super::FillMode::Require)
-                .unwrap()
-                .hooks,
-        );
+        // Parsing the sources is the slow part, so each tree is parsed once.
+        let filled = super::sources(&root, super::FillMode::Require).unwrap();
+        let shipped_sources = super::sources(&real, super::FillMode::Require).unwrap();
+        assert_eq!(filled.hooks, shipped_sources.hooks);
         std::fs::remove_dir_all(root).unwrap();
     }
 

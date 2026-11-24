@@ -39,9 +39,9 @@ fn observed_overlay_id(overlays: &[(bool, &'static str)]) -> Option<&'static str
 }
 
 impl Game<'_> {
-    pub(super) fn observed_screen_view(&self) -> Option<ScreenView<'_>> {
+    fn observed_prefix_screen_id(&self) -> Option<&'static str> {
         let book = self.book.as_ref().map(super::books::BookScreen::id);
-        let overlay = observed_overlay_id(&[
+        observed_overlay_id(&[
             (self.command_prompt.is_some(), "command_prompt"),
             (self.link_prompt.is_some(), "link_prompt"),
             (self.code_of_conduct.is_some(), "code_of_conduct"),
@@ -49,8 +49,26 @@ impl Game<'_> {
             (self.dialog_open(), "dialog"),
             (book.is_some(), book.unwrap_or("book_view")),
             (self.sign_edit.is_some(), "sign_editor"),
-        ]);
-        let Some(id) = overlay else {
+        ])
+    }
+
+    /// Classify the live screen without constructing a render/input view.
+    pub(super) fn current_screen_parts(&self) -> Option<(&'static str, Option<&str>)> {
+        if let Some(id) = self.observed_prefix_screen_id() {
+            return Some((id, None));
+        }
+        if self.remote_screen_up() {
+            return None;
+        }
+        let screen = self.screen;
+        if screen != Screen::Playing {
+            return Some((screen.id(), self.screen_menu(screen)));
+        }
+        self.title.as_ref().map(|title| (title.mode.id(), None))
+    }
+
+    pub(super) fn observed_screen_view(&self) -> Option<ScreenView<'_>> {
+        let Some(id) = self.observed_prefix_screen_id() else {
             return self.screen_view_now();
         };
         let renderer = self.renderer.as_ref()?;
@@ -99,6 +117,9 @@ impl Game<'_> {
         }
         if self.screen == screen && owner.is_none() {
             return;
+        }
+        if self.screen == Screen::Options {
+            self.ui.options.discard_draw();
         }
         self.apply_screen_with_mod_book(screen, owner);
     }
@@ -192,7 +213,7 @@ impl Game<'_> {
         let none = screen == Screen::Playing;
         ScreenView::from(mod_api::__private::built::ScreenView {
             id: screen.id(),
-            menu: self.remote_menu_type().filter(|m| !none && !m.is_empty()),
+            menu: self.screen_menu(screen),
             title: self
                 .remote
                 .as_ref()
@@ -473,6 +494,16 @@ fn posed_camera(
     )
 }
 
+/// A mod's camera roll (`native_camera_roll`), in degrees, within a turn (-360 to 360): one that
+/// isn't finite is none. Every reader (the view, the billboards, the name tags) then turns by
+/// the same small angle, where a huge one would round differently in each. Neither bounded nor
+/// scaled by Distortion Effects, unlike a shake: it is the camera's pose.
+fn posed_roll(roll: f32) -> f32 {
+    let turn = if roll.is_finite() { roll % 360.0 } else { 0.0 };
+    // -0 (a whole number of turns the other way) is no roll, as 0.
+    if turn == 0.0 { 0.0 } else { turn }
+}
+
 /// The largest turn a shake gives, in degrees, on each axis.
 const SHAKE_MAX_DEGREES: f32 = 10.0;
 /// The largest offset a shake gives, in blocks, along each axis.
@@ -491,7 +522,7 @@ fn shake_pose(shake: Shake) -> glam::Mat4 {
         * glam::Mat4::from_rotation_y(shake.yaw.to_radians())
 }
 
-/// The mod screen open on this client: the block it is for, the key its
+/// The mod screen open on this client: its block if it has one, the key its
 /// slots are under, the window id of its menu, the menu's data slots as
 /// the server sent them, and what the server sent before the menu opened
 /// (`horizon:menu_extra`), when it did.
@@ -499,7 +530,7 @@ pub(super) struct OpenNativeScreen {
     pub(super) layout_revision: u64,
     key: Pos,
     window: i32,
-    block: String,
+    block: Option<String>,
     screen: mod_api::Screen,
     data: Vec<i32>,
     extra: Option<horizon_protocol::menu_extra::Message>,
@@ -510,8 +541,10 @@ impl OpenNativeScreen {
     /// block its slots are under (a server without `horizon:menu_extra`).
     fn pos(&self) -> Option<[i32; 3]> {
         match &self.extra {
-            Some(extra) => Some(extra.pos),
-            None if self.key.0 != i32::MIN => Some([self.key.0, self.key.1, self.key.2]),
+            Some(extra) => extra.pos,
+            None if self.block.is_some() && self.key.0 != i32::MIN => {
+                Some([self.key.0, self.key.1, self.key.2])
+            }
             None => None,
         }
     }
@@ -596,6 +629,34 @@ pub(crate) struct NativeRecipeView {
     pub(crate) note: String,
     /// The action button beside it: none, enabled, or shown greyed.
     pub(crate) action: Option<bool>,
+}
+
+impl From<mod_api::RecipeView> for NativeRecipeView {
+    /// A recipe a mod shows through `RecipesClientHost::panel_recipes`, field for field.
+    fn from(view: mod_api::RecipeView) -> Self {
+        Self {
+            layout: match view.layout {
+                mod_api::RecipeLayout::Grid => NativeRecipeLayout::Grid,
+                mod_api::RecipeLayout::Cooking => NativeRecipeLayout::Cooking,
+                mod_api::RecipeLayout::Single => NativeRecipeLayout::Single,
+                mod_api::RecipeLayout::Smithing => NativeRecipeLayout::Smithing,
+                mod_api::RecipeLayout::Brewing => NativeRecipeLayout::Brewing,
+            },
+            width: view.width,
+            height: view.height,
+            slots: view.slots,
+            results: (view.results.into_iter())
+                .map(|r| NativeRecipeResult {
+                    stacks: r.stacks,
+                    chance: r.chance,
+                })
+                .collect(),
+            fluid_inputs: view.fluid_inputs,
+            fluid_outputs: view.fluid_outputs,
+            note: view.note,
+            action: view.action,
+        }
+    }
 }
 
 /// An item of [`NativeRecipes::items`], by its index there, with a count
@@ -833,26 +894,14 @@ impl Game<'_> {
         .into_iter()
         .any(mod_api::__private::listened)
     }
-    /// `Render.Pre`, then `Render.Background` unless it cancelled: whether the
-    /// screen draws.
+    /// `Render.Pre`: whether the screen draws. The screen owns its later phases.
     pub(super) fn screen_render_begin(&self, draw: &mut HudBatch, screen: &ScreenView<'_>) -> bool {
         let mut canceled = false;
         self.native_screen_render_pre(draw, screen, &mut canceled);
-        if !canceled {
-            self.native_screen_render_background(draw, screen);
-        }
         !canceled
     }
-    /// `Render.Foreground` when the screen `drawn`, then `Render.Post`.
-    pub(super) fn screen_render_end(
-        &self,
-        draw: &mut HudBatch,
-        screen: &ScreenView<'_>,
-        drawn: bool,
-    ) {
-        if drawn {
-            self.native_screen_render_foreground(draw, screen);
-        }
+    /// `Render.Post`, including when Pre cancelled the screen's drawing.
+    pub(super) fn screen_render_end(&self, draw: &mut HudBatch, screen: &ScreenView<'_>) {
         self.native_screen_render_post(draw, screen);
     }
     /// The open screen as a native mod sees it (`ScreenView`): its id,
@@ -863,13 +912,23 @@ impl Game<'_> {
     pub(super) fn screen_view(&self, batch: &HudBatch, screen: Screen) -> ScreenView<'_> {
         self.screen_view_at(screen, self.screen_rect(batch, screen))
     }
+
+    /// Only the inventory screen renders a server-opened container.
+    fn screen_menu(&self, screen: Screen) -> Option<&str> {
+        if screen == Screen::Inventory {
+            self.remote_menu_type().filter(|menu| !menu.is_empty())
+        } else {
+            None
+        }
+    }
+
     /// `screen_view` with the panel `rect` the caller is laying out: the
     /// container build tells a mod the panel it is about to draw, not the one
     /// the previous frame drew.
     pub(super) fn screen_view_at(&self, screen: Screen, rect: [f32; 4]) -> ScreenView<'_> {
         ScreenView::from(mod_api::__private::built::ScreenView {
             id: screen.id(),
-            menu: self.remote_menu_type().filter(|m| !m.is_empty()),
+            menu: self.screen_menu(screen),
             title: self.remote.as_ref().and_then(|r| r.menu_title_snapshot()),
             rect,
             slots: self.slot_count(),
@@ -1286,7 +1345,7 @@ pub(super) fn use_totem(level: DamageLevel<'_>, hurting: Hurting<'_>, off_hand: 
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
     let hand = if off_hand { Hand::Off } else { Hand::Main };
     let mut cancel = false;
-    HitLevel(level).native_living_use_totem(
+    HitLevel::new(level).native_living_use_totem(
         entity,
         kind,
         &source,
@@ -1301,7 +1360,16 @@ pub(super) fn use_totem(level: DamageLevel<'_>, hurting: Hurting<'_>, off_hand: 
 /// own attachments. Not `GameLevel`, which a hit can't build: a mob's hit lands in the mob
 /// tick, where the world is read by every mob and its random is lent out, and building one
 /// per hit would allocate its entity boxes.
-pub(super) struct HitLevel<'a>(pub(super) DamageLevel<'a>);
+pub(super) struct HitLevel<'a>(
+    pub(super) DamageLevel<'a>,
+    pub(super) Option<&'a mod_api::SweptEntity>,
+);
+
+impl<'a> HitLevel<'a> {
+    pub(in crate::game) fn new(level: DamageLevel<'a>) -> Self {
+        Self(level, None)
+    }
+}
 
 /// Let listeners override the vanilla invulnerability decision for this hit.
 pub(super) fn invulnerability_check(
@@ -1314,7 +1382,7 @@ pub(super) fn invulnerability_check(
     }
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
     let mut invulnerable = vanilla;
-    HitLevel(level).native_entity_invulnerability_check(
+    HitLevel::new(level).native_entity_invulnerability_check(
         entity,
         kind,
         &source,
@@ -1342,15 +1410,17 @@ pub(super) fn incoming_damage(
         return false;
     };
     let mut snapshot = (*container).try_into_api().expect("scalar damage snapshot");
-    HitLevel(level).native_living_incoming_damage(mod_api::__private::LivingIncomingDamageCall {
-        entity,
-        kind,
-        source: &source,
-        victim: &victim,
-        weapon: weapon.as_ref(),
-        container: &mut snapshot,
-        canceled: &mut canceled,
-    });
+    HitLevel::new(level).native_living_incoming_damage(
+        mod_api::__private::LivingIncomingDamageCall {
+            entity,
+            kind,
+            source: &source,
+            victim: &victim,
+            weapon: weapon.as_ref(),
+            container: &mut snapshot,
+            canceled: &mut canceled,
+        },
+    );
     *container = snapshot
         .try_into_engine(&())
         .expect("scalar damage snapshot");
@@ -1368,7 +1438,7 @@ pub(super) fn damage_pre(
     }
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
     let mut snapshot = (*container).try_into_api().expect("scalar damage snapshot");
-    HitLevel(level).native_living_damage_pre(entity, kind, &source, &mut snapshot);
+    HitLevel::new(level).native_living_damage_pre(entity, kind, &source, &mut snapshot);
     *container = snapshot
         .try_into_engine(&())
         .expect("scalar damage snapshot");
@@ -1385,7 +1455,7 @@ pub(super) fn damage_post(
     }
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
     let snapshot = (*container).try_into_api().expect("scalar damage snapshot");
-    HitLevel(level).native_living_damage_post(entity, kind, &source, &snapshot);
+    HitLevel::new(level).native_living_damage_post(entity, kind, &source, &snapshot);
 }
 
 /// `native_living_shield_block` for the damage code. Its one
@@ -1398,7 +1468,7 @@ pub(super) fn shield_block(
     block: &mut ShieldBlock,
 ) {
     let (entity, kind, source) = hurt_server_args(hurting, level.attack());
-    HitLevel(level).native_living_shield_block(
+    HitLevel::new(level).native_living_shield_block(
         entity,
         kind,
         &source,
@@ -1453,7 +1523,10 @@ impl Game<'_> {
             attacker,
             held,
             projectile: None,
+            projectile_is_arrow: false,
             direct: None,
+            position: None,
+            projectile_weapon: None,
             player_uuid,
         }
     }
@@ -1479,36 +1552,35 @@ pub(super) fn knockback(level: DamageLevel<'_>, pushed: Hurting<'_>, knock: &mut
     if !mod_api::__private::listened(mod_api::HookId::LivingKnockback) {
         return false;
     }
+    let attack = level.attack();
     let attacker = match &pushed {
         Hurting::Mob(mob, damage) => match damage.attacker.or(mob.ai.last_hurt_by) {
             Some(Who::Mob(id)) => id as i32,
-            _ => level.attack().attacker,
+            _ => attack.attacker,
         },
         Hurting::Player(_, source)
         | Hurting::Dragon(_, source)
         | Hurting::ArmorStand(_, source)
-        | Hurting::Entity(_, _, source) => {
-            if source.causing != 0 {
-                source.causing
-            } else {
-                level.attack().attacker
-            }
-        }
+        | Hurting::Entity(_, _, source) => match source.causing {
+            0 => attack.attacker,
+            causing => causing,
+        },
     };
-    let attack = level.attack();
     let (entity, kind, source) = hurt_server_args(pushed, level.attack());
     let mut canceled = false;
     let [main, off] = &attack.held;
     let (Ok(main), Ok(off)) = (main.try_into_api(), off.try_into_api()) else {
         return false;
     };
-    HitLevel(level).native_living_knockback(mod_api::__private::LivingKnockbackCall {
+    let entry = level.knockback_entry();
+    HitLevel::new(level).native_living_knockback(mod_api::__private::LivingKnockbackCall {
         entity,
         kind,
         source: &source,
         attacker,
         attacker_main: main.as_ref(),
         attacker_off: off.as_ref(),
+        entry,
         strength: &mut knock.strength,
         x: &mut knock.x,
         z: &mut knock.z,
@@ -1526,6 +1598,7 @@ pub(super) const DAMAGE_HOOKS: DamageHooks = DamageHooks {
     knockback: Some(knockback),
     totem: Some(use_totem),
     shield: Some(shield_block),
+    accepted: Some(living_death::capture_hit),
 };
 /// The contacts of a simulating entity with a block, as the simulation's own code (client-lib)
 /// reports them.
@@ -1559,18 +1632,18 @@ pub(super) const BLOCK_CONTACT_HOOKS: horizon_client::block_contact::Hooks =
         bounce_listens: |state| {
             crate::game::api_values::block_state::block_listens(mod_api::HookId::BounceOn, state)
         },
-        inside_fire: |level, dimension, entity, kind, state, pos, precise, staged, writes| {
+        inside_fire: |level, dimension, contact, precise, swept, staged, writes| {
             // The whole callback is staged: a panic is contained and the walk
-            // keeps the caller's collector and write list as they were (#2247's
+            // keeps the caller's collector and write list as they were (arismoko/horizon#2247's
             // rule: a mod's panic never breaks the model).
             let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                HitLevel(level.reborrow()).native_entity_inside(
+                HitLevel(level.reborrow(), Some(swept)).native_entity_inside(
                     crate::game::native_hooks::fire::EntityInsideCall {
                         dimension,
-                        entity,
-                        kind,
-                        state,
-                        pos,
+                        entity: contact.entity,
+                        kind: contact.kind,
+                        state: contact.state,
+                        pos: contact.position,
                         precise,
                         effects: staged,
                         writes,
@@ -1586,7 +1659,7 @@ pub(super) const BLOCK_CONTACT_HOOKS: horizon_client::block_contact::Hooks =
             }
         },
         fall_on: |dimension, level, c, distance, damage, writes| {
-            HitLevel(level.reborrow()).native_fall_on(
+            HitLevel::new(level.reborrow()).native_fall_on(
                 crate::game::native_hooks::fire::FallOnCall {
                     dimension,
                     entity: c.entity,
@@ -1601,7 +1674,7 @@ pub(super) const BLOCK_CONTACT_HOOKS: horizon_client::block_contact::Hooks =
         },
         bounce_on: |dimension, level, c, fall_distance, movement| {
             let mut answer = [movement.x, movement.y, movement.z];
-            HitLevel(level.reborrow()).native_bounce_on(
+            HitLevel::new(level.reborrow()).native_bounce_on(
                 crate::game::native_hooks::fire::BounceOnCall {
                     dimension,
                     entity: c.entity,
@@ -1615,46 +1688,8 @@ pub(super) const BLOCK_CONTACT_HOOKS: horizon_client::block_contact::Hooks =
             *movement = horizon_core::geometry::Vec3::new(answer[0], answer[1], answer[2]);
         },
     };
-
-/// `native_living_incoming_damage`'s entity, entity type and source for a hit.
-fn hurt_server_args<'a>(hurting: Hurting<'a>, attack: &Attack) -> (i32, &'a str, HurtSource<'a>) {
-    match hurting {
-        Hurting::Player(entity, source) => (entity, "minecraft:player", source),
-        Hurting::Mob(mob, damage) => (
-            mob.id as i32,
-            mob.kind.id.as_str(),
-            mob_source(damage, attack),
-        ),
-        Hurting::Dragon(entity, source) => (entity, "minecraft:ender_dragon", source),
-        Hurting::ArmorStand(entity, source) => (entity, "minecraft:armor_stand", source),
-        Hurting::Entity(entity, kind, source) => (entity, kind, source),
-    }
-}
-/// A mob's damage as its `DamageSource`: the causing entity is known when it
-/// is a mob, or the player whose attack the level lends. The direct entity is
-/// the attacker in melee, or the projectile when this damage type names one
-/// (`arrow`, `wither_skull`). `magic()` does not, even during the impact.
-fn mob_source(damage: &Damage, attack: &Attack) -> HurtSource<'static> {
-    let causing = match damage.attacker {
-        Some(Who::Mob(id)) => id as i32,
-        Some(Who::Player) => attack.attacker,
-        None => 0,
-    };
-    let damage_type = super::creatures::source_damage_type(*damage);
-    let melee = super::creatures::melee(damage.kind);
-    HurtSource {
-        damage_type,
-        causing,
-        direct: if let Some(direct) = attack.direct {
-            direct
-        } else if melee {
-            causing
-        } else {
-            attack.projectile_direct(damage_type)
-        },
-        position: damage.from,
-    }
-}
+pub(super) use horizon_client::health::mob_source;
+pub(super) use living_death::hurt_server_args;
 
 /// Whether `id` is a sound event's id, `namespace:path` as `Identifier`
 /// allows: the namespace of `[a-z0-9_.-]`, the path also with `/`.
@@ -1843,7 +1878,7 @@ impl GameLevel<'_> {
         self.native_particles
             .push(super::lan_particles::QueuedParticle {
                 dimension: dimension_id(self.dimension),
-                options: options.clone(),
+                options: options.clone().into(),
                 state,
                 at,
                 spread,
@@ -1866,13 +1901,16 @@ impl GameLevel<'_> {
     /// Creates a declared state-aware block entity from its actual state. No answer
     /// means no entity; the registered declaration owns its type identity.
     pub(super) fn new_block_entity_for_state(&self, state: BlockStateId) -> Option<BlockEntity> {
-        let name = &self.registry.state(state)?.name;
+        let state_info = self.registry.state(state)?;
+        let name = &state_info.name;
         if self.world.block_entities.stateful_entity(state.0) {
             let mut nbt = None;
             self.native_block_entity(name, state, &mut nbt);
             return block_entity_for_block(self.registry, self.facts, name, nbt?);
         }
-        self.new_block_entity(name)
+        let mut entity = self.new_block_entity(name)?;
+        entity.apply_state_mode(state_info.properties.get("mode").map(String::as_str));
+        Some(entity)
     }
     /// Replaces the block at `pos` with `state` through `Level.setBlock`, as
     /// `Game::native_set_block` does for the Host, from a hook that gets the
@@ -1985,6 +2023,14 @@ impl GameLevel<'_> {
     pub(super) fn native_state_block(&self, state: BlockStateId) -> Option<&str> {
         self.registry.state(state).map(|s| &*s.name)
     }
+    /// Property `key` of block state `state` (a machine's `facing`), if it
+    /// has one, as `native_state_with_property`'s partner read. A registry
+    /// lookup, no access to the world: cheap even from a hook that only gets
+    /// a `LevelHost` (`block_signal`, `is_signal_source`). None for an
+    /// unknown state or a property it doesn't have.
+    pub(super) fn native_state_property(&self, state: BlockStateId, key: &str) -> Option<&str> {
+        state_property(self.registry, state, key)
+    }
 }
 
 /// `EntityBlock.newBlockEntity` of block `name`: a declared mod type starting
@@ -2083,7 +2129,7 @@ impl Game<'_> {
     }
     /// The item entities of the server level `dimension` whose box meets
     /// the box `min`..`max`, in the level's order: vanilla's
-    /// `Level.getEntitiesOfClass(ItemEntity.class, box, ENTITY_STILL_ALIVE)`, as a
+    /// `EntityGetter.getEntitiesOfClass(ItemEntity.class, box, ENTITY_STILL_ALIVE)`, as a
     /// hopper's `getItemsAtAndAbove` asks for its block and the one above
     /// (`[x, y, z]`..`[x + 1, y + 2, z + 1]`). Empty for a level not in place
     /// (as `native_set_block`) and on a client of a server.
@@ -2216,7 +2262,7 @@ impl Game<'_> {
     /// Whether a box in `corner` shows: F3's debug screen takes both top
     /// corners (its left and right columns), and a bottom corner while one
     /// of its charts is drawn there.
-    pub(super) fn native_corner_shown(&self, corner: Corner) -> bool {
+    pub(in crate::game) fn native_corner_shown(&self, corner: Corner) -> bool {
         let charts = self.debug_charts.corners(!self.has_singleplayer_server());
         !debug_takes(corner, self.debug, charts)
     }
@@ -2359,7 +2405,7 @@ impl Game<'_> {
 
 /// A mob's kind as the hook points name it (`minecraft:zombie`).
 pub(super) fn mob_kind(mob: &horizon_client::mobs::Mob) -> String {
-    ["minecraft:", mob.kind.id.trim_start_matches("minecraft:")].concat()
+    crate::game::native_namespaced_id::namespaced(&mob.kind.id)
 }
 
 /// The level behaviour's answer, or `None` to try `useWithoutItem`.
@@ -2705,6 +2751,20 @@ impl Game<'_> {
             return;
         }
         let dimension = self.dim.id();
+        if let Some(host) = self.lan.as_mut() {
+            host.hub
+                .terrain_residency_changed(loaded.iter().map(|&(x, z, _)| (x, z)));
+            let lit = self
+                .world
+                .light_log
+                .iter()
+                .flat_map(|log| log.keys().copied());
+            host.hub.warm_admitted_terrain(
+                &self.world,
+                &self.streaming,
+                loaded.iter().map(|&(x, z, _)| (x, z)).chain(lit),
+            );
+        }
         for (x, z, new) in loaded {
             self.native_chunk_load(dimension, [x, z], new);
         }
@@ -2718,6 +2778,10 @@ impl Game<'_> {
             return;
         }
         let dimension = self.dim.id();
+        if let Some(host) = self.lan.as_mut() {
+            host.hub
+                .terrain_residency_changed(unloaded.iter().map(|chunk| (chunk.x, chunk.z)));
+        }
         for chunk in unloaded {
             self.native_chunk_and_block_entities_unload(dimension, [chunk.x, chunk.z]);
         }
@@ -2731,14 +2795,32 @@ impl Game<'_> {
         if std::mem::replace(&mut host.players_told_left, true) {
             return;
         }
-        let players: Vec<(u128, String)> = host
+        let players: Vec<(u32, u128, String, crate::game::Dim)> = host
             .hub
             .guests
             .iter()
             .filter(|g| g.placed && g.participates_online())
-            .map(|g| (g.uuid, g.name.clone()))
+            .map(|g| {
+                (
+                    g.conn,
+                    g.uuid,
+                    g.name.clone(),
+                    crate::game::Dim::from_id(&g.dimension),
+                )
+            })
             .collect();
-        for (player, name) in players {
+        // They are all still here: each hears of its leave first, then of its logout, in the
+        // level they are in.
+        let back = self.dim;
+        for (conn, player, name, level) in &players {
+            if self.enter_level(*level).is_ok() {
+                self.announce_player_leaving(*conn, *player, name, "Server closed");
+            }
+        }
+        if let Err(e) = self.enter_level(back) {
+            log::error!("could not reopen {}: {e}", back.id());
+        }
+        for (_, player, name, _) in players {
             self.native_player_logged_out(player, &name);
         }
     }
@@ -3109,7 +3191,10 @@ impl Game<'_> {
                 );
             }
         }
-        self.native_screen_draw(&s.block, &s.data, batch, [ox, oy]);
+        if let Some(block) = &s.block {
+            self.native_screen_draw(block, &s.data, batch, [ox, oy]);
+        }
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         if s.screen.own_labels {
             return true;
         }
@@ -3121,44 +3206,6 @@ impl Game<'_> {
         let label_y = oy + s.screen.inventory_y - 11.0;
         batch.text(atlas, &inventory, ox + 8.0, label_y, grey, false);
         true
-    }
-    /// The tick of the mod block entity at `pos`.
-    pub(super) fn tick_mod_block_entity_loaded(&mut self, pos: Pos) {
-        let Some(BlockEntity::Mod(m)) = self.world.block_entities.get_mut(&pos) else {
-            return;
-        };
-        // An empty id marks its place while the mod has it.
-        let mut taken = std::mem::take(&mut **m);
-        let placeholder_identity = m.revision().identity();
-        let state = self.world.block(pos.0, pos.1, pos.2).0;
-        let slots = self
-            .world
-            .block_entities
-            .mod_container(state)
-            .map_or(0, |c| c.slots);
-        // Grown only: items a container no longer has room for stay saved.
-        if taken.items.len() < slots {
-            taken.items.resize(slots, None);
-        }
-        let items = taken.items.clone();
-        // Without a container, an `Items` item list is the mod's own field.
-        if slots == 0 && !taken.items.is_empty() {
-            let items = horizon_client::save::encode_items(&std::mem::take(&mut taken.items));
-            taken.nbt.insert("Items".into(), items);
-        }
-        let parent = (
-            self.block_entity_tick_key
-                .replace(super::block_entity_tick_items::Key {
-                    pos,
-                    placeholder_identity,
-                    failure_generation: self.wasm_dispatch_failures.get(),
-                    transaction_depth: self.transactions.len(),
-                    unbalanced: false,
-                }),
-            self.block_entity_tick_items.take(),
-        );
-        self.api_block_entity_tick([pos.0, pos.1, pos.2], &mut taken);
-        self.finish_tick_item_writeback(pos, taken, &items, parent);
     }
     /// Puts back a mod block entity taken out for a call, unless the call
     /// removed or replaced it, with what its `setChanged` does.
@@ -3180,7 +3227,7 @@ impl Game<'_> {
                 self.container_changed(pos);
             }
         } else {
-            self.drop_unreturned_mod_contents(pos, taken);
+            self.drop_unreturned_tick_contents(pos, taken);
         }
     }
     /// Menu button `id` on the mod container at `pos` (`clickMenuButton`),
@@ -3209,6 +3256,7 @@ impl Game<'_> {
     /// data, for its press and tooltip hooks.
     fn native_screen_at(&self) -> Option<(String, Vec<i32>, [f32; 2])> {
         let s = self.shown_native_screen()?;
+        let block = s.block.as_ref()?;
         let r = self.renderer.as_ref()?;
         let batch = HudBatch::new(
             [r.config.width, r.config.height],
@@ -3216,7 +3264,7 @@ impl Game<'_> {
         );
         let (ox, oy) = self.inventory_origin(&batch);
         let at = [self.cursor.0 - ox, self.cursor.1 - oy];
-        Some((s.block.clone(), s.data.clone(), at))
+        Some((block.clone(), s.data.clone(), at))
     }
     /// A press on the open mod screen's own button (`native_screen_click`)
     /// goes to the server as a menu button click (true).
@@ -3469,6 +3517,14 @@ impl Game<'_> {
         posed
     }
 
+    /// The roll native mods draw this frame with (`native_camera_roll`), in degrees about
+    /// the view direction; 0 when no mod rolls it.
+    pub(super) fn native_camera_roll_now(&self, partial: f32) -> f32 {
+        let mut roll = 0.0;
+        self.native_camera_roll(partial, &mut roll);
+        posed_roll(roll)
+    }
+
     /// What native mods hand shader packs in this frame (`native_shader_params`),
     /// with values that aren't finite as 0.
     pub(super) fn native_shader_params_now(&self, partial: f32) -> [[f32; 4]; 8] {
@@ -3535,6 +3591,20 @@ pub(super) fn with_property(
     }
     s.properties.insert(key.into(), value.into());
     registry.resolve(&s).ok()
+}
+
+/// Property `key` of `state`; none for an unknown state or a property it
+/// doesn't have.
+pub(super) fn state_property<'r>(
+    registry: &'r BlockRegistry,
+    state: BlockStateId,
+    key: &str,
+) -> Option<&'r str> {
+    registry
+        .state(state)?
+        .properties
+        .get(key)
+        .map(String::as_str)
 }
 
 /// The state a mod's property write changes `state` to; none when the block
@@ -3741,7 +3811,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn enchantment_registry_returns_records_and_unknown_cost() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let all = game.enchantments();
@@ -3760,7 +3830,7 @@ mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn translate_gives_the_text_of_a_defined_key_and_none_otherwise() {
         use horizon_client::lang::{Language, ResourceSource, scoped};
         struct Empty;
@@ -3780,7 +3850,7 @@ mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_trait_mod_measures_text_through_its_draw_context() {
         use super::super::host::draw::GameDrawContext;
         use super::super::native_entity_refs::tests::with_game;
@@ -3788,10 +3858,7 @@ mod tests {
 
         with_game(|game| {
             let mut batch = horizon_client::hud::HudBatch::scratch([320, 240]);
-            let draw = GameDrawContext {
-                game,
-                surface: &mut batch,
-            };
+            let draw = GameDrawContext::new(game, &mut batch);
             // A server's HUD atlas is metrics-only (upstream 2e5a2629a): no sprite sheets,
             // while an upper-case A still advances 6 GUI pixels.
             assert_eq!(draw.text_width("AA"), 12.0);
@@ -3800,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn declared_types_create_tick_and_reload_through_game() {
         use super::super::native_entity_refs::tests::{record_key, run_fresh_cases, with_game_at};
         use horizon_client::{chunk::Chunk, containers::BlockEntity, save};
@@ -4011,7 +4078,7 @@ mod tests {
                 let probe = level.capability(game, &PROBE, [x, 64, 0], None).unwrap();
                 assert_eq!((probe.value(), probe.owner()), (6300, "be_user".into()));
                 game.tick_mod_block_entity(pos);
-                let saved = save::encode_block_entity(
+                let saved = save::block_entity_encode::encode(
                     pos,
                     game.world.block_entities.get(&pos).unwrap(),
                     block,
@@ -4024,7 +4091,7 @@ mod tests {
                 assert!(save::decode_block_entity_for_block(&saved, EMPTY).is_none());
                 game.world.block_entities.insert(pos, restored);
                 game.tick_mod_block_entity(pos);
-                let saved = save::encode_block_entity(
+                let saved = save::block_entity_encode::encode(
                     pos,
                     game.world.block_entities.get(&pos).unwrap(),
                     block,
@@ -4053,7 +4120,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn client_host_reads_current_pause_state() {
         use super::super::native_entity_refs::tests::with_game;
         use crate::game::execution_role::ExecutionRole;
@@ -4068,7 +4135,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn client_host_reads_playing_and_key_mappings() {
         use super::super::Screen;
         use super::super::native_entity_refs::tests::with_game;
@@ -4114,12 +4181,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn replacing_mod_block_entity_payload_keeps_its_type_and_saved_identity() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
         use horizon_client::containers::{BlockEntity, ModBlockEntity, ModBlockEntityFields};
-        use horizon_client::save::{decode_block_entity, encode_block_entity};
+        use horizon_client::save::{block_entity_encode, decode_block_entity};
         use std::sync::Arc;
 
         with_game(|game| {
@@ -4150,7 +4217,7 @@ mod tests {
             assert_eq!(machine.data, [7]);
             assert_ne!(machine.revision(), made);
             assert!(game.world.modified.contains(&(0, 0)));
-            let saved = encode_block_entity(pos, entity, "minecraft:stone");
+            let saved = block_entity_encode::encode(pos, entity, "minecraft:stone");
             let (saved_pos, loaded) = decode_block_entity(&saved).unwrap();
             assert_eq!(saved_pos, pos);
             assert_eq!(loaded.id(), "test:machine");
@@ -4196,7 +4263,7 @@ mod tests {
     /// Exercise the gameplay constructor, where name-based entities compete
     /// with a mod block's sign template.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mod_sign_constructor_prioritizes_templates_over_suffixes() {
         // This fixture adds blocks that are absent from the shared vanilla
         // game's frozen process-wide block definitions.
@@ -4257,10 +4324,7 @@ mod tests {
                 jars: Vec::new(),
             }],
             &root,
-            &horizon_mod_package::enabled::EnabledMods::new([(
-                "ruby".into(),
-                horizon_mod_package::Side::Both,
-            )]),
+            &horizon_mod_package::enabled::EnabledMods::new([("ruby".into(), mod_api::Side::Both)]),
         )
         .unwrap();
         let settings = Settings::default();
@@ -4330,7 +4394,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn generated_fire_matches_dispatch() {
         use super::super::{Audio, Game, Options, Progress, Settings, load_resources};
         use mod_api::{ClientHost, Flow, Hooks, ModEntry};
@@ -4440,18 +4504,7 @@ mod tests {
                 }
                 let collect_trace = trace.lock().unwrap().clone();
                 trace.lock().unwrap().clear();
-                let (mut forward, mut strafe, mut jump, mut sneak) = (1.0, 0.0, false, false);
-                if fire {
-                    game.fire_movement_input(&mut forward, &mut strafe, &mut jump, &mut sneak);
-                } else {
-                    mod_api::dispatch_movement_input(
-                        &game,
-                        &mut forward,
-                        &mut strafe,
-                        &mut jump,
-                        &mut sneak,
-                    );
-                }
+                let forward = game.movement_dispatch_fixture(fire);
                 (
                     canceled,
                     cancel_trace,
@@ -4472,7 +4525,7 @@ mod tests {
 
     /// With no window to lay a screen out in there is no slot under the pointer.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn no_item_is_hovered_without_a_window() {
         use super::super::{Audio, Game, Options, Progress, Settings, load_resources};
 
@@ -4594,6 +4647,24 @@ mod tests {
             ),
             (glam::DVec3::new(1.0, 5.0, 3.0), 10.0, 20.0)
         );
+    }
+
+    /// A mod's roll is kept within a turn, however far it turns (no shake bound, no Distortion
+    /// Effects scale), and one that isn't finite is none.
+    #[test]
+    fn a_mod_camera_roll_is_kept_unless_it_isnt_finite() {
+        use super::posed_roll;
+        for roll in [0.0, 22.5, -22.5, 90.0, -180.0, 359.5] {
+            assert_eq!(posed_roll(roll), roll);
+        }
+        // Whole turns go, keeping the sign of what is left; no roll is +0.
+        assert_eq!(posed_roll(382.5), 22.5);
+        assert_eq!(posed_roll(-382.5), -22.5);
+        assert_eq!(posed_roll(1_000_000_000.0), 1_000_000_000.0 % 360.0);
+        assert!(posed_roll(1_000_000_000.0).abs() < 360.0);
+        for roll in [720.0, -720.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(posed_roll(roll).to_bits(), 0.0f32.to_bits(), "{roll}");
+        }
     }
 
     /// A shake is scaled by Distortion Effects, bounded on each axis, and a
@@ -4748,6 +4819,24 @@ mod tests {
             None
         );
     }
+    /// `state_property` (what `LevelHost::state_property` on `GameLevel` and `HitLevel` reads):
+    /// a known state's property, `None` for a property it doesn't have and for an unknown state.
+    #[test]
+    fn state_property_reads_the_registry() {
+        let facts = br#"{"defaults":{"minecraft:air":0,"test:pipe":1},"states":[
+            ["air",true,false,"","minecraft:air"],
+            ["north_gas",false,false,"",{"id":"test:pipe","properties":{"carries":"gas","facing":"north"}}]
+        ]}"#;
+        let registry = horizon_world::registry::BlockRegistry::from_facts_json(&facts[..]).unwrap();
+        use horizon_world::registry::BlockStateId;
+        let (north_gas, unknown) = (BlockStateId(1), BlockStateId(99));
+        assert_eq!(
+            super::state_property(&registry, north_gas, "facing"),
+            Some("north")
+        );
+        assert_eq!(super::state_property(&registry, north_gas, "missing"), None);
+        assert_eq!(super::state_property(&registry, unknown, "facing"), None);
+    }
     /// Both property setters return false for a write that changes nothing:
     /// each goes through `property_change`, none returns true on its own.
     #[test]
@@ -4772,7 +4861,7 @@ mod tests {
             layout_revision: 0,
             key: (0, 0, 0),
             window: 4,
-            block: "gtmod:machine".into(),
+            block: Some("gtmod:machine".into()),
             screen: mod_api::Screen::default(),
             data: Vec::new(),
             extra: None,
@@ -4892,6 +4981,7 @@ mod tests {
                     direct: None,
                     player_uuid: None,
                     held: Default::default(),
+                    ..Default::default()
                 },
             );
             (s.damage_type, s.causing, s.direct)
@@ -4918,6 +5008,7 @@ mod tests {
                     direct: None,
                     player_uuid: None,
                     held: Default::default(),
+                    ..Default::default()
                 },
             );
             (s.damage_type, s.direct)
@@ -5085,7 +5176,7 @@ mod item_fall_on_tests {
     /// Only the inner production loan is exercised: the outer dropped-item pass
     /// is deliberately not claimed to survive this unwind.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated mod registry"]
+    #[ignore = "daily"]
     fn item_fall_on_returns_progressed_level_loan_after_part_panic() {
         let payload = std::sync::Arc::new(());
         let mods: mod_api::Mods = vec![ModEntry::new(
@@ -5163,7 +5254,7 @@ mod item_fall_on_tests {
     /// `minecraft:item`, with the whole fall and no damage; the write the part asks for lands
     /// after the items' batch; and an item resting there lands no more.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_dropped_item_lands_on_a_fall_on_part() {
         let heard = Lands::default();
         let mods: mod_api::Mods = vec![ModEntry::new("lands", Box::new(Mod(heard.clone())))].into();
@@ -5235,6 +5326,7 @@ pub(super) mod particle_count_tests {
             fall_distance: 0.0,
             rotation: [0.0, 0.0],
             join: Default::default(),
+            section_order: 0,
             no_gravity: false,
             id: 1,
             position: at,
@@ -5244,6 +5336,7 @@ pub(super) mod particle_count_tests {
             age: 0,
             on_ground: false,
             count: 1,
+            fire_ticks: 0,
             ticks: 0,
             health: 5,
             air: 300,
@@ -5273,7 +5366,7 @@ pub(super) mod particle_count_tests {
     /// before the next frame is drawn, with no tick in between (a paused or frozen game),
     /// or at the next particle tick. A server answers 0 and refuses the clear.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_client_mod_counts_and_clears_particles() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.options.execution_role = super::ExecutionRole::Client;
@@ -5335,7 +5428,7 @@ pub(super) mod particle_count_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn late_gui_clear_prevents_same_frame_particle_geometry_without_a_tick() {
         let mods: mod_api::Mods =
             vec![mod_api::ModEntry::new("clear_gui", Box::new(ClearInGui))].into();
@@ -5380,7 +5473,7 @@ pub(super) mod particle_count_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_model_callback_clear_discards_particle_geometry_already_extracted() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -5535,6 +5628,11 @@ pub(super) mod particle_count_tests {
             use winit::platform::x11::EventLoopBuilderExtX11;
             builder.with_x11().with_any_thread(true);
         }
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_any_thread(true);
+        }
         let event_loop = builder.build().unwrap();
         #[allow(deprecated)]
         let window = std::sync::Arc::new(
@@ -5636,7 +5734,7 @@ pub(super) mod particle_count_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a display"]
+    #[ignore = "daily"]
     fn fog_clear_reaches_the_complete_frame_consumer() {
         let name = "game::native_hooks::particle_count_tests::fog_clear_reaches_the_complete_frame_consumer";
         if super::super::native_entity_refs::tests::run_fresh_cases(
@@ -5698,7 +5796,7 @@ pub(super) mod particle_count_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a display"]
+    #[ignore = "daily"]
     fn late_clear_removes_native_particle_lights_at_the_frame_consumer() {
         let name = "game::native_hooks::particle_count_tests::late_clear_removes_native_particle_lights_at_the_frame_consumer";
         if super::super::native_entity_refs::tests::run_fresh_cases(

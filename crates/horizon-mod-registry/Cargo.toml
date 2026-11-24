@@ -2,7 +2,7 @@
 name = "horizon-mod-registry"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "LGPL-3.0-or-later"
 rust-version = "1.90"
 publish = false
 description = "The registry's submission service: GitHub sign-in, the file's checks, staging, and a pull request (docs/modding/src/reference/registry-index.md)"
@@ -11,7 +11,8 @@ description = "The registry's submission service: GitHub sign-in, the file's che
 [workspace]
 
 [dependencies]
-horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index"] }
+horizon-addresses = { path = "../horizon-addresses" }
+horizon-platform = { path = "../horizon-platform", features = ["mod-index"] }
 horizon-release-sign = { path = "../horizon-release-sign" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util"] }
@@ -21,6 +22,8 @@ toml = "1"
 # GitHub's API, blocking, on tokio's blocking pool: the launcher's HTTP client.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 hmac = "0.12"
+# Signing the GitHub App's JWT (RS256): already here, under ureq's rustls.
+ring = "0.17"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"

@@ -13,6 +13,8 @@ pub(crate) mod enchantment_damage;
 #[doc(hidden)]
 pub mod enchantments;
 pub(crate) mod energy_capability;
+pub(crate) mod item_component_handlers;
+pub mod mod_slots;
 // hidden: a module of game-side types; mods use their re-exports
 #[doc(hidden)]
 pub mod item_attributes;
@@ -26,6 +28,7 @@ pub mod item_tooltip;
 #[doc(hidden)]
 pub mod menu;
 pub(crate) mod menu_slot;
+pub(crate) mod menu_slot_place;
 // hidden: owned trading values are re-exported at the API root
 #[doc(hidden)]
 pub mod merchant;

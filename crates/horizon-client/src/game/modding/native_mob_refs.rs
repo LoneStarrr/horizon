@@ -1,5 +1,6 @@
 //! Mob handles for native server mods.
 use super::{Game, commands::Target};
+use horizon_client::items::ItemStack;
 use horizon_client::mobs::{self, Mob, Species, Who, ai::brain_target};
 use mod_api::{EntityRef, LivingRef, MobRef};
 
@@ -106,7 +107,7 @@ enum MobFlag {
 impl Game<'_> {
     /// `Mob.asValidTarget` and the modeled `canAttack` overrides: the game's
     /// own state as the target's facts, through the one rule set
-    /// [`Mob::valid_target`] (#1175) a goal tick's view shares.
+    /// [`Mob::valid_target`] (arismoko/horizon#1175) a goal tick's view shares.
     pub(super) fn native_mob_valid_target(&self, mob: &Mob, target: Target) -> bool {
         if mob.species() == Species::Warden {
             return self.native_warden_valid_target(mob, target);
@@ -116,7 +117,11 @@ impl Game<'_> {
                 let Some(other) = self.mobs.iter().find(|m| m.id == id && !m.removed) else {
                     return false;
                 };
-                let seen = [super::creatures::seen(other, self.level.player_uuid)];
+                let seen = [super::creatures::seen(
+                    other,
+                    self.level.player_uuid,
+                    self.items(),
+                )];
                 mob.valid_target(
                     &self.mob_world_base(&seen),
                     &mobs::goals::TargetFacts::Mob {
@@ -207,7 +212,7 @@ impl Game<'_> {
 
     /// The entity as a vanilla Mob: a mob or the ender dragon. Players, armor
     /// stands, stale handles and clients are rejected. Mobs taken out for
-    /// ticking are unavailable (a #29 follow-up).
+    /// ticking are unavailable (a arismoko/horizon#29 follow-up).
     pub(super) fn mob(&self, entity: EntityRef) -> Option<MobRef> {
         match self.native_entity_target(entity)? {
             Target::Mob(_) | Target::Dragon(_) => Some(MobRef::new(entity)),
@@ -252,7 +257,7 @@ impl Game<'_> {
     /// can be stored in the current level are supported; armor stands are
     /// refused. The dragon stores a mob or a player, which its flight ignores
     /// and its save does not keep (vanilla keeps no target either). Brain-backed mobs refuse writes: vanilla's setter
-    /// does not update their brain memory (#934). A fox, an enderman or a
+    /// does not update their brain memory (arismoko/horizon#934). A fox, an enderman or a
     /// zombified piglin stores the target with its own `setTarget` side
     /// effects (`Mob::set_target`).
     /// Invalid targets are refused (false, mob unchanged); vanilla instead
@@ -366,7 +371,7 @@ impl Game<'_> {
     /// `Brain.setMemory(ATTACK_TARGET, target)`, or `eraseMemory` for None:
     /// the target a brain-driven mob — an axolotl, a breeze, a creaking, a
     /// hoglin, a piglin or piglin brute, a warden or a zoglin — reads instead
-    /// of `Mob.setTarget`'s (#934). A plain, non-expiring memory write: the
+    /// of `Mob.setTarget`'s (arismoko/horizon#934). A plain, non-expiring memory write: the
     /// brain's own behaviours act on it from the next tick (a target the
     /// species may not attack is dropped there, as vanilla's
     /// `StopAttackingIfTargetInvalid` drops it), and none of a species' own
@@ -721,6 +726,51 @@ impl Game<'_> {
             .is_some()
     }
 
+    /// `Shearable.shear` with shears on mob `mob`, the dispenser's shearing without its block's events.
+    /// See the host declaration for what it refuses.
+    pub(super) fn mob_shear(&mut self, mob: MobRef) -> bool {
+        let Some(Target::Mob(id)) = self.native_entity_target(mob.entity()) else {
+            return false;
+        };
+        let shears = ItemStack::new("minecraft:shears", 1);
+        match self.mobs.iter().position(|m| m.id == id && !m.removed) {
+            Some(i) => self.shear_mob(i, &shears),
+            None => false,
+        }
+    }
+
+    /// `AbstractPiglin.finishConversion` on mob `mob`: a piglin turns into a zombified piglin in its place
+    /// through the game's own conversion (equipment and loot pickup kept, the nausea after, the pre hook asked).
+    /// See the host declaration for what it refuses.
+    pub(super) fn mob_zombify(&mut self, mob: MobRef) -> bool {
+        let Some(Target::Mob(id)) = self.native_entity_target(mob.entity()) else {
+            return false;
+        };
+        let mut events = Vec::new();
+        {
+            let Some(piglin) = self.mobs.iter_mut().find(|m| m.id == id && !m.removed) else {
+                return false;
+            };
+            if !matches!(piglin.species(), Species::Piglin) {
+                return false;
+            }
+            // `Piglin.finishConversion`: cancel the admiring, drop the inventory.
+            mobs::piglin::finish_conversion_drops(piglin, &mut events);
+        }
+        let _ = self.handle_mob_events(events);
+        let Some(from) = self.mobs.iter().find(|m| m.id == id && !m.removed).cloned() else {
+            return false;
+        };
+        self.convert_to(
+            &from,
+            "minecraft:zombified_piglin",
+            mobs::conversion::Params::KEEP_ALL,
+            false,
+            |_, _| {},
+        )
+        .is_some()
+    }
+
     /// `Mob.canPickUpLoot`, with the overrides of an allay (holding
     /// something) and a sulfur cube (with no block). None for anything but
     /// a mob.
@@ -767,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn redirected_fake_target_is_refused_with_the_original_target_intact() {
         use std::sync::{Arc, Mutex};
         struct Redirect(Arc<Mutex<Option<LivingRef>>>);
@@ -808,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn leash_holder_reads_live_state() {
         use super::super::{boats::Boat, lan::LanSettings};
         use horizon_client::lan::{
@@ -847,6 +897,7 @@ mod tests {
                 max_players: 2,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             game.lan_host(settings, net, config).unwrap();
             let (tx, _rx) = std::sync::mpsc::channel();
@@ -918,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_portal_eligibility_matches_gameplay() {
         with_game(|game| {
             let cow = add_mob(game, 12, "minecraft:cow");
@@ -955,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_flags_custom_persistence_is_independent_of_stored_flags() {
         with_game(|game| {
             let mob = add_mob(game, 12, "minecraft:cow");
@@ -993,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_flags_baby_setter_uses_species_age_and_attribute_boundaries() {
         use mobs::finalize::{Attr, base_value};
 
@@ -1036,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_flags_baby_setter_runs_ghastling_setup_in_both_directions() {
         use mobs::{control::MoveKind, nav::NavKind};
 
@@ -1065,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_flags_baby_setter_refuses_no_baby_species_and_unavailable_mobs() {
         with_game(|game| {
             for (id, name) in [(12, "minecraft:skeleton"), (13, "minecraft:parrot")] {
@@ -1112,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn player_target_round_trips_through_the_mob_binding() {
         use horizon_client::lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig};
         use horizon_protocol::packets::configuration::ClientInformation;
@@ -1141,6 +1192,7 @@ mod tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             };
             game.lan_host(settings, net, config).unwrap();
             let (tx, _rx) = mpsc::channel();
@@ -1292,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fox_enderman_and_zombified_piglin_take_targets_with_their_side_effects() {
         use horizon_core::random::{LegacyRandom, RandomSource};
         with_game(|game| {
@@ -1366,7 +1418,8 @@ mod tests {
             let mut expected = LegacyRandom::new(2026);
             let sound_delay = expected.next_int_bound(21).unwrap();
             let alert_delay = 80 + expected.next_int_bound(41).unwrap();
-            game.mobs.iter_mut().find(|m| m.id == 14).unwrap().random = LegacyRandom::new(2026);
+            game.mobs.iter_mut().find(|m| m.id == 14).unwrap().random =
+                horizon_core::random::EntityRandom::own(LegacyRandom::new(2026));
             assert!(piglin.set_target(game, Some(other)));
             assert_eq!(piglin.target(game), Some(other));
             let first = state(game, 14);
@@ -1386,7 +1439,7 @@ mod tests {
     /// propagated to another piglin. Seed selection fixes the first sound at
     /// one tick; advancing the alert timer avoids waiting four seconds.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn piglin_target_write_drives_anger_sound_and_alert() {
         use horizon_core::random::{LegacyRandom, RandomSource};
         with_game(|game| {
@@ -1408,7 +1461,7 @@ mod tests {
             let seed = (0..10_000)
                 .find(|&seed| LegacyRandom::new(seed).next_int_bound(21) == Ok(1))
                 .unwrap();
-            game.mobs[0].random = LegacyRandom::new(seed);
+            game.mobs[0].random = horizon_core::random::EntityRandom::own(LegacyRandom::new(seed));
             let actor = game.mob(game.entity(12).unwrap()).unwrap();
             let other = game.mob(game.entity(13).unwrap()).unwrap();
             let target = game.living(game.entity(14).unwrap()).unwrap();
@@ -1431,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn brain_species_take_a_written_attack_target_memory() {
         with_game(|game| {
             for (id, name) in [
@@ -1510,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_handles_read_write_and_refuse_unavailable_entities() {
         with_game(|game| {
             let zombie = game
@@ -1606,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn look_and_jump_go_through_the_mobs_own_controls() {
         with_game(|game| {
             let zombie = game
@@ -1653,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_restriction_round_trips_through_the_handle_and_saves() {
         use horizon_core::nbt::Tag;
         with_game(|game| {
@@ -1713,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_extreme_restriction_answers_as_vanilla() {
         with_game(|game| {
             let zombie = game
@@ -1755,7 +1808,102 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn mob_shear_sheds_a_sheeps_wool_once_and_refuses_a_baby() {
+        with_game(|game| {
+            let sheep = game.res.mob_types().get("minecraft:sheep").unwrap().clone();
+            game.mobs.push(Mob::new(12, sheep.clone(), Vec3::ZERO, 0.0));
+            game.mobs.push(Mob::new(13, sheep, Vec3::ZERO, 0.0));
+            let mob = game.mob(game.entity(12).unwrap()).unwrap();
+            let baby = game.mob(game.entity(13).unwrap()).unwrap();
+            assert!(game.mob_set_baby(baby, true));
+            assert!(!game.mob_shear(baby), "a baby sheep has no wool to shed");
+            let before = game.dropped.len();
+            assert!(game.mob_shear(mob));
+            let wool = game.dropped.len() - before;
+            assert!((1..=3).contains(&wool), "{wool} wool items");
+            assert!(game.mobs[0].extra.sheared);
+            assert!(!game.mob_shear(mob), "a sheared sheep gives nothing again");
+            assert_eq!(game.dropped.len() - before, wool);
+            // A stale handle changes no other entity.
+            let stale = MobRef::new(EntityRef::new(
+                WorldEpoch::new(game.entity(12).unwrap().epoch().get() + 1),
+                12,
+            ));
+            assert!(!game.mob_shear(stale));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn mob_zombify_turns_a_piglin_into_a_zombified_piglin_once() {
+        with_game(|game| {
+            let piglin = game
+                .res
+                .mob_types()
+                .get("minecraft:piglin")
+                .unwrap()
+                .clone();
+            game.mobs.push(Mob::new(12, piglin, Vec3::ZERO, 0.0));
+            let mob = game.mob(game.entity(12).unwrap()).unwrap();
+            assert!(game.mob_zombify(mob));
+            assert!(
+                game.mobs.iter().all(|m| m.id != 12 || m.removed),
+                "the piglin is gone"
+            );
+            let zombie = game
+                .mobs
+                .iter()
+                .find(|m| !m.removed && matches!(m.species(), Species::ZombifiedPiglin))
+                .expect("a zombified piglin stands in its place");
+            assert_eq!(zombie.kind.id, "minecraft:zombified_piglin");
+            let zombie_id = zombie.id;
+            // The stale handle and a zombified piglin itself (not a piglin) change nothing.
+            assert!(!game.mob_zombify(mob));
+            let zombie_handle = game.mob(game.entity(zombie_id).unwrap()).unwrap();
+            assert!(!game.mob_zombify(zombie_handle));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn mob_zombify_drops_the_admired_item_and_inventory() {
+        with_game(|game| {
+            let piglin = game
+                .res
+                .mob_types()
+                .get("minecraft:piglin")
+                .unwrap()
+                .clone();
+            let mut m = Mob::new(12, piglin, Vec3::ZERO, 0.0);
+            m.extra.inventory = vec![ItemStack::new("minecraft:gold_nugget", 3)];
+            m.extra.set_slot_id(
+                horizon_items::equipment::OFFHAND,
+                Some("minecraft:gold_ingot".into()),
+            );
+            m.extra.using_item = 60;
+            game.mobs.push(m);
+            let mob = game.mob(game.entity(12).unwrap()).unwrap();
+            assert!(game.mob_zombify(mob));
+            let zombie = game
+                .mobs
+                .iter()
+                .find(|m| !m.removed && matches!(m.species(), Species::ZombifiedPiglin))
+                .expect("a zombified piglin stands in its place");
+            assert!(zombie.extra.off_hand_id().is_none(), "no admired ingot");
+            assert!(zombie.extra.inventory.is_empty());
+            let has = |item: &str, count: u32| {
+                game.dropped
+                    .iter()
+                    .any(|d| d.stack.item.as_ref() == item && d.stack.count == count)
+            };
+            assert!(has("minecraft:gold_ingot", 1), "the admired item drops");
+            assert!(has("minecraft:gold_nugget", 3), "the inventory drops");
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn hand_and_loot_flags_live_on_the_mob_handle() {
         use horizon_core::nbt::Tag;
         with_game(|game| {

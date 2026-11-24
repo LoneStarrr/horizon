@@ -86,6 +86,7 @@ fn a_tall_column_streams_lights_and_meshes_to_its_top() {
         assets: assets.clone(),
         render: render.clone(),
         hidden_states: Arc::from([]),
+        part_tables: Default::default(),
     });
     let state = |name: &str| assets.registry.default_state(name).unwrap().0;
     let (stone, torch) = (state("minecraft:stone"), state("minecraft:torch"));
@@ -143,6 +144,7 @@ fn a_tall_column_streams_lights_and_meshes_to_its_top() {
             shader_pack_lighting: false,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
             zoom: BiomeZoom::new(0),
             blend_radius: 2,
             smooth_lighting: true,
@@ -154,6 +156,7 @@ fn a_tall_column_streams_lights_and_meshes_to_its_top() {
             render: &context.render,
             tables: &context.tables,
             hidden_states: &context.hidden_states,
+            part_tables: &context.part_tables,
             biomes: &context.biomes,
             visibility: context.tables.visibility.clone(),
         };

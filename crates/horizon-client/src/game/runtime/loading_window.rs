@@ -33,7 +33,7 @@ pub(super) fn build_renderer(
     api: horizon_client::graphics::GraphicsApi,
     translucent_batching: bool,
     vsync: bool,
-    // HDR and Smooth Gradients pick the frame, with what the window's display reported to the
+    // HDR picks the frame, with what the window's display reported to the
     // renderer before (`display`, `Renderer::new`).
     settings: &horizon_client::graphics::Graphics,
     shader_pack: shader_packs::PickedPack,
@@ -75,7 +75,7 @@ pub(super) fn build_renderer(
         previous,
         api,
         translucent_batching,
-        shader_pack.draws_flat,
+        (shader_pack.draws_flat, shader_pack.starts_wide),
         settings,
         shader_pack.frame(),
         display,
@@ -99,11 +99,22 @@ pub(super) fn build_renderer(
     renderer
         .hud
         .set_text_shader(&renderer.device, atlas.text_shaders.gui.as_deref());
+    renderer
+        .hud
+        .set_gui_shader(&renderer.device, atlas.gui_shader.as_deref());
+    renderer
+        .hud
+        .set_blit_shader(&renderer.device, atlas.blit_shader.as_deref());
     pack.item_renderer
         .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
     renderer.set_lines_shader(atlas.lines_shader.as_deref());
     renderer.set_world_text_shaders(&atlas.text_shaders);
-    renderer.set_sky_shaders(atlas.sky_shader.as_deref(), atlas.stars_shader.as_deref());
+    renderer.set_sky_shaders(
+        atlas.sky_shader.as_deref(),
+        atlas.stars_shader.as_deref(),
+        atlas.sunrise_shader.as_deref(),
+    );
+    renderer.set_lightmap_shader(atlas.lightmap_shader.as_deref());
     renderer.set_custom_sky(&*pack.custom_sky);
     renderer.set_shared_material_maps(&atlas.material_maps);
     let cit_glints = pack.item_renderer.cit.as_ref().map(|c| &c.glint_textures);
@@ -111,7 +122,11 @@ pub(super) fn build_renderer(
         .hud
         .set_cit_glints(&renderer.device, &renderer.queue, cit_glints);
     // Last, so a renderer that fails before this marks none of the pack's pipelines invalid.
-    renderer.build_mod_pipelines(&pack.render.mod_pipelines)?;
+    // Textured pipelines' sprites are looked up in the atlas the renderer was built with.
+    renderer.build_mod_pipelines(&pack.render.mod_pipelines, &|name| {
+        let r = atlas.sprites.get(name)?;
+        Some([r.u0, r.v0, r.u1, r.v1])
+    })?;
     Ok(renderer)
 }
 
@@ -125,6 +140,8 @@ pub(super) fn loading_renderer(
     panorama: Option<&Arc<horizon_client::gfx::panorama::Faces>>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
+    rays: bool, // The startup pick declares `[ray_tracing]`: the world renderer keeps this device.
+    ray_tracing: horizon_client::graphics::RayTracingMode,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -132,8 +149,9 @@ pub(super) fn loading_renderer(
     let panorama = panorama
         .cloned()
         .unwrap_or_else(|| Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])));
-    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 1), |a| {
-        (a.pixels.as_slice(), a.width, a.height)
+    // `pixels()`: the loading screen keeps them compressed once its renderer has them.
+    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.as_slice().into(), 1, 1), |a| {
+        (a.pixels(), a.width, a.height)
     });
     let (glint_pixels, glint_width, glint_height) = atlas
         .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
@@ -154,7 +172,7 @@ pub(super) fn loading_renderer(
         1,
         &[],
         &[],
-        (pixels, width, height),
+        (&pixels, width, height),
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),
         (&FORCEFIELD[..], 1),
@@ -164,10 +182,16 @@ pub(super) fn loading_renderer(
         api,
         // It draws no terrain.
         false,
-        false,
+        (false, false),
         // An 8-bit frame, which HDR output takes as well: HDR off until the settings apply.
-        &horizon_client::graphics::Graphics::default(),
-        Default::default(),
+        &horizon_client::graphics::Graphics {
+            ray_tracing,
+            ..Default::default()
+        },
+        horizon_client::gfx::FrameRequest {
+            ray_tracing: rays,
+            ..Default::default()
+        },
         previous.map(|r| r.display_reading()).unwrap_or_default(),
     ))?;
     if let Some(atlas) = atlas {
@@ -203,6 +227,7 @@ pub(super) fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         water_plane: None,
         cave_culling: false,
         title: true,
+        gui_only: false,
         sky_blocked: false,
         skybox: false,
         end_sky: false,
@@ -328,6 +353,9 @@ pub(super) fn start_game<'a>(
     // Benchmarks measure the game alone.
     if game.options.benchmark.is_none() {
         game.start_mods();
+        if game.options.execution_role.is_client() {
+            game.configure_chat_history();
+        }
     }
     // The initial load's client reload listeners, registered and staged by
     // the loader thread, publish now that the game owns the assets.
@@ -344,7 +372,9 @@ pub(super) fn start_game<'a>(
             control.sender(),
             horizon_client::benchmark::Setup {
                 scenario,
-                started,
+                // The report's startup times count from the process's start, not
+                // from `run`: what `entry` does before it belongs to the start too.
+                started: horizon_client::spans::startup::origin().unwrap_or(started),
                 app: horizon_bench::App {
                     name: "horizon-client".into(),
                     version: horizon_client::crash::version(),
@@ -360,10 +390,6 @@ pub(super) fn start_game<'a>(
                 profile: game.options.benchmark_profile,
             },
         );
-    }
-    if let Some(directory) = std::env::var_os("HORIZON_NATIVE_CLIENT_PARTICLES_FIXTURE") {
-        game.run_native_client_particles_fixture(std::path::Path::new(&directory))?;
-        return Ok(None);
     }
     if let Some(directory) = std::env::var_os("HORIZON_BOAT_RIDER_FIXTURE") {
         game.run_boat_rider_fixture(std::path::Path::new(&directory))?;
@@ -385,6 +411,10 @@ pub(super) fn start_game<'a>(
         game.run_component_harness(integrated::ComponentHarness::Sculk(spec))?;
         return Ok(None);
     }
+    if let Ok(output) = std::env::var("HORIZON_HOT_PATHS") {
+        game.run_component_harness(integrated::ComponentHarness::HotPaths(output))?;
+        return Ok(None);
+    }
     if game.options.execution_role == execution_role::ExecutionRole::DedicatedServer {
         let result = game.run_dedicated();
         game.native_game_shutting_down();
@@ -395,9 +425,14 @@ pub(super) fn start_game<'a>(
     // per process, here in `run`, after the initial load applied.
     // A dedicated server has no client and returned above; a splitscreen guest's `run` is
     // another local player of the same process.
-    game.publish_initial_client_models();
+    game.publish_initial_client_models()?;
     // Finish Setup -> Config -> World before any screen, connection, input or tick hooks.
     game.native_configs_client_start();
+    // After the World phase: the Host bridge refuses add_particle during Setup, as for a mod.
+    if let Some(directory) = std::env::var_os("HORIZON_NATIVE_CLIENT_PARTICLES_FIXTURE") {
+        game.run_native_client_particles_fixture(std::path::Path::new(&directory))?;
+        return Ok(None);
+    }
     if let Some(error) = pack_error {
         game.open_options_at(true, horizon_client::options_ui::Page::Packs);
         game.ui.options.resource_error = Some(error);
@@ -438,6 +473,7 @@ pub(super) fn start_game<'a>(
                     seed: Some(seed),
                     creative,
                     create: None,
+                    existing_only: false,
                 });
             }
         }

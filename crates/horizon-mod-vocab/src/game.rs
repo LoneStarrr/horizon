@@ -36,7 +36,7 @@ pub struct BlockEdit {
     pub filters: Vec<StatePredicate>,
     pub runs: Vec<BlockRun>,
 }
-/// The camera shake native mods ask for (`native_camera_shake`): turns in
+/// The camera shake native mods ask for (`camera_shake`): turns in
 /// degrees, and an offset in blocks along the camera's right, up and back.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 // exhaustive: the game builds it with a literal; mods only read it
@@ -93,6 +93,133 @@ pub struct ColumnBlocks {
     pub blocks: Vec<u16>,
     pub tints: Vec<u32>,
 }
+/// The surface of a loaded client column as selected by a [`Heightmap`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct SurfaceColumn {
+    /// The first free Y according to the heightmap, as in `client_surface_heights`.
+    pub height: i32,
+    /// The complete state at `height - 1`, or air if that Y is outside the build height.
+    pub block: BlockState,
+    /// The stored, unblended biome at `height - 1`, clamped to the build height.
+    pub biome: String,
+    /// Stored sky light (0–15) at the same position as `biome`.
+    pub sky_light: u8,
+    /// Stored block light (0–15) at the same position as `biome`.
+    pub block_light: u8,
+}
+/// What `terrain_surface` found at one column of terrain nobody has loaded: the level's generator before its
+/// features (trees, ores, lava pools, cacti) are placed. `client_far_surface` gives the same fields for a
+/// client's far terrain, the surface its finest far tile holds there.
+/// Mods receive this snapshot from the game; they do not construct it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct TerrainColumn {
+    /// One above the highest solid block the generator scans down to, fluids skipped (the `OceanFloor`
+    /// heightmap's count). The scan starts at the top of the level, so in the Nether this is the bedrock roof,
+    /// not a floor.
+    pub height: i32,
+    /// The block at `height - 1`, such as `minecraft:grass_block`.
+    pub block: String,
+    /// One above the highest water or other fluid block over the surface, none where the surface is dry.
+    pub water: Option<i32>,
+    /// The biome, such as `minecraft:plains`.
+    pub biome: String,
+}
+
+/// The topmost material footprint in one retained LOD cell. It can be a
+/// solid, a fluid, or a reduced footprint covering many world columns.
+#[derive(Clone, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub struct LodColumnFootprint {
+    /// The lowest Y in this material run, inclusive.
+    pub min_y: i16,
+    /// The top face of the run (its upper Y, exclusive).
+    pub top_y: i16,
+    /// The retained material as a state ID in the current game's registry.
+    pub state: BlockStateId,
+    /// The biome used to tint this run.
+    pub biome: String,
+    /// Retained sky light (0–15).
+    pub sky_light: u8,
+    /// Retained block light, including material emission (0–15).
+    pub block_light: u8,
+}
+
+/// An exact retained far-terrain tile read by `ClientHost::client_lod_columns`.
+#[derive(Clone, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub struct LodTileFootprint {
+    /// The width of a cell in world blocks (`1 << level`).
+    pub cell_width: i32,
+    /// The tile's 256 cells in order `z * 16 + x`; `None` is an empty cell.
+    pub columns: Vec<Option<LodColumnFootprint>>,
+}
+
+/// Why `upgrade_block_entity_nbt` or `upgrade_entity_nbt` gave no upgraded value. Depth is counted as the data is
+/// encoded (the root compound at 0): the compound the NBT writer puts around an element of a mixed list is a level
+/// of its own. There is no size refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum NbtUpgradeError {
+    /// The data version is below zero. Refused before any fix runs.
+    NegativeVersion(i32),
+    /// The data version is newer than the game's: the fixes only go forward. Refused before any fix runs.
+    FutureVersion(i32),
+    /// The data given has a list or compound 512 levels deep or more, the depth cap of every NBT read. Refused
+    /// before any fix runs.
+    TooDeep,
+    /// The data given was within the cap, but the fixes made it deeper (1.9's `Riding` to `Passengers` doubles a
+    /// chain's depth) and the upgraded data has a list or compound 512 levels deep or more: no NBT read, vanilla's
+    /// included, could take it back. Nothing is returned.
+    UpgradedTooDeep,
+}
+/// The saved data kinds `data_fix` upgrades: the same three the upgrade methods take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum DataKind {
+    /// A block state, `{Name, Properties}`, as `upgrade_block_state_nbt` takes it.
+    BlockState,
+    /// A block entity, as `upgrade_block_entity_nbt` takes it.
+    BlockEntity,
+    /// An entity, its passengers included, as `upgrade_entity_nbt` takes it.
+    Entity,
+}
+/// Why `data_fix` gave no upgraded value: the target version, or the refusal the upgrade gave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum DataFixError {
+    /// The target version is not the game's DataVersion. This build upgrades only up to it. Refused
+    /// before any fix runs.
+    TargetNotCurrent(i32),
+    /// The upgrade itself was refused, by name.
+    Upgrade(NbtUpgradeError),
+}
+impl std::fmt::Display for DataFixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetNotCurrent(v) => write!(f, "target data version {v} is not the game's"),
+            Self::Upgrade(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for DataFixError {}
+impl std::fmt::Display for NbtUpgradeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NegativeVersion(v) => write!(f, "data version {v} is negative"),
+            Self::FutureVersion(v) => write!(f, "data version {v} is newer than the game's"),
+            Self::TooDeep => f.write_str("the data nests 512 levels deep or more"),
+            Self::UpgradedTooDeep => f.write_str("the upgraded data nests 512 levels deep or more"),
+        }
+    }
+}
+impl std::error::Error for NbtUpgradeError {}
 /// Which side reads a config and when (NeoForge's `ModConfig.Type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -104,7 +231,7 @@ pub enum ConfigKind {
     /// server when it starts. A single player's server thread shares the
     /// window's.
     Common,
-    /// The server, before `native_server_about_to_start`, for each world it
+    /// The server, before `server_about_to_start`, for each world it
     /// opens: the world's `serverconfig/<file>` when there is one, else
     /// `config/<file>`.
     Server,
@@ -165,9 +292,11 @@ pub struct ConfigFile {
 #[derive(horizon_mod_api_macros::Wire)]
 pub struct DataMapType {
     /// `mod_id:name`: not in the `minecraft` namespace. Its files are
-    /// `data/<mod_id>/data_maps/<registry path>/<name>.json`.
+    /// `data/<mod_id>/data_maps/<registry folder>/<name>.json`, the
+    /// registry's own path for a `minecraft` registry, `<namespace>/<path>`
+    /// otherwise.
     pub id: String,
-    /// The registry it is for: `minecraft:item` or `minecraft:block`.
+    /// The registry it is for: any the game names (`minecraft:item`, `minecraft:entity_type`...).
     pub registry: String,
 }
 /// A mod the world was saved with that differs from the loaded mods
@@ -189,7 +318,7 @@ pub struct ModMismatch {
 // exhaustive: the game builds it with a literal; mods only read it
 #[derive(horizon_mod_api_macros::Wire)]
 pub struct ExperienceOrb {
-    /// The entity's ID, as `native_entity_join_level` names it.
+    /// The entity's ID, as `entity_join_level` names it.
     pub id: u32,
     pub position: [f64; 3],
     /// `ExperienceOrb.value`: the signed points value saved by vanilla.
@@ -259,7 +388,7 @@ pub enum ModEvent {
     UseStop(HeldItemSlot, u32),
 }
 // no wire: borrowed call-scoped view; transport uses owned snapshots rather than serializing references.
-/// A map as a native mod sees it when `native_map_decorations` is asked.
+/// A map as a native mod sees it when `map_decorations` is asked.
 // Native mods read it; nothing in Horizon does.
 #[derive(Clone, Copy, Debug)]
 // exhaustive: the game builds it with a literal; mods only read it
@@ -334,8 +463,8 @@ pub struct MobRender<'a> {
     pub on_ground: bool,
 }
 // no wire: borrowed call-scoped view; transport uses owned snapshots rather than serializing references.
-/// Which player a [`MobRender`] is, for `native_player_submit` and
-/// `native_mob_layer`.
+/// Which player a [`MobRender`] is, for `render_player_pre` and
+/// `render_player_post`.
 // Native mods read it; nothing in Horizon does.
 #[derive(Clone, Copy, Debug)]
 // exhaustive: the game builds it with a literal; mods only read it

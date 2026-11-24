@@ -101,6 +101,13 @@ pub trait LivingBackend {
     #[access(WorldOnly)]
     fn living_health(&self, living: LivingRef) -> Option<f32>;
     /// Side: both.
+    /// The entity's absorption amount (`LivingEntity.getAbsorptionAmount`; Paper's
+    /// `Damageable#getAbsorptionAmount`), the extra hearts that take a hit before
+    /// health does. Resolves as `living_health` does: during a player's turn only
+    /// that player. None for an armor stand and the dragon, which carry none.
+    #[access(WorldOnly)]
+    fn living_absorption(&self, living: LivingRef) -> Option<f32>;
+    /// Side: both.
     /// The entity's maximum health (`LivingEntity.getMaxHealth`; Paper's
     /// `Damageable#getMaxHealth`). Players and guests read their attribute
     /// map; a mob, an armor stand and the dragon their own fields (the
@@ -242,11 +249,11 @@ pub trait LivingBackend {
     /// passenger — and not asleep, vanilla `LivingEntity.canUsePortal`'s
     /// `isSleeping` half; a parity fix: the client's portal entry used to
     /// skip it), a guest's the same rule over their body and vehicle, a
-    /// mob's walk gate (`mob_can_use_portal`, #1275's read: not a boss that
+    /// mob's walk gate (`mob_can_use_portal`, 's read: not a boss that
     /// never travels, not a creaking bound to its heart, not asleep in its
     /// bed, riding nothing, carrying no one this side holds back). None for
     /// a stale handle, an armor stand or the dragon: the portal walk
-    /// carries neither as its own traveller. #943.
+    /// carries neither as its own traveller.
     #[access(WorldOnly)]
     fn living_can_use_portal(&self, living: LivingRef) -> Option<bool>;
     /// Side: server.
@@ -258,7 +265,7 @@ pub trait LivingBackend {
     /// range attribute), so a player answers None — as does every living
     /// entity that is no mob (a guest, an armor stand, the dragon), a
     /// stale `living` handle, a mob already removed, or a `target` with no
-    /// box here (a stale or unavailable handle). #943.
+    /// box here (a stale or unavailable handle).
     #[access(WorldOnly)]
     fn living_in_melee_range(&self, living: LivingRef, target: EntityRef) -> Option<bool>;
     /// Side: server.
@@ -266,7 +273,7 @@ pub trait LivingBackend {
     /// a mob's (`ai::can_freeze`: not `#freeze_immune_entity_types`, no
     /// `#freeze_immune_wearables` worn), a player's
     /// (`PlayerMotion::can_freeze`: not a spectator, no immune armor).
-    /// None for a stale handle, an armor stand or the dragon. #943.
+    /// None for a stale handle, an armor stand or the dragon.
     #[access(WorldOnly)]
     fn living_can_freeze(&self, living: LivingRef) -> Option<bool>;
     /// Side: server.
@@ -277,7 +284,7 @@ pub trait LivingBackend {
     /// decision: the air tick itself also keeps the air up behind Water
     /// Breathing, the conduit's power and a player's invulnerability,
     /// which this read does not carry. None for a stale handle, an armor
-    /// stand or the dragon. #943.
+    /// stand or the dragon.
     #[access(WorldOnly)]
     fn living_can_breathe_underwater(&self, living: LivingRef) -> Option<bool>;
     /// Side: server.
@@ -286,7 +293,7 @@ pub trait LivingBackend {
     /// the block at the sleeping position, its `facing` where that block is
     /// one of `#minecraft:beds` — one path for every sleeper. None where
     /// the sleeper keeps no position, the block is not a bed, or the handle
-    /// is stale. #943.
+    /// is stale.
     #[access(WorldOnly)]
     fn living_bed_orientation(&self, living: LivingRef) -> Option<Direction>;
 }
@@ -421,12 +428,37 @@ pub trait LivingBackendMut {
     #[access(WorldOnly)]
     fn living_set_is_jumping(&mut self, living: LivingRef, jumping: bool) -> bool;
     /// Side: server.
+    /// `Entity.setSprinting` for a mob: sets its shared sprinting flag (the one a
+    /// cat or ocelot dashing after its target keeps) and sends it to the players
+    /// tracking it. Players are refused: their sprint is what their own client
+    /// reports, so the server could not hold it (Paper's `Player#setSprinting`
+    /// is not covered yet). False for a player, a guest, an armor stand, the
+    /// dragon or a stale handle.
+    #[access(WorldOnly)]
+    fn living_set_sprinting(&mut self, living: LivingRef, sprinting: bool) -> bool;
+    /// `TamableAnimal.setTame(tame, false)`: sets whether a tamable mob (a wolf,
+    /// cat, parrot or horse) is tame. The owner stays as it was, and the taming
+    /// side effects do not run: no advancement, no particles, no attribute
+    /// update. False for a kind that cannot be tamed, a player, an armor stand,
+    /// the dragon or a stale handle.
+    #[access(WorldOnly)]
+    fn living_set_tamed(&mut self, living: LivingRef, tamed: bool) -> bool;
+    /// Side: server.
     /// Sets the entity's health (`LivingEntity.setHealth`; Paper's
     /// `Damageable#setHealth`), cut to its maximum health. No heal or damage
     /// hook runs. False for a stale handle, a non-finite value, an armor stand
     /// or the dragon.
     #[access(WorldOnly)]
     fn living_set_health(&mut self, living: LivingRef, health: f32) -> bool;
+    /// Side: server.
+    /// Sets the entity's absorption amount (`LivingEntity.setAbsorptionAmount`;
+    /// Paper's `Damageable#setAbsorptionAmount`), cut to `0..=max_absorption`
+    /// (the `minecraft:max_absorption` attribute). A player's new amount reaches
+    /// their client and the trackers through the synced data the same tick. No
+    /// heal or damage hook runs. False for a stale handle, a non-finite amount, an
+    /// armor stand or the dragon.
+    #[access(WorldOnly)]
+    fn living_set_absorption(&mut self, living: LivingRef, amount: f32) -> bool;
     /// Side: server.
     /// Heals the entity by `amount` (`LivingEntity.heal`), through the
     /// `living_heal` hook, which may change or cancel it. A dead or dying
@@ -548,7 +580,8 @@ pub trait LivingBackendMut {
     /// death's drops. `include_thrower_name` sets the thrower, and a player's
     /// throw along the view then counts in its stats and fires `item_toss`.
     /// None for an empty stack, a stand or the dragon, a stale handle, or an
-    /// item a mod kept out. API @API:living_refs@.
+    /// item a mod kept out. Inside a transaction its join waits for the root commit, so a mod
+    /// keeping the item out is not known at the call. API @API:living_refs@.
     #[access(WorldOnly)]
     fn living_drop(
         &mut self,

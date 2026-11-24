@@ -123,18 +123,32 @@ pub fn spawn_egg_entity_data<'a>(
 
 /// `EntityType.appendDefaultStackConfig` for a hanging entity or armor stand an
 /// item places: `Entity.applyImplicitComponents` stores the item's
-/// `minecraft:custom_data` as the entity's `data`, then `updateCustomEntityTag`
+/// `minecraft:custom_name` as the entity's `CustomName` and its
+/// `minecraft:custom_data` as its `data`, then `updateCustomEntityTag`
 /// (`TypedEntityData.loadInto`) merges the item's `minecraft:entity_data` over
 /// the entity's saved tag `own` when its type is `kind`.
 pub fn stack_configured_entity(stack: &crate::items::ItemStack, kind: &str, own: &Tag) -> Tag {
+    stack_configured_entity_by(stack, kind, own, false)
+}
+
+/// [`stack_configured_entity`], `op` saying whether the user may load the
+/// data of an op-only entity type (`EntityType.onlyOpCanSetNbt`).
+pub fn stack_configured_entity_by(
+    stack: &crate::items::ItemStack,
+    kind: &str,
+    own: &Tag,
+    op: bool,
+) -> Tag {
     let mut tag = own.clone();
-    if let (Tag::Compound(map), Some(custom)) = (
-        &mut tag,
-        stack.data().and_then(|d| d.other("minecraft:custom_data")),
-    ) {
-        map.insert("data".into(), custom.clone());
+    if let Tag::Compound(map) = &mut tag {
+        if let Some(name) = stack.data().and_then(|d| d.custom_name.clone()) {
+            map.insert("CustomName".into(), name);
+        }
+        if let Some(custom) = stack.data().and_then(|d| d.other("minecraft:custom_data")) {
+            map.insert("data".into(), custom.clone());
+        }
     }
-    match spawn_egg_entity_data(stack, kind, false) {
+    match spawn_egg_entity_data(stack, kind, op) {
         Some(data) => crate::data_cmd::merged(&tag, data),
         None => tag,
     }
@@ -216,6 +230,13 @@ fn parts(id: &str) -> &'static [Part] {
 /// The component a part reads, and what it holds for `tag` (None: unset).
 fn collect(part: Part, tag: &Tag) -> Option<(&'static str, Option<Tag>)> {
     Some(match part {
+        // BaseContainerBlockEntity only adds its lock when it is locked.
+        Part::Same(key, "minecraft:lock") => {
+            let lock = tag
+                .get(key)
+                .filter(|tag| matches!(tag, Tag::Compound(fields) if !fields.is_empty()))?;
+            ("minecraft:lock", Some(lock.clone()))
+        }
         Part::Same(key, component) => (
             component,
             tag.get(key).cloned().or_else(|| unset(component)),
@@ -559,14 +580,15 @@ mod tests {
     fn a_filled_named_chest_gives_its_items_and_name_as_components() {
         let chest = saved(
             "{id:\"minecraft:chest\",x:1,y:2,z:3,CustomName:\"Loot\",\
-             Items:[{Slot:4b,id:\"minecraft:stone\",count:5}]}",
+             Items:[{Slot:4b,id:\"minecraft:stone\",count:5}],\
+             components:{\"minecraft:custom_data\":{a:1b}}}",
         );
         let patch = pick(&chest);
         assert_eq!(
             canon(&patch),
             crate::item_data::canon_tag(&snbt(
                 "{\"minecraft:container\":[{slot:4,item:{id:\"minecraft:stone\",count:5}}],\
-                 \"minecraft:custom_name\":\"Loot\"}"
+                 \"minecraft:custom_name\":\"Loot\",\"minecraft:custom_data\":{a:1b}}"
             ))
         );
         // Placing it back gives the same chest.
@@ -574,6 +596,43 @@ mod tests {
         assert_eq!(place(&empty, &patch, false), chest);
         // An empty chest has nothing to carry.
         assert!(pick(&empty).is_empty());
+    }
+
+    #[test]
+    fn a_chest_pick_uses_the_live_lock_or_the_explicit_component() {
+        let chest = saved(
+            r#"{id:"minecraft:chest",x:1,y:2,z:3,components:{"minecraft:lock":{items:"minecraft:stick"}}}"#,
+        );
+        let explicit = snbt(r#"{items:"minecraft:stick"}"#);
+        let live = snbt(r#"{items:"minecraft:gold_ingot"}"#);
+        for (field, expected) in [
+            (None, &explicit),
+            (Some(Tag::Compound(Compound::new())), &explicit),
+            (Some(live.clone()), &live),
+        ] {
+            let Tag::Compound(mut fields) = chest.clone() else {
+                unreachable!()
+            };
+            if let Some(value) = field {
+                fields.insert("lock".into(), value);
+            }
+            let patch = pick(&Tag::Compound(fields));
+            assert_eq!(patch.get(&"minecraft:lock".into()), Some(expected));
+            assert!(!patch.contains_key(&BLOCK_ENTITY_DATA.into()));
+        }
+    }
+
+    #[test]
+    fn placing_a_comparator_or_pot_keeps_its_explicit_custom_data() {
+        let input = snbt(r#"{"minecraft:custom_data":{a:1b}}"#);
+        let Tag::Compound(patch) = &input else {
+            unreachable!()
+        };
+        for id in ["comparator", "decorated_pot"] {
+            let fresh = saved(&format!(r#"{{id:"minecraft:{id}",x:1,y:2,z:3}}"#));
+            let placed = place(&fresh, patch, false);
+            assert_eq!(placed.get("components"), Some(&input), "{id}");
+        }
     }
 
     #[test]
@@ -604,12 +663,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_mod_block_entity_rides_its_item() {
         // The declared types are frozen once per process: install them in a fresh one.
         const CHILD: &str = "HORIZON_TEST_MOD_BLOCK_ENTITY_ITEM";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "block_entity_item::tests::a_mod_block_entity_rides_its_item",
                     "--nocapture",
@@ -832,6 +893,62 @@ mod tests {
         assert_eq!(keys, ["minecraft:sign_text_front", "minecraft:waxed"]);
         let fresh = saved("{id:\"minecraft:sign\",x:0,y:0,z:0}");
         assert_eq!(place(&fresh, &patch, false), sign);
+    }
+
+    /// A loot block predicate's `components` map reads a chest's collected
+    /// components: its container and custom name.
+    #[test]
+    fn a_loot_block_predicate_reads_a_chests_collected_components() {
+        use crate::items::Items;
+        use horizon_world::chunk::BlockProperties;
+        use horizon_world::loot::{LootPlace, with_native_loot_place};
+        use serde_json::json;
+        let source = saved(
+            "{id:\"minecraft:chest\",x:1,y:2,z:3,CustomName:\"Loot\",\
+             Items:[{Slot:4b,id:\"minecraft:stone\",count:5}]}",
+        );
+        // The full save a loot roll carries, then the map its components are
+        // read from, as `Game::loot_place_at` builds them.
+        let (pos, chest) = crate::save::decode_block_entity(&source).expect("chest");
+        let custom_name = source
+            .get("CustomName")
+            .and_then(crate::block_entity_nbt::component);
+        let full = crate::save::full_block_entity_data(
+            pos,
+            &chest,
+            "minecraft:chest",
+            Some(&source),
+            custom_name.as_ref(),
+            source.get("lock"),
+        );
+        let place = LootPlace {
+            block_entity: Some(full.clone()),
+            block_entity_components: Some(Tag::Compound(collected_components(&full))),
+            ..LootPlace::default()
+        };
+        let items = Items::for_tests(Default::default());
+        let props = BlockProperties::new();
+        let matches = |predicate: serde_json::Value| {
+            with_native_loot_place(place.clone(), || {
+                items.matches_block_state(&predicate, "minecraft:chest", &props)
+            })
+        };
+        assert!(
+            matches(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:container":[{"slot":4,"item":{"id":"minecraft:stone","count":5}}],
+                "minecraft:custom_name":"Loot"}})),
+            "the chest's collected container and name match"
+        );
+        assert!(
+            !matches(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:container":[{"slot":4,"item":{"id":"minecraft:stone","count":6}}]}})),
+            "a different container value does not"
+        );
+        assert!(
+            !matches(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:custom_data":{"k":1}}})),
+            "a component the chest does not carry does not"
+        );
     }
 
     /// A content sign's block entity starts with its declared colour and glow. An item with

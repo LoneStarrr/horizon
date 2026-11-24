@@ -4,7 +4,7 @@ use super::Game;
 use horizon_client::mobs::{Part, Species, anim::Poses};
 use horizon_client::particles::{ParticleOptions, ParticleType};
 use horizon_core::geometry::Vec3;
-use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_core::random::{EntityRandom, RandomSource};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -19,8 +19,10 @@ pub(super) struct Fangs {
     pub life: i32,
     pub owner: u32,
     pub started: bool,
+    /// `Entity.deltaMovement`, once a tick has read the loaded `Motion`.
+    pub velocity: Option<Vec3>,
     /// `Entity.random`. The attack sound's pitch is its first draw.
-    random: LegacyRandom,
+    random: EntityRandom,
 }
 
 horizon_client::impl_joined!(Fangs);
@@ -72,6 +74,7 @@ impl Game<'_> {
             life: 22,
             owner,
             started: false,
+            velocity: None,
             random: horizon_client::mobs::entity_random(id, Vec3::new(at[0], at[1], at[2])),
         });
     }
@@ -83,6 +86,7 @@ impl Game<'_> {
             self.persist.uuids.get(&f.owner).copied(),
             uuid,
             self.persist.raw.get(&f.id),
+            f.velocity,
         )
     }
     pub(super) fn loaded_fangs_owner(&self, tag: &horizon_core::nbt::Tag) -> u32 {
@@ -152,7 +156,40 @@ impl Game<'_> {
         let mut list = self.fangs.list.lift();
         #[cfg(test)]
         super::entity::taken_pass_tests::after_take(self);
+        // ServerLevel.tick: only entities in entity-ticking chunks tick.
+        let ticking = self.entity_ticking_area();
         list.retain_mut(|f| {
+            if !ticking(f.pos[0].floor() as i32, f.pos[2].floor() as i32) {
+                return true;
+            }
+            // Entity.baseTick: a burning fang's loaded Fire counts down.
+            if let Some(raw) = self.persist.raw.get_mut(&f.id) {
+                horizon_client::entity_nbt::count_down_fire(raw);
+            }
+            // `EvokerFangs.tick` -> `Entity.baseTick` -> `updateFluidInteraction`:
+            // a current pushes the fangs (they are pushed by fluid).
+            let mut velocity = f.velocity.unwrap_or_else(|| {
+                self.persist
+                    .raw
+                    .get(&f.id)
+                    .map_or(Vec3::ZERO, horizon_client::entity_nbt::loaded_motion)
+            });
+            let (x, y, z) = (f.pos[0], f.pos[1], f.pos[2]);
+            let half = 0.25;
+            let bounds = horizon_core::geometry::Aabb::new(
+                Vec3::new(x - half, y, z - half),
+                Vec3::new(x + half, y + f64::from(0.8_f32), z + half),
+            );
+            horizon_client::entities::update_entity_fluids(
+                bounds,
+                Vec3::new(x, y, z),
+                y + f64::from(0.8_f32 * 0.85_f32),
+                &mut velocity,
+                &self.world,
+                &self.res.motion().fluids,
+                &self.loop_context,
+            );
+            f.velocity = Some(velocity);
             f.warmup = f.warmup.wrapping_sub(1);
             if f.warmup >= 0 {
                 return true;
@@ -392,7 +429,7 @@ mod tests {
     use horizon_core::random::LegacyRandom;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn taken_fangs_tick_keeps_survivors_before_both_spawns() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.fangs.list.clear();

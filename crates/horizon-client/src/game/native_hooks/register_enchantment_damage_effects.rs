@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for startup registration"]
+    #[ignore = "daily"]
     fn custom_enchantment_changes_real_hit_damage_and_observes_hit_context() {
         let reads: Observations = Default::default();
         with_mods(
@@ -128,7 +128,7 @@ mod tests {
                     let stack = game.reload_datapacks(false, &[]).unwrap();
                     let resources = game.options.resources.clone();
                     game.world_tables = game
-                        .build_world_tables(&stack, false, &resources, game.mods.data_switched)
+                        .stage_world_tables(&stack, false, &resources)
                         .unwrap()
                         .0;
                     assert!(
@@ -228,7 +228,7 @@ mod tests {
                     {
                         *critical = true;
                     }
-                    arrow.random.0 = horizon_core::random::LegacyRandom::new(42);
+                    arrow.random.0 = horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(42));
                     assert_eq!(
                         game.shot_damage(
                             &mut arrow,

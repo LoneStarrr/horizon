@@ -494,11 +494,16 @@ pub fn export_record(
     if let Some(id) = id {
         let since = hub.ticks;
         hub.guests.update(i, |g| {
+            if !g.transfer_unresolved.contains(&id) {
+                g.transfer_unresolved.push(id);
+            }
             g.handover = Some(Handover {
                 id,
                 since,
                 record: record.clone(),
             });
+            // Queued `player_move_packet` reports must not reach listeners after the snapshot.
+            g.move_packet_queue.clear();
         });
     }
     Ok(record)
@@ -840,7 +845,11 @@ pub fn release_request(hub: &mut Hub, args: &str) -> serde_json::Value {
     }
     match hub.handover_of(uuid, id) {
         Ok(i) => {
-            hub.guests.update(i, |g| g.handover = None);
+            // The player stays here: this hand-over is settled, an earlier unsettled one is not.
+            hub.guests.update(i, |g| {
+                g.handover = None;
+                g.transfer_unresolved.retain(|&u| u != id);
+            });
             serde_json::json!({ "ok": true, "released": "abort" })
         }
         Err(why) => error(why),
@@ -880,6 +889,11 @@ mod hub_tests {
             horizon_protocol::registry::Ids::from_names(vec!["minecraft:player".to_string()]),
         );
         let sync = std::sync::Arc::new(sync);
+        // No listener: these tests drive the hub directly and never connect.
+        let config = NetConfig {
+            listen: false,
+            ..config
+        };
         let lan = Lan::start_with(sync.clone(), config).unwrap();
         let encoder = ChunkEncoder::new(
             [] as [(std::sync::Arc<str>, bool); 0],
@@ -900,6 +914,7 @@ mod hub_tests {
             max_players: 4,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         };
         let mut hub = Hub::new(
             lan,
@@ -986,6 +1001,7 @@ mod hub_tests {
             next_entity: &mut next,
             spawn: [0.5, 64.0, 0.5],
             spawn_angle: [0.0; 2],
+            spawn_dimension: "minecraft:overworld",
             difficulty: 2,
             difficulty_locked: false,
             clock_rate: 1.0,
@@ -1011,6 +1027,7 @@ mod hub_tests {
             next_entity: next,
             spawn: [0.5, 64.0, 0.5],
             spawn_angle: [0.0; 2],
+            spawn_dimension: "minecraft:overworld",
             difficulty: 2,
             difficulty_locked: false,
             clock_rate: 1.0,
@@ -1762,6 +1779,10 @@ mod hub_tests {
             stats: serde_json::json!({"stats": {"minecraft:custom": {"minecraft:jump": 3}}}),
         };
         let record = super::export_record(&mut hub, i, false, records).unwrap();
+        assert!(
+            hub.guests[i].transfer_unresolved.is_empty(),
+            "a plain export is no hand-over"
+        );
         assert_eq!(record["version"], 1);
         assert_eq!(record["data_version"], horizon_world::DATA_VERSION);
         assert_eq!(record["uuid"], UUID);
@@ -1809,6 +1830,7 @@ mod hub_tests {
         let record = super::export_record(&mut hub, i, true, Default::default()).unwrap();
         let handover = hub.guests[i].handover.clone().unwrap();
         assert_eq!(handover.since, hub.ticks);
+        assert_eq!(hub.guests[i].transfer_unresolved, [handover.id]);
         assert_eq!(
             record["handover"].as_str(),
             Some(super::handover_text(handover.id).as_str())
@@ -1852,6 +1874,10 @@ mod hub_tests {
         assert!(hub.guests[i].handover.is_some());
         assert!(hub.poll(&mut ctx).iter().any(|e| is_warn(e, "frozen")));
         assert_eq!(hub.guests[i].handover, None, "the hand-over is over");
+        assert!(
+            !hub.guests[i].transfer_unresolved.is_empty(),
+            "a freeze running out does not say who owns the player"
+        );
     }
 
     #[test]
@@ -2026,8 +2052,15 @@ mod hub_tests {
     #[test]
     fn an_aborted_hand_over_lets_the_player_go_on_as_it_was() {
         let (mut hub, seen, mine, h) = frozen_with_a_watcher();
+        // An earlier hand-over whose freeze ran out unsettled stays unsettled.
+        hub.guests.update(1, |g| g.transfer_unresolved.insert(0, 7));
         let reply = super::release_request(&mut hub, &format!("{UUID} {h} abort"));
         assert_eq!(reply, serde_json::json!({"ok": true, "released": "abort"}));
+        assert_eq!(
+            hub.guests[1].transfer_unresolved,
+            [7],
+            "the abort settles its own only"
+        );
         assert_eq!(hub.guests.len(), 2);
         assert!(hub.guests[1].handover.is_none() && hub.guests[1].placed);
         assert_eq!(ids(&seen), Vec::<i32>::new());
@@ -2322,13 +2355,41 @@ mod hub_tests {
     }
 
     /// What the game does with a request (`game/interface/dedicated/transfer.rs`), without the disk: the
-    /// import, then the placing unless `"place": false`.
+    /// import, then the placing unless `"place": false`. The catalog has vanilla's bounds of the
+    /// attributes the record's values are checked against.
     fn import_player(
         hub: &mut Hub,
         uuid: u128,
         request: &serde_json::Value,
     ) -> Result<crate::lan::import::Imported, String> {
-        let done = crate::lan::import::import_player(hub, uuid, request)?;
+        import_player_with(hub, 1024.0, uuid, request)
+    }
+
+    /// [`import_player`] with `max_health` bounded at `max_health`, as a mod
+    /// that widened it leaves the catalog (arismoko/horizon#3728).
+    fn import_player_with(
+        hub: &mut Hub,
+        max_health: f64,
+        uuid: u128,
+        request: &serde_json::Value,
+    ) -> Result<crate::lan::import::Imported, String> {
+        let bits = |v: f64| format!("{:016x}", v.to_bits());
+        let attributes = horizon_world::attributes::entity::Catalog::from_json(&serde_json::json!({
+            "data_version": horizon_world::DATA_VERSION,
+            "attributes": [
+                {"id": "minecraft:max_health", "default": bits(20.0), "min": bits(1.0), "max": bits(max_health), "syncable": true},
+                {"id": "minecraft:max_absorption", "default": bits(0.0), "min": bits(0.0), "max": bits(2048.0), "syncable": true},
+            ],
+            "entities": {},
+        }))
+        .unwrap();
+        let done = crate::lan::import::import_player(
+            hub,
+            &attributes,
+            &Default::default(),
+            uuid,
+            request,
+        )?;
         if done.place {
             hub.confirm_arrival(uuid, done.handover)?;
         }
@@ -3026,6 +3087,22 @@ mod hub_tests {
             assert!(hub.guests[1].held && !hub.guests[1].imported, "{what}");
             assert_eq!(ids(&seen), Vec::<i32>::new(), "{what}");
         }
+    }
+
+    /// arismoko/horizon#3728: a player whose health is past vanilla's 1024, as a mod that
+    /// widened `max_health` lets one be, is imported where that mod widened it
+    /// too, and refused where it did not.
+    #[test]
+    fn a_record_past_vanillas_health_imports_where_the_bounds_are_widened() {
+        let (mut source, i) = exported_guest();
+        source.guests.update(i, |g| g.health = 5000.0);
+        let record = super::export_record(&mut source, i, true, Default::default()).unwrap();
+        let request = serde_json::json!({ "record": record });
+        let (_, mut hub, _seen, _mine) = held_in_a_second_hub();
+        assert!(import_player(&mut hub, UUID_N, &request).is_err());
+        let (_, mut hub, _seen, _mine) = held_in_a_second_hub();
+        import_player_with(&mut hub, 1e6, UUID_N, &request).unwrap();
+        assert_eq!(hub.guests[1].health, 5000.0);
     }
 
     /// The record must be a hand-over's, and the held player takes one hand-over's record.

@@ -7,13 +7,30 @@ use crate::*;
 pub struct ModEntry {
     pub(crate) id: &'static str,
     pub(crate) hooks: Box<dyn Hooks>,
+    /// Whether the game loaded it as a wasm module: what its registrations are checked against,
+    /// whatever the module says of itself.
+    pub(crate) wasm: bool,
 }
 
 impl ModEntry {
     /// Bind a hook implementation to its nonempty bundle id.
     pub fn new(id: &'static str, hooks: Box<dyn Hooks>) -> Self {
         assert!(!id.is_empty(), "native mod id must not be empty");
-        Self { id, hooks }
+        Self {
+            id,
+            hooks,
+            wasm: false,
+        }
+    }
+
+    /// Bind a loaded wasm module's hook proxy to its bundle id.
+    // hidden: the wasm runtime's side, not part of the mod surface
+    #[doc(hidden)]
+    pub fn wasm(id: &'static str, hooks: Box<dyn Hooks>) -> Self {
+        Self {
+            wasm: true,
+            ..Self::new(id, hooks)
+        }
     }
 
     /// Marks the thread as inside this mod's `hook` until the guard drops, so a panic in it
@@ -23,6 +40,25 @@ impl ModEntry {
     pub fn enter(&self, hook: &'static str) -> crate::content::crash::ModGuard {
         mark_mod(self.id, hook)
     }
+
+    /// The first client-side hook this mod subscribes to, by name: the game refuses a
+    /// `side = "server"` mod that has one.
+    pub(crate) fn client_hook(&self) -> Option<&'static str> {
+        client_hook_name(self.hooks.subscribed())
+    }
+}
+
+/// The first client-side hook among `subscribed`, by name, in catalog order.
+pub(crate) fn client_hook_name(subscribed: &[Option<HookId>]) -> Option<&'static str> {
+    generated::CLIENT_HOOKS
+        .iter()
+        .find(|(id, _)| {
+            subscribed
+                .iter()
+                .flatten()
+                .any(|s| *s as usize == *id as usize)
+        })
+        .map(|(_, name)| *name)
 }
 
 // no wire: installed hook trait objects and shared dispatch ownership are process-local.
@@ -33,6 +69,13 @@ pub(crate) struct Installed {
     pub(crate) mods: Mods,
     pub(crate) subscribers: horizon_mod_runtime::subscribers::Subscribers,
     pub(crate) disabled: Box<[std::sync::atomic::AtomicBool]>,
+    /// The poison sets of the hooks whose dispatch isolates every listener
+    /// (arismoko/horizon#2414 ruling): a listener that unwound is skipped by that one hook
+    /// for the rest of the session. One set per hook, filled only on a panic;
+    /// `poison_free` answers through one atomic load, so a dispatch with no
+    /// poison pays nothing.
+    poisons: std::sync::Mutex<Option<Box<[Option<std::collections::HashSet<&'static str>>]>>>,
+    poison_free: std::sync::atomic::AtomicBool,
 }
 
 impl Installed {
@@ -68,6 +111,8 @@ impl Installed {
             mods,
             subscribers,
             disabled,
+            poisons: std::sync::Mutex::new(None),
+            poison_free: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
@@ -104,6 +149,40 @@ pub(crate) fn install(mods: Mods) -> &'static Installed {
     }
 }
 
+/// Mark `id`'s listener of `hook` poisoned for the session (arismoko/horizon#2414 ruling):
+/// it is skipped by that one hook alone — its other hooks and Parts are
+/// untouched, unlike a whole-mod disable. Called only from a listener's
+/// `catch_unwind` handler, so an installation is always in place.
+pub(crate) fn poison(hook: generated::HookId, id: &'static str) {
+    let installed = installed().expect("a poison lands inside a dispatch");
+    let mut poisons = installed.poisons.lock().unwrap();
+    let sets =
+        poisons.get_or_insert_with(|| std::vec![None; generated::HOOK_COUNT].into_boxed_slice());
+    sets[hook as usize]
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(id);
+    installed
+        .poison_free
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether `id`'s listener of `hook` is poisoned for the session.
+pub(crate) fn poisoned(hook: generated::HookId, id: &str) -> bool {
+    // One atomic load on the usual path: the sets only fill on a panic.
+    installed().is_some_and(|installed| {
+        !installed
+            .poison_free
+            .load(std::sync::atomic::Ordering::Acquire)
+            && installed
+                .poisons
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|poisons| poisons[hook as usize].as_ref())
+                .is_some_and(|poisoned| poisoned.contains(id))
+    })
+}
+
 /// The process-wide list in dispatch order, or an empty list before installation.
 pub(crate) fn mods() -> &'static [ModEntry] {
     installed().map_or(&[], |installed| &installed.mods)
@@ -111,6 +190,15 @@ pub(crate) fn mods() -> &'static [ModEntry] {
 
 pub(crate) fn listened(hook: generated::HookId) -> bool {
     installed().is_some_and(|installed| installed.subscribers.contains_any(hook as usize))
+}
+
+pub(crate) fn enabled_listened(hook: generated::HookId) -> bool {
+    installed().is_some_and(|installed| {
+        installed
+            .subscribers
+            .indices(hook as usize)
+            .any(|index| !installed.disabled[index].load(std::sync::atomic::Ordering::Relaxed))
+    })
 }
 
 /// Switch an installed trait mod's subsequent dispatches on or off.
@@ -123,6 +211,9 @@ pub(crate) fn set_mod_enabled(id: &str, on: bool) -> bool {
         if entry.id == id {
             if disabled.swap(!on, std::sync::atomic::Ordering::Relaxed) == on {
                 MODS_SWITCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !on {
+                    horizon_mod_runtime::water_tickets::remove_owner(id);
+                }
             }
             found = true;
         }

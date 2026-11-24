@@ -58,11 +58,15 @@ fn module(reply: &Writer, depth: i32) -> horizon_mod_wasm::WasmMod {
         (func $recurse (param i32) (result i32)
             local.get 0 i32.eqz if (result i32) i32.const 0 else
             local.get 0 i32.const 1 i32.sub call $recurse i32.const 1 i32.add end)
-        (func (export "horizon_hook") (param i32) (result i64)
-            i32.const {depth} call $recurse i32.const 60000 i32.ne if unreachable end
-            {stores} i64.const {}))"#,
+        (func (export "horizon_hook") (param i32) (result i64) {hook}))"#,
         *mod_api::wire::LAYOUT,
-        (2048u64 << 32) | reply.bytes().len() as u64
+        hook = horizon_mod_wasm::fixture::answering::<&str>(
+            &[],
+            &format!(
+                "i32.const {depth} call $recurse i32.const 60000 i32.ne if unreachable end {stores} i64.const {}",
+                (2048u64 << 32) | reply.bytes().len() as u64
+            )
+        )
     ))
     .unwrap();
     horizon_mod_wasm::fixture::module(&bytes).unwrap()
@@ -102,13 +106,21 @@ fn proof() {
     let mut host = Host;
     let mut reply = Writer::default();
     reply.put(&Duration::from_secs(60000));
+    reply.put(&0.25f32);
+    reply.put(&0.5f32);
     let client = module(&reply, 60000);
     memory("one module loaded");
     let mut render = mod_api::RenderFramePreEvent {
         elapsed: Duration::from_secs(1),
+        world_partial_tick: 0.25,
+        partial_tick: 0.5,
     };
     client.render_frame_pre(&mut host, &mut render);
     assert_eq!(render.elapsed, Duration::from_secs(60000));
+    assert_eq!(
+        (render.world_partial_tick, render.partial_tick),
+        (0.25, 0.5)
+    );
     let mut reply = Writer::default();
     reply.put(&mod_api::ServerTickPhase::ServerTickEnd {
         world_running: true,
@@ -187,9 +199,11 @@ fn limited(soft: libc::rlim_t, hard: libc::rlim_t) -> Command {
     command
 }
 fn main() {
-    // This is the same function re-exported as horizon_platform::prepare_main_stack,
-    // the first call in horizon-server/src/main.rs. No test worker or hand-off.
-    horizon_guest_stack::prepare_main();
+    // This is the same function re-exported as horizon_platform::run_main, around
+    // horizon-server/src/main.rs. No test worker or hand-off.
+    horizon_guest_stack::run_main(probe);
+}
+fn probe() {
     if std::env::args().any(|arg| arg == "--child") {
         proof();
         return;

@@ -4,6 +4,7 @@ Initial default delivery is observational; flags never stand in for a typed Pose
 """
 import argparse,hashlib,json,os,re,time
 from pathlib import Path
+PARITY_MANUAL = "a proof run by hand: --work-dir DIR --reference-only for the Java side, then --work-dir DIR2 --reference-dir DIR --binary BIN"  # not a harness: tools/parity.py leaves it out
 try:
     from . import net_capture,test_locator_bar_parity as net
     from .test_builtin_component_delivery_parity import Commands,generate,offline,uuid_words
@@ -177,7 +178,7 @@ def main():
         assert a.binary
         meta=json.loads((a.reference_dir/'reference-client.json').read_text())
         client=meta['command'];world=Path(meta['world'])
-        actual=run_side('native',[str(a.binary),'--resources',str(net.lab.LOCAL/'horizon-client/26.3'),'--dedicated','--nogui'],client,a.work_dir,world)
+        actual=run_side('native',[str(a.binary),'--resources',str(net.lab.RESOURCES),'--dedicated','--nogui'],client,a.work_dir,world)
         ref=json.loads((a.reference_dir/'java-report.json').read_text());report=compare(ref,actual)
         (a.work_dir/'comparison.json').write_text(json.dumps(report,indent=2)+'\n');print(report)
         return 0 if report['all_pass'] else 1

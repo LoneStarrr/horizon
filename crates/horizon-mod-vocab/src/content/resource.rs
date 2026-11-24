@@ -1,4 +1,4 @@
-//! NeoForge 26.3's transfer API (#41 §7): a resource is what a handler holds, without an amount
+//! NeoForge 26.3's transfer API ( §7): a resource is what a handler holds, without an amount
 //! ([`ItemResource`]), and a [`ResourceHandler`] is the indexed contents of one holder, written
 //! only inside a transaction.
 use crate::{
@@ -247,6 +247,13 @@ impl ItemResource {
     pub fn use_duration(&self, host: &dyn Host) -> Option<i32> {
         backend_of(host)?.item_resource_use_duration(&self.0)
     }
+    /// `IItemExtension.getCreatorModId`: the mod that made this stack, for a
+    /// recipe viewer or a tooltip to name. The item id's namespace, unless the
+    /// item's `creator_mod_id` Part answers another mod or none. None for an
+    /// unknown item or a host without the engine backend.
+    pub fn creator_mod_id(&self, host: &dyn Host) -> Option<String> {
+        backend_of(host)?.item_resource_creator_mod_id(&self.0)
+    }
     /// `ItemStack.isBarVisible`, `getBarWidth` and `getBarColor`: the visible
     /// vanilla durability or bundle bar, after effective components. None when
     /// no bar is visible. Client drawing hooks can later replace this bar.
@@ -291,9 +298,10 @@ impl ItemResource {
     ) -> Option<f32> {
         backend_of(host)?.item_resource_attack_damage_bonus(&self.0, attacker, target, base_damage)
     }
-    /// Standard tooltip text, with explicit advanced and creative flags and the client's
-    /// current viewer context. Uses the same line builder as inventory tooltips and skips
-    /// mod callbacks, so a tooltip hook can safely request another item's base lines.
+    /// Inventory tooltip lines, with explicit advanced and creative flags and the client's
+    /// current viewer context. Uses the same line builder as inventory tooltips, including item
+    /// parts, registered tooltip appenders and `item_tooltip` edits. When called re-entrantly
+    /// from inside a tooltip callback, returns the base lines without re-invoking mod callbacks.
     /// Returns None without a client backend, or when the item cannot be resolved.
     pub fn tooltip(
         &self,

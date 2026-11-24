@@ -169,6 +169,7 @@ fn weapon_case(item: &str, enchantment: &str, level: u32, projectile: bool, swap
                     }
                 };
                 let mut shot = Projectile::new(kind, Vec3::ZERO, Some(Who::Mob(41)));
+                shot.id = 912;
                 let arrow = shot.arrow.as_mut().unwrap();
                 if trident {
                     arrow.pickup_item = weapon;
@@ -185,6 +186,7 @@ fn weapon_case(item: &str, enchantment: &str, level: u32, projectile: bool, swap
                 victim.health = 20.0;
                 victim.last_damage = None;
                 game.mobs.push(victim);
+                damage.kind = game.projectile_damage_kind(&shot);
                 assert!(game.damage_projectile_with_weapon(&shot, 70, 100.0, damage, None));
                 victim = game.mobs.iter().find(|mob| mob.id == 70).unwrap().clone();
                 drop(shot);
@@ -196,28 +198,28 @@ fn weapon_case(item: &str, enchantment: &str, level: u32, projectile: bool, swap
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn death_weapon_a_longbow_power_ii_survives_hand_change() {
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
         weapon_case("minecraft:bow", "minecraft:power", 2, true, false);
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn death_weapon_b_crossbow_piercing_i() {
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
         weapon_case("minecraft:crossbow", "minecraft:piercing", 1, true, false);
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn death_weapon_c_trident_loyalty_ii() {
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
         weapon_case("minecraft:trident", "minecraft:loyalty", 2, true, false);
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn death_weapon_d_sharpness_v_sword_reads_live_axe() {
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
         weapon_case(
@@ -230,7 +232,7 @@ fn death_weapon_d_sharpness_v_sword_reads_live_axe() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn death_weapon_e_fall_has_no_weapon() {
     if isolated() {
         return;
@@ -321,7 +323,7 @@ fn wasm_weapon_dispatch(
             answer_len = answer.bytes().len()
         )
     };
-    let bytes = wat::parse_str(format!(
+    let bytes = wat::parse_str(horizon_mod_wasm::fixture::by_name(&format!(
         r#"(module
       (@custom "dylink.0" "\01\04\00\00\00\00")
       (import "env" "memory" (memory 1))
@@ -354,7 +356,7 @@ fn wasm_weapon_dispatch(
         request = escape(request.bytes()),
         answer = escape(answer.bytes()),
         answer_len = answer.bytes().len()
-    ))
+    ), &[("Backend", "living_weapon_item")]))
     .unwrap();
     let module = horizon_mod_wasm::fixture::module(&bytes).unwrap();
     let mut sentinel = expected.clone();

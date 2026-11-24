@@ -6,11 +6,19 @@
 //!
 //! The renderer draws into frames of its own while this is on; the present thread
 //! copies each to the swapchain, which it alone acquires and presents.
+//!
+//! With HDR output (the float frame with the HUD's layer) the world kept is light, as the
+//! frame holds it before the tone curve; the made frame's light goes through the frame's
+//! own passes, the tone curve, the HUD's layer and `Hdr::present`, as the real frame's
+//! does (`Renderer::draw_generated`).
 
+#[cfg(test)]
+mod hdr_tests;
 mod interpolation;
-mod motion;
+pub(in crate::gfx) mod motion;
 mod optical_flow;
 
+use super::external;
 use glam::{DMat4, DVec3, Mat4};
 use std::{
     sync::{
@@ -43,11 +51,29 @@ fn debug() -> Option<&'static str> {
         .as_deref()
 }
 
+/// Frame generation with a native shader pack, unless `HORIZON_FRAMEGEN_NATIVE_PACK=0`.
+/// Read once: the frame's gate asks every frame.
+pub(super) fn native_pack_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED
+        .get_or_init(|| std::env::var("HORIZON_FRAMEGEN_NATIVE_PACK").map_or(true, |v| v != "0"))
+}
+
 pub struct FrameGen {
     pub on: bool,
+    /// The refusal reason last logged, so a standing one logs once, not per frame.
+    pub logged_refusal: Option<String>,
     /// The present thread failed to show a frame (or died): until the renderer has
     /// acquired a frame itself, the normal path runs and handles the surface.
     pub paused: bool,
+    /// The surface refused its last configuration (HDR's colour space, once the window is on
+    /// a display without it) and kept its old swapchain, while wgpu describes its frames by
+    /// the new size: the present thread's copy would overrun, a validation error that is
+    /// fatal there. Frame generation stays off until the next attempt (`stop_to_configure`).
+    pub refused: bool,
+    /// Its frames or targets had no room (#13624): off until the surface is configured again
+    /// (`stop_to_configure`).
+    pub no_room: bool,
     gpu: Option<Gpu>,
     presenter: Option<Presenter>,
     /// When the last real frame was handed over, and the time between real frames.
@@ -73,14 +99,19 @@ pub struct FrameGen {
 
 /// What runs on the GPU for one screen size.
 struct Gpu {
+    /// The frame-generation frames' own post: its pipelines write their surface
+    /// format, where the renderer's `Post` writes the frame's (a pack's float
+    /// one). The groups it binds sample the same float textures.
+    present: super::world_post::Post,
+    present_world: wgpu::BindGroup,
+    present_output: wgpu::BindGroup,
     size: [u32; 2],
+    format: wgpu::TextureFormat,
     flow: optical_flow::OpticalFlow,
     interpolation: interpolation::Interpolation,
     /// This frame's world at the screen's size, and bindings that copy it or the
     /// interpolation's output (`Post::finish_with`).
     world: wgpu::TextureView,
-    world_group: wgpu::BindGroup,
-    output_group: wgpu::BindGroup,
     /// The next interpolation has no previous frame.
     reset: bool,
 }
@@ -104,7 +135,10 @@ impl FrameGen {
     pub fn new() -> Self {
         Self {
             on: false,
+            logged_refusal: None,
             paused: false,
+            refused: false,
+            no_room: false,
             gpu: None,
             presenter: None,
             last: None,
@@ -119,6 +153,23 @@ impl FrameGen {
             shown_since: Instant::now(),
             made_share: None,
         }
+    }
+
+    /// `stop`, before the surface is configured again: what it `refused` no longer counts.
+    pub fn stop_to_configure(&mut self) {
+        self.refused = false;
+        self.no_room = false;
+        self.stop();
+    }
+
+    /// There was no room for its frames or targets: stopped, nothing it made is kept, and it
+    /// is off until the surface is configured again.
+    pub(super) fn out_of_room(&mut self) {
+        self.stop();
+        self.gpu = None;
+        self.offscreen_generated = None;
+        self.motion = None;
+        self.no_room = true;
     }
 
     /// Ends frame generation's frames and present thread: before the surface is
@@ -185,7 +236,7 @@ impl FrameGen {
         camera: DVec3,
     ) {
         self.motion
-            .get_or_insert_with(|| motion::ObjectMotion::new(device, atlas.clone()))
+            .get_or_insert_with(|| motion::ObjectMotion::new(device, Some(atlas.clone()), false))
             .track(entities, spans, camera);
     }
 
@@ -241,15 +292,20 @@ impl FrameGen {
         pair
     }
 
-    /// The world's target at the screen's size this frame, where `Post::finish` draws.
+    /// The world's target at the screen's size this frame, where `Post::finish` draws, in
+    /// the frame's `format`.
     pub fn world(
         &mut self,
         device: &wgpu::Device,
-        post: &super::world_post::Post,
         config: &wgpu::SurfaceConfiguration,
+        format: wgpu::TextureFormat,
     ) -> wgpu::TextureView {
         let size = [config.width, config.height];
-        if self.gpu.as_ref().is_none_or(|g| g.size != size) {
+        if self
+            .gpu
+            .as_ref()
+            .is_none_or(|g| g.size != size || g.format != format)
+        {
             let world = device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("Frame generation world"),
@@ -261,7 +317,7 @@ impl FrameGen {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: config.format.remove_srgb_suffix(),
+                    format,
                     // COPY_SRC: the interpolation keeps it as the previous frame.
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING
@@ -270,11 +326,16 @@ impl FrameGen {
                 })
                 .create_view(&Default::default());
             let interpolation = interpolation::Interpolation::new(device, size);
+            let present = super::world_post::Post::new(device, config.format);
+            let present_world = present.bind(device, &world);
+            let present_output = present.bind(device, interpolation.output());
             self.gpu = Some(Gpu {
                 size,
+                format,
                 flow: optical_flow::OpticalFlow::new(device, size),
-                world_group: post.bind(device, &world),
-                output_group: post.bind(device, interpolation.output()),
+                present,
+                present_world,
+                present_output,
                 interpolation,
                 world,
                 reset: true,
@@ -283,39 +344,54 @@ impl FrameGen {
         self.gpu.as_ref().expect("made above").world.clone()
     }
 
-    /// Copy the world (`world`) onto `screen` for the real frame, and draw the made
-    /// frame's world onto `generated`. Returns false when there is no made frame (the
-    /// first after a reset): `generated` then holds this frame's world too.
+    /// Copy this frame's world onto `screen` for the real frame, or the made frame's
+    /// (`made`, after `generate`).
+    pub fn show_world(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        screen: &wgpu::TextureView,
+        made: bool,
+    ) {
+        let gpu = self.gpu.as_ref().expect("world() ran this frame");
+        let group = if made {
+            &gpu.present_output
+        } else {
+            &gpu.present_world
+        };
+        gpu.present.finish_with(encoder, screen, group, None);
+    }
+
+    /// Draw the made frame's world onto `generated`. `peak`: on the float frame, the
+    /// display's peak in paper whites (`OpticalFlow::dispatch`). Returns false when there is
+    /// no made frame (the first after a reset): `generated` then holds this frame's world.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        post: &super::world_post::Post,
-        screen: &wgpu::TextureView,
         generated: &wgpu::TextureView,
         camera: &Camera,
+        peak: Option<f32>,
     ) -> bool {
         let gpu = self.gpu.as_mut().expect("world() ran this frame");
-        post.finish_with(encoder, screen, &gpu.world_group, None);
         let reset = gpu.reset || camera.reproject.is_none();
         let reproject = camera.reproject.unwrap_or(Mat4::IDENTITY);
-        let object_motion = self
+        let motion = self
             .motion
             .as_mut()
-            .expect("track_entities() ran this frame")
-            .draw(
-                device,
-                queue,
-                encoder,
-                &camera.depth,
-                camera.render_size,
-                camera.jittered,
-                camera.view_proj,
-                reproject * camera.view_proj,
-            );
-        gpu.flow.dispatch(device, queue, encoder, &gpu.world, reset);
+            .expect("track_entities() ran this frame");
+        motion.prepare(
+            device,
+            queue,
+            camera.render_size,
+            camera.jittered,
+            camera.view_proj,
+            reproject * camera.view_proj,
+        );
+        let object_motion = motion.draw(device, encoder, &camera.depth);
+        gpu.flow
+            .dispatch(device, queue, encoder, &gpu.world, peak, reset);
         gpu.interpolation.dispatch(
             device,
             queue,
@@ -337,15 +413,25 @@ impl FrameGen {
         );
         gpu.reset = false;
         if debug() == Some("motion") {
-            post.finish_with(encoder, generated, &post.bind(device, &object_motion), None);
+            let group = gpu.present.bind(device, &object_motion);
+            gpu.present.finish_with(encoder, generated, &group, None);
             return true;
         }
         if reset {
-            post.finish_with(encoder, generated, &gpu.world_group, None);
+            gpu.present
+                .finish_with(encoder, generated, &gpu.present_world, None);
         } else {
-            post.finish_with(encoder, generated, &gpu.output_group, None);
+            gpu.present
+                .finish_with(encoder, generated, &gpu.present_output, None);
         }
         !reset
+    }
+
+    /// The present thread presented a frame.
+    pub fn shown(&self) -> bool {
+        self.presenter
+            .as_ref()
+            .is_some_and(|p| p.shown.load(Ordering::Relaxed))
     }
 
     /// Hand this frame's pair to the present thread, after the frame's submission: the
@@ -393,7 +479,136 @@ impl FrameGen {
     }
 }
 
-/// A frame to draw into, like the swapchain's.
+impl super::Renderer {
+    /// Frame generation's part of a frame once the world is drawn (`scaled`): the world at the
+    /// screen's size becomes the real frame's on `view_target` (`target`'s), and the made
+    /// frame is drawn onto `generated`, the hand and HUD over it (`overlay`) as over the real
+    /// one. Returns whether there is a made frame.
+    ///
+    /// With HDR output the made frame's world is light, as the real one's: it takes the frame
+    /// first and goes through the same passes, the tone curve, the HUD's layer and the last
+    /// pass into `generated`, so the two match in brightness, tone curve and HUD; then this
+    /// frame's world takes the frame. Under `HORIZON_FRAMEGEN_DEBUG` it is the made frame's
+    /// world again, so screenshots, drawn from HDR's targets, show the made frame too.
+    pub(super) fn draw_generated(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &super::Frame,
+        camera: &Camera,
+        overlay: &super::Overlay,
+        (view_target, target, generated): (&wgpu::TextureView, &wgpu::Texture, &wgpu::Texture),
+    ) -> bool {
+        let format = self.output.frame.format;
+        let world = self.frame_gen.world(&self.device, &self.config, format);
+        // A native pack composes the picture itself: its post chain ran in the
+        // frame (`run_post` on the scaled world), and its output pass replaces
+        // the engine's resolve wherever the picture lands — the frame's world
+        // (what optical flow and the interpolation see, at the frame's format)
+        // and the real frame — so no vanilla picture leaks into the made ones.
+        let native_tonemap = self.executor.is_some() && self.external.is_some() && !frame.title;
+        // A pack without post passes reads the engine's resolve of the world.
+        let engine_resolve = self.executor.as_ref().is_some_and(|c| c.engine_resolve);
+        let resolved = (native_tonemap && engine_resolve)
+            .then(|| {
+                (self.world_post).resolve_taa_staged(
+                    &self.device,
+                    &mut self.uploads,
+                    encoder,
+                    self.own_timing.as_mut(),
+                )
+            })
+            .flatten()
+            .or_else(|| {
+                let fxaa = (native_tonemap && engine_resolve && self.world_post.antialias)
+                    .then(|| self.world_post.resolved(&self.device))
+                    .flatten()?;
+                self.world_post
+                    .finish(&mut self.uploads, encoder, &fxaa, self.own_timing.as_mut());
+                Some(fxaa)
+            });
+        if !native_tonemap {
+            let timing = self.own_timing.as_mut();
+            self.world_post
+                .finish(&mut self.uploads, encoder, &world, timing);
+        } else {
+            let native = self.external.as_mut().expect("checked above");
+            native.run_output(external::WorldOutput {
+                device: &self.device,
+                encoder,
+                screen: &world,
+                resolved: resolved.as_ref(),
+            });
+        }
+        let peak = self
+            .hdr
+            .as_ref()
+            .map(|h| (h.peak / h.paper_white.max(1.0)).max(1.0));
+        let generated_view = generated.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(generated.format().remove_srgb_suffix()),
+            ..Default::default()
+        });
+        let made_onto = match peak {
+            Some(_) => (view_target, target),
+            None => {
+                if native_tonemap {
+                    let native = self.external.as_mut().expect("checked above");
+                    native.run_output(external::WorldOutput {
+                        device: &self.device,
+                        encoder,
+                        screen: view_target,
+                        resolved: resolved.as_ref(),
+                    });
+                } else {
+                    self.frame_gen.show_world(encoder, view_target, false);
+                }
+                (&generated_view, generated)
+            }
+        };
+        let (device, queue) = (&self.device, &self.queue);
+        let made = self
+            .frame_gen
+            .generate(device, queue, encoder, made_onto.0, camera, peak);
+        // With HDR output, a reset's world too under the debug view, which shows `generated`.
+        if made || peak.is_some() && generated_only() {
+            self.draw_overlay(encoder, frame, made_onto.0, made_onto.1, overlay);
+            if let Some(hdr) = &self.hdr {
+                hdr.present_staged(&mut self.uploads, encoder, generated, None);
+            }
+        }
+        if peak.is_some() {
+            let debug = made && generated_only();
+            if native_tonemap && !debug {
+                let native = self.external.as_mut().expect("checked above");
+                native.run_output(external::WorldOutput {
+                    device: &self.device,
+                    encoder,
+                    screen: view_target,
+                    resolved: None,
+                });
+            } else {
+                self.frame_gen.show_world(encoder, view_target, debug);
+            }
+        }
+        made
+    }
+
+    /// Hands this frame's pair to the present thread (`FrameGen::present`); once it has
+    /// presented, HDR output has shown a frame (`hdr_start`).
+    pub(super) fn present_generated(
+        &mut self,
+        real: wgpu::Texture,
+        generated: wgpu::Texture,
+        made: bool,
+    ) {
+        self.frame_gen.present(real, generated, made);
+        if self.frame_gen.shown() {
+            self.drop_hdr_marker();
+        }
+    }
+}
+
+/// A frame to draw into, like the swapchain's. The 8-bit surface format: the pack's
+/// output pass and the overlays both draw their picture at it, as on the swapchain.
 fn frame(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Frame generation frame"),
@@ -423,6 +638,17 @@ struct Pair {
     interval: Duration,
 }
 
+/// Whether the present thread may call `Window::pre_present_notify`.
+///
+/// On macOS winit implements that call as `dispatch_sync` onto the main queue,
+/// and the callback it runs there is empty. This thread is not the main thread.
+/// The main thread is blocked in the pair channel until `show` returns, so the
+/// sync never runs and the window stops (spinning cursor). Wayland is the
+/// platform that uses the notify.
+fn notify_before_present(vsync: bool) -> bool {
+    vsync && cfg!(not(target_os = "macos"))
+}
+
 /// The thread that copies frames to the swapchain and presents them on time.
 struct Presenter {
     config: wgpu::SurfaceConfiguration,
@@ -430,6 +656,8 @@ struct Presenter {
     free: mpsc::Receiver<wgpu::Texture>,
     /// The surface gave something other than a frame: the renderer takes it back.
     failed: Arc<AtomicBool>,
+    /// A frame was presented.
+    shown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -451,6 +679,8 @@ impl Presenter {
         let vsync = config.present_mode == wgpu::PresentMode::Fifo;
         let failed = Arc::new(AtomicBool::new(false));
         let failed_here = failed.clone();
+        let shown = Arc::new(AtomicBool::new(false));
+        let shown_here = shown.clone();
         let thread = thread::Builder::new()
             .name("Frame generation present".into())
             .spawn(move || {
@@ -461,6 +691,9 @@ impl Presenter {
                     // Anything but a frame (outdated, lost, occluded...): the renderer
                     // stops this thread and acquires itself, handling it as it does
                     // without frame generation. A suboptimal frame still shows.
+                    // This runs off the main thread. On macOS the Metal acquire must
+                    // not call into AppKit here, and `nextDrawable` must be able to
+                    // time out: the main thread waits on this thread for targets.
                     let target = match surface.get_current_texture() {
                         wgpu::CurrentSurfaceTexture::Success(t) => t,
                         wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -479,10 +712,11 @@ impl Presenter {
                         target.texture.size(),
                     );
                     queue.submit([encoder.finish()]);
-                    if vsync {
+                    if notify_before_present(vsync) {
                         window.pre_present_notify();
                     }
                     queue.present(target);
+                    shown_here.store(true, Ordering::Relaxed);
                 };
                 while let Ok(pair) = receive.recv() {
                     if let Some(first) = pair.first {
@@ -509,6 +743,7 @@ impl Presenter {
             send: Some(send),
             free,
             failed,
+            shown,
             thread: Some(thread),
         }
     }
@@ -539,6 +774,14 @@ mod tests {
             pos: pos.into(),
             ..bytemuck::Zeroable::zeroed()
         }
+    }
+
+    /// macOS must not hop to the main queue from the present thread. That hop is
+    /// what froze the window with upscaling and frame generation on.
+    #[test]
+    fn the_present_thread_does_not_wait_on_the_main_queue() {
+        assert!(!notify_before_present(false));
+        assert_eq!(notify_before_present(true), cfg!(not(target_os = "macos")));
     }
 
     /// A swing lands halfway; a hand still on screen while the camera turns stays still;

@@ -1,4 +1,4 @@
-//! Main-thread fault isolation on one raw channel (#3209), through a published server and a
+//! Main-thread fault isolation on one raw channel (arismoko/horizon#3209), through a published server and a
 //! vanilla-shaped TCP peer that never answers the Horizon payload query: the first declaring
 //! mod stages a write and fails, the second commits its own; the first's write is rolled back
 //! before the second runs, each runs once per message in load order, and the connection stays.
@@ -29,13 +29,25 @@ struct Step {
     log: Log,
 }
 impl IPayloadHandler for Step {
-    fn handle(&self, bytes: PayloadBytes, context: &mut dyn IPayloadContext) -> Result<(), String> {
+    fn handle(
+        &self,
+        bytes: PayloadBytes,
+        context: &mut dyn IPayloadContext,
+    ) -> Result<(), mod_api::PayloadHandleError> {
         assert_eq!(std::thread::current().name(), Some("Server thread"));
         let round = bytes.0[0];
-        let player = context.player().map_err(|e| format!("{e:?}"))?;
-        let host = context.server_host().map_err(|e| format!("{e:?}"))?;
-        let living = host.living(player.entity()).ok_or("no living player")?;
-        let seen = living.health(host).ok_or("no health")?;
+        let player = context
+            .player()
+            .map_err(|e| mod_api::PayloadHandleError::Failed(format!("{e:?}")))?;
+        let host = context
+            .server_host()
+            .map_err(|e| mod_api::PayloadHandleError::Failed(format!("{e:?}")))?;
+        let living = host
+            .living(player.entity())
+            .ok_or_else(|| mod_api::PayloadHandleError::Failed("no living player".into()))?;
+        let seen = living
+            .health(host)
+            .ok_or_else(|| mod_api::PayloadHandleError::Failed("no health".into()))?;
         self.log.lock().unwrap().push((self.name, round, seen));
         if self.fails {
             assert!(living.set_health(host, STAGED));
@@ -44,13 +56,15 @@ impl IPayloadHandler for Step {
                 Some(STAGED),
                 "the write is staged in place"
             );
-            return Err("refused after staging a write".into());
+            return Err(mod_api::PayloadHandleError::Failed(
+                "refused after staging a write".into(),
+            ));
         }
         assert!(living.set_health(host, COMMITTED));
         context
             .reply(&PayloadId(CHANNEL.into()), bytes)
             .map(drop)
-            .map_err(|e| format!("reply: {e:?}"))
+            .map_err(|e| mod_api::PayloadHandleError::Failed(format!("reply: {e:?}")))
     }
 }
 struct Declares(Arc<Step>);
@@ -65,7 +79,7 @@ impl Hooks for Declares {
 }
 
 #[test]
-#[ignore = "needs HORIZON_TEST_RESOURCES; starts an integrated server and a physical TCP client"]
+#[ignore = "daily"]
 fn a_failing_raw_handler_rolls_back_alone_and_the_next_one_commits() {
     super::tests::require_resources();
     if super::super::native_entity_refs::tests::run_fresh_cases(

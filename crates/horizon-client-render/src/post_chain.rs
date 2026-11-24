@@ -32,7 +32,7 @@ const BLOCK_BYTES: usize = 128;
 /// more than vanilla writes still binds.
 const UNIFORM_BYTES: u64 = 256;
 
-/// `ResourceLocation.withDefaultNamespace` on an id read from a chain.
+/// `Identifier.withDefaultNamespace` on an id read from a chain.
 fn normalise(id: &str) -> String {
     if id.contains(':') {
         id.to_owned()
@@ -557,6 +557,8 @@ pub struct PostEffects {
     /// Chains loading on a thread of their own ([`PostEffects::preload`]), for the
     /// root they load from; `pending` until they arrive.
     preloading: Option<(ResourceSource, mpsc::Receiver<Preloaded>)>,
+    #[cfg(test)]
+    test_workers: Vec<std::thread::JoinHandle<()>>,
     pending: HashSet<String>,
     /// This frame's `Extras::blocks`.
     extra_blocks: BTreeMap<String, Vec<u8>>,
@@ -564,6 +566,24 @@ pub struct PostEffects {
     /// pipeline, and the texture at the frame's size.
     gl_depth: Option<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
     gl_depth_target: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+#[cfg(test)]
+impl Drop for PostEffects {
+    fn drop(&mut self) {
+        drop(self.preloading.take());
+        let mut panic = None;
+        for worker in self.test_workers.drain(..) {
+            if let Err(error) = worker.join() {
+                panic.get_or_insert(error);
+            }
+        }
+        if !std::thread::panicking()
+            && let Some(error) = panic
+        {
+            std::panic::resume_unwind(error);
+        }
+    }
 }
 
 /// The frame's depth with its rows flipped as the chains' colour is (row 0 at the bottom). Its
@@ -680,6 +700,8 @@ impl PostEffects {
             chains: HashMap::new(),
             failed: HashSet::new(),
             preloading: None,
+            #[cfg(test)]
+            test_workers: Vec::new(),
             pending: HashSet::new(),
             root: empty_source().clone(),
             extra_blocks: BTreeMap::new(),
@@ -697,7 +719,7 @@ impl PostEffects {
         }
     }
 
-    /// `GameRenderer.reloadPostEffects`-alike: forget chains loaded from another
+    /// `GameRenderer.onResourceManagerReload`-alike: forget chains loaded from another
     /// root, and the failures with them (`shouldResetFailedPostEffects`).
     fn use_root(&mut self, root: &ResourceSource) {
         if !self.root.same_generation(root) {
@@ -755,7 +777,11 @@ impl PostEffects {
                     }
                 }
             });
-        if spawned.is_ok() {
+        if let Ok(worker) = spawned {
+            #[cfg(test)]
+            self.test_workers.push(worker);
+            #[cfg(not(test))]
+            drop(worker);
             self.pending.extend(ids);
             self.preloading = Some((self.root.clone(), rx));
         }
@@ -1092,22 +1118,9 @@ impl PostEffects {
         Ok(pass)
     }
 
-    /// `textures/effect/<location>.png` as a texture (`PostChain.createPass`'s `TextureInput`).
-    fn image(
-        root: &ResourceSource,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        location: &str,
-    ) -> Result<(wgpu::Texture, wgpu::TextureView, [u32; 2]), String> {
-        let (ns, path) = location.split_once(':').unwrap_or(("minecraft", location));
-        let file = format!("assets/{ns}/textures/effect/{path}.png");
-        let bytes = root.read(&file).map_err(|e| format!("{file}: {e}"))?;
-        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-        // As the other resource-pack images: stb_image never checks chunk CRCs.
-        decoder.ignore_checksums(true);
-        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-        let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-        let mut data = vec![0; reader.output_buffer_size().ok_or("a huge image")?];
+    /// A post effect image's PNG `bytes` as its frame and RGBA pixels.
+    fn decode_image(bytes: Vec<u8>) -> Result<(png::OutputInfo, Vec<u8>), String> {
+        let (mut reader, mut data) = crate::hud::read_png(bytes)?;
         let info = reader.next_frame(&mut data).map_err(|e| e.to_string())?;
         let rgba: Vec<u8> = match info.color_type {
             png::ColorType::Rgba => data[..info.buffer_size()].to_vec(),
@@ -1129,6 +1142,20 @@ impl PostEffects {
                 .collect(),
             png::ColorType::Indexed => return Err("an indexed image".into()),
         };
+        Ok((info, rgba))
+    }
+
+    /// `textures/effect/<location>.png` as a texture (`PostChain.createPass`'s `TextureInput`).
+    fn image(
+        root: &ResourceSource,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        location: &str,
+    ) -> Result<(wgpu::Texture, wgpu::TextureView, [u32; 2]), String> {
+        let (ns, path) = location.split_once(':').unwrap_or(("minecraft", location));
+        let file = format!("assets/{ns}/textures/effect/{path}.png");
+        let bytes = root.read(&file).map_err(|e| format!("{file}: {e}"))?;
+        let (info, rgba) = Self::decode_image(bytes)?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Post effect image"),
             size: wgpu::Extent3d {
@@ -2075,6 +2102,7 @@ mod tests {
     /// `swap`, then a blit modulated by (1, 0, 0.5, 1) back onto the frame.
     #[test]
     fn a_chain_draws_onto_the_frame() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -2111,6 +2139,7 @@ mod tests {
 
     #[test]
     fn a_chain_naming_an_unknown_shader_fails_once() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -2212,6 +2241,7 @@ mod tests {
     /// Frame orientation survives a chain through an intermediate target.
     #[test]
     fn a_chain_keeps_the_frame_upright() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -2243,6 +2273,7 @@ mod tests {
     /// `textures/effect` image: nothing here is one of vanilla's shaders.
     #[test]
     fn a_chain_runs_its_own_glsl() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = depth_device() else {
             return;
         };
@@ -2285,6 +2316,7 @@ mod tests {
     /// close to 1), not as GL's window depth.
     #[test]
     fn a_pass_reads_the_frame_depth_as_it_is() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = depth_device() else {
             return;
         };
@@ -2412,6 +2444,7 @@ mod tests {
     /// thread, and runs as one loaded in its frame does.
     #[test]
     fn a_preloaded_archive_chain_arrives_compiled() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = depth_device() else {
             return;
         };
@@ -2487,6 +2520,7 @@ mod tests {
     /// without the prepared resources).
     #[test]
     fn vanilla_chains_run() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -2521,6 +2555,7 @@ mod tests {
 
     #[test]
     fn vanilla_chains_load() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };
@@ -2552,6 +2587,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod effect_image_size_tests {
+    /// A post effect image whose header claims more pixels than a full atlas fails the chain as
+    /// an undecodable one does, before memory for its pixels is reserved.
+    #[test]
+    fn an_effect_image_claiming_a_huge_size_is_refused() {
+        let png = crate::hud::claimed_size_png(16_385, 16_384);
+        let error = super::PostEffects::decode_image(png).unwrap_err();
+        assert!(error.contains("16385x16384 PNG is larger"), "{error}");
+    }
+
+    #[test]
+    fn an_effect_image_still_decodes() {
+        let (info, rgba) = super::PostEffects::decode_image(crate::hud::grey_png(4, 2)).unwrap();
+        assert_eq!((info.width, info.height), (4, 2));
+        assert_eq!(rgba, [128, 128, 128, 255].repeat(8));
     }
 }
 

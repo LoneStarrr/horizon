@@ -5,7 +5,7 @@ use horizon_core::position::ChunkPos;
 use std::sync::Arc;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+#[ignore = "daily"]
 fn loaded_air_is_discarded_on_first_actual_game_tick() {
     crate::game::native_entity_refs::tests::with_game(|game| {
         game.build_registries();
@@ -16,6 +16,7 @@ fn loaded_air_is_discarded_on_first_actual_game_tick() {
         game.block_ticks
             .add_empty_chunk(ChunkPos::new(0, 0))
             .unwrap();
+        game.load_ticking_neighbourhood(0, 0);
         assert!(game.run_command("forceload add 0 0"));
         assert!(game.run_command("fill 0 199 0 15 199 15 stone"));
         assert!(game.res.facts().is_air(game.world.block(4, 204, 4)));

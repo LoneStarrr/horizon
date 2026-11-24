@@ -14,36 +14,6 @@ use horizon_client::{
 use horizon_core::nbt::{JavaString, Tag};
 use std::collections::HashMap;
 
-/// `LodestoneTracker.tick`: existing native eligibility/loaded-block predicate.
-/// The POI/unloaded boundary is unchanged; callers mutate their actual stacks.
-pub(super) fn lodestone_target_gone(game: &Game<'_>, stack: &ItemStack, dim: &str) -> bool {
-    let Some(tracker) = stack
-        .data()
-        .and_then(|d| d.other("minecraft:lodestone_tracker"))
-    else {
-        return false;
-    };
-    let (Some(target), true) = (
-        tracker.get("target"),
-        horizon_client::save::number(tracker.get("tracked")).is_none_or(|v| v != 0),
-    ) else {
-        return false;
-    };
-    let Some(Tag::IntArray(pos)) = target.get("pos") else {
-        return false;
-    };
-    let [x, y, z] = [pos[0], pos[1], pos[2]];
-    horizon_client::save::text(target.get("dimension")).as_deref() == Some(dim)
-        && game.world.chunks.contains_key(&(x >> 4, z >> 4))
-        && game
-            .res
-            .facts()
-            .get(game.world.block(x, y, z))
-            .name
-            .as_ref()
-            != "minecraft:lodestone"
-}
-
 /// What a decoration is filed under in `MapItemSavedData.decorations` (a
 /// `LinkedHashMap<String, MapDecoration>`): a player's marker by their
 /// connection, the banner at a position (`MapBanner.getId`), a framed map's
@@ -228,6 +198,10 @@ pub(super) struct MapData {
     dirty: bool,
     texture_dirty: bool,
 }
+/// Narrow to `i32`, clipping at its ends.
+fn clip_i32(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
 impl MapData {
     /// `MapItemSavedData.createFresh`: centred on the scale's grid cell.
     pub(super) fn fresh(x: f64, z: f64, scale: u8, dimension: &str) -> Self {
@@ -247,6 +221,14 @@ impl MapData {
             holders: Vec::new(),
             dirty: true,
             texture_dirty: true,
+        }
+    }
+    /// `MapItemSavedData.setLocked`: the flag changes and the map is marked to save. Nothing is
+    /// repainted and no holder is sent anything, as vanilla.
+    pub(super) fn set_locked(&mut self, locked: bool) {
+        if self.locked != locked {
+            self.locked = locked;
+            self.dirty = true;
         }
     }
     /// `MapItemSavedData.setColor` for every pixel of `colors` (128 by 128, row by row): each
@@ -1124,16 +1106,16 @@ impl Game<'_> {
             return;
         }
         let scale = 1i32 << m.scale;
-        let start_x = m.center[0] / scale - 64;
-        let start_z = m.center[1] / scale - 64;
+        let start_x = i64::from(m.center[0] / scale) - 64;
+        let start_z = i64::from(m.center[1] / scale) - 64;
         let sea_level = crate::game::Dim::sea_level_of_id(dim);
-        let quarts: Vec<[i32; 3]> = (0..128)
+        let quarts: Vec<[i32; 3]> = (0..128i32)
             .flat_map(|row| {
-                (0..128).map(move |column| {
+                (0..128i32).map(move |column| {
                     zoom.quart_at_block(horizon_core::position::BlockPos::new(
-                        (start_x + column) * scale,
+                        clip_i32((start_x + i64::from(column)) * i64::from(scale)),
                         sea_level,
-                        (start_z + row) * scale,
+                        clip_i32((start_z + i64::from(row)) * i64::from(scale)),
                     ))
                 })
             })
@@ -1333,36 +1315,14 @@ impl Game<'_> {
         self.swing_arm();
         true
     }
-    /// `CompassItem.inventoryTick` / `LodestoneTracker.tick`: a compass whose
-    /// lodestone is gone loses its target. A target in an unloaded chunk waits.
+    /// `Inventory.tick` (and `EntityEquipment.tick` for the armour) ->
+    /// `CompassItem.inventoryTick`: each compass the player carries whose
+    /// lodestone is gone loses its target (`inventory_tick`).
     pub(super) fn tick_lodestone_compasses(&mut self) {
-        let dim = self.dimension_id();
-        for slot in (0..self.inventory.len()).chain([super::shield::OFFHAND_SLOT]) {
-            if self
-                .stack_in(slot)
-                .is_some_and(|s| lodestone_target_gone(self, s, dim))
-                && let Some(s) = self.stack_in_mut(slot)
-            {
-                s.data_mut().set_other(
-                    "minecraft:lodestone_tracker",
-                    Some(Tag::Compound(Default::default())),
-                );
-            }
-        }
-        // `LivingEntity.tick` ticks `EntityEquipment` (the armour slots) as
-        // well as the inventory, so a compass worn there loses its target too.
-        let gone = self.armor.each_ref().map(|stack| {
-            stack
-                .as_ref()
-                .is_some_and(|s| lodestone_target_gone(self, s, dim))
-        });
-        for (stack, gone) in self.armor.iter_mut().zip(gone) {
-            if gone && let Some(stack) = stack {
-                stack.data_mut().set_other(
-                    "minecraft:lodestone_tracker",
-                    Some(Tag::Compound(Default::default())),
-                );
-            }
+        let (world, facts, dim) = (&self.world, self.res.facts(), self.dim.id());
+        let stacks = self.inventory.iter_mut().chain([&mut self.offhand]);
+        for stack in stacks.chain(self.armor.iter_mut()).flatten() {
+            super::inventory_tick::compass_inventory_tick(world, facts, dim, stack);
         }
     }
     fn give_or_drop_stack(&mut self, stack: ItemStack) {
@@ -1601,8 +1561,16 @@ impl Game<'_> {
                 }
                 let d2 = (img_x - px).pow(2) + (img_y - pz).pow(2);
                 let dither_black = d2 > (radius - 2) * (radius - 2);
-                let min_x = (cx / scale + img_x - 64) * scale;
-                let min_z = (cz / scale + img_y - 64) * scale;
+                // Widened: a mod may centre a map where the i32 block coordinate overflows.
+                let wide_x = (i64::from(cx / scale) + i64::from(img_x) - 64) * i64::from(scale);
+                let wide_z = (i64::from(cz / scale) + i64::from(img_y) - 64) * i64::from(scale);
+                let fits = |v: i64| {
+                    i32::try_from(v).is_ok() && i32::try_from(v + i64::from(scale)).is_ok()
+                };
+                if !fits(wide_x) || !fits(wide_z) {
+                    continue;
+                }
+                let (min_x, min_z) = (wide_x as i32, wide_z as i32);
                 if !self.world.chunks.contains_key(&(min_x >> 4, min_z >> 4)) {
                     continue;
                 }
@@ -2133,6 +2101,7 @@ mod tests {
     /// `can_place_on` component includes the banner block toggles that banner's
     /// marker, while one without does not.
     #[test]
+    #[ignore = "daily"]
     fn map_on_banner_in_adventure_mode_honours_can_place_on() {
         use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
         use horizon_client::{chunk::Chunk, command::args::GameMode};

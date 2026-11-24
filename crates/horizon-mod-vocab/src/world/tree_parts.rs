@@ -21,6 +21,7 @@ use std::sync::Arc;
 /// A block state a tree part places: the handle [`TreeContext::state`] and
 /// [`TreeContext::block`] give. It means something only inside the tree that gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// no wire: a handle meaningful only inside the tree that gave it; never sent between processes
 #[non_exhaustive]
 pub struct TreeState(pub(crate) u32);
 
@@ -39,6 +40,7 @@ impl TreeState {
 
 /// A log's axis (`RotatedPillarBlock.AXIS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// no wire: a parameter of a tree-part call into the engine, in process
 // exhaustive: a log has exactly these three axes
 pub enum TreeAxis {
     /// East-west.
@@ -51,6 +53,7 @@ pub enum TreeAxis {
 
 /// `FoliageAttachment`: where a trunk placer asks the foliage placer to grow leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// no wire: a value a tree part hands back in process
 // exhaustive: mods build it themselves as place_trunk's answer
 pub struct FoliageAttachment {
     /// The attachment's block position.
@@ -186,8 +189,11 @@ pub(crate) struct TreePartTable {
 
 /// The tree parts the mods registered at startup, by kind, for the hidden game integration
 /// boundary: `modid:name` → type.
+// hidden: the game's startup adapter reads the registered parts; mods declare them through the registrar.
 #[doc(hidden)]
 #[derive(Default)]
+// no wire: the game integration boundary, in process
+#[non_exhaustive]
 pub struct TreePartDeclarations {
     /// Trunk placer types.
     pub trunk_placers: Vec<(String, Arc<dyn TrunkPlacerType>)>,

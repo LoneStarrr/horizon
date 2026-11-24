@@ -2,205 +2,13 @@
 //! value, `ComponentSerialization` turns it into styled text.
 use crate::text::{InlineObject, Origin, Style, Text, named_color};
 use horizon_core::nbt::Tag;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-/// `SnbtGrammar`, enough for components: compounds, lists, quoted and
-/// unquoted strings, numbers (with type suffixes) and booleans. Returns the
-/// value and the bytes consumed.
+/// `SnbtGrammar` into JSON for the text renderer, using the canonical NBT parser.
 pub fn parse_snbt(input: &str) -> Result<(Value, usize), String> {
-    let mut p = Parser {
-        s: input.as_bytes(),
-        i: 0,
-        depth: 0,
-    };
-    let v = p.value()?;
-    Ok((v, p.i))
-}
-/// Nesting deeper than NBT's own limit (`NbtAccounter`'s 512) is refused
-/// rather than overflowing the stack.
-const SNBT_MAX_DEPTH: usize = 512;
-struct Parser<'a> {
-    s: &'a [u8],
-    i: usize,
-    depth: usize,
-}
-impl Parser<'_> {
-    fn ws(&mut self) {
-        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
-            self.i += 1;
-        }
-    }
-    fn peek(&self) -> Option<u8> {
-        self.s.get(self.i).copied()
-    }
-    fn expect(&mut self, c: u8) -> Result<(), String> {
-        self.ws();
-        if self.peek() == Some(c) {
-            self.i += 1;
-            Ok(())
-        } else {
-            Err(format!("expected '{}'", c as char))
-        }
-    }
-    fn value(&mut self) -> Result<Value, String> {
-        self.ws();
-        match self.peek() {
-            Some(b'{') => {
-                if self.depth >= SNBT_MAX_DEPTH {
-                    return Err(format!("tag nesting too deep at {}", self.i));
-                }
-                self.depth += 1;
-                let v = self.object();
-                self.depth -= 1;
-                v
-            }
-            Some(b'[') => {
-                if self.depth >= SNBT_MAX_DEPTH {
-                    return Err(format!("tag nesting too deep at {}", self.i));
-                }
-                self.depth += 1;
-                let v = self.array();
-                self.depth -= 1;
-                v
-            }
-            Some(b'"' | b'\'') => Ok(Value::String(self.string()?)),
-            Some(_) => {
-                let word = self.unquoted();
-                if word.is_empty() {
-                    return Err("expected a value".into());
-                }
-                Ok(match word.as_str() {
-                    "true" => Value::Bool(true),
-                    "false" => Value::Bool(false),
-                    _ => {
-                        let digits = word
-                            .trim_end_matches(['b', 'B', 's', 'S', 'l', 'L', 'f', 'F', 'd', 'D']);
-                        // Only digits (and an exponent) make a number: `nan`
-                        // or `Infinity`, which Rust's parse would take, stays
-                        // a string.
-                        if digits
-                            .bytes()
-                            .any(|c| c.is_ascii_alphabetic() && c != b'e' && c != b'E')
-                        {
-                            Value::String(word)
-                        } else {
-                            match (digits.parse::<i64>(), digits.parse::<f64>()) {
-                                (Ok(n), _) if digits.len() + 1 >= word.len() => Value::from(n),
-                                (_, Ok(f)) if digits.len() + 1 >= word.len() => Value::from(f),
-                                _ => Value::String(word),
-                            }
-                        }
-                    }
-                })
-            }
-            None => Err("expected a value".into()),
-        }
-    }
-    fn object(&mut self) -> Result<Value, String> {
-        self.i += 1;
-        let mut map = Map::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.i += 1;
-            return Ok(Value::Object(map));
-        }
-        loop {
-            self.ws();
-            let key = self.string()?;
-            self.expect(b':')?;
-            map.insert(key, self.value()?);
-            self.ws();
-            match self.peek() {
-                // SnbtGrammar: an entry may be followed by a comma before the brace.
-                Some(b',') => {
-                    self.i += 1;
-                    self.ws();
-                    if self.peek() == Some(b'}') {
-                        self.i += 1;
-                        return Ok(Value::Object(map));
-                    }
-                }
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(Value::Object(map));
-                }
-                _ => return Err("expected ',' or '}'".into()),
-            }
-        }
-    }
-    fn array(&mut self) -> Result<Value, String> {
-        self.i += 1;
-        let mut list = Vec::new();
-        self.ws();
-        // Typed arrays [B;...], [I;...], [L;...].
-        if matches!(
-            self.s.get(self.i..self.i + 2),
-            Some([b'B' | b'I' | b'L', b';'])
-        ) {
-            self.i += 2;
-        }
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.i += 1;
-            return Ok(Value::Array(list));
-        }
-        loop {
-            list.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                // SnbtGrammar: a list or array may end with a comma.
-                Some(b',') => {
-                    self.i += 1;
-                    self.ws();
-                    if self.peek() == Some(b']') {
-                        self.i += 1;
-                        return Ok(Value::Array(list));
-                    }
-                }
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(Value::Array(list));
-                }
-                _ => return Err("expected ',' or ']'".into()),
-            }
-        }
-    }
-    fn unquoted(&mut self) -> String {
-        let start = self.i;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+') {
-                self.i += 1;
-            } else {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&self.s[start..self.i]).into_owned()
-    }
-    fn string(&mut self) -> Result<String, String> {
-        self.ws();
-        let Some(q @ (b'"' | b'\'')) = self.peek() else {
-            return Ok(self.unquoted());
-        };
-        self.i += 1;
-        let mut out = Vec::new();
-        while let Some(c) = self.peek() {
-            self.i += 1;
-            match c {
-                b'\\' => {
-                    let Some(e) = self.peek() else { break };
-                    self.i += 1;
-                    out.push(match e {
-                        b'n' => b'\n',
-                        b't' => b'\t',
-                        other => other,
-                    });
-                }
-                c if c == q => return Ok(String::from_utf8_lossy(&out).into_owned()),
-                c => out.push(c),
-            }
-        }
-        Err("unterminated string".into())
-    }
+    let (tag, used) = horizon_core::nbt::parse_snbt(input)?;
+    let value = horizon_core::json_nbt::tag_to_json(&tag).map_err(|error| error.to_string())?;
+    Ok((value, used))
 }
 /// `click_event` / `hover_event`, or the pre-datafixer `clickEvent` /
 /// `hoverEvent` names SNBT and older chat JSON still use.
@@ -400,36 +208,15 @@ fn object_style<'a>(
     style
 }
 
-/// `TextColor.parseColor` for `#...`: `Integer.parseInt(rest, 16)` (so a sign
-/// and any digit count are accepted), kept only within `0..=0xFFFFFF`.
-pub(crate) fn hex_color(c: &str) -> Option<u32> {
-    let value = i64::from_str_radix(c.strip_prefix('#')?, 16).ok()?;
-    (0..=0xFF_FFFF).contains(&value).then_some(value as u32)
-}
+pub(crate) use horizon_assets::component_codec::hex_color;
+pub use horizon_assets::component_codec::shadow_color;
 
-/// `Style.shadow_color`: a packed ARGB int or normalized RGBA array.
-pub fn shadow_color(value: &Value) -> Option<u32> {
-    if let Some(packed) = value.as_i64() {
-        return i32::try_from(packed).ok().map(|n| n as u32);
-    }
-    let rgba = value.as_array()?;
-    if rgba.len() != 4 {
-        return None;
-    }
-    let channels = rgba
-        .iter()
-        .map(|channel| {
-            // ExtraCodecs.ARGB_COLOR_CODEC reads floats; ARGB.as8BitChannel
-            // floors each normalized channel multiplied by 255.
-            let value = channel.as_f64()? as f32;
-            (value.is_finite() && (0.0..=1.0).contains(&value))
-                .then_some((value * 255.0_f32).floor() as u32)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(channels[3] << 24 | channels[0] << 16 | channels[1] << 8 | channels[2])
+/// Whether `c` is a style `color` (`TextColor.parseColor`): a named colour or `#` and hex.
+pub fn is_color(c: &str) -> bool {
+    named_color(c).is_some() || hex_color(c).is_some()
 }
 /// `ComponentSerialization.CODEC` decoding into text. `selector` components
-/// are resolved by `resolve` (ComponentUtils.updateForEntity).
+/// are resolved by `resolve` (ComponentUtils.resolve).
 pub fn to_text(v: &Value, resolve: &mut dyn FnMut(&str) -> Text) -> Text {
     to_text_with(v, resolve, &mut |_| None)
 }
@@ -839,6 +626,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "daily"]
     fn mixed_recursive_temporaries_are_released_on_256_kib() {
         std::thread::Builder::new()
             .stack_size(256 * 1024)

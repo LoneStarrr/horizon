@@ -2,12 +2,30 @@ use super::*;
 
 impl Game<'_> {
     pub(super) fn guest_tick_death(&mut self, gi: usize) {
-        if self
-            .lan
-            .as_mut()
-            .is_some_and(|host| host.hub.guests.update(gi, |g| g.tick_death()))
-        {
-            self.guest_drop_carried(gi);
+        let removed = self.lan.as_mut().and_then(|host| {
+            host.hub.guests.update(gi, |guest| {
+                if !guest.tick_death() || guest.death_time != 20 {
+                    return None;
+                }
+                let dimensions = guest.dimensions();
+                Some((
+                    guest.entity_id,
+                    guest.position,
+                    dimensions,
+                    guest.death_canceled,
+                ))
+            })
+        });
+        if let Some((entity, position, dimensions, death_canceled)) = removed {
+            self.lan_entity_event(entity, 60, position);
+            self.death_poof(
+                position,
+                f64::from(dimensions.width),
+                f64::from(dimensions.height),
+            );
+            if !death_canceled {
+                self.guest_drop_carried(gi);
+            }
         }
     }
 
@@ -49,9 +67,9 @@ impl Game<'_> {
             g.position[2],
         ];
         let (yaw, pitch) = (g.yaw, g.pitch);
+        let mut r = horizon_client::random_source::entity(); // the guest's Entity.random
         for stack in stacks {
-            let r = &mut self.world.random;
-            let v = horizon_client::entities::drop_motion(r, yaw, pitch, false);
+            let v = horizon_client::entities::drop_motion(&mut r, yaw, pitch, false);
             self.spawn_item(stack, eye, v, 40);
         }
     }
@@ -174,10 +192,6 @@ impl Game<'_> {
         }
     }
 
-    /// `Level.getEntityOrPart(id).getBoundingBox()` for a guest's attack or
-    /// interaction: the host, another player, a mob, a vehicle or object, a
-    /// dragon part or crystal, a projectile. None for an id the level doesn't
-    /// have (the handlers then find nothing either).
     /// `WorldBorder.isWithinBounds(target.blockPosition())` for an entity of this box:
     /// the block its feet are in (the box's bottom centre).
     pub(super) fn inside_border(&self, target: &Aabb) -> bool {
@@ -185,6 +199,11 @@ impl Game<'_> {
         self.border.contains(feet.x.floor(), feet.z.floor())
     }
 
+    /// `Level.getEntityOrPart(id).getBoundingBox()` for a guest's attack or
+    /// interaction: the host, another player, a mob, a vehicle or object (a boat,
+    /// a minecart, an armour stand, an item frame, a painting or the level's own
+    /// `minecraft:interaction`), a dragon part or crystal, a projectile. None for
+    /// an id the level doesn't have (the handlers then find nothing either).
     pub(in crate::game) fn guest_target_box(&self, gi: usize, id: i32) -> Option<Aabb> {
         let host = self.lan.as_ref()?;
         let conn = host.hub.guests[gi].conn;
@@ -256,7 +275,7 @@ impl Game<'_> {
         }
         let inside = (0..3).all(|k| (hit.point[k] - f64::from(hit.pos[k]) - 0.5).abs() < 1.0000001);
         if !inside {
-            let d = horizon_client::java_text::double_to_string;
+            let d = horizon_core::java_number::double_to_string;
             let at = |k: usize| d(hit.point[k]);
             let line = format!(
                 "Rejecting UseItemOnPacket from {}: Location ({}, {}, {}) too far away from hit block BlockPos{{x={}, y={}, z={}}}.",
@@ -352,17 +371,8 @@ impl Game<'_> {
         let Some(host) = self.lan.as_mut() else {
             return refused.map_or(Ok(consumed), Err);
         };
-        for pos in [
-            hit.pos,
-            [
-                hit.pos[0] + face[0],
-                hit.pos[1] + face[1],
-                hit.pos[2] + face[2],
-            ],
-        ] {
-            let state = self.world.block(pos[0], pos[1], pos[2]).0 as i32;
-            host.hub
-                .send_to(conn, &C::BlockUpdate(play::BlockUpdate { pos, state }));
+        for pos in [hit.pos, hit.beside()] {
+            host.hub.send_block_correction(conn, &self.world, pos);
         }
         refused.map_or(Ok(consumed), Err)
     }
@@ -545,24 +555,48 @@ impl Game<'_> {
             .iter()
             .find(|g| g.entity_id == id && g.conn != conn && host.hub.here(g))
         {
-            Some(("minecraft:player".to_owned(), g.position))
+            Some(("minecraft:player".to_owned(), g.position, None))
         } else {
             // The mod hooks hear no natural fence knot (#13036).
             self.level_entity(id)
                 .filter(|t| !matches!(t, crate::game::commands::Target::Knot(_)))
                 .map(|t| {
+                    let primed_tnt = match t {
+                        crate::game::commands::Target::Tnt(id) => Some(id),
+                        _ => None,
+                    };
                     (
                         self.target_type(t),
                         self.target_position(t).unwrap_or_default(),
+                        primed_tnt,
                     )
                 })
         };
-        if let Some((kind, at)) = aimed
-            && self.as_guest_at(gi, conn, |g| {
+        if let Some((kind, at, primed_tnt)) = aimed {
+            if self.as_guest_at(gi, conn, |g| {
                 let mut canceled = false;
-                g.native_attack_entity(id, &kind, at, &mut canceled);
+                let dimension = g.dim.id();
+                g.native_attack_entity(dimension, id, &kind, at, &mut canceled);
                 canceled || g.native_left_click_entity_event(id, &kind)
             }) == Ok(true)
+            {
+                return Ok(false);
+            }
+            if let Some(tnt) = primed_tnt {
+                // The packet names the TNT. Its refused hit must never be
+                // redirected to a mob intersecting the server's recomputed ray.
+                let _ = self.as_guest_at(gi, conn, |g| g.attack_primed_tnt(tnt));
+                return Ok(false);
+            }
+        }
+        // `Interaction.skipAttackInteraction` keeps the blow on itself, and
+        // `Player.attack` for it is not ported: re-picking the crosshair here
+        // must not find a mob behind the interaction's box (#19010).
+        if let Ok(id) = u32::try_from(id)
+            && self
+                .others
+                .iter()
+                .any(|o| o.id == id && o.interaction.is_some())
         {
             return Ok(false);
         }

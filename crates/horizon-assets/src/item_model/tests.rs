@@ -454,6 +454,32 @@ fn registered_node_draws_the_models_the_mod_answers_per_stack() {
 }
 
 #[test]
+fn a_head_model_names_a_skull_kind_only_once_a_mod_registers_it() {
+    let head = |kind: &str| SpecialModel::decode(&json!({"type": "minecraft:head", "kind": kind}));
+    // Before registration a mod's kind is refused, as an unknown vanilla kind is.
+    assert!(head("skulltest:goblin").is_err());
+    assert!(head("goblin").is_err());
+    let kept = register_skull_kinds(vec![
+        "skulltest:goblin".into(),
+        "minecraft:goblin".into(),
+        "zombie".into(),
+        "skulltest:goblin".into(),
+    ]);
+    // Vanilla's namespace, an unnamespaced name and a second registration are left out.
+    assert_eq!(kept, ["skulltest:goblin"]);
+    assert!(register_skull_kinds(vec!["skulltest:goblin".into()]).is_empty());
+    assert!(is_skull_kind("skulltest:goblin"));
+    assert!(!is_skull_kind("minecraft:goblin"));
+    let goblin = head("skulltest:goblin").unwrap();
+    assert!(matches!(&goblin.kind, SpecialKind::Head { kind, .. } if kind == "skulltest:goblin"));
+    assert_eq!(goblin.to_json()["kind"], "skulltest:goblin");
+    assert!(head("minecraft:goblin").is_err());
+    assert!(head("skulltest:orc").is_err());
+    // Vanilla's kinds are unchanged.
+    assert!(head("zombie").is_ok());
+}
+
+#[test]
 fn last_index_less_or_equal_linear_and_binary() {
     use super::last_index_less_or_equal;
     let make = |thresholds: &[f32]| -> Vec<(f32, ItemModelNode)> {
@@ -509,4 +535,336 @@ fn last_index_less_or_equal_linear_and_binary() {
     ]);
     assert_eq!(last_index_less_or_equal(&zeroes, -0.0), Some(7));
     assert_eq!(last_index_less_or_equal(&zeroes, 0.0), Some(9));
+}
+
+#[test]
+fn component_select_normalizes_text_components_books_and_entity_ids() {
+    let mut models = ItemModels::default();
+    for (item_id, definition) in [
+        (
+            "minecraft:bread",
+            r##"{"model":{
+                "type":"minecraft:select","property":"minecraft:component","component":"minecraft:custom_name",
+                "cases":[
+                    {"when":{"text":"","extra":[{"text":"Styled Item","strikethrough":false,"obfuscated":false,"bold":false,"italic":true,"underlined":false,"color":"gold"}]},"model":{"type":"minecraft:model","model":"example:item/styled"}},
+                    {"when":{"text":"","extra":[{"text":"Hex Item","color":"#FFAA00"}]},"model":{"type":"minecraft:model","model":"example:item/hex"}}
+                ],
+                "fallback":{"type":"minecraft:model","model":"minecraft:item/bread"}
+            }}"##,
+        ),
+        (
+            "minecraft:written_book",
+            r#"{"model":{
+                "type":"minecraft:select","property":"minecraft:component","component":"minecraft:written_book_content",
+                "cases":[{"when":{"generation":1,"pages":[{"raw":"Page 1"}],"resolved":true,"title":{"raw":"Ledger"},"author":"Alice"},"model":{"type":"minecraft:model","model":"example:item/ledger"}}],
+                "fallback":{"type":"minecraft:model","model":"minecraft:item/written_book"}
+            }}"#,
+        ),
+        (
+            "minecraft:frog_spawn_egg",
+            r#"{"model":{
+                "type":"select","property":"component","component":"entity_data",
+                "cases":[{"when":{"id":"frog","variant":"cold"},"model":{"type":"minecraft:model","model":"example:item/cold_variant"}}],
+                "fallback":{"type":"minecraft:model","model":"minecraft:item/frog_spawn_egg"}
+            }}"#,
+        ),
+    ] {
+        models
+            .definitions
+            .insert(item_id.into(), ClientItem::from_json(definition).unwrap());
+        Arc::make_mut(&mut models.prototypes).insert(
+            item_id.into(),
+            BTreeMap::from([("minecraft:item_model".into(), json!(item_id))]),
+        );
+    }
+
+    let ctx = Context {
+        display: DisplayContext::Gui,
+        owner: None,
+        level: None,
+        seed: 0,
+    };
+    let resolve_model = |stack: &StackView| -> String {
+        let resolved = models.resolve(stack, &ctx, &NoEnv);
+        let LayerContent::Model { model } = &resolved.layers[0].content else {
+            panic!("expected model");
+        };
+        model.clone()
+    };
+
+    let mut bread = StackView::new("minecraft:bread", 1);
+    bread.patch.insert(
+        "minecraft:custom_name".into(),
+        Some(json!(["", {"text": "Styled Item", "strikethrough": 0, "obfuscated": 0, "bold": 0, "italic": 1, "underlined": 0, "color": "gold"}])),
+    );
+    assert_eq!(resolve_model(&bread), "example:item/styled");
+
+    // Vanilla's SelectItemModel hashes TextColor(value, name), so `#ffaa00` matches `#FFAA00` but not `gold`.
+    let mut hex_miss = StackView::new("minecraft:bread", 1);
+    hex_miss.patch.insert(
+        "minecraft:custom_name".into(),
+        Some(json!(["", {"text": "Styled Item", "strikethrough": false, "obfuscated": false, "bold": false, "italic": true, "underlined": false, "color": "#ffaa00"}])),
+    );
+    assert_eq!(resolve_model(&hex_miss), "minecraft:item/bread");
+
+    let mut hex_hit = StackView::new("minecraft:bread", 1);
+    hex_hit.patch.insert(
+        "minecraft:custom_name".into(),
+        Some(json!({"text": "", "extra": [{"text": "Hex Item", "color": "#ffaa00"}]})),
+    );
+    assert_eq!(resolve_model(&hex_hit), "example:item/hex");
+
+    let mut book = StackView::new("minecraft:written_book", 1);
+    book.patch.insert(
+        "minecraft:written_book_content".into(),
+        Some(json!({"title": "Ledger", "author": "Alice", "generation": 1, "pages": [{"text": "Page 1"}], "resolved": 1})),
+    );
+    assert_eq!(resolve_model(&book), "example:item/ledger");
+
+    let mut egg = StackView::new("minecraft:frog_spawn_egg", 1);
+    egg.patch.insert(
+        "minecraft:entity_data".into(),
+        Some(json!({"id": "minecraft:frog", "variant": "cold"})),
+    );
+    assert_eq!(resolve_model(&egg), "example:item/cold_variant");
+}
+
+#[test]
+fn static_item_classification_and_resolution_match_uncached_resolve() {
+    let mut models = ItemModels::default();
+    let mut insert = |item: &str, model_id: &str, definition: Value, extra: Vec<(&str, Value)>| {
+        models
+            .definitions
+            .insert(model_id.into(), ClientItem::decode(&definition).unwrap());
+        let mut proto = BTreeMap::from([(
+            "minecraft:item_model".into(),
+            Value::String(model_id.into()),
+        )]);
+        for (k, v) in extra {
+            proto.insert(k.into(), v);
+        }
+        Arc::make_mut(&mut models.prototypes).insert(item.into(), proto);
+    };
+
+    // Static items: plain leaf, constant-tinted leaf, empty, composite with transform + oversized_in_gui.
+    insert(
+        "minecraft:stone",
+        "minecraft:stone",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:block/stone"}}),
+        vec![],
+    );
+    insert(
+        "minecraft:tinted_gem",
+        "minecraft:tinted_gem",
+        json!({
+            "oversized_in_gui": true,
+            "model": {
+                "type": "minecraft:composite",
+                "transformation": [1.0, 0.0, 0.0, 0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                "models": [
+                    {"type": "minecraft:model", "model": "minecraft:item/base", "tints": [{"type": "minecraft:constant", "value": -1}]},
+                    {"type": "minecraft:empty"},
+                    {"type": "minecraft:model", "model": "minecraft:item/overlay", "tints": [{"type": "minecraft:constant", "value": [1.0, 0.5, 0.0]}]}
+                ]
+            }
+        }),
+        vec![],
+    );
+    insert(
+        "minecraft:empty_item",
+        "minecraft:empty_item",
+        json!({"model": {"type": "minecraft:empty"}}),
+        vec![],
+    );
+    // Air must never be static even if given a definition.
+    insert(
+        "minecraft:air",
+        "minecraft:air",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/air"}}),
+        vec![],
+    );
+    // Prototype foil items must never be classified static.
+    insert(
+        "minecraft:enchanted_golden_apple",
+        "minecraft:enchanted_golden_apple",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/golden_apple"}}),
+        vec![("minecraft:enchantment_glint_override", json!(true))],
+    );
+    insert(
+        "minecraft:default_enchanted",
+        "minecraft:default_enchanted",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/stick"}}),
+        vec![("minecraft:enchantments", json!({"minecraft:sharpness": 1}))],
+    );
+    insert(
+        "minecraft:compass",
+        "minecraft:compass",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/compass"}}),
+        vec![("minecraft:lodestone_tracker", json!({"tracked": true}))],
+    );
+
+    // Dynamic tint sources must never be static.
+    insert(
+        "minecraft:leather_helmet",
+        "minecraft:leather_helmet",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/leather_helmet", "tints": [{"type": "minecraft:dye", "default": -6265536}]}}),
+        vec![],
+    );
+    insert(
+        "minecraft:grass_block",
+        "minecraft:grass_block",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:block/grass_block", "tints": [{"type": "minecraft:grass", "temperature": 0.5, "downfall": 1.0}]}}),
+        vec![],
+    );
+    insert(
+        "minecraft:potion",
+        "minecraft:potion",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/potion", "tints": [{"type": "minecraft:potion", "default": -13083194}]}}),
+        vec![],
+    );
+    insert(
+        "minecraft:cmd_tinted",
+        "minecraft:cmd_tinted",
+        json!({"model": {"type": "minecraft:model", "model": "minecraft:item/stick", "tints": [{"type": "minecraft:custom_model_data", "default": -1}]}}),
+        vec![],
+    );
+
+    // Dynamic node types: Condition (bow/using), RangeDispatch (clock/damage), Select (trimmed armor),
+    // Special (shield), BundleSelectedItem, and Composite containing a dynamic child.
+    insert(
+        "minecraft:bow",
+        "minecraft:bow",
+        json!({"model": {
+            "type": "minecraft:condition",
+            "property": "minecraft:using_item",
+            "on_true": {"type": "minecraft:model", "model": "minecraft:item/bow_pulling_0"},
+            "on_false": {"type": "minecraft:model", "model": "minecraft:item/bow"}
+        }}),
+        vec![],
+    );
+    insert(
+        "minecraft:clock",
+        "minecraft:clock",
+        json!({"model": {
+            "type": "minecraft:range_dispatch",
+            "property": "minecraft:time",
+            "source": "daytime",
+            "entries": [{"threshold": 0.0, "model": {"type": "minecraft:model", "model": "minecraft:item/clock_00"}}],
+            "fallback": {"type": "minecraft:model", "model": "minecraft:item/clock_00"}
+        }}),
+        vec![],
+    );
+    insert(
+        "minecraft:iron_chestplate",
+        "minecraft:iron_chestplate",
+        json!({"model": {
+            "type": "minecraft:select",
+            "property": "minecraft:trim_material",
+            "cases": [{"when": "minecraft:gold", "model": {"type": "minecraft:model", "model": "minecraft:item/iron_chestplate_gold_trim"}}],
+            "fallback": {"type": "minecraft:model", "model": "minecraft:item/iron_chestplate"}
+        }}),
+        vec![],
+    );
+    insert(
+        "minecraft:shield",
+        "minecraft:shield",
+        json!({"model": {"type": "minecraft:special", "base": "minecraft:item/shield", "model": {"type": "minecraft:shield"}}}),
+        vec![],
+    );
+    insert(
+        "minecraft:bundle",
+        "minecraft:bundle",
+        json!({"model": {"type": "minecraft:bundle/selected_item"}}),
+        vec![],
+    );
+    insert(
+        "minecraft:composite_dynamic",
+        "minecraft:composite_dynamic",
+        json!({"model": {
+            "type": "minecraft:composite",
+            "models": [
+                {"type": "minecraft:model", "model": "minecraft:item/base"},
+                {"type": "minecraft:condition", "property": "minecraft:damaged",
+                 "on_true": {"type": "minecraft:model", "model": "minecraft:item/damaged"},
+                 "on_false": {"type": "minecraft:model", "model": "minecraft:item/ok"}}
+            ]
+        }}),
+        vec![],
+    );
+
+    let static_ids = models.static_item_ids();
+    assert_eq!(
+        static_ids,
+        vec![
+            "minecraft:empty_item",
+            "minecraft:stone",
+            "minecraft:tinted_gem",
+        ]
+    );
+
+    for item in [
+        "minecraft:stone",
+        "minecraft:tinted_gem",
+        "minecraft:empty_item",
+    ] {
+        assert!(models.is_static_item(item), "{item} should be static");
+        let cached = models.resolve_static(item).expect("static item resolves");
+        for display in DisplayContext::ALL {
+            for count in [1, 16, 64] {
+                let ctx = Context {
+                    display,
+                    owner: None,
+                    level: None,
+                    seed: count,
+                };
+                let uncached = models.resolve(&StackView::new(item, count), &ctx, &NoEnv);
+                assert_eq!(cached, uncached, "{item} in {display:?} count={count}");
+            }
+        }
+    }
+
+    for dynamic in [
+        "minecraft:air",
+        "minecraft:unknown_item",
+        "minecraft:enchanted_golden_apple",
+        "minecraft:default_enchanted",
+        "minecraft:compass",
+        "minecraft:leather_helmet",
+        "minecraft:grass_block",
+        "minecraft:potion",
+        "minecraft:cmd_tinted",
+        "minecraft:bow",
+        "minecraft:clock",
+        "minecraft:iron_chestplate",
+        "minecraft:shield",
+        "minecraft:bundle",
+        "minecraft:composite_dynamic",
+    ] {
+        assert!(
+            !models.is_static_item(dynamic),
+            "{dynamic} must not be static"
+        );
+        assert!(
+            models.resolve_static(dynamic).is_none(),
+            "{dynamic} must return None"
+        );
+    }
+}
+
+#[test]
+fn canonical_identifier_fast_path_matches_identifier_codec() {
+    for raw in [
+        "minecraft:stone",
+        "example:dir/sub_item-1.2",
+        "stone",
+        ":stone",
+        "BAD:Upper",
+        "a:b:c",
+        "",
+        ":",
+    ] {
+        if is_canonical_identifier(raw) {
+            assert_eq!(identifier(raw).unwrap(), raw);
+        }
+    }
 }

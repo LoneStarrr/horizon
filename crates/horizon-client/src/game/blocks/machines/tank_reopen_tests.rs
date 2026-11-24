@@ -1,4 +1,4 @@
-//! A committed mod tank survives a complete world save, close and reopen (#2412): the
+//! A committed mod tank survives a complete world save, close and reopen (arismoko/horizon#2412): the
 //! create-mekanism capability audit's undetermined persistence row. The tanks are the game's
 //! own (`native_block_entity_fluids`), filled through `LevelRef::capability(FLUIDS)` in a
 //! committed transaction; an aborted transaction's insert must not reach the disk.
@@ -14,8 +14,8 @@ use super::{BlockEntity, Game};
 use crate::game::native_entity_refs::tests::{run_fresh_cases, with_game_at};
 use crate::game::world_loading::WorldRequest;
 use mod_api::{
-    BlockEntityFluidsEvent, BlocksEvent, FLUIDS, FluidResource, FluidStack, Hooks, Host,
-    HostTransaction, LevelRef, ModEntry, ModFluidTanks, Mods, Registrar, RegistrationContext,
+    BlocksEvent, FLUIDS, FluidResource, FluidStack, Hooks, HostTransaction, LevelRef, ModEntry,
+    ModFluidTanks, Mods, Registrar, RegistrationContext,
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -29,25 +29,20 @@ impl Hooks for Tanks {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         r.declare_fluid("brine");
         r.block_entity_type("tank").blocks(&[TANK]).build();
+        let mut tanks = ModFluidTanks::default();
+        tanks.tanks = vec![4000, 2000];
+        tanks.inputs = vec![0, 1];
+        tanks.outputs = vec![0, 1];
+        tanks.faces = std::array::from_fn(|_| vec![0, 1]);
+        let block = r.block_key(TANK);
+        assert!(!r.is_block_capability_registered(&FLUIDS, &block));
+        r.block_fluids(&block, tanks);
+        assert!(r.is_block_capability_registered(&FLUIDS, &block));
     }
     fn blocks(&self, _: &RegistrationContext, event: &mut BlocksEvent<'_>) {
         event
             .blocks
             .push(mod_api::Block::new(TANK, "minecraft:stone"));
-    }
-    fn block_entity_fluids(
-        &self,
-        _: &dyn Host,
-        event: &mut BlockEntityFluidsEvent<'_>,
-    ) -> Option<ModFluidTanks> {
-        (event.block == TANK).then(|| {
-            let mut tanks = ModFluidTanks::default();
-            tanks.tanks = vec![4000, 2000];
-            tanks.inputs = vec![0, 1];
-            tanks.outputs = vec![0, 1];
-            tanks.faces = std::array::from_fn(|_| vec![0, 1]);
-            tanks
-        })
     }
 }
 
@@ -110,7 +105,7 @@ fn contents(
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_committed_mod_tank_survives_a_world_save_close_and_reopen() {
     if run_fresh_cases(
         "game::machines::tank_reopen_tests::a_committed_mod_tank_survives_a_world_save_close_and_reopen",

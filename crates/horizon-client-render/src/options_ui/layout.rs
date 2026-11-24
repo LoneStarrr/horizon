@@ -24,6 +24,7 @@ impl OptionsUi {
     /// Something the page layout reads changed: make it again at the next
     /// read, once.
     pub(super) fn relayout(&mut self) {
+        self.discard_draw();
         self.rev = self.rev.wrapping_add(1);
     }
     /// The game changed state the page layout reads (the mod browser's
@@ -247,8 +248,9 @@ impl OptionsUi {
                     list: false,
                     row: 0,
                 });
-                let mut mappings: Vec<(&str, &str)> =
-                    MAPPINGS.iter().map(|(n, _, c)| (*n, *c)).collect();
+                // Vanilla's mappings and Horizon's own (`emoteKey` in horizon-extras.txt).
+                let mut mappings: Vec<(&'static str, &'static str)> =
+                    keybinds::all_mappings().map(|(n, _, c)| (*n, *c)).collect();
                 let query = self.settings_search.value.to_lowercase();
                 mappings.retain(|(name, _)| {
                     query.is_empty() || lang::get(name).to_lowercase().contains(&query)
@@ -350,8 +352,7 @@ impl OptionsUi {
                     }
                     let reset_x = scrollbar_x - 50.0 - 10.0;
                     let change_x = reset_x - 5.0 - 75.0;
-                    let name_static = MAPPINGS.iter().find(|m| m.0 == name).map_or("", |m| m.0);
-                    out.push(button(change_x, y, 75.0, message, Act::Key(name_static)));
+                    out.push(button(change_x, y, 75.0, message, Act::Key(name)));
                     if !conflicts.is_empty() {
                         out.push(Widget {
                             x: change_x - 6.0,
@@ -367,13 +368,7 @@ impl OptionsUi {
                             row: 0,
                         });
                     }
-                    let reset = button(
-                        reset_x,
-                        y,
-                        50.0,
-                        tr("controls.reset"),
-                        Act::ResetKey(name_static),
-                    );
+                    let reset = button(reset_x, y, 50.0, tr("controls.reset"), Act::ResetKey(name));
                     out.push(if s.keys.is_default(name) {
                         inactive(reset)
                     } else {

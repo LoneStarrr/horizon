@@ -24,7 +24,7 @@ use horizon_client::projectiles::{Projectile, ProjectileKind};
 use horizon_core::geometry::{Aabb, Direction, Vec3};
 use horizon_core::nbt::Tag;
 use horizon_core::position::BlockPos;
-use horizon_world::{level::data::PushReaction, piston_push};
+use horizon_world::{level::data::PushReaction, move_gate::MoveGate, piston_push};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -76,6 +76,9 @@ pub(super) trait Entity: EntityRules {
     fn id(&self) -> u32;
     fn position(&self) -> Vec3;
     fn position_mut(&mut self) -> &mut Vec3;
+    fn set_position(&mut self, position: Vec3) {
+        *self.position_mut() = position;
+    }
     /// Where it stood when the last tick began (`Entity.lastKnownPosition`'s
     /// reading): `position - previous_position` is `computeSpeed`.
     fn previous_position(&self) -> Vec3;
@@ -190,6 +193,11 @@ pub(super) trait Entity: EntityRules {
     fn ticks_after_projectiles(&self) -> bool {
         false
     }
+    /// Whether one that joined since the last spawn packets ticks in the late
+    /// ordered pass, after them (primed TNT and falling blocks; orbs do not).
+    fn waits_for_spawn_packet(&self) -> bool {
+        false
+    }
     /// `Entity.push` with the explosion's knockback.
     fn push_from_explosion(&mut self, push: Vec3) {
         let v = self.velocity_mut();
@@ -204,7 +212,7 @@ pub(super) trait Entity: EntityRules {
     fn fluid_eye_y(&self) -> f64 {
         self.bounds().max_position().y
     }
-    /// `Entity.updateFluidHeightAndDoFluidPushing`: its water and lava heights
+    /// `Entity.updateFluidInteraction`: its water and lava heights
     /// (`(0, 0)` for a kind that is not pushed by fluid), and the current of
     /// each fluid added to its velocity. One body for every kind.
     fn push_by_fluid(
@@ -265,11 +273,26 @@ pub(super) trait Entity: EntityRules {
         PushReaction::PushPull
     }
     /// Width and height of the box a portal sweep follows, or None for a kind
-    /// the game does not carry through portals (so far armor stands and
-    /// falling blocks; fishing hooks are off the walk, and
-    /// `FishingHook.canUsePortal` is false in vanilla).
+    /// the game does not carry through portals (so far falling blocks; fishing
+    /// hooks are off the walk, and `FishingHook.canUsePortal` is false in
+    /// vanilla).
     fn portal_size(&self) -> Option<(f32, f32)> {
         None
+    }
+    /// The box a portal sweep follows at `position` (`Entity.getBoundingBox`).
+    /// The default is the box [`Self::portal_size`] describes; a kind whose
+    /// real box differs from its dimensions (an open shulker) overrides it.
+    fn portal_bounds(&self, position: Vec3) -> Option<Aabb> {
+        let (width, height) = self.portal_size()?;
+        let half = f64::from(width) / 2.0;
+        Some(Aabb::new(
+            Vec3::new(position.x - half, position.y, position.z - half),
+            Vec3::new(
+                position.x + half,
+                position.y + f64::from(height),
+                position.z + half,
+            ),
+        ))
     }
     /// Whether [`Self::portal_size`] is Some, without working the size out (a
     /// mob's depends on its age, scale and pose).
@@ -301,15 +324,16 @@ pub(super) trait Entity: EntityRules {
         true
     }
     /// `Entity.noPhysics` between ticks: its moves pass through the blocks,
-    /// and a shulker's lid leaves it be.
-    fn no_physics(&self) -> bool {
-        false
+    /// and a shulker's lid leaves it be. `stored` is the value a mod wrote for
+    /// a kind that keeps no field of its own (`EntityMemory.no_physics`); None
+    /// when none was written, so the kind answers its own default.
+    fn no_physics(&self, stored: Option<bool>) -> bool {
+        stored.unwrap_or(false)
     }
-    /// `Entity.move(MoverType.PISTON, …)` once the movement is resolved.
-    fn move_by_piston(&mut self, movement: Vec3) {
-        let position = self.position_mut();
-        *position = position.add_vector(movement);
-    }
+    /// Apply this kind's resolved movement after the invocation's gate is armed.
+    /// Every entity kind states how it moves; family ticks resolve through
+    /// the same gate in their own movement path.
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3);
     /// Bounds for `AbstractArrow.shouldFall` after a non-SELF piston move.
     fn piston_release_bounds(&self) -> Option<Aabb> {
         None
@@ -399,7 +423,7 @@ impl RenderEntityBounds for ArmorStand {
         // 0.5 x 1.975 collision box (especially raised arms and head banners).
         // This axis-aligned envelope contains every vanilla pose while staying
         // independent of the stand's yaw and partial-tick rotation.
-        let scale = if self.small { 0.5 } else { 1.0 };
+        let scale = if self.small { 0.5 } else { 1.0 } * f64::from(self.scale);
         let equipped = self.equipment.iter().any(Option::is_some);
         let horizontal = if equipped { 2.0 } else { 1.5 * scale };
         let lower = if equipped { -1.0 } else { -0.5 * scale };
@@ -581,9 +605,28 @@ impl horizon_client::block_contact::InsideWalk for ItemInside<'_, '_> {
         precise: bool,
         effects: &mut mod_api::InsideEffects,
     ) -> std::result::Result<(), ()> {
-        let id = self.item.id;
-        self.game
-            .fire_batch_inside(id as i32, "minecraft:item", state, at, precise, effects);
+        let item = &*self.item;
+        self.game.fire_batch_inside(
+            horizon_client::block_contact::Contact {
+                entity: item.id as i32,
+                kind: "minecraft:item",
+                state,
+                position: at,
+            },
+            precise,
+            effects,
+            || {
+                mod_api::SweptEntity::new(
+                    item.position,
+                    item.previous,
+                    item.velocity,
+                    false,
+                    false,
+                    item.fall_distance,
+                    false,
+                )
+            },
+        );
         Ok(())
     }
 }
@@ -633,9 +676,28 @@ impl horizon_client::block_contact::InsideWalk for ProjectileInside<'_, '_> {
         precise: bool,
         effects: &mut mod_api::InsideEffects,
     ) -> std::result::Result<(), ()> {
-        let (id, kind) = (self.shot.id, self.shot.entity_type());
-        self.game
-            .fire_batch_inside(id as i32, kind, state, at, precise, effects);
+        let shot = &*self.shot;
+        self.game.fire_batch_inside(
+            horizon_client::block_contact::Contact {
+                entity: shot.id as i32,
+                kind: shot.entity_type(),
+                state,
+                position: at,
+            },
+            precise,
+            effects,
+            || {
+                mod_api::SweptEntity::new(
+                    shot.position,
+                    shot.previous,
+                    shot.velocity,
+                    false,
+                    false,
+                    shot.fall_distance,
+                    false,
+                )
+            },
+        );
         Ok(())
     }
 }
@@ -697,7 +759,9 @@ mod render_bounds_tests {
             invisible: false,
             check_interval: 0,
             custom_name: None,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
         };
         let bounds = frame.render_bounds(1.0);
         assert!(bounds.min_position().x <= -0.71875);
@@ -751,8 +815,9 @@ macro_rules! stored_motion {
 /// fluids again. Returns false when the item should be removed. A server's tick
 /// runs the halves itself, with the landing's `Block.fallOn` between them.
 impl Game<'_> {
-    /// Tick an item owned by the caller. The two results are ordinary survival
-    /// and explicit consumption by a block-contact handler. `escape_speed`:
+    /// Tick an item owned by the caller. The results are ordinary survival,
+    /// explicit consumption by a block-contact handler, and the fall it landed
+    /// with on a server (its block's `fallOn` is the caller's). `escape_speed`:
     /// the item is inside a block and moves without physics this tick, pushed
     /// out at this speed.
     /// The item's `Entity.checkInsideBlocks`, run at its batch with the part's
@@ -884,23 +949,21 @@ impl Game<'_> {
     /// mid-walk over a lent level, the whole callback staged: only an answering
     /// callback's writes join the walk, and a panic there is contained, leaving
     /// the batch's rows and the level as they were. The level is lent and given
-    /// back per contact, as `item_fall_on` lends its own (#2194's carrier
+    /// back per contact, as `item_fall_on` lends its own (arismoko/horizon#2194's carrier
     /// discipline).
     pub(in crate::game) fn fire_batch_inside(
         &mut self,
-        entity: i32,
-        kind: &'static str,
-        state: horizon_world::registry::BlockStateId,
-        at: horizon_core::position::BlockPos,
+        contact: horizon_client::block_contact::Contact<'_>,
         precise: bool,
         effects: &mut mod_api::InsideEffects,
+        swept: impl FnOnce() -> mod_api::SweptEntity,
     ) {
         let Some(dimension) = horizon_client::block_contact::current_level() else {
             return;
         };
         if !horizon_client::block_contact::HOOKS
             .get()
-            .is_some_and(|hooks| (hooks.inside_listens)(state))
+            .is_some_and(|hooks| (hooks.inside_listens)(contact.state))
         {
             return;
         }
@@ -919,18 +982,16 @@ impl Game<'_> {
             (hooks.inside_fire)(
                 &mut level,
                 dimension,
-                entity,
-                kind,
-                state,
-                at,
+                contact,
                 precise,
+                &swept(),
                 &mut staged,
                 &mut writes,
             );
         }
         lent.give_back(&mut self.world);
         effects.absorb_step(staged);
-        horizon_client::block_contact::inside_written(state, at, writes);
+        horizon_client::block_contact::inside_written(contact.state, contact.position, writes);
     }
 
     pub(super) fn tick_item_with_block_contacts(
@@ -940,29 +1001,12 @@ impl Game<'_> {
         entity_boxes: &[Aabb],
         client: bool,
         splash: &mut impl FnMut(horizon_client::entities::ItemSplash),
-    ) -> (bool, bool) {
+    ) -> (bool, bool, super::ahead::Landed, Option<Vec3>) {
         let no_physics = escape_speed.is_some();
-        // Entity.baseTick splashes before moving, except on the first tick, at
-        // the motion before the currents push it.
-        let before = item.velocity;
-        let heights =
-            item.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context);
-        item.water_entry(heights.0 > 0.0, item.ticks == 0, before, splash);
-        item.lava_fall(heights.1 > 0.0);
-        let mut step = item.tick_move_before_block_effects(
-            &self.world,
-            self.res.facts(),
-            self.collision,
-            no_physics,
-            escape_speed,
-            heights,
-            entity_boxes,
-            Some(self.border.geometry()),
-            Some(&self.res.motion().blocks),
-        );
-        item.check_fall(&mut step, |fall, from, moved| {
-            self.vehicle_fall_reset(fall, from, moved)
-        });
+        let (step, landed) = self
+            .item_tables()
+            .move_item(item, escape_speed, entity_boxes, splash);
+        let landed = landed.filter(|_| !client);
         if !client && let Some((on, distance)) = step.landed() {
             self.item_fall_on(item.id, on, distance);
         }
@@ -997,36 +1041,13 @@ impl Game<'_> {
                 }
             }
             if discarded || item.stack.count == 0 {
-                return (false, true);
+                return (false, true, landed, step.original_movement());
             }
         }
-        item.finish_move_block_effects(
-            &self.world,
-            self.res.facts(),
-            no_physics,
-            Some(&self.res.motion().blocks),
-            step,
-            &self.loop_context,
-        );
-        item.push_by_bubble_column(
-            &self.world,
-            self.pack.assets.registry,
-            self.res.facts(),
-            self.collision,
-        );
-        let alive = item.tick_settle(
-            &self.world,
-            self.res.facts(),
-            no_physics,
-            step,
-            &self.loop_context,
-        );
-        // ItemEntity.tick refreshes immersion and splashes on water entry.
-        let before = item.velocity;
-        let (water, _) =
-            item.push_by_fluid(&self.world, &self.res.motion().fluids, &self.loop_context);
-        item.water_entry(water > 0.0, false, before, splash);
-        (alive, false)
+        let alive = self
+            .item_tables()
+            .settle_item(item, no_physics, step, splash);
+        (alive, false, landed, step.original_movement())
     }
 }
 
@@ -1085,6 +1106,13 @@ macro_rules! define_entity_handles {
         #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
         pub(super) enum EntityHandle {
             $($kind(usize),)*
+        }
+
+        /// Allocation-free storage-order walk with stable IDs and verified index hints.
+        /// The next ID is captured before the caller can remove the current entity.
+        pub(super) struct EntityIdCursor {
+            before: JoinSeq,
+            $($field: (Option<(u32, JoinSeq)>, usize, usize),)*
         }
 
         /// Every list moved out of `Game`, for [`for_each_entity_mut`]: the
@@ -1148,6 +1176,51 @@ macro_rules! define_entity_handles {
             pub(super) fn entity_handles(&self) -> impl Iterator<Item = EntityHandle> + use<> {
                 std::iter::empty()
                     $(.chain((0..self$(.$list)+.len()).map(EntityHandle::$kind)))*
+            }
+
+            pub(super) fn entity_id_cursor(&self) -> EntityIdCursor {
+                EntityIdCursor {
+                    before: JoinSeq::upcoming(),
+                    $($field: (self$(.$list)+.first().map(|e| (e.id(), e.join_seq())), 0, self$(.$list)+.len()),)*
+                }
+            }
+
+            /// Verify a stable identity before returning any index-bearing handle.
+            /// Removed next identities resume at the next surviving original join.
+            /// The captured join ceiling excludes entities spawned by callbacks.
+            pub(super) fn next_entity_id(&self, cursor: &mut EntityIdCursor) -> Option<(u32, EntityHandle)> {
+                $({
+                    let (next, hint, remaining) = &mut cursor.$field;
+                    if *remaining > 0 {
+                        if let Some((id, join)) = *next {
+                            let index = if self$(.$list)+.get(*hint).is_some_and(|e| e.id() == id && e.join_seq() == join) {
+                                Some(*hint)
+                            } else {
+                                self$(.$list)+.iter().position(|e| e.id() == id && e.join_seq() == join).or_else(|| {
+                                    self$(.$list)+.iter().position(|e| e.join_seq() > join && e.join_seq() < cursor.before)
+                                })
+                            };
+                            if let Some(i) = index {
+                                *remaining -= 1;
+                                *hint = i + 1;
+                                *next = self$(.$list)+.get(i + 1).filter(|e| e.join_seq() < cursor.before).map(|e| (e.id(), e.join_seq()));
+                                return Some((self$(.$list)+[i].id(), EntityHandle::$kind(i)));
+                            }
+                        }
+                        *remaining = 0;
+                    }
+                })*
+                None
+            }
+
+            /// Resolve one stable ID, checking its cheap index hint before searching.
+            pub(super) fn refresh_entity_handle(&self, id: u32, hint: EntityHandle) -> Option<EntityHandle> {
+                match hint {
+                    $(EntityHandle::$kind(i) => {
+                        if self$(.$list)+.get(i).is_some_and(|e| e.id() == id) { Some(hint) }
+                        else { self$(.$list)+.iter().position(|e| e.id() == id).map(EntityHandle::$kind) }
+                    })*
+                }
             }
 
             /// Takes the entity out of its list (`Entity.discard` before it ever ticked).
@@ -1262,22 +1335,10 @@ macro_rules! with_entity {
 }
 pub(super) use with_entity;
 
-macro_rules! borrow_lists {
-    (($game:expr) $($kind:ident($ty:ty) $field:ident: $($list:ident).+,)*) => {
-        $crate::game::entity::EntityLists {
-            $($field: &$game$(.$list)+,)*
-        }
-    };
-}
-pub(crate) use borrow_lists;
-
-/// `$game`'s [`EntityLists`]; a macro so the borrow stays field by field.
-macro_rules! entity_lists_of {
-    ($game:expr) => {
-        $crate::game::entity::entity_lists!(borrow_lists, $game)
-    };
-}
-pub(super) use entity_lists_of;
+#[path = "entity/list_borrows.rs"]
+mod list_borrows;
+pub(super) use list_borrows::entity_lists_of;
+pub(crate) use list_borrows::{borrow_level_list, borrow_lists};
 /// The level `$game` ticks, lent to a hit's damage hooks with its block registry and merged
 /// tag tables, so a mob or the player beside them can take the hit. With `$attack` (an
 /// [`Attack`](horizon_client::health::Attack) the site took first), the level of that attack.
@@ -1452,14 +1513,6 @@ impl Game<'_> {
         super::boats::any_boat_wood(kind)
             .is_some_and(|(wood, chest)| self.boat_models.has(wood, chest))
     }
-    /// Whether `load_listed` loads `kind` as a vehicle that takes its mob
-    /// riders (`take_mob_passengers`): a mob, boat, minecart or primed TNT.
-    pub(super) fn listed_kind_takes_riders(&self, kind: &str) -> bool {
-        self.loads_as_mob(kind)
-            || self.loads_as_boat(kind)
-            || loads_as_cart(kind)
-            || loads_as_tnt(kind)
-    }
     /// Loads a saved entity as the first kind in `entity_lists!` that claims
     /// its type id: `Err` hands the compound back when none does.
     pub(super) fn load_listed(
@@ -1484,6 +1537,21 @@ impl Game<'_> {
     ) -> Result<(), Tag> {
         let mut state = Some(state);
         load_entity_of_any_kind!(self, kind, uuid, player_uuid, tag, &mut state)
+            .or_else(|tag| {
+                self.load_unlisted_transferred(
+                    Self::chunk_of(horizon_client::entity_nbt::position(&tag).unwrap_or_default()),
+                    kind,
+                    uuid,
+                    tag,
+                    &mut state,
+                )
+            })
+            .or_else(|tag| {
+                let saved = tag.clone();
+                self.load_other_transferred(tag, kind, state.take())
+                    .map(|_| ())
+                    .ok_or(saved)
+            })
     }
 
     /// The ids of the entities that are not on the walk of `entity_lists!`.
@@ -1544,9 +1612,18 @@ impl Entity for Mob {
     fn set_on_ground(&mut self, on_ground: bool) {
         self.on_ground = on_ground;
     }
+    /// `Entity.noPhysics`: written through the mod API; no mob tick rewrites it
+    /// (a vex sets it only for the length of its own, custom travel). Its own
+    /// field is the write's store, so `stored` is None for a mob.
+    fn no_physics(&self, _stored: Option<bool>) -> bool {
+        self.no_physics
+    }
     /// `Entity.move(MoverType.PISTON, ...)` ends in `setPos`, which `Shulker`
     /// overrides to snap to the block centre.
-    fn move_by_piston(&mut self, movement: Vec3) {
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
         let moved = self.position.add_vector(movement);
         if self.species() == Species::Shulker {
             crate::mobs::shulker::client_set_pos(self, moved.x, moved.y, moved.z);
@@ -1596,6 +1673,9 @@ impl Entity for Mob {
     fn portal_size(&self) -> Option<(f32, f32)> {
         Some((self.width(), self.height()))
     }
+    fn portal_bounds(&self, position: Vec3) -> Option<Aabb> {
+        Some(self.bounds_at(position))
+    }
     fn sweeps_portals(&self) -> bool {
         true
     }
@@ -1603,9 +1683,10 @@ impl Entity for Mob {
         game.mob_portal_eligible(self)
     }
     /// `PersistentEntitySectionManager.Callback.onRemove`: discard stops
-    /// section enumeration immediately, before the entity list is swept.
+    /// section enumeration immediately, before the entity list is swept; and
+    /// `EntitySelectorParser`'s `Entity::isAlive` drops a dying mob at once.
     fn selector_target(&self) -> Option<Target> {
-        (!self.removed && self.death_time == 0).then_some(Target::Mob(self.id))
+        (!self.removed && self.alive()).then_some(Target::Mob(self.id))
     }
     fn bounds(&self) -> Aabb {
         Mob::bounds(self)
@@ -1674,6 +1755,13 @@ impl Entity for Mob {
 impl Entity for ItemEntity {
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
     }
 
     fn set_on_ground(&mut self, on_ground: bool) {
@@ -1753,8 +1841,18 @@ impl Entity for ItemEntity {
 }
 
 impl Entity for ExperienceOrb {
+    fn set_position(&mut self, position: Vec3) {
+        ExperienceOrb::set_position(self, position);
+    }
+
     fn reset_fall_distance(&mut self) {
         // An orb keeps no fall distance here.
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        self.set_position(self.position.add_vector(movement));
     }
 
     fn set_on_ground(&mut self, on_ground: bool) {
@@ -1827,6 +1925,13 @@ impl Entity for ExperienceOrb {
 impl Entity for Boat {
     fn reset_fall_distance(&mut self) {
         // A boat keeps no fall distance here.
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
     }
 
     fn set_on_ground(&mut self, on_ground: bool) {
@@ -1915,6 +2020,13 @@ impl Entity for Boat {
 impl Entity for Minecart {
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
     }
 
     fn set_on_ground(&mut self, on_ground: bool) {
@@ -2014,6 +2126,13 @@ impl Entity for ArmorStand {
     fn reset_fall_distance(&mut self) {
         self.enchantment_fall_distance = 0.0;
     }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
+    }
 
     fn set_on_ground(&mut self, on_ground: bool) {
         self.on_ground = on_ground;
@@ -2033,7 +2152,7 @@ impl Entity for ArmorStand {
         ArmorStand::fluid_eye_y(self)
     }
     fn native_type(&self) -> Cow<'static, str> {
-        "minecraft:armor_stand".into()
+        super::armor_stands::TYPE_ID.into()
     }
     fn save_nbt(
         game: &mut Game<'_>,
@@ -2053,10 +2172,14 @@ impl Entity for ArmorStand {
         if !(kind == "minecraft:armor_stand") {
             return Err(tag);
         }
-        if transferred.is_some() {
-            return Err(tag);
-        }
-        game.load_armor_stand(tag, uuid);
+        load_with_transfer!(
+            game,
+            transferred,
+            load_armor_stand,
+            load_armor_stand_transferred,
+            tag,
+            uuid
+        );
         Ok(())
     }
     stored_motion!();
@@ -2111,16 +2234,20 @@ impl Entity for ArmorStand {
     }
     /// A NoGravity stand is not swept for the blocks it stands in (plates,
     /// fire): measured beside the real server, it never presses a plate nor
-    /// catches fire, and does again once `NoGravity` is cleared.
+    /// catches fire, and does again once `NoGravity` is cleared. A marker is
+    /// not either: `ArmorStand.hasPhysics` is false for it too, so
+    /// `noPhysics` keeps it out of `applyEffectsFromBlocks`.
     fn sweeps_blocks_inside(&self) -> bool {
-        !self.no_gravity
+        !self.marker && !self.no_gravity
     }
     fn pushed_by_explosion(&self) -> bool {
         false
     }
-    /// A marker and a NoGravity stand have no physics (`noPhysics`).
-    fn no_physics(&self) -> bool {
-        self.marker || self.no_gravity
+    /// `Entity.noPhysics`: `Marker` or `NoGravity` unless a mod wrote it,
+    /// recomputed from them on load because `readAdditionalSaveData` does.
+    /// Its own field is the write's store, so `stored` is None for a stand.
+    fn no_physics(&self, _stored: Option<bool>) -> bool {
+        self.no_physics.unwrap_or(self.marker || self.no_gravity)
     }
     /// `ArmorStand.getPistonPushReaction`: a marker is ignored.
     fn get_piston_push_reaction(&self) -> PushReaction {
@@ -2130,11 +2257,30 @@ impl Entity for ArmorStand {
             PushReaction::PushPull
         }
     }
+    /// `ArmorStand.getDefaultDimensions`: the box a portal sweep follows, and
+    /// the size its exit is placed by. `ArmorStand.readAdditionalSaveData`
+    /// makes a stand without `hasPhysics` (a marker or a `NoGravity` one)
+    /// `noPhysics`, so `Entity.isAffectedByBlocks` never runs its sweep and it
+    /// enters no portal; a marker's box is `MARKER_DIMENSIONS`, 0 by 0, too.
+    fn portal_size(&self) -> Option<(f32, f32)> {
+        if self.marker || self.no_gravity {
+            return None;
+        }
+        let (width, height) = armor_stand_size(self);
+        Some((width as f32, height as f32))
+    }
 }
 
 impl Entity for PrimedTnt {
     fn reset_fall_distance(&mut self) {
         // Primed TNT keeps no fall distance here.
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
     }
 
     fn set_on_ground(&mut self, on_ground: bool) {
@@ -2150,6 +2296,9 @@ impl Entity for PrimedTnt {
         self.rotation = [yaw, pitch.clamp(-90.0, 90.0)];
     }
     fn ticks_after_projectiles(&self) -> bool {
+        true
+    }
+    fn waits_for_spawn_packet(&self) -> bool {
         true
     }
     fn native_type(&self) -> Cow<'static, str> {
@@ -2217,6 +2366,13 @@ impl Entity for FallingBlock {
     fn reset_fall_distance(&mut self) {
         self.fall_distance = 0.0;
     }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
+    }
     fn rotation(&self) -> [f32; 2] {
         self.rotation
     }
@@ -2237,6 +2393,9 @@ impl Entity for FallingBlock {
         self.on_ground = on_ground;
     }
     fn ticks_after_projectiles(&self) -> bool {
+        true
+    }
+    fn waits_for_spawn_packet(&self) -> bool {
         true
     }
     fn native_type(&self) -> Cow<'static, str> {
@@ -2281,6 +2440,7 @@ impl Entity for FallingBlock {
 
 impl Entity for Projectile {
     fn reset_fall_distance(&mut self) {
+        self.fall_distance = 0.0;
         if let Some(arrow) = self.arrow.as_deref_mut() {
             arrow.fall_distance = 0.0;
         }
@@ -2430,12 +2590,19 @@ impl Entity for Projectile {
     fn bounds(&self) -> Aabb {
         Projectile::bounds(self)
     }
-    /// A shulker bullet's, set when it is made; an arrow's `AbstractArrow.noPhysics`.
-    fn no_physics(&self) -> bool {
-        matches!(self.kind, ProjectileKind::ShulkerBullet { .. })
-            || self.arrow.as_ref().is_some_and(|a| a.no_physics)
+    /// A shulker bullet's, set when it is made, unless a mod wrote one: the
+    /// write has no field on this struct and lands in `stored`, so a cleared
+    /// flag is what the movement code reads; an arrow's `AbstractArrow.noPhysics`.
+    fn no_physics(&self, stored: Option<bool>) -> bool {
+        stored.unwrap_or_else(|| {
+            matches!(self.kind, ProjectileKind::ShulkerBullet { .. })
+                || self.arrow.as_ref().is_some_and(|a| a.no_physics)
+        })
     }
-    fn move_by_piston(&mut self, movement: Vec3) {
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
         Projectile::move_by_piston(self, movement);
     }
     fn piston_release_bounds(&self) -> Option<Aabb> {
@@ -2452,6 +2619,13 @@ impl Entity for Projectile {
 impl Entity for Rocket {
     fn reset_fall_distance(&mut self) {
         // A firework rocket keeps no fall distance here.
+    }
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
+        let position = self.position_mut();
+        *position = position.add_vector(movement);
     }
     fn rotation(&self) -> [f32; 2] {
         self.rotation
@@ -2614,11 +2788,15 @@ impl Entity for ThrownTrident {
             Vec3::new(p.x + 0.25, p.y + 0.5, p.z + 0.25),
         )
     }
-    /// `AbstractArrow.noPhysics`, set once a loyal trident turns back.
-    fn no_physics(&self) -> bool {
+    /// `AbstractArrow.noPhysics`, set once a loyal trident turns back. Its own
+    /// field is the write's store, so `stored` is None for a trident.
+    fn no_physics(&self, _stored: Option<bool>) -> bool {
         self.no_physics
     }
-    fn move_by_piston(&mut self, movement: Vec3) {
+    fn move_entity(&mut self, gate: &mut MoveGate, movement: Vec3) {
+        if gate.skipped() {
+            return;
+        }
         ThrownTrident::move_by_piston(self, movement);
     }
     fn piston_release_bounds(&self) -> Option<Aabb> {
@@ -2636,35 +2814,6 @@ impl Entity for ThrownTrident {
     }
 }
 
-impl EntityRules for Rocket {}
-impl EntityRules for ThrownTrident {}
-impl EntityRules for Boat {
-    fn is_no_gravity(&self) -> bool {
-        self.no_gravity
-    }
-    /// `AbstractBoat.getDefaultGravity`.
-    fn get_default_gravity(&self) -> f64 {
-        0.04
-    }
-}
-impl EntityRules for Minecart {
-    fn is_no_gravity(&self) -> bool {
-        self.no_gravity
-    }
-    /// `AbstractMinecart.getDefaultGravity`.
-    fn get_default_gravity(&self) -> f64 {
-        if self.in_water { 0.005 } else { 0.04 }
-    }
-}
-impl EntityRules for PrimedTnt {
-    fn is_no_gravity(&self) -> bool {
-        self.no_gravity
-    }
-    /// `PrimedTnt.getDefaultGravity`.
-    fn get_default_gravity(&self) -> f64 {
-        0.04
-    }
-}
 impl EntityRules for FallingBlock {
     fn is_no_gravity(&self) -> bool {
         self.no_gravity
@@ -2691,7 +2840,85 @@ mod no_gravity_stand_tests {
         assert!(!stand.sweeps_blocks_inside());
         stand.no_gravity = false;
         stand.marker = true;
+        assert!(!stand.sweeps_blocks_inside());
         assert!(!stand.triggers_blocks());
+    }
+}
+
+#[cfg(test)]
+mod portal_bounds_tests {
+    use super::Entity as _;
+    use crate::mobs::{Anim, Brain, Flags, Mob, MobType, Part, Species, shulker::PEEK};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// A shulker's type, without the resource tables a `Game` fixture needs.
+    fn shulker_kind() -> Arc<MobType> {
+        Arc::new(MobType {
+            shadow: None,
+            id: "minecraft:shulker".into(),
+            species: Species::Shulker,
+            width: 1.0,
+            height: 1.0,
+            eye_height: 0.5,
+            category: "creature".into(),
+            max_health: 30.0,
+            speed: 0.0,
+            flying_speed: 0.0,
+            attack_damage: 0.0,
+            attack_knockback: 0.0,
+            follow_range: 16.0,
+            step_height: 0.5,
+            armor: 0.0,
+            armor_toughness: 0.0,
+            knockback_resistance: 0.0,
+            jump_strength: 0.42,
+            attributes: Arc::default(),
+            item_stack_limits: Default::default(),
+            attribute_bounds: Default::default(),
+            gravity: 0.08,
+            safe_fall_distance: 3.0,
+            fall_damage_multiplier: 1.0,
+            water_efficiency: 0.0,
+            water_slowdown: 0.8,
+            air_speed: 0.02,
+            baby_scale: 0.5,
+            head_rot_speed: 10.0,
+            max_head_x_rot: 40.0,
+            max_head_y_rot: 180.0,
+            ambient_interval: 120,
+            flags: Flags::default(),
+            model: Arc::new(Part {
+                name: "root".into(),
+                pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                polygons: Vec::new(),
+                children: Vec::new(),
+            }),
+            layers: Default::default(),
+            texture: String::new(),
+            brain: Brain::Passive,
+            anim: Anim::Rabbit,
+            sounds: [""; 3],
+            sound_overrides: Default::default(),
+            food: Arc::default(),
+            tempt: Arc::default(),
+            passenger_attachments: Vec::new(),
+        })
+    }
+
+    /// F3+B and the portal sweep follow `Entity.getBoundingBox`: an open
+    /// shulker's lid box, not the fixed 1x1x1 its width and height describe.
+    #[test]
+    fn an_open_lid_is_in_the_debug_and_portal_box() {
+        for face in 0..6u8 {
+            let mut m = Mob::new(1, shulker_kind(), Vec3::new(0.5, 4.0, 0.5), 0.0);
+            m.extra.variant3 = face;
+            m.anim.v[PEEK] = 1.0;
+            let bounds = m.bounds();
+            let portal = m.portal_bounds(m.position).unwrap();
+            assert_eq!(portal.min_position(), bounds.min_position(), "face {face}");
+            assert_eq!(portal.max_position(), bounds.max_position(), "face {face}");
+        }
     }
 }
 
@@ -2909,6 +3136,7 @@ mod set_rotation_tests {
             attachment_lifetime: Default::default(),
             fall_distance: 0.0,
             join: Default::default(),
+            section_order: 0,
             no_gravity: false,
             id: 0,
             position: horizon_core::geometry::Vec3::ZERO,
@@ -2923,6 +3151,7 @@ mod set_rotation_tests {
             air: 300,
             rotation: [0.0, 0.0],
             following: None,
+            fire_ticks: 0,
         };
         orb.set_rotation([90.0, 10.0]);
         assert_eq!(orb.rotation(), [90.0, 10.0]);

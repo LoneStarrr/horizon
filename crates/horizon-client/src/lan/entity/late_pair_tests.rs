@@ -8,6 +8,7 @@ fn trident() -> EntityState {
         kind: "minecraft:trident".into(),
         position: [0.5, 65.5, 0.5],
         velocity: [0.25, 0.0, 0.0],
+        acceleration_power: None,
         ..EntityState::default()
     }
 }
@@ -33,6 +34,7 @@ fn late_pairing_does_not_duplicate_or_spend_the_next_arrow_update() {
         position: [0.5, 64.0, 0.5],
         view_distance: 10,
         chunks: &chunks,
+        sources: None,
         tracker: &mut tracker,
         out: &mut out,
         gone: None,
@@ -111,6 +113,7 @@ fn late_pairing_keeps_chunk_range_and_own_entity_filters() {
             position: [x, 64.0, 0.5],
             view_distance: 10,
             chunks: &chunks,
+            sources: None,
             tracker: &mut tracker,
             out: &mut out,
             gone: None,
@@ -156,6 +159,7 @@ fn a_vehicle_uses_a_later_passengers_range_in_the_same_late_batch() {
             position: [144.5, 64.0, 0.5],
             view_distance: 10,
             chunks: &chunks,
+            sources: None,
             tracker: &mut tracker,
             out: &mut out,
             gone: None,

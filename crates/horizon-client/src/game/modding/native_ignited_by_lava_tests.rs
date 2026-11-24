@@ -1,4 +1,4 @@
-//! `ignited_by_lava` answered by a block Part with the asked block's face (#3185): the Part's
+//! `ignited_by_lava` answered by a block Part with the asked block's face (arismoko/horizon#3185): the Part's
 //! answer replaces the state's `IGNITED_BY_LAVA` flag either way.
 use super::native_entity_refs::tests::with_game;
 use horizon_core::{geometry::Direction, position::BlockPos};
@@ -26,7 +26,7 @@ impl Hooks for LavaMod {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_block_part_decides_whether_lava_lights_it() {
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("lava", Box::new(LavaMod))].into();
     crate::game::api_values::install_parts(&mods).unwrap();

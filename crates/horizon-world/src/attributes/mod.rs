@@ -79,6 +79,29 @@ pub enum Sentiment {
     /// Rising red, falling blue.
     Negative,
 }
+/// How an attribute's modifier lines read on a tooltip: NeoForge's `RangedAttribute`,
+/// `PercentageAttribute` and `BooleanAttribute`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Display {
+    /// Added values as numbers, multiplied ones as percentages: vanilla's.
+    #[default]
+    Ranged,
+    /// Added values as percentages too (`+5%` for `+0.05`).
+    Percentage,
+    /// On or off: an added value above zero enables, any other disables.
+    Boolean,
+}
+/// What an attribute's tooltip lines take from its declaration (NeoForge's
+/// `IAttributeExtension`): the colour, the display, and the modifier shown as the green
+/// total of the player's base and its amount, as `minecraft:base_attack_damage` is for attack
+/// damage. Vanilla's attributes keep the default: their colours stay where the tooltip reads them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tooltip {
+    pub sentiment: Sentiment,
+    pub display: Display,
+    /// The namespaced id of the attribute's base modifier (`getBaseId`), if it has one.
+    pub base_modifier: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Definition {
@@ -103,6 +126,20 @@ impl Definition {
     }
     pub fn default_value(self) -> f64 {
         self.default
+    }
+    /// A ranged attribute's `[min, max]` bounds (`RangedAttribute.minValue`, `maxValue`);
+    /// none for an attribute without them.
+    pub fn bounds(self) -> Option<(f64, f64)> {
+        self.range
+    }
+    /// The definition with its bounds widened to take `[min, max]` in: the
+    /// lower of the two minimums and the higher of the two maximums. The
+    /// default stays; an attribute without bounds stays without them.
+    pub fn widened(self, min: f64, max: f64) -> Self {
+        Self {
+            default: self.default,
+            range: self.range.map(|(low, high)| (low.min(min), high.max(max))),
+        }
     }
     pub fn sanitize(self, value: f64) -> f64 {
         let Some((min, max)) = self.range else {
@@ -144,23 +181,37 @@ pub struct Packed {
     pub base: f64,
     pub modifiers: Vec<Modifier>,
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Instance {
     definition: Definition,
     base: f64,
-    dirty: std::cell::Cell<bool>,
-    cached: std::cell::Cell<f64>,
+    dirty: std::sync::atomic::AtomicBool,
+    cached: std::sync::atomic::AtomicU64,
     by_id: Vec<Modifier>,
     permanent: Vec<Modifier>,
     operations: [Option<OperationMap>; 3],
+}
+impl Clone for Instance {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        Self {
+            definition: self.definition,
+            base: self.base,
+            dirty: AtomicBool::new(self.dirty.load(Ordering::Acquire)),
+            cached: AtomicU64::new(self.cached.load(Ordering::Relaxed)),
+            by_id: self.by_id.clone(),
+            permanent: self.permanent.clone(),
+            operations: self.operations.clone(),
+        }
+    }
 }
 impl Instance {
     pub fn new(definition: Definition) -> Self {
         Self {
             definition,
             base: definition.default,
-            dirty: std::cell::Cell::new(true),
-            cached: std::cell::Cell::new(0.0),
+            dirty: std::sync::atomic::AtomicBool::new(true),
+            cached: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             by_id: Vec::new(),
             permanent: Vec::new(),
             operations: [None, None, None],
@@ -170,10 +221,10 @@ impl Instance {
         self.base
     }
     pub fn is_dirty(&self) -> bool {
-        self.dirty.get()
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
     }
     pub fn cached_value(&self) -> f64 {
-        self.cached.get()
+        f64::from_bits(self.cached.load(std::sync::atomic::Ordering::Relaxed))
     }
     pub fn modifiers(&self) -> &[Modifier] {
         &self.by_id
@@ -191,7 +242,7 @@ impl Instance {
         &mut self,
         observer: &mut O,
     ) -> Result<(), AttributeError<O::Error>> {
-        self.dirty.set(true);
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         observer.dirty(self).map_err(AttributeError::Observer)
     }
     pub fn set_base_value<O: Observer>(
@@ -291,8 +342,8 @@ impl Instance {
         Ok(())
     }
     pub fn compute_value(&self) -> f64 {
-        if !self.dirty.get() {
-            return self.cached.get();
+        if !self.is_dirty() {
+            return self.cached_value();
         }
         let mut base = self.base;
         for m in self.operation_modifiers(Operation::AddValue) {
@@ -308,11 +359,13 @@ impl Instance {
         self.definition.sanitize(value)
     }
     pub fn value(&self) -> f64 {
-        if self.dirty.get() {
-            self.cached.set(self.compute_value());
-            self.dirty.set(false);
+        use std::sync::atomic::Ordering;
+        if self.dirty.load(Ordering::Acquire) {
+            self.cached
+                .store(self.compute_value().to_bits(), Ordering::Relaxed);
+            self.dirty.store(false, Ordering::Release);
         }
-        self.cached.get()
+        f64::from_bits(self.cached.load(Ordering::Relaxed))
     }
     pub fn replace_from<O: Observer>(
         &mut self,

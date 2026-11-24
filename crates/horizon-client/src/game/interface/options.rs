@@ -181,16 +181,33 @@ impl Game<'_> {
     pub(super) fn draw_options(&mut self, batch: &mut HudBatch) {
         self.watch_pack_folder();
         let context = self.controller_settings_context();
-        let mut ui = std::mem::take(&mut self.ui.options);
-        if ui.controller_open() {
-            ui.set_controller_context(context);
+        if self.ui.options.controller_open() {
+            self.ui.options.set_controller_context(context);
         }
+        let pack = (self.renderer.as_ref()).and_then(|r| r.native_pack_name());
+        if self.settings.running_pack.as_deref() != pack {
+            self.settings.running_pack = pack.map(str::to_owned);
+        }
+        self.ui.options.set_shader_pack_loading(
+            self.renderer
+                .as_ref()
+                .is_some_and(|r| r.shader_pack_loading()),
+        );
         let output = self
             .renderer
             .as_ref()
             .map_or(Default::default(), |r| r.output());
-        ui.draw(&self.settings, output, batch, &self.gui.atlas, self.cursor);
-        self.ui.options = ui;
+        self.ui
+            .options
+            .draw_background(&self.settings, output, batch, &self.gui.atlas);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+        self.ui
+            .options
+            .draw_contents(&self.settings, batch, &self.gui.atlas, self.cursor);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
+        self.ui
+            .options
+            .draw_overlays(batch, &self.gui.atlas, self.cursor);
         self.show_calibration((batch.width, batch.height));
     }
     /// Whose controller settings these are and what this game sees (`controller_ui`): the
@@ -502,6 +519,7 @@ impl Game<'_> {
                 Event::NativePackOptions(i) => {
                     if let Some(pack) = self.settings.shader_packs.get(i) {
                         pack.save_values(&Self::shader_packs_dir());
+                        self.native_shaders.check_now();
                     }
                 }
                 Event::OpenShaderPackFolder => {
@@ -576,6 +594,7 @@ impl Game<'_> {
     }
     /// Settings that Horizon applies beyond render distance, volume and GUI scale.
     pub(super) fn apply_ui_settings(&mut self) {
+        horizon_client::parallel::set_setting(self.settings.horizon.parallel_tick);
         if horizon_client_render::mipmap::set_dither_cutouts(
             self.settings.horizon.dither_cutout_mips,
         ) {
@@ -593,6 +612,7 @@ impl Game<'_> {
         self.hold_fullbright();
         let s = &self.settings;
         if let Some(r) = self.renderer.as_mut() {
+            r.set_msaa4x(s.horizon.msaa4x);
             r.gamma = s.gamma;
             r.improved_transparency = s.improved_transparency;
             r.set_present_mode(s.vsync, s.horizon.present_mode);
@@ -612,7 +632,7 @@ impl Game<'_> {
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
             );
-            r.set_hdr_lighting(s.horizon.hdr_lighting);
+            r.set_hdr_lighting(s.horizon.hdr_look == horizon_client::graphics::HdrLook::Horizon);
             // Where it is offered (`Renderer::gpu_culling_offer`); unchanged, it does nothing.
             // Auto has it on while its measurements say so (`GpuCullingAuto`), and starts over
             // when the choice is another one.
@@ -819,6 +839,20 @@ impl Game<'_> {
             r.fullbright = self.settings.extras.fullbright && !held;
         }
     }
+    /// The fullbright key (`key.fullbright`), from the game: it toggles the extra the Video
+    /// settings' switch does, and the next tick's `hold_fullbright` draws it. Reported handled
+    /// where the server holds fullbright off too, so the key does nothing else there (the
+    /// settings row is hidden in that state, and the key says nothing either).
+    pub(super) fn fullbright_key_press(&mut self, name: &str) -> bool {
+        if self.screen != Screen::Playing
+            || self.settings.keys.get("key.fullbright") != name
+            || name == "key.keyboard.unknown"
+        {
+            return false;
+        }
+        self.set_fullbright(!self.fullbright());
+        true
+    }
 }
 
 /// Fullbright is held off on another's server, where it would light what the server shows
@@ -877,7 +911,7 @@ mod resize_state_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an X11 display"]
+    #[ignore = "daily"]
     fn viewport_resize_notifications_follow_each_player() {
         // Winit permits only one event loop per process, even after it is dropped.
         if crate::game::native_entity_refs::tests::run_fresh_cases(

@@ -2,7 +2,7 @@
 //! `isShiftKeyDown`), unless an `entity_mount` listener cancels the dismount (NeoForge's
 //! `EntityMountEvent`). Kept on, the mount still reads that tick's input, sneak included
 //! (`LivingEntity.getRiddenInput` reads the controller), on the local player's route and on a
-//! server player's (#2739).
+//! server player's (arismoko/horizon#2739).
 use super::camel_jump_tests::game;
 use crate::game::Game;
 use horizon_client::{mobs::equine, sprint::Keys};
@@ -64,7 +64,7 @@ fn rider(game: &Game<'_>, horse: u32) -> Option<equine::Rider> {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn underwater_dismount_obeys_the_listener_without_sneak() {
     with_horse(|game, horse, keep, leaves| {
         game.riding = Some(horse);
@@ -89,7 +89,7 @@ fn underwater_dismount_obeys_the_listener_without_sneak() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_dead_mount_never_receives_input_even_when_dismount_is_cancelled() {
     with_horse(|game, horse, keep, leaves| {
         game.riding = Some(horse);
@@ -110,7 +110,7 @@ fn a_dead_mount_never_receives_input_even_when_dismount_is_cancelled() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_kept_local_rider_still_drives_and_sneaks() {
     with_horse(|game, horse, keep, leaves| {
         game.riding = Some(horse);
@@ -143,7 +143,7 @@ fn a_kept_local_rider_still_drives_and_sneaks() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_kept_server_player_still_drives_and_sneaks() {
     // `PlayerInput` flags: forward 1, left 4, jump 16, shift 32.
     const INPUT: u8 = 1 | 4 | 16 | 32;

@@ -238,7 +238,7 @@ fn goal_name(m: &Mob, name: &str) -> String {
         "RestrictSun" => "RestrictSunGoal",
         "FleeSun" => "FleeSunGoal",
         // `Cat.CatAvoidEntityGoal`, `Fox.FoxAvoidEntityGoal`... name their subclass.
-        "AvoidEntity" if m.species() == Species::Cat => "CatAvoidEntityGoal",
+        "AvoidEntity" | "CatAvoid" if m.species() == Species::Cat => "CatAvoidEntityGoal",
         "AvoidEntity" => "AvoidEntityGoal",
         "BowAttack" => "RangedBowAttackGoal",
         "Swell" => "SwellGoal",
@@ -338,7 +338,7 @@ fn summon_golem(
     w: &MobWorld,
     types: &MobTypes,
     born: &mut Vec<Mob>,
-    level_random: &mut LegacyRandom,
+    level_random: &mut impl RandomSource,
 ) {
     use horizon_client::mobs::{villager, villager_brain};
     let Some(near) = villager::golem_summoners(mobs, a, w.game_time, needed) else {
@@ -380,7 +380,7 @@ fn villager_events(
     items: &Items,
     born: &mut Vec<Mob>,
     day_time: i64,
-    level_random: &mut LegacyRandom,
+    level_random: &mut impl RandomSource,
 ) {
     use horizon_client::mobs::villager;
     let index = |mobs: &[Mob], id: u32| {
@@ -393,14 +393,7 @@ fn villager_events(
             MobEvent::VillagerMeet { mob, other } => {
                 events.remove(i);
                 if let (Some(a), Some(b)) = (index(mobs, mob), index(mobs, other)) {
-                    let meeting = villager::meet(
-                        mobs,
-                        a,
-                        b,
-                        w.game_time,
-                        |item| items.get(item).map_or(64, |i| i.max_stack),
-                        w.professions,
-                    );
+                    let meeting = villager::meet(mobs, a, b, w.game_time, items, w.professions);
                     assert!(
                         meeting.thrown.is_empty(),
                         "villagers toss items: not modelled here"
@@ -425,7 +418,7 @@ fn villager_events(
                 let (Some(a), Some(b)) = (index(mobs, parent), index(mobs, partner)) else {
                     continue;
                 };
-                villager::ext_mut(&mut mobs[b]).eat_and_digest();
+                villager::ext_mut(&mut mobs[b]).eat_and_digest(items);
                 let Some((bed, variant)) = child else {
                     continue;
                 };
@@ -453,8 +446,8 @@ fn villager_events(
 /// The player's UUID (the oracle's `PLAYER_UUID`).
 const PLAYER_UUID: [i32; 4] = [0, 0x1234, 0, 0x5678];
 
-fn seen(m: &Mob) -> Seen {
-    m.seen(Some(PLAYER_UUID))
+fn seen(m: &Mob, items: &Items) -> Seen {
+    m.seen(Some(PLAYER_UUID), items)
 }
 
 /// The probe's mobs as a creaking heart sees them: creakings it creates take
@@ -611,7 +604,11 @@ fn player_damage(e: &MobEvent) -> f32 {
     match e {
         MobEvent::AttackPlayer(amount, _)
         | MobEvent::CubeHurtPlayer { amount, .. }
-        | MobEvent::StingPlayer { amount, .. }
+        | MobEvent::Sting {
+            target: Who::Player,
+            amount,
+            ..
+        }
         | MobEvent::AttackPlayerWithEffect { amount, .. }
         | MobEvent::DamagePlayer { amount, .. }
         | MobEvent::IronGolemHit {
@@ -635,7 +632,11 @@ fn player_hurt(player: Option<&PlayerView>, e: &MobEvent) -> bool {
     match e {
         MobEvent::AttackPlayer(amount, _)
         | MobEvent::CubeHurtPlayer { amount, .. }
-        | MobEvent::StingPlayer { amount, .. }
+        | MobEvent::Sting {
+            target: Who::Player,
+            amount,
+            ..
+        }
         | MobEvent::AttackPlayerWithEffect { amount, .. }
         | MobEvent::DamagePlayer { amount, .. }
         | MobEvent::IronGolemHit {
@@ -1167,6 +1168,7 @@ pub fn main() -> horizon_client::Result<()> {
                 armor_cover: 0.0,
                 invisible: false,
                 spectator: false,
+                on_climbable: false,
                 gold_armor: false,
                 hurt_by: None,
                 last_hurt: None,
@@ -1203,6 +1205,7 @@ pub fn main() -> horizon_client::Result<()> {
             };
             ($snapshot:expr, $grid:expr) => {
                 MobWorld {
+                    mob_maps: horizon_client::neoforge_mob_maps::NeoForgeMobMaps::vanilla(),
                     goal_host: None,
                     teams: Default::default(),
                     professions: horizon_client::mobs::villager::profession_table(),
@@ -1232,6 +1235,8 @@ pub fn main() -> horizon_client::Result<()> {
                     others_index: None,
                     passenger_objects: &[],
                     others_villagers: None,
+                    village: None,
+                    species_slots: None,
                     others_solid: None,
                     daylight: (world.day_time.rem_euclid(24000)) < 12000,
                     monsters_burn: !(12542..23460).contains(&world.day_time.rem_euclid(24000)),
@@ -1260,6 +1265,7 @@ pub fn main() -> horizon_client::Result<()> {
                     asks_living_destroy_block: false,
                     asks_baby_spawn: false,
                     border: None,
+                    section_writer: None,
                 }
             };
         }
@@ -1313,7 +1319,11 @@ pub fn main() -> horizon_client::Result<()> {
                 p.look = [f64::from(sin), -0.0, f64::from(cos)];
                 p.yaw = yaw;
             }
-            let mut snapshot: Vec<Seen> = mobs.iter().filter(|m| !m.removed).map(seen).collect();
+            let mut snapshot: Vec<Seen> = mobs
+                .iter()
+                .filter(|m| !m.removed)
+                .map(|m| seen(m, &items))
+                .collect();
             // The snapshot by position, kept as the game keeps it.
             let mut grid = SeenGrid::new(snapshot.iter().map(|e| e.bounds));
             let w = mob_world!(&snapshot);
@@ -1472,6 +1482,36 @@ pub fn main() -> horizon_client::Result<()> {
                     }
                     k += 1;
                 }
+                // `Bee.doHurtTarget`: the game applies the stinger, the poison
+                // and the sound only when the sting landed (the scenario's
+                // player is hurtable every tick); a refused one gives the bee
+                // its stinger and its anger back.
+                let mut k = from;
+                while k < events.len() {
+                    let attacker = match &events[k] {
+                        MobEvent::Sting {
+                            target: Who::Player,
+                            source,
+                            ..
+                        } => match source.attacker {
+                            Some(Who::Mob(id)) => Some(id),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(id) = attacker
+                        && let Some(b) = mobs.iter_mut().find(|m| m.id == id)
+                    {
+                        if !player_hurt(player.as_ref(), &events[k]) {
+                            horizon_client::mobs::bee::sting_refused(b);
+                        } else if horizon_client::mobs::bee::sting_landed(b) {
+                            let at = [b.position.x, b.position.y, b.position.z];
+                            events.insert(k + 1, MobEvent::Sound("entity.bee.sting", at, 1.0, 1.0));
+                            k += 1;
+                        }
+                    }
+                    k += 1;
+                }
                 // What a copper golem did to chests, before the next mob ticks.
                 for e in &events[from.min(events.len())..] {
                     match e {
@@ -1546,7 +1586,7 @@ pub fn main() -> horizon_client::Result<()> {
                 // ServerLevel ticks entities one after another: the ones
                 // after this mob see it as it is now.
                 if let Some(k) = snapshot.iter().position(|e| e.id == mobs[i].id) {
-                    snapshot[k] = seen(&mobs[i]);
+                    snapshot[k] = seen(&mobs[i], &items);
                     snapshot[k].alive &= !mobs[i].removed;
                     grid.update(k, snapshot[k].bounds);
                 }

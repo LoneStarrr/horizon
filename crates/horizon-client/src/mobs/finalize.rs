@@ -20,9 +20,11 @@
 //! fish base colour), `variant3` the tropical fish pattern colour, and
 //! `sound_variant` the index in the species' sound variant registry.
 use super::{
-    Mob, MobWorld, Species, farm::Climate, gear, spawn_rules::Reason, spawning::LocalDifficulty,
+    Mob, MobWorld, Species, equip, farm::Climate, gear, spawn_rules::Reason,
+    spawning::LocalDifficulty,
 };
 use crate::{enchant::Enchantments, items::Items};
+use horizon_core::equipment_slot::EquipmentSlot;
 use horizon_core::{geometry::Aabb, random::RandomSource};
 use serde_json::Value;
 use std::{fs, path::Path, sync::Arc};
@@ -40,6 +42,10 @@ pub enum SpawnEvent {
 
 /// The level as finalizeSpawn reads it.
 pub trait FinalizeLevel {
+    /// The owning world's immutable builtin generation (vanilla for bare fixtures).
+    fn mob_maps(&self) -> &crate::neoforge_mob_maps::NeoForgeMobMaps {
+        crate::neoforge_mob_maps::NeoForgeMobMaps::vanilla()
+    }
     /// The biome id at a block.
     fn biome(&self, pos: [i32; 3]) -> String;
     /// The biome at a block is in a biome tag (`minecraft:...`).
@@ -50,7 +56,7 @@ pub trait FinalizeLevel {
     fn moon_phase(&self, pos: [i32; 3]) -> usize;
     /// `ServerLevel.isSpawningMonsters`.
     fn spawning_monsters(&self) -> bool;
-    /// `Level.noCollision(AABB)`.
+    /// `CollisionGetter.noCollision(AABB)`.
     fn no_collision(&self, bounds: Aabb) -> bool;
     /// The first chicken (in entity order) whose box meets `bounds` and
     /// that is not being ridden (`Zombie.finalizeSpawn`'s chicken jockeys).
@@ -400,19 +406,51 @@ impl Attr {
             Self::FlyingSpeed => "minecraft:flying_speed",
         }
     }
-    /// `RangedAttribute` bounds.
-    fn range(self) -> (f64, f64) {
-        match self {
-            Self::MaxHealth => (1.0, 1024.0),
-            Self::MovementSpeed => (0.0, 1024.0),
-            Self::FollowRange => (0.0, 2048.0),
-            Self::AttackDamage => (0.0, 2048.0),
-            Self::KnockbackResistance | Self::SpawnReinforcements => (0.0, 1.0),
-            Self::JumpStrength => (0.0, 32.0),
-            Self::Armor => (0.0, 30.0),
-            Self::BurningTime | Self::FlyingSpeed => (0.0, 1024.0),
+}
+/// The definition of each [`Attr`] and of `max_absorption`
+/// (`RangedAttribute`'s default and bounds), read once from the attribute
+/// catalog when the mob types load: what a mob's own attribute record
+/// sanitizes its values with, as `AttributeInstance` does. A type built
+/// without a catalog (a test fixture, the player's render type) has none,
+/// and its values are not clamped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttrBounds {
+    attrs: [Option<horizon_world::attributes::Definition>; Attr::ALL.len()],
+    /// `Attributes.MAX_ABSORPTION`'s, for a mob with no attribute map yet.
+    max_absorption: Option<horizon_world::attributes::Definition>,
+}
+impl AttrBounds {
+    /// Each attribute's definition in `catalog`.
+    pub fn of(catalog: &horizon_world::attributes::entity::Catalog) -> Self {
+        Self {
+            attrs: Attr::ALL.map(|a| catalog.definition(a.id())),
+            max_absorption: catalog.definition("minecraft:max_absorption"),
         }
     }
+    /// `RangedAttribute.sanitizeValue` of `a`: NaN to the minimum, then into
+    /// the bounds.
+    pub fn sanitize(&self, a: Attr, value: f64) -> f64 {
+        sanitize(self.attrs[a as usize], value)
+    }
+    /// The saved base `base` of the attribute `id` as a load takes it
+    /// ([`crate::living_attributes::loaded_base`]): clamped into an [`Attr`]'s
+    /// bounds when a mod that widened them is gone.
+    pub fn loaded_base(&self, id: &str, base: f64) -> f64 {
+        Attr::ALL
+            .into_iter()
+            .find(|a| a.id() == id)
+            .and_then(|a| self.attrs[a as usize])
+            .map_or(base, |definition| {
+                crate::living_attributes::loaded_base(id, definition, base)
+            })
+    }
+    /// `RangedAttribute.sanitizeValue` of `max_absorption`.
+    pub fn sanitize_max_absorption(&self, value: f64) -> f64 {
+        sanitize(self.max_absorption, value)
+    }
+}
+fn sanitize(definition: Option<horizon_world::attributes::Definition>, value: f64) -> f64 {
+    definition.map_or(value, |definition| definition.sanitize(value))
 }
 /// `AttributeModifier.Operation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -447,6 +485,9 @@ pub struct Attributes {
     /// (`/attribute ... modifier remove`) until the next setBaby. Not
     /// saved: a load runs setBaby again.
     pub baby_speed_removed: bool,
+    /// The maximum health changed since the mob's last tick
+    /// (`AttributeMap.getAttributesToUpdate`). Not saved.
+    pub max_health_dirty: bool,
 }
 /// The attribute `/attribute` names (`follow_range`, not
 /// `minecraft:follow_range`) when gameplay reads it from this store. Armor
@@ -486,8 +527,6 @@ pub fn base_value_with(m: &Mob, a: Attr, default: impl FnOnce() -> Option<f64>) 
 /// - `movement_speed`: Zombie and Piglin.setBaby (the load calls it even for an
 ///   adult), `Enderman.setTarget` (the load ends in `readPersistentAngerSaveData`,
 ///   which calls it), and the first tick of any mob (`LivingEntity.removeFrost`).
-/// - `max_health`: `Wolf.applyTamingSideEffects`, through `setTame(false, true)`
-///   when the load finds no owner (a wolf that is tamed in game makes it too).
 /// - `attack_damage`: `Rabbit.setVariant`, and a baby Goat or Hoglin, whose load's
 ///   `setAge` crosses the baby boundary (`ageBoundaryReached`).
 pub fn made_at_load(m: &Mob) -> Vec<Attr> {
@@ -495,9 +534,6 @@ pub fn made_at_load(m: &Mob) -> Vec<Attr> {
     let mut made = Vec::new();
     if super::doors::is_zombie(s) || matches!(s, Species::Piglin | Species::Enderman) || m.age > 0 {
         made.push(Attr::MovementSpeed);
-    }
-    if s == Species::Wolf {
-        made.push(Attr::MaxHealth);
     }
     if s == Species::Rabbit || (matches!(s, Species::Goat | Species::Hoglin) && m.is_baby()) {
         made.push(Attr::AttackDamage);
@@ -507,11 +543,6 @@ pub fn made_at_load(m: &Mob) -> Vec<Attr> {
 /// The base of an instance `made_at_load` lists, as `AttributeMap.pack` writes it.
 pub fn made_base(m: &Mob, a: Attr) -> f64 {
     match (m.species(), a) {
-        // `Wolf.applyTamingSideEffects` sets 40 for a tame wolf and 8 for the others;
-        // `attrs.max_health` is the value (modifiers included), never the base.
-        (Species::Wolf, Attr::MaxHealth) => {
-            base_value_with(m, a, || Some(super::tame::wolf_health_base(m.extra.tame)))
-        }
         (s @ (Species::Goat | Species::Hoglin), Attr::AttackDamage) => {
             base_value_with(m, a, || age_attack_damage(s, m.is_baby()))
         }
@@ -578,13 +609,107 @@ pub fn value(m: &Mob, a: Attr) -> f64 {
 pub fn value_with(m: &Mob, a: Attr, extra: &[(f64, Op)]) -> f64 {
     compute(m, a, true, extra)
 }
+/// The modifiers the mob's equipment puts in its attribute map for
+/// `attribute` (`LivingEntity.collectEquipmentChanges`): for every
+/// `EquipmentSlot` with an unbroken stack, `ItemStack.forEachModifier` (the
+/// stack's `attribute_modifiers`, then its enchantments' `attributes` effects),
+/// each by `removeModifier(id)` then `addTransientModifier`, so a later one
+/// with the same id replaces the earlier.
+pub fn equipment_modifiers(
+    m: &Mob,
+    attribute: &str,
+    items: &Items,
+    enchantments: &Enchantments,
+) -> Vec<(String, f64, Op)> {
+    let mut out: Vec<(String, f64, Op)> = Vec::new();
+    for slot in EquipmentSlot::ALL {
+        let Some(stack) =
+            equipment_stack(m, slot).filter(|s| s.count > 0 && &*s.item != "minecraft:air")
+        else {
+            continue;
+        };
+        // `ItemStack.isBroken`: damageable and its damage at the maximum.
+        let max_damage = items.stack_max_damage(&stack);
+        if max_damage > 0 && stack.damage >= max_damage {
+            continue;
+        }
+        let own = crate::item_attributes::attribute_modifiers(&stack, items)
+            .iter()
+            .filter(|row| equip::group_matches(&row.slot, slot))
+            .map(|row| {
+                (
+                    row.attribute.clone(),
+                    row.id.clone(),
+                    row.amount,
+                    row.operation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // `EnchantmentHelper.forEachModifier`: `matchingSlot`, one modifier
+        // per slot, its id suffixed with the slot (`idForSlot`).
+        let enchanted = enchantments
+            .modifier_rows(&stack)
+            .into_iter()
+            .filter(|row| equip::group_matches(&row.slot, slot))
+            .map(|row| {
+                (
+                    row.attribute,
+                    format!("{}/{}", row.id, slot_name(slot)),
+                    row.amount,
+                    row.operation,
+                )
+            });
+        for (kind, id, amount, operation) in own.into_iter().chain(enchanted) {
+            if kind != attribute {
+                continue;
+            }
+            let op = match operation.as_str() {
+                "add_multiplied_base" => Op::AddMultipliedBase,
+                "add_multiplied_total" => Op::AddMultipliedTotal,
+                _ => Op::AddValue,
+            };
+            out.retain(|(held, _, _)| *held != id);
+            out.push((id, amount, op));
+        }
+    }
+    out
+}
+/// `EquipmentSlot.getSerializedName`.
+fn slot_name(slot: EquipmentSlot) -> &'static str {
+    match slot {
+        EquipmentSlot::MainHand => "mainhand",
+        EquipmentSlot::OffHand => "offhand",
+        EquipmentSlot::Feet => "feet",
+        EquipmentSlot::Legs => "legs",
+        EquipmentSlot::Chest => "chest",
+        EquipmentSlot::Head => "head",
+        EquipmentSlot::Body => "body",
+        EquipmentSlot::Saddle => "saddle",
+    }
+}
+/// [`value`] of the map with the gear's modifiers in it
+/// (`equipment_modifiers`): one with the id of a stored modifier replaces it.
+pub fn value_with_gear(m: &Mob, a: Attr, gear: &[(String, f64, Op)]) -> f64 {
+    let extra: Vec<(f64, Op)> = gear.iter().map(|(_, amount, op)| (*amount, *op)).collect();
+    compute_replacing(m, a, true, &extra, gear)
+}
 fn compute(m: &Mob, a: Attr, with_transient: bool, extra: &[(f64, Op)]) -> f64 {
+    compute_replacing(m, a, with_transient, extra, &[])
+}
+/// [`compute`] without the stored modifiers whose id one in `replaced` has.
+fn compute_replacing(
+    m: &Mob,
+    a: Attr,
+    with_transient: bool,
+    extra: &[(f64, Op)],
+    replaced: &[(String, f64, Op)],
+) -> f64 {
     let mut base = base_value(m, a);
     let empty = Vec::new();
     let mods = m.extra.attributes.as_ref().map_or(&empty, |s| &s.modifiers);
     let mut ops: Vec<(f64, Op)> = mods
         .iter()
-        .filter(|x| x.attr == a)
+        .filter(|x| x.attr == a && !replaced.iter().any(|(id, _, _)| *id == x.id))
         .map(|x| (x.amount, x.op))
         .collect();
     if let Some(s) = m.extra.attributes.as_deref() {
@@ -616,17 +741,19 @@ fn compute(m: &Mob, a: Attr, with_transient: bool, extra: &[(f64, Op)]) -> f64 {
             result *= 1.0 + amount;
         }
     }
-    let (lo, hi) = a.range();
-    if result.is_nan() {
-        lo
-    } else {
-        result.clamp(lo, hi)
-    }
+    m.kind.attribute_bounds.sanitize(a, result)
 }
 /// Copies the attribute values into the fields the game reads.
 fn refresh(m: &mut Mob, a: Attr) {
     match a {
-        Attr::MaxHealth => m.attrs.max_health = value(m, a) as f32,
+        Attr::MaxHealth => {
+            m.attrs.max_health = value(m, a) as f32;
+            // `AttributeInstance.setDirty`: the tick's `refreshDirtyAttributes`
+            // checks Health against the new maximum.
+            if let Some(s) = m.extra.attributes.as_mut() {
+                s.max_health_dirty = true;
+            }
+        }
         Attr::MovementSpeed => m.attrs.speed = base_with_modifiers(m, a),
         Attr::FollowRange => {
             m.attrs.follow_range = value(m, a);
@@ -804,18 +931,43 @@ pub fn zombie_attributes(m: &mut Mob, special: f32, reason: Reason) {
 pub fn max_health(m: &Mob) -> f32 {
     value(m, Attr::MaxHealth) as f32
 }
+/// The max health `LivingEntity.readAdditionalSaveData` clamps the saved
+/// Health to: the attribute as the save left it. Vanilla reads Health before
+/// a saved Health Boost adds its modifier back, so the boost doesn't count.
+/// The cached maximum counts too when no boost is in it, for the mobs that
+/// write theirs outside the attribute model.
+pub fn loaded_max_health(m: &Mob) -> f32 {
+    let saved = base_with_modifiers(m, Attr::MaxHealth) as f32;
+    if effect_modifiers(m, Attr::MaxHealth).next().is_some() {
+        saved
+    } else {
+        saved.max(m.attrs.max_health)
+    }
+}
 /// `LivingEntity.onAttributeUpdated(MAX_HEALTH)` after a Health Boost
 /// change: the cached maximum follows the attribute model again, and Health
-/// above it is lowered (nothing is healed). Wolves write their maximum
-/// straight into the cache (`tame::set_tame`), outside the model, so they
-/// keep theirs.
+/// above it is lowered (nothing is healed). Wolves use the type's default
+/// unless a saved base or `tame::set_tame` stored one; neither refreshing an
+/// effect nor the tame flag may replace that base (#16719).
 pub fn health_boost_changed(m: &mut Mob) {
-    if m.species() == Species::Wolf {
-        return;
-    }
     refresh(m, Attr::MaxHealth);
+    clamp_health(m);
+}
+/// `LivingEntity.onAttributeUpdated(MAX_HEALTH)`: a lowered maximum lowers
+/// Health (nothing is healed).
+fn clamp_health(m: &mut Mob) {
     if m.health > m.attrs.max_health {
         m.health = m.attrs.max_health;
+    }
+}
+/// `LivingEntity.refreshDirtyAttributes`, near the end of `LivingEntity.tick`:
+/// a maximum health changed since the last tick (`/attribute`, a modifier)
+/// lowers Health to it.
+pub fn refresh_dirty_attributes(m: &mut Mob) {
+    if let Some(s) = m.extra.attributes.as_mut()
+        && std::mem::take(&mut s.max_health_dirty)
+    {
+        clamp_health(m);
     }
 }
 
@@ -979,21 +1131,15 @@ fn age_boundary_reached(m: &mut Mob, w: Option<&MobWorld<'_>>) {
 /// `Goat.finalizeSpawn` on a natural spawn (the spawn path in spawning.rs): the ram
 /// cooldowns (`GoatAi.initMemories`), screaming 2 percent of the time and a
 /// horn lost 10 percent of the time, adults only.
-pub fn goat_spawn(m: &mut Mob) {
-    let jump = m
-        .random
-        .next_int_between_inclusive(600, 1200)
-        .unwrap_or(600);
+pub fn goat_spawn(m: &mut Mob, r: &mut impl RandomSource) {
+    let jump = r.next_int_between_inclusive(600, 1200).unwrap_or(600);
     set_memory(m, "long_jump_cooling_down", i64::from(jump), i64::MAX);
-    let ram = m
-        .random
-        .next_int_between_inclusive(600, 6000)
-        .unwrap_or(600);
+    let ram = r.next_int_between_inclusive(600, 6000).unwrap_or(600);
     set_memory(m, "ram_cooldown_ticks", i64::from(ram), i64::MAX);
-    m.extra.screaming = m.random.next_double() < 0.02;
+    m.extra.screaming = r.next_double() < 0.02;
     age_boundary_reached(m, None);
-    if !m.is_baby() && m.random.next_float() < 0.1 {
-        let left = m.random.next_boolean();
+    if !m.is_baby() && r.next_float() < 0.1 {
+        let left = r.next_boolean();
         m.extra.lost_horns[usize::from(!left)] = true;
     }
 }
@@ -1005,7 +1151,8 @@ pub fn spawn_egg_is_for(egg: &str, kind: &str) -> bool {
 
 /// `SpawnEggItem.spawnOffspringFromSpawnEgg`: the offspring of a spawn egg
 /// used on a mob of the same kind is a baby of that kind: it starts with
-/// the age of a baby and keeps the parent's variant and colour.
+/// the age of a baby and takes the variant and colour it is given (the
+/// parent's, but a mooshroom's colour rolled by `MushroomCow.getOffspringVariant`).
 pub fn spawn_egg_offspring(child: &mut Mob, species: Species, variant: u8, color: u8) {
     set_baby(child, true);
     child.extra.variant = variant;
@@ -1015,6 +1162,13 @@ pub fn spawn_egg_offspring(child: &mut Mob, species: Species, variant: u8, color
     // `SulfurCube.getBreedOffspring`: `setSize(1, true)`.
     if species == Species::SulfurCube {
         sulfur_size(child, 1);
+    }
+}
+/// `Zombie.onOffspringSpawnedFromEgg`: a baby from a zombie's own egg rolls
+/// `CanPickUpLoot` from the parent's random against the difficulty at it.
+pub fn zombie_egg_pick_up_loot(child: &mut Mob, special: f32, random: &mut impl RandomSource) {
+    if zombie(child.species()) {
+        child.extra.pick_up_loot = random.next_float() < 0.55 * special;
     }
 }
 /// `setBaby`: AgeableMob through its age, zombies, piglins and zoglins.
@@ -1824,8 +1978,11 @@ impl<L: FinalizeLevel + ?Sized, R: RandomSource> Ctx<'_, L, R> {
             + self.random.next_double() * 0.2
     }
     fn villager_type(&mut self, m: &mut Mob) {
-        let at = block(m);
-        m.extra.variant = villager_type(&self.level.biome(at));
+        if !super::villager::ext(m).is_some_and(|e| e.data_finalized) {
+            let at = block(m);
+            m.extra.variant = self.level.mob_maps().villager_type(&self.level.biome(at));
+            super::villager::ext_mut(m).data_finalized = true;
+        }
     }
     /// `VariantUtils.selectVariantToSpawn` into `variant`, by registry name.
     fn variant(&mut self, m: &mut Mob, registry: fn(&SpawnRegistries) -> &VariantRegistry) {
@@ -1925,18 +2082,11 @@ impl<L: FinalizeLevel + ?Sized, R: RandomSource> Ctx<'_, L, R> {
             }
             S::Rabbit => {
                 let at = block(m);
-                let roll = self.int(100);
-                let mut variant = if self.level.biome_tag("minecraft:spawns_white_rabbits", at) {
-                    if roll < 80 { 1 } else { 3 }
-                } else if self.level.biome_tag("minecraft:spawns_gold_rabbits", at) {
-                    4
-                } else if roll < 50 {
-                    0
-                } else if roll < 90 {
-                    5
-                } else {
-                    2
-                };
+                let mut variant = super::rabbit::random_variant(
+                    self.level.biome_tag("minecraft:spawns_white_rabbits", at),
+                    self.level.biome_tag("minecraft:spawns_gold_rabbits", at),
+                    self.random,
+                );
                 let g = match g {
                     Some(Group::Rabbit(a, v)) => {
                         variant = v;
@@ -2305,6 +2455,20 @@ pub fn variant_index(s: Species, name: &str) -> u8 {
     let i = match s {
         Species::Cat => super::tame::CAT_VARIANTS.iter().position(|v| *v == name),
         Species::Wolf => super::tame::WOLF_VARIANTS.iter().position(|v| v.0 == name),
+        // Rabbit.Variant and Parrot.Variant, in their registry order.
+        Species::Rabbit => match name {
+            "brown" => Some(0),
+            "white" => Some(1),
+            "black" => Some(2),
+            "white_splotched" => Some(3),
+            "gold" => Some(4),
+            "salt" => Some(5),
+            "evil" => Some(99),
+            _ => None,
+        },
+        Species::Parrot => ["red", "blue", "green", "cyan", "yellow"]
+            .iter()
+            .position(|v| *v == name),
         Species::ZombieNautilus => super::nautilus::VARIANTS.iter().position(|v| *v == name),
         // MushroomCow.Variant: red is the codec's default, brown the other.
         Species::Mooshroom => ["red", "brown"].iter().position(|v| *v == name),
@@ -2437,30 +2601,141 @@ pub fn variant_name(s: Species, index: u8) -> &'static str {
             .unwrap_or("temperate"),
     }
 }
-/// `VillagerType.byBiome` (index into `render::VILLAGER_TYPES`: plains,
-/// desert, jungle, savanna, snow, swamp, taiga).
+/// `VillagerType.BY_BIOME` (index into `render::VILLAGER_TYPES`: plains,
+/// desert, jungle, savanna, snow, swamp, taiga); other biomes are plains.
+pub const BIOME_VILLAGER_TYPES: &[(&str, u8)] = &[
+    ("badlands", 1),
+    ("desert", 1),
+    ("eroded_badlands", 1),
+    ("wooded_badlands", 1),
+    ("bamboo_jungle", 2),
+    ("jungle", 2),
+    ("sparse_jungle", 2),
+    ("savanna_plateau", 3),
+    ("savanna", 3),
+    ("windswept_savanna", 3),
+    ("deep_frozen_ocean", 4),
+    ("frozen_ocean", 4),
+    ("frozen_river", 4),
+    ("ice_spikes", 4),
+    ("snowy_beach", 4),
+    ("snowy_taiga", 4),
+    ("snowy_plains", 4),
+    ("grove", 4),
+    ("snowy_slopes", 4),
+    ("frozen_peaks", 4),
+    ("jagged_peaks", 4),
+    ("swamp", 5),
+    ("mangrove_swamp", 5),
+    ("old_growth_spruce_taiga", 6),
+    ("old_growth_pine_taiga", 6),
+    ("windswept_gravelly_hills", 6),
+    ("windswept_hills", 6),
+    ("taiga", 6),
+    ("windswept_forest", 6),
+];
+/// `VillagerType.byBiome` over vanilla's table.
 pub fn villager_type(biome: &str) -> u8 {
-    match biome.strip_prefix("minecraft:").unwrap_or(biome) {
-        "badlands" | "desert" | "eroded_badlands" | "wooded_badlands" => 1,
-        "bamboo_jungle" | "jungle" | "sparse_jungle" => 2,
-        "savanna_plateau" | "savanna" | "windswept_savanna" => 3,
-        "deep_frozen_ocean" | "frozen_ocean" | "frozen_river" | "ice_spikes" | "snowy_beach"
-        | "snowy_taiga" | "snowy_plains" | "grove" | "snowy_slopes" | "frozen_peaks"
-        | "jagged_peaks" => 4,
-        "swamp" | "mangrove_swamp" => 5,
-        "old_growth_spruce_taiga"
-        | "old_growth_pine_taiga"
-        | "windswept_gravelly_hills"
-        | "windswept_hills"
-        | "taiga"
-        | "windswept_forest" => 6,
-        _ => 0,
-    }
+    let biome = biome.strip_prefix("minecraft:").unwrap_or(biome);
+    BIOME_VILLAGER_TYPES
+        .iter()
+        .find(|(b, _)| *b == biome)
+        .map_or(0, |(_, t)| *t)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wolves_refresh_health_boost_with_default_and_stored_bases() {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:wolf".into();
+        kind.species = Species::Wolf;
+        kind.max_health = 8.0;
+        kind.attributes = Arc::new([(Attr::MaxHealth.id().to_owned(), 8.0)].into());
+        let kind = Arc::new(kind);
+        // A fresh wild wolf, an owner-only load, a wild load's stored 8,
+        // a newly tamed wolf's 40, and a saved custom tame maximum.
+        for (tame, stored, base) in [
+            (false, None, 8.0),
+            (true, None, 8.0),
+            (false, Some(8.0), 8.0),
+            (true, Some(40.0), 40.0),
+            (true, Some(80.0), 80.0),
+        ] {
+            let mut m = Mob::new(
+                1,
+                Arc::clone(&kind),
+                horizon_core::geometry::Vec3::ZERO,
+                0.0,
+            );
+            m.extra.tame = tame;
+            if let Some(base) = stored {
+                set_base(&mut m, Attr::MaxHealth, base);
+            }
+            m.health = 4.0;
+            m.add_effect("minecraft:health_boost", 600, 1);
+            assert_eq!(m.attrs.max_health, base as f32 + 8.0);
+            assert_eq!(m.health, 4.0, "adding Health Boost must not heal");
+            assert_eq!(base_value(&m, Attr::MaxHealth), base);
+            m.health = m.attrs.max_health;
+            assert!(m.retain_effects(|e| e.id != "minecraft:health_boost"));
+            assert_eq!(m.attrs.max_health, base as f32);
+            assert_eq!(
+                m.health, base as f32,
+                "removal clamps to the unboosted maximum"
+            );
+            assert_eq!(base_value(&m, Attr::MaxHealth), base);
+            assert_eq!(
+                m.extra
+                    .attributes
+                    .as_ref()
+                    .and_then(|s| s.bases.first().map(|(_, v)| *v)),
+                stored,
+                "effect changes must not synthesize or overwrite a saved base"
+            );
+        }
+    }
+
+    /// A mob's own attribute record sanitizes with the definitions of the
+    /// catalog its type loaded with, not with copies of vanilla's bounds:
+    /// 26.3's catalog keeps `max_health` at 1..1024 and `knockback_resistance`
+    /// at -2..1, and a catalog with wider bounds keeps more.
+    #[test]
+    fn a_mobs_attributes_take_the_bounds_of_the_types_catalog() {
+        use horizon_world::attributes::entity::Catalog;
+        let bits = |v: f64| format!("{:016x}", v.to_bits());
+        let catalog = |max_health: f64| {
+            Catalog::from_json(&serde_json::json!({
+                "data_version": horizon_world::DATA_VERSION,
+                "attributes": [
+                    {"id": "minecraft:max_health", "default": bits(20.0), "min": bits(1.0), "max": bits(max_health), "syncable": true},
+                    {"id": "minecraft:knockback_resistance", "default": bits(0.0), "min": bits(-2.0), "max": bits(1.0), "syncable": true},
+                ],
+                "entities": {},
+            }))
+            .unwrap()
+        };
+        let mob = |catalog: &Catalog| {
+            let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+            kind.attribute_bounds = AttrBounds::of(catalog);
+            let mut m = Mob::new(1, Arc::new(kind), horizon_core::geometry::Vec3::ZERO, 0.0);
+            set_base(&mut m, Attr::MaxHealth, 5000.0);
+            set_base(&mut m, Attr::KnockbackResistance, -1.5);
+            m
+        };
+        let vanilla = mob(&catalog(1024.0));
+        assert_eq!(value(&vanilla, Attr::MaxHealth), 1024.0);
+        assert_eq!(vanilla.attrs.max_health, 1024.0);
+        assert_eq!(value(&vanilla, Attr::KnockbackResistance), -1.5);
+        let mut nan = mob(&catalog(1024.0));
+        set_base(&mut nan, Attr::MaxHealth, f64::NAN);
+        assert_eq!(value(&nan, Attr::MaxHealth), 1.0, "NaN is the minimum");
+        let wide = mob(&catalog(1e6));
+        assert_eq!(value(&wide, Attr::MaxHealth), 5000.0);
+        assert_eq!(wide.attrs.max_health, 5000.0);
+    }
 
     #[test]
     fn panda_genes_follow_the_vanilla_table() {

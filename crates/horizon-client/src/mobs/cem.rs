@@ -180,7 +180,14 @@ impl CemModels {
         (Self { layers }, standing_species)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
     pub fn layer(&self, key: &str) -> Option<&CemLayer> {
+        if self.layers.is_empty() {
+            return None;
+        }
         self.layers.get(key)
     }
 }
@@ -1427,7 +1434,7 @@ mod tests {
             pois: Default::default(),
             species_placements: Default::default(),
             mod_spawns: Default::default(),
-            pathfindable_overrides: Default::default(),
+            resolved: Default::default(),
         };
         // Sprite i spans u and v from 0.2 i to 0.2 i + 0.1.
         let atlas = |name: &str| -> Option<[f32; 4]> {
@@ -1592,7 +1599,7 @@ mod tests {
     /// there is one a baby model name maps to, and so are the parts a sample of part names is
     /// renamed to.
     #[test]
-    #[ignore = "requires prepared entity models in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn names_reach_horizons_models() {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES");
         let types: HashMap<String, Arc<MobType>> = super::super::MobTypes::load(Path::new(&root))

@@ -683,11 +683,15 @@ impl Game<'_> {
         self.capture(true);
     }
     pub(super) fn draw_command_block(&mut self, batch: &mut HudBatch) {
-        let Some(mut s) = self.command_block_screen.take() else {
+        let Some(s) = self.command_block_screen.as_ref() else {
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             return;
         };
         // AbstractCommandBlockEditScreen.tick: the block (or the cart) is gone.
-        if self.edit_base(&s).is_none() {
+        if self.edit_base(s).is_none() {
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             self.close_command_block();
             return;
         }
@@ -712,6 +716,7 @@ impl Game<'_> {
             rgba(0x10, 0x10, 0x10, 0xC0),
             rgba(0x10, 0x10, 0x10, 0xD0),
         );
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let title = Text::translate("advMode.setCommand", &[]);
         let tw = atlas.font.width_text(&title);
         batch.text_styled(
@@ -725,6 +730,8 @@ impl Game<'_> {
         let grey = rgba(160, 160, 160, 255);
         let label = Text::translate("advMode.command", &[]);
         batch.text_styled(atlas, &label, mid - 149.0, 40.0, grey, true);
+        let s = self.command_block_screen.as_mut().unwrap();
+        let cart = s.cart.is_some();
         if !s.previous.value.is_empty() {
             let label = Text::translate("advMode.previousOutput", &[]);
             // 75 + 5 * 9 + 1 + getPreviousY() - 135, then the label's 4.
@@ -732,11 +739,12 @@ impl Game<'_> {
             batch.text_styled(atlas, &label, mid - 149.0, y, grey, true);
             s.previous.draw(batch, atlas, None);
         }
+        let s = self.command_block_screen.as_ref().unwrap();
         let fallback;
         let buttons = match self.built_command_block(w, h) {
             Some(layout) => &layout.buttons,
             None => {
-                fallback = CommandBlockScreen::buttons(w, h, s.cart.is_some());
+                fallback = CommandBlockScreen::buttons(w, h, cart);
                 &fallback
             }
         };
@@ -770,10 +778,12 @@ impl Game<'_> {
         let blink = s.opened.elapsed().as_millis() as u64;
         // The command box is added first.
         let mark = horizon_client::widgets::narratables_mark();
+        let s = self.command_block_screen.as_mut().unwrap();
         let draws = s.command.draw(&m, mouse, blink, 0);
         horizon_client::widgets::move_narratables(mark, 0);
-        horizon_client::screen_draw::paint(batch, atlas, &draws);
-        self.command_block_screen = Some(s);
+        let tooltip = horizon_client::screen_draw::paint(batch, atlas, &draws);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
+        horizon_client::screen_draw::paint_tooltip(batch, atlas, &draws, tooltip);
     }
     /// The wheel over the suggestion list (`CommandSuggestions.mouseScrolled`).
     pub(super) fn command_block_scroll(&mut self, amount: f32) {
@@ -1019,18 +1029,21 @@ impl Game<'_> {
         let Some(block) = self.command_block(pos) else {
             return;
         };
+        let at = [pos.0, pos.1, pos.2];
+        if !host.hub.terrain_metadata_visible(conn, &self.world, at) {
+            return;
+        }
         let tag = Tag::compound(block.save());
         let state = self.world.block(pos.0, pos.1, pos.2).0;
         let Some(kind) = host.hub.encoder.entity_type(state) else {
             return;
         };
+        if host.hub.terrain_protected(conn, self.dim.id()) {
+            host.hub.send_block_correction(conn, &self.world, at);
+        }
         host.hub.send_to(
             conn,
-            &C::BlockEntityData(play::BlockEntityData {
-                pos: [pos.0, pos.1, pos.2],
-                kind,
-                tag,
-            }),
+            &C::BlockEntityData(play::BlockEntityData { pos: at, kind, tag }),
         );
     }
     /// What `handleSetCommandBlock` does once the player may edit the block.
@@ -1148,7 +1161,7 @@ mod tests {
     /// `AbstractCommandBlockEditScreen.init` and `addExtraControls` worked by
     /// hand for the test's 1280x720 window.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn the_edit_screen_is_laid_out_by_the_build() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.title = None;
@@ -1210,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn mode_switch_preserves_command_entity_output_and_state() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.options.dedicated = Some(Vec::new());

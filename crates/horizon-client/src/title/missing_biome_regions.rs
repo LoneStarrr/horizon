@@ -1,5 +1,5 @@
 //! The question before a world opens whose saved biome regions name mods that are not
-//! installed (#2554): open it with vanilla's biomes where those regions were, recorded in the
+//! installed (arismoko/horizon#2554): open it with vanilla's biomes where those regions were, recorded in the
 //! world, or do not open it.
 use super::*;
 
@@ -52,8 +52,10 @@ impl Title {
         batch: &mut HudBatch,
         (w, h): (f32, f32),
         missing: &[(String, String)],
+        phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
     ) {
         crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+        phases(crate::screen_draw::RenderPhase::Background, batch);
         let lines = wrapped(atlas, &message(missing), w - 50.0);
         self.message_lines.set(lines.len());
         let top = confirm_top(h, lines.len());

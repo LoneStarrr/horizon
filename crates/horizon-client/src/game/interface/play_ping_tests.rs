@@ -18,7 +18,7 @@ fn decode(packet: S) -> (S, usize) {
     (S::decode(id, reader.rest()).unwrap(), bytes.len())
 }
 
-fn output(rx: &mpsc::Receiver<Out>) -> Vec<C> {
+pub(in crate::game) fn output(rx: &mpsc::Receiver<Out>) -> Vec<C> {
     rx.try_iter()
         .flat_map(|out| match out {
             Out::Packet(body) => vec![body],
@@ -99,7 +99,9 @@ fn pass(game: &mut Game<'_>, conn: u32, packet: S) {
     );
 }
 
-fn fixture(
+/// Two registered guests (connections 1 and 2) on a LAN host, with their
+/// outbound packets.
+pub(in crate::game) fn fixture(
     resources: &mut Option<std::sync::Arc<crate::game::Resources>>,
 ) -> (Game<'_>, [mpsc::Receiver<Out>; 2]) {
     let mut game = crate::game::game_tests::tests::server_game(resources);
@@ -127,6 +129,7 @@ fn fixture(
             max_players: 2,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         },
     )
     .unwrap();
@@ -162,7 +165,7 @@ fn fixture(
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated scratch homes/cwd"]
+#[ignore = "daily"]
 fn registered_play_ping_echoes_exact_long_to_only_its_connection() {
     let mut resources = None;
     let (mut game, receivers) = fixture(&mut resources);
@@ -214,7 +217,7 @@ fn registered_play_ping_echoes_exact_long_to_only_its_connection() {
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated scratch homes/cwd"]
+#[ignore = "daily"]
 fn dead_guest_play_ping_is_transport_not_an_action() {
     let mut resources = None;
     let (mut game, receivers) = fixture(&mut resources);
@@ -246,7 +249,7 @@ fn dead_guest_play_ping_is_transport_not_an_action() {
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated scratch homes/cwd"]
+#[ignore = "daily"]
 fn server_ping_client_pong_keeps_the_existing_prediction_route() {
     let mut resources = None;
     let (mut game, receivers) = fixture(&mut resources);
@@ -296,7 +299,7 @@ fn server_ping_client_pong_keeps_the_existing_prediction_route() {
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated scratch homes/cwd"]
+#[ignore = "daily"]
 fn held_guest_play_ping_survives_the_acknowledgement_filter() {
     let mut resources = None;
     let (mut game, receivers) = fixture(&mut resources);
@@ -326,7 +329,7 @@ fn held_guest_play_ping_survives_the_acknowledgement_filter() {
 }
 
 #[test]
-#[ignore = "needs prepared resources and isolated scratch homes/cwd"]
+#[ignore = "daily"]
 fn handover_guest_play_ping_survives_the_acknowledgement_filter() {
     let mut resources = None;
     let (mut game, receivers) = fixture(&mut resources);

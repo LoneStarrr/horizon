@@ -297,6 +297,7 @@ mod tests {
     /// Without it the count stayed at 20 after the first spell, so the
     /// illusioner kept casting: no second spell and no bow.
     #[test]
+    #[ignore = "daily"]
     fn the_cast_counts_down() {
         use crate::mobs::world::with_test_world;
         use std::sync::Arc;
@@ -309,7 +310,8 @@ mod tests {
                 0.0,
             );
             m.extra.counter = 20;
-            m.random = horizon_core::random::LegacyRandom::new(0);
+            m.random =
+                horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(0));
             let mut fixture = crate::health::TestLevel::new(0);
             let mut level = fixture.level();
             let mut events = Vec::new();
@@ -329,6 +331,7 @@ mod tests {
     /// an iron golem (mob 2) gets it as the player does. Without the fix the
     /// cast on a mob sent no effect at all.
     #[test]
+    #[ignore = "daily"]
     fn the_blindness_spell_reaches_a_targeted_mob() {
         use crate::mobs::world::with_test_world;
         use std::sync::Arc;
@@ -344,7 +347,9 @@ mod tests {
                 m.ai.target = Some(target);
                 let mut spell = Spell::new(BLINDNESS_SPELL);
                 spell.warmup = 1;
-                m.random = horizon_core::random::LegacyRandom::new(0);
+                m.random = horizon_core::random::EntityRandom::own(
+                    horizon_core::random::LegacyRandom::new(0),
+                );
                 let mut fixture = crate::health::TestLevel::new(0);
                 let mut level = fixture.level();
                 let mut events = Vec::new();

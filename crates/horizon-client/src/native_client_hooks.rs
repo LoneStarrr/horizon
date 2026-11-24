@@ -6,27 +6,40 @@ use horizon_world::registry::BlockStateId;
 use mod_api::{BlockSoundCause, BlockSoundType};
 use std::sync::OnceLock;
 
+type CanSwimInFluid = fn(&LoopContext, u32, &str, &str, bool, &mut bool);
+type LivingFluidTravel = fn(crate::motion::LivingFluidTravelCall<'_>);
+
 /// Client-library hooks, installed before any menu, entity or recipe is used.
 pub struct NativeClientHooks {
-    pub menu_slot_rules: fn(&LoopContext, &str, usize, &ItemStack, &mut bool, &mut u32),
     pub menu_still_valid: fn(&LoopContext, u128, &str, [i32; 3], [f64; 3], &mut bool),
     pub menu_still_valid_listens: fn(&str) -> bool,
     pub item_stacked_on_other: fn(&LoopContext, &mut crate::menu::StackedOnOther<'_>, &mut bool),
     pub living_heal: fn(&LoopContext, u32, &mut f32, &mut bool),
+    /// `living_heal_cause`: the entity, the cause name and the amount applied.
+    pub living_heal_cause: fn(&LoopContext, u32, &str, f32),
     pub living_breathe: fn(&LoopContext, u32, &str, &mut bool, &mut i32, &mut i32),
+    /// `player_login_profile`: a login's UUID, name and profile properties, before the login
+    /// success sends them. The login thread calls it, so the callback has no host.
+    pub player_login_profile: fn(u128, &str, &mut Vec<mod_api::ProfileProperty>),
     pub farmland_trample: fn(&LoopContext, u32, [i32; 3], u32, f64, &mut bool),
     pub has_mods: fn() -> bool,
     pub player_name_format: fn(&LoopContext, &crate::text::Text, &mut crate::text::Text),
     pub player_tab_list_name_format: fn(&LoopContext, u128, &str, &mut Option<crate::text::Text>),
-    pub living_drown: fn(&LoopContext, u32, &str, &mut bool, &mut f32, i32, &mut bool),
+    pub living_drown: fn(&LoopContext, u32, &str, &mut bool, &mut f32, &mut i32, &mut bool),
     pub living_fall: fn(&LoopContext, u32, &str, &mut f64, &mut f32, &mut bool),
     pub living_jump: fn(&LoopContext, u32, &str),
     pub living_jump_power: fn(&LoopContext, u32, &str, &mut f32),
     pub living_speed: fn(&LoopContext, u32, &str, &mut f32),
     pub living_flying_speed: fn(&LoopContext, u32, &str, &mut f32),
+    pub can_swim_in_fluid_listened: fn() -> bool,
+    pub can_swim_in_fluid: CanSwimInFluid,
+    pub living_fluid_travel_listened: fn() -> bool,
+    pub living_fluid_travel: LivingFluidTravel,
     pub block_jump_factor: fn(&LoopContext, BlockStateId, &mut f32),
     pub block_speed_factor: fn(&LoopContext, BlockStateId, &mut f32),
     pub is_ladder: fn(&LoopContext, u32, BlockPos, BlockStateId, &mut bool),
+    pub makes_open_trapdoor_above_climbable:
+        fn(&LoopContext, BlockStateId, BlockPos, BlockStateId, &mut bool),
     pub friction: fn(&LoopContext, u32, &str, BlockPos, BlockStateId, &mut f32),
     pub player_stays_on_ground_surface: fn(&LoopContext, u32, &mut bool),
     pub ender_entity_teleport: fn(&LoopContext, u32, &str, [f64; 3], &mut [f64; 3], &mut bool),
@@ -39,26 +52,25 @@ pub struct NativeClientHooks {
         BlockSoundCause,
         &mut BlockSoundType,
     ),
+    /// `ItemPart::can_grindstone_repair` of the stack's item; `can_repair` arrives with
+    /// vanilla's.
+    pub can_grindstone_repair: fn(&LoopContext, &ItemStack, &mut bool),
+    /// `ItemPart::is_combine_repairable` of the stack's item; `repairable` arrives with vanilla's.
+    pub is_combine_repairable: fn(&LoopContext, &ItemStack, &mut bool),
+    /// `ItemPart::can_fit_inside_container_items` of the stack's item; `fits` arrives with
+    /// vanilla's.
+    pub can_fit_inside_container_items: fn(&LoopContext, &ItemStack, &mut bool),
 }
 
 static HOOKS: OnceLock<NativeClientHooks> = OnceLock::new();
 
+#[cfg(test)]
+#[path = "native_client_hooks_tests.rs"]
+pub(crate) mod test_hooks;
+
 /// Install the process-wide callbacks once; a second installation keeps the first and answers false.
 pub fn install(hooks: NativeClientHooks) -> bool {
     HOOKS.set(hooks).is_ok()
-}
-
-pub(crate) fn menu_slot_rules(
-    context: &LoopContext,
-    menu: &str,
-    slot: usize,
-    stack: &ItemStack,
-    may_place: &mut bool,
-    max_stack: &mut u32,
-) {
-    if let Some(hooks) = HOOKS.get() {
-        (hooks.menu_slot_rules)(context, menu, slot, stack, may_place, max_stack);
-    }
 }
 
 /// Ask the installed adapter for a mod menu type's `stillValid` answer; with
@@ -99,6 +111,12 @@ pub(crate) fn living_heal(context: &LoopContext, entity: u32, amount: &mut f32, 
     }
 }
 
+pub(crate) fn living_heal_cause(context: &LoopContext, entity: u32, cause: &str, amount: f32) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.living_heal_cause)(context, entity, cause, amount);
+    }
+}
+
 pub(crate) fn living_breathe(
     context: &LoopContext,
     entity: u32,
@@ -109,6 +127,16 @@ pub(crate) fn living_breathe(
 ) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.living_breathe)(context, entity, kind, can_breathe, consume, refill);
+    }
+}
+
+pub(crate) fn player_login_profile(
+    player: u128,
+    name: &str,
+    properties: &mut Vec<mod_api::ProfileProperty>,
+) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.player_login_profile)(player, name, properties);
     }
 }
 
@@ -156,7 +184,7 @@ pub(crate) fn living_drown(
     kind: &str,
     is_drowning: &mut bool,
     damage_amount: &mut f32,
-    bubble_count: i32,
+    bubble_count: &mut i32,
     cancel: &mut bool,
 ) {
     if let Some(hooks) = HOOKS.get() {
@@ -209,6 +237,26 @@ pub(crate) fn living_flying_speed(context: &LoopContext, entity: u32, kind: &str
     }
 }
 
+pub(crate) fn can_swim_in_fluid_listened() -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|hooks| (hooks.can_swim_in_fluid_listened)())
+}
+
+pub(crate) fn can_swim_in_fluid() -> Option<CanSwimInFluid> {
+    HOOKS.get().map(|hooks| hooks.can_swim_in_fluid)
+}
+
+pub(crate) fn living_fluid_travel_listened() -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|hooks| (hooks.living_fluid_travel_listened)())
+}
+
+pub(crate) fn living_fluid_travel() -> Option<LivingFluidTravel> {
+    HOOKS.get().map(|hooks| hooks.living_fluid_travel)
+}
+
 pub(crate) fn block_jump_factor(context: &LoopContext, state: BlockStateId, factor: &mut f32) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.block_jump_factor)(context, state, factor);
@@ -230,6 +278,18 @@ pub(crate) fn is_ladder(
 ) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.is_ladder)(context, entity, pos, state, ladder);
+    }
+}
+
+pub(crate) fn makes_open_trapdoor_above_climbable(
+    context: &LoopContext,
+    state: BlockStateId,
+    pos: BlockPos,
+    trapdoor: BlockStateId,
+    climbable: &mut bool,
+) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.makes_open_trapdoor_above_climbable)(context, state, pos, trapdoor, climbable);
     }
 }
 
@@ -285,5 +345,41 @@ pub(crate) fn sound_type(
 ) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.sound_type)(context, pos, state, entity, cause, sound);
+    }
+}
+
+/// Ask the installed adapter for the parts of `stack`'s item (`can_grindstone_repair`); with none
+/// installed, `can_repair` keeps vanilla's answer.
+pub(crate) fn can_grindstone_repair(
+    context: &LoopContext,
+    stack: &ItemStack,
+    can_repair: &mut bool,
+) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.can_grindstone_repair)(context, stack, can_repair);
+    }
+}
+
+/// Ask the installed adapter for the parts of `stack`'s item (`is_combine_repairable`); with none
+/// installed, `repairable` keeps vanilla's answer.
+pub(crate) fn is_combine_repairable(
+    context: &LoopContext,
+    stack: &ItemStack,
+    repairable: &mut bool,
+) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.is_combine_repairable)(context, stack, repairable);
+    }
+}
+
+/// Ask the installed adapter for the parts of `stack`'s item (`can_fit_inside_container_items`);
+/// with none installed, `fits` keeps vanilla's answer.
+pub(crate) fn can_fit_inside_container_items(
+    context: &LoopContext,
+    stack: &ItemStack,
+    fits: &mut bool,
+) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.can_fit_inside_container_items)(context, stack, fits);
     }
 }

@@ -3,7 +3,7 @@ use super::*;
 use crate::*;
 use horizon_core::nbt::{Compound, JavaString};
 
-fn install_layout_resources() {
+pub(super) fn install_layout_resources() {
     let _ = crate::wire::install_resource_access(crate::wire::ResourceAccess {
         intern: |value| {
             if value.len() > crate::wire::MAX_STATIC_STRING_BYTES {
@@ -178,10 +178,13 @@ fn handle_records_have_declared_field_bytes() {
     let entity = EntityRef::new(epoch, 29);
     let player = crate::__private::game::player_ref(entity, 0x1234);
     let pos = BlockPos { x: 7, y: -8, z: 9 };
-    fields(level, (epoch, DimensionKey::OVERWORLD));
+    fields(level, (epoch, DimensionKey::OVERWORLD, 0u32));
+    let reopened = LevelRef::with_generation(epoch, DimensionKey::NETHER, 5);
+    fields(reopened, (epoch, DimensionKey::NETHER, 5u32));
     fields(ChunkRef::new(level, [3, -4]), (level, [3i32, -4]));
     fields(RaidRef::new(level, 53), (level, 53i32));
     fields(RaidRef::new(level, -1), (level, -1i32));
+    fields(WaterTicket::new(level, 59), (level, 59u64));
     fields(player, (entity, 0x1234u128));
     fields(
         GlobalPos::new(id("example:moon"), pos),
@@ -462,7 +465,15 @@ fn registration_and_attribute_records_have_declared_field_bytes() {
             PackageKind::Code,
             Side::Both,
             vec!["example".into()],
-            vec!["library".into()],
+            vec![PackageDependency::new(
+                "library".into(),
+                "^1".into(),
+                crate::DependencyKind::Optional,
+                crate::DependencyOrder::After,
+                crate::Side::Both,
+                None,
+                None,
+            )],
         ),
         (
             "example".to_owned(),
@@ -470,7 +481,89 @@ fn registration_and_attribute_records_have_declared_field_bytes() {
             PackageKind::Code,
             Side::Both,
             vec!["example".to_owned()],
-            vec!["library".to_owned()],
+            // Nested tuples flatten into one field list.
+            (
+                vec![PackageDependency::new(
+                    "library".into(),
+                    "^1".into(),
+                    crate::DependencyKind::Optional,
+                    crate::DependencyOrder::After,
+                    crate::Side::Both,
+                    None,
+                    None,
+                )],
+                PackageDetails::default(),
+            ),
+        ),
+    );
+    fields(PropertyValue::Integer(3), (1u32, 3i64));
+    let dependency = PackageDependency::new(
+        "library".into(),
+        "^1".into(),
+        crate::DependencyKind::Optional,
+        crate::DependencyOrder::After,
+        crate::Side::Both,
+        None,
+        None,
+    );
+    fields(
+        dependency.clone(),
+        (
+            "library".to_owned(),
+            "^1".to_owned(),
+            crate::DependencyKind::Optional,
+            crate::DependencyOrder::After,
+            crate::Side::Both,
+            (None::<String>, None::<String>),
+        ),
+    );
+    // Independently check actual enum discriminants, not just a round trip
+    // through the same enum codec: Optional = 1, After = 0, Both = 1.
+    let mut bytes = Writer::new();
+    bytes.put(&dependency);
+    let raw = Reader::decode::<(
+        String,
+        String,
+        u32,
+        u32,
+        u32,
+        (Option<String>, Option<String>),
+    )>(bytes.bytes())
+    .unwrap();
+    assert_eq!(
+        raw,
+        (
+            "library".to_owned(),
+            "^1".to_owned(),
+            1u32,
+            0u32,
+            1u32,
+            (None::<String>, None::<String>)
+        )
+    );
+    let details = PackageDetails {
+        name: "Example".into(),
+        icon_path: Some("icon.png".into()),
+        runtime: Some(PackageRuntime::Native),
+        properties: [("ratio".into(), PropertyValue::Float(0.5))].into(),
+        ..Default::default()
+    };
+    fields(
+        details.clone(),
+        (
+            (
+                "Example".to_owned(),
+                String::new(),
+                Vec::<String>::new(),
+                String::new(),
+                None::<String>,
+            ),
+            (
+                None::<String>,
+                Some("icon.png".to_owned()),
+                Some(PackageRuntime::Native),
+                details.properties.clone(),
+            ),
         ),
     );
     let spawners = vec![
@@ -493,6 +586,21 @@ fn registration_and_attribute_records_have_declared_field_bytes() {
             id("minecraft:generic.attack_damage"),
             modifier,
             EquipmentSlotGroup::MainHand,
+            Option::<NamedSlotGroup>::None,
+        ),
+    );
+    let named = ItemAttributeModifier::named(
+        id("minecraft:luck"),
+        AttributeModifier::new(id("example:ring"), 1.0, AttributeOperation::AddValue),
+        NamedSlotGroup::new("curios:ring").unwrap(),
+    );
+    fields(
+        named.clone(),
+        (
+            id("minecraft:luck"),
+            AttributeModifier::new(id("example:ring"), 1.0, AttributeOperation::AddValue),
+            EquipmentSlotGroup::Any,
+            Some(NamedSlotGroup::new("curios:ring").unwrap()),
         ),
     );
     fields(
@@ -656,6 +764,7 @@ fn newtype_widths_and_unit_enum_tags_match_their_layouts() {
     fields(crate::wire::wire_slots::Id(0x100000003), (0x100000003u64,));
     fields(BlockUpdateFlags(17), (17u32,));
     fields(PackageKind::Code, (0u32,));
+    fields(PackageRuntime::Wasm, (1u32,));
     fields(Side::Both, (1u32,));
     fields(Reduction::Armor, (1u8,));
     fields(SpawnerKind::Patrol, (1u32,));
@@ -740,6 +849,18 @@ fn every_item_place_case_has_declared_tag_and_field_types() {
             slot: EquipmentSlot::Saddle,
         },
         (9u32, 29u32, EquipmentSlot::Saddle),
+    );
+    fields(ItemPlace::Scratch(41), (10u32, 41u64));
+    fields(ItemPlace::ScratchSlots(43), (14u32, 43u64));
+    let parent = Box::new(ItemPlace::ItemEntity { id: 71 });
+    fields(ItemPlace::Strict(parent.clone()), (11u32, parent.clone()));
+    fields(ItemPlace::OneByOne(parent.clone()), (12u32, parent.clone()));
+    fields(
+        ItemPlace::InfiniteMaterials {
+            player: 0x1234,
+            inner: parent.clone(),
+        },
+        (13u32, 0x1234u128, parent),
     );
     // The other four holder cases are exercised in handle_records above.
     fields(AttachmentHolder::Level(level), (4u32, level));
@@ -920,4 +1041,276 @@ fn original_player_identity_and_attachment_selector_cross_the_boundary() {
     let original = crate::__private::game::original_player_ref(0x1234_5678);
     fields(original, (0x1234_5678u64,));
     fields(Holder::OriginalPlayer(0x1234_5678), (5u32, 0x1234_5678u64));
+}
+
+/// A hand-written codec composes the layouts of what it encodes (#18253): reordering two fields
+/// of a derived type it carries, the way `RegistrationContext` carries `RuntimeEnvironment`,
+/// changes its layout, so a call reaching it refuses a mod built against the other order.
+#[test]
+fn a_manual_codec_carries_a_nested_types_layout_change() {
+    mod before {
+        #[derive(horizon_mod_api_macros::Wire)]
+        pub struct Environment {
+            pub game_version: String,
+            pub horizon_version: String,
+        }
+    }
+    mod after {
+        #[derive(horizon_mod_api_macros::Wire)]
+        pub struct Environment {
+            pub horizon_version: String,
+            pub game_version: String,
+        }
+    }
+    struct Context<T>(Option<T>);
+    impl<T: Wire> Wire for Context<T> {
+        crate::wire::layout_fields!("runtime" => Option<T>);
+        const LAYOUT_SEED: u64 = crate::wire::layout_seed("Context");
+        const MIN: usize = 1;
+        fn put(&self, out: &mut Writer) {
+            out.put(&self.0);
+        }
+        fn take(input: &mut Reader<'_>) -> Result<Self, WireError> {
+            Ok(Self(input.take()?))
+        }
+    }
+    assert_ne!(
+        <Context<before::Environment>>::layout(&mut vec![]),
+        <Context<after::Environment>>::layout(&mut vec![])
+    );
+    let runtime = <Option<crate::RuntimeEnvironment>>::layout(&mut vec![]);
+    assert!(
+        <crate::RegistrationContext as Wire>::__field_layouts()
+            .unwrap()
+            .contains(&("runtime", runtime))
+    );
+}
+
+/// Decodes `parts` (literal fields) to `value` (built from its raw fields), and encodes `value`
+/// back to `parts`: a codec in a hashed file whose parts come from a helper outside it.
+fn both_ways<
+    T: Wire + Clone + std::fmt::Debug + PartialEq,
+    F: Wire + std::fmt::Debug + PartialEq,
+>(
+    value: T,
+    parts: F,
+) {
+    install_layout_resources();
+    let mut out = Writer::new();
+    out.put(&parts);
+    assert_eq!(Reader::decode::<T>(out.bytes()).unwrap(), value);
+    fields(value, parts);
+}
+
+/// The hash reads these codecs but not the constructors and accessors they call (#18400), so
+/// each projection is pinned both ways. Slots are 1, so a slot dropped to zero shows.
+#[test]
+fn out_of_scan_projections_keep_their_fields_both_ways() {
+    let _keys = Keys::new();
+    let second = crate::parts::REGISTERING_KEYS.with(|keys| {
+        let keys = keys.borrow();
+        let mut requests = keys.as_ref().unwrap().borrow_mut();
+        [
+            requests.items.request("example", "example:cog"),
+            requests.blocks.request("example", "example:slab"),
+            requests.fluids.request("example", "example:oil"),
+            requests.entity_types.request("example", "example:golem"),
+            requests.entity_types.request("example", "example:drone"),
+        ]
+        .map(Result::unwrap)
+    });
+    assert_eq!(second, [1, 1, 1, 0, 1]);
+
+    let gear = Reader::decode::<Identifier>(&{
+        let mut out = Writer::new();
+        out.put(&("example".to_owned(), "gear".to_owned()));
+        out.into_bytes()
+    })
+    .unwrap();
+    assert_eq!((gear.namespace(), gear.path()), ("example", "gear"));
+    both_ways(
+        id("example:gear"),
+        ("example".to_owned(), "gear".to_owned()),
+    );
+
+    both_ways(ModelRef(31, 7), (31u64, 7u32));
+    both_ways(RenderPipelineRef(41, 5), (41u64, 5u32));
+    both_ways(InstanceGroupRef(37, 9), (37u64, 9u32));
+
+    both_ways(ItemKey(1), (1u32,));
+    both_ways(BlockKey(1), (1u32,));
+    both_ways(FluidKey(1), (1u32,));
+    // `#[wire(via = u32)]` declares no fields: its bytes are the slot's.
+    let mut out = Writer::new();
+    out.put(&EntityTypeKey(1));
+    assert_eq!(out.bytes(), 1u32.to_le_bytes());
+    assert_eq!(
+        Reader::decode::<EntityTypeKey>(out.bytes()),
+        Ok(EntityTypeKey(1))
+    );
+
+    let mut stack = ItemStack::new(ItemKey(1), 7).unwrap();
+    stack.set_damage(11);
+    both_ways(
+        stack.clone(),
+        (ItemKey(1), 7u32, Some(11u32), None::<Components>),
+    );
+    let mut out = Writer::new();
+    out.put(&(ItemKey(1), 7u32, Some(11u32), None::<Components>));
+    let decoded = Reader::decode::<ItemStack>(out.bytes()).unwrap();
+    assert_eq!(
+        (decoded.item(), decoded.count(), decoded.damage_component()),
+        (ItemKey(1), 7, Some(11))
+    );
+
+    let resource = ItemResource::of(&stack);
+    let mut page = StoragePage::new(3).unwrap();
+    assert!(page.push(resource.clone(), 5));
+    fields(page, (vec![(resource.clone(), 5u64)], 3u64));
+    let mut out = Writer::new();
+    out.put(&(vec![(resource.clone(), 5u64)], 3u64));
+    let decoded = Reader::decode::<StoragePage>(out.bytes()).unwrap();
+    assert_eq!(
+        (decoded.entries(), decoded.limit()),
+        (&[(resource, 5u64)][..], 3)
+    );
+
+    use crate::world::ticket_controller::{ControllerInfo, TEST_CONTROLLERS};
+    let table: &'static [ControllerInfo] = Box::leak(Box::new([
+        ControllerInfo {
+            id: "example:quarry".into(),
+            mod_id: "example",
+            validates: false,
+        },
+        ControllerInfo {
+            id: "example:pump".into(),
+            mod_id: "example",
+            validates: true,
+        },
+    ]));
+    let before = TEST_CONTROLLERS.replace(Some(table));
+    let controller = TicketController { slot: 1 };
+    assert_eq!(controller.slot(), 1);
+    both_ways(controller, (1u32,));
+    TEST_CONTROLLERS.set(before);
+
+    let holder = AttachmentHolder::Entity(EntityRef::new(WorldEpoch::new(43), 29));
+    let mut out = Writer::new();
+    out.put(&(holder, 71u64));
+    let token = Reader::decode::<AttachmentWriteToken>(out.bytes()).unwrap();
+    let (identity, generation): (AttachmentHolder, u64) = decode(token);
+    assert_eq!((identity, generation), (holder, 71));
+}
+
+/// The derive's types as a mod writes them, in a module that keeps the prelude.
+mod plain {
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    pub(super) struct Record {
+        pub(super) a: u32,
+        pub(super) b: u8,
+    }
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    pub(super) enum Choice {
+        A,
+        B(u32),
+        C { x: u8 },
+    }
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    #[wire(via = u32)]
+    pub(super) struct Via(pub(super) u32);
+    impl From<&Via> for u32 {
+        fn from(via: &Via) -> Self {
+            via.0
+        }
+    }
+    impl From<u32> for Via {
+        fn from(value: u32) -> Self {
+            Self(value)
+        }
+    }
+}
+
+/// The same types in a module that defines its own prelude names: a bare path in the derive's
+/// expansion would reach these and fail to compile.
+#[allow(dead_code, unused_macros, non_camel_case_types)]
+mod shadowed {
+    macro_rules! stringify {
+        ($($t:tt)*) => {
+            compile_error!("the Wire derive wrote a bare `stringify!`")
+        };
+    }
+    macro_rules! unreachable {
+        ($($t:tt)*) => {
+            compile_error!("the Wire derive wrote a bare `unreachable!`")
+        };
+    }
+    struct Option;
+    struct Some;
+    struct None;
+    struct Result;
+    struct Ok;
+    struct Err;
+    struct Vec;
+    struct String;
+    struct From;
+    struct TryFrom;
+    struct u8;
+    struct u32;
+    struct u64;
+    struct usize;
+    struct str;
+
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    pub(super) struct Record {
+        pub(super) a: ::core::primitive::u32,
+        pub(super) b: ::core::primitive::u8,
+    }
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    pub(super) enum Choice {
+        A,
+        B(::core::primitive::u32),
+        C { x: ::core::primitive::u8 },
+    }
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::Wire)]
+    #[wire(via = ::core::primitive::u32)]
+    pub(super) struct Via(pub(super) ::core::primitive::u32);
+    impl ::core::convert::From<&Via> for ::core::primitive::u32 {
+        fn from(via: &Via) -> Self {
+            via.0
+        }
+    }
+    impl ::core::convert::From<::core::primitive::u32> for Via {
+        fn from(value: ::core::primitive::u32) -> Self {
+            Self(value)
+        }
+    }
+}
+
+#[test]
+fn the_derive_compiles_where_prelude_names_are_shadowed_and_means_the_same() {
+    fn same<P: Wire, S: Wire + std::fmt::Debug + PartialEq>(plain: P, shadowed: S) {
+        assert_eq!(P::LAYOUT_SEED, S::LAYOUT_SEED);
+        assert_eq!(P::MIN, S::MIN);
+        assert_eq!(P::layout(&mut Vec::new()), S::layout(&mut Vec::new()));
+        let (mut p, mut s) = (Writer::new(), Writer::new());
+        p.put(&plain);
+        s.put(&shadowed);
+        assert_eq!(p.bytes(), s.bytes());
+        assert_eq!(Reader::decode::<S>(s.bytes()).unwrap(), shadowed);
+    }
+    same(
+        plain::Record { a: 7, b: 9 },
+        shadowed::Record { a: 7, b: 9 },
+    );
+    same(plain::Choice::A, shadowed::Choice::A);
+    same(plain::Choice::B(11), shadowed::Choice::B(11));
+    same(plain::Choice::C { x: 3 }, shadowed::Choice::C { x: 3 });
+    same(plain::Via(5), shadowed::Via(5));
+    // A tag no case has is refused the same way.
+    let mut out = Writer::new();
+    out.put(&9u32);
+    assert_eq!(
+        Reader::decode::<plain::Choice>(out.bytes()).unwrap_err(),
+        Reader::decode::<shadowed::Choice>(out.bytes()).unwrap_err()
+    );
 }

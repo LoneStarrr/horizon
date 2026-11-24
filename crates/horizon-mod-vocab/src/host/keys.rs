@@ -5,6 +5,48 @@ use crate::*;
 /// and reached through [`Host`].
 #[horizon_mod_api_macros::host_area]
 pub trait KeysHost {
+    /// Side: server. The biome in the installed world registry, or None on a client,
+    /// before world data is installed, or for an unknown id. Reacquire after reload.
+    #[access(WorldOnly)]
+    fn biome_key(&self, id: &str) -> Option<BiomeKey>;
+
+    /// Side: both. Exact startup game-event id; None before registry completion or for an unknown id.
+    #[access(Metadata)]
+    fn game_event_key(&self, id: &str) -> Option<GameEventKey>;
+    /// Side: both.
+    /// The key of the block named `id`, for a name that only arrives at run time (data, config,
+    /// a command, a network message). `id` is the full registry name, `minecraft:stone` or
+    /// `mymod:machine`. None for a name the registry does not hold, and before the registry is
+    /// complete (during registration, use `Registrar::block_key`). Does not allocate.
+    #[access(Metadata)]
+    fn block_key(&self, id: &str) -> Option<BlockKey>;
+    /// Side: both.
+    /// The key of the effect named `id`: the full registry name, `minecraft:speed` or
+    /// `mymod:rage`. None for a name the registry does not hold, and before the registry is
+    /// complete (during registration, use `Registrar::effect_key`). Does not allocate.
+    #[access(Metadata)]
+    fn effect_key(&self, id: &str) -> Option<EffectKey>;
+    /// Side: both.
+    /// Resolve a canonical entry in the current side's live registry. None for an
+    /// unknown registry or entry, or before that registry is available.
+    #[access(WorldOnly)]
+    fn registry_entry(&self, registry: &str, id: &str) -> Option<RegistryEntry>;
+    /// Side: both.
+    /// Entry identifiers in the current table, each once. None for an unavailable or unknown
+    /// registry; an available empty registry returns an empty list.
+    #[access(WorldOnly)]
+    fn registry_entries(&self, registry: &str) -> Option<Vec<Identifier>>;
+    /// Side: both.
+    /// Membership in the current side's merged tags. None for an unavailable registry or
+    /// entry; an absent tag, or a tag not containing the entry, returns false.
+    #[access(WorldOnly)]
+    fn registry_entry_in_tag(&self, entry: &RegistryEntry, tag: &str) -> Option<bool>;
+    /// Side: both.
+    /// Resolve a live typed key's load-owned slot, never its protocol numeric id.
+    // hidden: RegistryEntry narrowing transports a host-issued opaque key.
+    #[doc(hidden)]
+    #[access(WorldOnly)]
+    fn registry_entry_key_slot(&self, entry: &RegistryEntry) -> Option<u32>;
     /// Side: both.
     /// Every block key in the registry's registration order: vanilla's first, then
     /// mod blocks in the order they registered. A block registry lists a name once
@@ -49,6 +91,14 @@ pub trait KeysHost {
 #[doc(hidden)]
 #[horizon_mod_api_macros::host_area]
 pub trait KeysBackend {
+    /// Side: server. Canonical biome id in the installed world generation.
+    /// A token from another world or reload returns `BiomeKeyError::WrongGeneration`.
+    #[access(WorldOnly)]
+    fn biome_key_id(&self, key: BiomeKey) -> Result<String, BiomeKeyError>;
+
+    /// Side: both. Exact id of an installed game-event slot; invalid keys are refused.
+    #[access(Metadata)]
+    fn game_event_key_id(&self, key: GameEventKey) -> Result<String, GameEventKeyError>;
     /// Side: both.
     /// The canonical block id retained by the load-owned registration slot. An invalid slot
     /// is a boundary error, including when a wasm guest supplies it.
@@ -70,19 +120,6 @@ pub trait KeysBackend {
     /// invalid slot is a boundary error, including when a wasm guest supplies it.
     #[access(Metadata)]
     fn fluid_key_id(&self, key: FluidKey) -> String;
-    /// Side: both.
-    /// The key of the block named `id`, for a name that only arrives at run time (data, config,
-    /// a command, a network message). `id` is the full registry name, `minecraft:stone` or
-    /// `mymod:machine`. None for a name the registry does not hold, and before the registry is
-    /// complete (during registration, use `Registrar::block_key`). Does not allocate.
-    #[access(Metadata)]
-    fn block_key(&self, id: &str) -> Option<BlockKey>;
-    /// Side: both.
-    /// The key of the effect named `id`: the full registry name, `minecraft:speed` or
-    /// `mymod:rage`. None for a name the registry does not hold, and before the registry is
-    /// complete (during registration, use `Registrar::effect_key`). Does not allocate.
-    #[access(Metadata)]
-    fn effect_key(&self, id: &str) -> Option<EffectKey>;
     /// Side: both.
     /// The canonical block entity type id retained by the load-owned slot.
     #[access(WorldOnly)]

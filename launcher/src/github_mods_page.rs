@@ -394,7 +394,7 @@ impl Launcher {
     }
 
     /// GitHub-specific actions, shared by both installed-mod lists.
-    fn github_actions(&self, origin: &Origin, busy: bool, cx: &Context<Self>) -> Div {
+    pub(super) fn github_actions(&self, origin: &Origin, busy: bool, cx: &Context<Self>) -> Div {
         let t = self.theme;
         let id = origin.id.clone();
         let mut right = div().flex().flex_wrap().items_center().gap(px(8.));
@@ -466,10 +466,21 @@ impl Launcher {
         let home = self.mods.home();
         let on = horizon_launcher::browser::java::is_enabled(&home, &row.id);
         let id = row.id.clone();
-        right = right.child(
-            switch(format!("native-switch-{id}"), on, &t).on_click(cx.listener(
-                move |this, _: &ClickEvent, _, cx| {
-                    if !on && this.settings.native_mods_allowed_at.is_none() {
+        // A mod the stop names is decided on the panel: turning it off here would skip the
+        // backup that keeps its worlds' content.
+        let named = self.stop_names(&id);
+        let reason = tr("Choose what to do about your worlds first");
+        // A wasm or content `.hmod` copied into `horizon-mods/` by hand needs no native consent.
+        let native = row.native();
+        let flip = switch(format!("native-switch-{id}"), on, &t);
+        // A retired file can't load: Remove is all its row offers. It can't be read, so it has
+        // no switch (`Installed::switch`).
+        right = right.when(row.switch, |right| {
+            right.child(if named {
+                self.with_reason(disabled(flip), reason)
+            } else {
+                flip.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if native && !on && this.settings.native_mods_allowed_at.is_none() {
                         this.pending_consent = Some(PendingConsent::Local(id.clone()));
                         cx.notify();
                         return;
@@ -488,11 +499,14 @@ impl Launcher {
                             .map(Err);
                     this.instance_mods_changed();
                     cx.notify();
-                },
-            )),
-        );
-        right = right.child(blocks::badge(tr("NATIVE"), t.muted, &t));
-        if self.settings.native_mods_allowed_at.is_none() {
+                }))
+            })
+        });
+        if native {
+            right = right.child(blocks::badge(tr("NATIVE"), t.muted, &t));
+        }
+        // Canceling its prompt turns `mod.<id>` off: only a row that may switch it asks.
+        if native && row.switch && self.settings.native_mods_allowed_at.is_none() {
             let id = row.id.clone();
             right = right
                 .child(blocks::badge(tr("Needs permission"), t.muted, &t))
@@ -524,7 +538,9 @@ impl Launcher {
             &t,
         )
         .when(confirming, |b| b.text_color(t.danger));
-        right = right.child(if busy {
+        right = right.child(if named {
+            self.with_reason(disabled(remove), reason)
+        } else if busy {
             disabled(remove)
         } else {
             remove.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -536,11 +552,7 @@ impl Launcher {
                         cx.notify();
                         return;
                     };
-                    let result = if row.origin.is_some() {
-                        github_mods::remove(&home, &row.id).map(|_| ())
-                    } else {
-                        std::fs::remove_file(home.join(&row.file)).map_err(|e| e.to_string())
-                    };
+                    let result = github_mods::remove_installed(&home, &row);
                     this.mods.message =
                         Some(result.map(|_| trf("Removed {name}.", &[("name", &row.id)])));
                     this.github.reread(&home);
@@ -562,10 +574,11 @@ impl Launcher {
         cx: &Context<Self>,
     ) -> Div {
         let t = self.theme;
-        let source = row.origin.as_ref().map_or_else(
-            || trf("Local file · {file}", &[("file", &row.file)]),
-            |o| trf("from GitHub: {source}", &[("source", &o.label())]),
-        );
+        let source = match (row.note(), &row.origin) {
+            (Some(note), _) => note.to_string(),
+            (None, Some(o)) => trf("from GitHub: {source}", &[("source", &o.label())]),
+            (None, None) => trf("Local file · {file}", &[("file", &row.file)]),
+        };
         slot_row(
             Some(blocks::slot(None, &row.id, 40., &t)),
             row.id.clone(),

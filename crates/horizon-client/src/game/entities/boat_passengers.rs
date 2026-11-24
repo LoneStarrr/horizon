@@ -9,7 +9,7 @@ use horizon_client::{
     camera::wrap_degrees,
     fast_hash::FxHashMap,
     join_seq::ListStamp,
-    mobs::{BoxReach, Mob, Species, Who, drops::is_animal, equine, riders, seen_grid::SeenGrid},
+    mobs::{BoxReach, Mob, Species, Who, drops::is_animal, riders, seen_grid::SeenGrid},
     scoreboard::pushable_by,
 };
 use horizon_core::geometry::{Aabb, Vec3};
@@ -62,11 +62,9 @@ fn carries(m: &Mob) -> bool {
 }
 /// `isPushable`, as `pushableBy` and `canVehicleCollide` ask it:
 /// `Mob::pushable` plus the shulkers it leaves out (they take no push, but
-/// count), less a ridden horse (`AbstractHorse.isPushable`).
+/// count).
 fn pushable(m: &Mob) -> bool {
-    !m.removed
-        && (m.pushable() || m.species() == Species::Shulker && m.alive())
-        && !(equine::is_equine(m.species()) && carries(m))
+    !m.removed && (m.pushable() || m.species() == Species::Shulker && m.alive())
 }
 /// Whether `Entity.push` moves the mob: it is pushable and carries no one.
 fn moved_by_push(m: &Mob) -> bool {
@@ -229,24 +227,6 @@ impl Game<'_> {
         }
         self.vehicle_mobs.near.set(near);
     }
-    /// The slots, ascending, of the mobs whose box may meet a cart, read from the mobs' grid
-    /// once per cart. None when the mobs are the fewer (asking the carts' grid once per mob
-    /// is then the shorter way) or the grid does not answer.
-    pub(in crate::game) fn mobs_near_carts(&self) -> Option<Vec<u32>> {
-        if self.mobs.len() <= self.carts.len() {
-            return None;
-        }
-        let (mut slots, mut near) = (Vec::new(), Vec::new());
-        for c in self.carts.iter() {
-            if !self.vehicle_mobs_near(c.bounds(), &mut near) {
-                return None;
-            }
-            slots.extend_from_slice(&near);
-        }
-        slots.sort_unstable();
-        slots.dedup();
-        Some(slots)
-    }
     /// Whether mob `m`, whose box `reach` bounds, may touch a cart: the carts' grid (`cells`)
     /// names the carts near it, or every cart when the grid cannot (a superset either way).
     pub(in crate::game) fn mob_may_meet_cart(
@@ -296,9 +276,47 @@ impl Game<'_> {
         let b = &self.boats[i];
         self.boat_passengers(b.id) < b.max_passengers() && !b.under_water()
     }
+    /// `getPassengers()` of boat `i` on a server's client: what the server's
+    /// last `SetPassengers` seated (the entities this client had then), less
+    /// those that have since left the level or ride another vehicle. Empty
+    /// where this game seats its riders itself.
+    fn listed_boat_passengers(&self, i: usize) -> Vec<u32> {
+        let b = &self.boats[i];
+        let Some(me) = self.remote.as_ref().map(|r| r.entity_id as u32) else {
+            return Vec::new();
+        };
+        let riding = |p: u32| {
+            if p == me {
+                self.riding == Some(b.id)
+            } else {
+                self.mobs
+                    .iter()
+                    .any(|m| m.id == p && !m.removed && m.extra.mount == Some(b.id))
+            }
+        };
+        (b.listed_passengers.iter())
+            .copied()
+            .filter(|&p| riding(p))
+            .collect()
+    }
     /// Where the player in boat `i` sits: in the middle alone, in front of a
     /// mob.
     pub(super) fn player_boat_seat(&self, i: usize) -> Vec3 {
+        let b = &self.boats[i];
+        // A server's client sits where the server's passenger list puts it:
+        // the second player sits behind the one steering.
+        let listed = self.listed_boat_passengers(i);
+        if let Some(index) = self
+            .remote
+            .as_ref()
+            .and_then(|r| listed.iter().position(|&p| p == r.entity_id as u32))
+        {
+            return b.seat(index, listed.len(), false, PLAYER_RIDING_OFFSET, false);
+        }
+        self.boat_seat(i, 0)
+    }
+    /// `Entity.positionRider` for a player whose seat the server has assigned.
+    pub(super) fn boat_seat(&self, i: usize, index: usize) -> Vec3 {
         let b = &self.boats[i];
         let players = self.boat_players(b.id);
         let count = if self.persist.off_level.is_empty() {
@@ -306,7 +324,7 @@ impl Game<'_> {
         } else {
             self.boat_passengers(b.id) + usize::from(players == 0)
         };
-        b.seat(0, count, false, PLAYER_RIDING_OFFSET, false)
+        b.seat(index, count, false, PLAYER_RIDING_OFFSET, false)
     }
     /// `getRootVehicle` of mob `j`: the mob or boat at the bottom of what it
     /// rides, None when it rides nothing.
@@ -388,7 +406,7 @@ impl Game<'_> {
     /// player touching it pushes the two apart once more. Only the window's
     /// own player is moved here: a server's players are pushed by their
     /// clients, which tick the boats near them (`remote_pushes`).
-    pub(super) fn boat_contacts(&mut self, i: usize) {
+    pub(super) fn boat_contacts(&mut self, mut i: usize) {
         let (id, bb, max) = {
             let b = &self.boats[i];
             (b.id, b.bounds(), b.max_passengers())
@@ -475,11 +493,25 @@ impl Game<'_> {
                     // is under water, or when a mod cancels it
                     // (EntityMountEvent).
                     let ready = m.extra.boarding_cooldown <= 0 && species_can_ride(m.species());
-                    if room
-                        && ready
-                        && self.native_mob_may_ride(mob, id, true)
-                        && let Some(m) = self.mobs.iter_mut().find(|m| m.id == mob)
-                    {
+                    if room && ready && self.native_mob_may_ride(mob, id, true) {
+                        // The hook had `&mut self`: find the boat and the mob
+                        // again by id and check the boarding still holds.
+                        let Some(bi) = self.boats.iter().position(|b| b.id == id) else {
+                            return;
+                        };
+                        i = bi;
+                        let fresh = self.boat_passengers(id);
+                        if fresh >= max {
+                            continue;
+                        }
+                        count = fresh;
+                        let Some(m) = self
+                            .mobs
+                            .iter_mut()
+                            .find(|m| m.id == mob && !m.removed && m.extra.mount.is_none())
+                        else {
+                            continue;
+                        };
                         horizon_client::mobs::shulker::on_start_riding(m);
                         m.extra.mount = Some(id);
                         m.extra.passenger = true;
@@ -593,11 +625,15 @@ impl Game<'_> {
                 continue;
             }
             let players = self.boat_players(id);
+            // A server's client counts and seats the server's passenger list.
+            let listed = self.listed_boat_passengers(i);
             let retained_seats =
                 (!self.persist.off_level.is_empty()).then(|| self.seated_passengers(id));
-            let count = retained_seats
-                .as_ref()
-                .map_or(players + mobs.len(), Vec::len);
+            let count = match (listed.len(), retained_seats.as_ref()) {
+                (0, Some(seats)) => seats.len(),
+                (0, None) => players + mobs.len(),
+                (n, _) => n,
+            };
             let b = &self.boats[i];
             let full = count == b.max_passengers();
             let delta = b.delta_rotation;
@@ -615,9 +651,14 @@ impl Game<'_> {
                     // Another player's too, on a server's client.
                     // AbstractBoat's box is 1.375 wide.
                     let offset = riders::vehicle_attachment(m, 1.375);
-                    let index = retained_seats
-                        .as_ref()
-                        .and_then(|seats| seats.iter().position(|&(_, id, _)| id == m.id))
+                    let index = listed
+                        .iter()
+                        .position(|&p| p == m.id)
+                        .or_else(|| {
+                            retained_seats
+                                .as_ref()
+                                .and_then(|seats| seats.iter().position(|&(_, id, _)| id == m.id))
+                        })
                         .unwrap_or(players + n);
                     // calculatePassengerBodyYRot.
                     let turn = match (animal && full, m.id.is_multiple_of(2)) {
@@ -700,6 +741,10 @@ impl Game<'_> {
             Target::Cart(_) => {
                 self.release_vehicle_container(id);
                 if let Some(i) = self.carts.iter().position(|c| c.id == id) {
+                    self.unpack_loot(
+                        super::container_loot::LootTarget::Cart(self.carts[i].id),
+                        None,
+                    );
                     let cart = self.carts.remove(i);
                     self.drop_vehicle_contents(cart.position.components(), &cart.items);
                     self.retain_removed_vehicle(id, RemovedVehicle::Cart(cart));
@@ -808,7 +853,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn rejected_boat_passengers_fill_actual_capacity_without_becoming_resident() {
         super::super::native_entity_refs::tests::with_game(|game| {
             let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
@@ -852,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mod_growing_a_mob_during_vehicle_ticks_keeps_it_in_collision_queries() {
         use super::super::native_entity_refs::tests::with_game;
 
@@ -898,7 +943,7 @@ mod tests {
     /// asked once per mob while the mobs are the fewer) or, in a crowd, the mobs' (asked once
     /// per cart).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn only_the_mob_touching_a_cart_pushes_it() {
         use super::super::minecarts::{CartKind, Minecart};
         let pushed = [0, 12].map(|crowd: u32| {
@@ -935,7 +980,7 @@ mod tests {
     /// every box names, in the same order, also right after a mob moved into the box (a
     /// push or a pick-up writes the mob list in the middle of a stretch).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_vehicles_box_query_matches_a_walk_over_every_mob() {
         let mut resources = None;
         let mut game = super::super::game_tests::tests::server_game(&mut resources);
@@ -992,7 +1037,7 @@ mod tests {
     /// boards counts from then on, one removed no longer does, and a dead one still makes
     /// its cart a vehicle but is no passenger of a boat.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_vehicle_knows_its_mob_riders_as_soon_as_they_board() {
         let mut resources = None;
         let mut game = super::super::game_tests::tests::server_game(&mut resources);
@@ -1022,7 +1067,7 @@ mod off_level_tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn retained_boat_passenger_occupies_a_seat_without_being_positioned() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
@@ -1086,7 +1131,7 @@ mod boat_callback_review_tests {
         }
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn boat_ejection_preserves_a_later_passengers_callback_reparenting() {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -1129,7 +1174,7 @@ mod boat_callback_review_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn boat_ejection_does_not_snap_a_rider_discarded_by_its_callback() {
         let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
             "mutate_rider",
@@ -1164,6 +1209,111 @@ mod boat_callback_review_tests {
                 assert_eq!(game.mob_object(72).unwrap().position, original);
                 assert_eq!(game.mob_object(73).unwrap().position, original);
             });
+        });
+    }
+}
+
+#[cfg(test)]
+mod server_passenger_order_tests {
+    use super::*;
+    use crate::game::native_client_session::tests::logged_client;
+    use crate::game::native_entity_refs::tests::with_client_game;
+    use horizon_client::{motion::PlayerMotion, sprint::Keys};
+    use horizon_protocol::packets::play::{self, Clientbound as C};
+
+    fn add(game: &mut Game<'_>, id: i32, name: &str) {
+        let kind = game
+            .remote
+            .as_ref()
+            .unwrap()
+            .builtin
+            .get("minecraft:entity_type")
+            .unwrap()
+            .id(name)
+            .unwrap();
+        // Facing west: yaw 90, packed 64.
+        game.handle_packet(C::AddEntity(play::AddEntity {
+            id,
+            uuid: id as u128,
+            kind,
+            position: [0.0, 64.0, 0.0],
+            velocity: [0.0; 3],
+            pitch: 0,
+            yaw: 64,
+            head_yaw: 64,
+            data: 0,
+        }))
+        .unwrap();
+    }
+
+    fn set(game: &mut Game<'_>, vehicle: i32, passengers: Vec<i32>) {
+        game.handle_packet(C::SetPassengers(play::SetPassengers {
+            vehicle,
+            passengers,
+        }))
+        .unwrap();
+    }
+
+    /// The x of this window's player, and of player 41, after one ride tick.
+    fn seats(game: &mut Game<'_>) -> (f64, f64) {
+        assert!(game.remote_ride(Keys::default(), 0).unwrap());
+        game.position_riders();
+        let me = game.player.as_ref().unwrap().position.x;
+        let other = game.mobs.iter().find(|m| m.id == 41).map(|m| m.position.x);
+        (me, other.unwrap_or(f64::NAN))
+    }
+
+    fn assert_x(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-5, "seat x {got}, expected {want}");
+    }
+
+    /// #14812: a server's client seats both players where the server's
+    /// `SetPassengers` list does, and keeps that list as
+    /// `handleSetEntityPassengersPacket` made it: an entity it didn't have then
+    /// takes no seat when it arrives later, and one that left the level or rides
+    /// another vehicle takes none either.
+    ///
+    /// Expected seats are worked out from `AbstractBoat.getPassengerAttachmentPoint`
+    /// (the first of two at z 0.2, the second at z -0.6, a lone one at 0), turned
+    /// by the boat's yaw 90: `Vec3(0, y, z).yRot(-90 deg)`, so x = -z.
+    #[test]
+    #[ignore = "daily"]
+    fn a_servers_client_seats_its_boat_players_in_the_servers_order() {
+        with_client_game(|game| {
+            let _server = logged_client(game);
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(5.0, 64.0, 5.0)).unwrap());
+            add(game, 30, "minecraft:oak_boat");
+            add(game, 31, "minecraft:oak_boat");
+            add(game, 41, "minecraft:player");
+
+            set(game, 30, vec![41, 7]);
+            let (me, other) = seats(game);
+            assert_x(me, 0.6);
+            assert_x(other, -0.2);
+            set(game, 30, vec![7, 41]);
+            let (me, other) = seats(game);
+            assert_x(me, -0.2);
+            assert_x(other, 0.6);
+
+            // Player 41 leaves the level with no new list (Entity.setRemoved
+            // stops its ride): alone, this one sits in the middle.
+            game.handle_packet(C::RemoveEntities(play::RemoveEntities { ids: vec![41] }))
+                .unwrap();
+            assert_x(seats(game).0, 0.0);
+
+            // [unknown 42, this player]: the packet seats only this player, and
+            // 42 arriving afterwards with no new packet seats nobody.
+            set(game, 30, vec![42, 7]);
+            add(game, 42, "minecraft:player");
+            assert_x(seats(game).0, 0.0);
+
+            // Player 41 back and seated first, then listed on the other boat:
+            // the first boat stops counting it.
+            add(game, 41, "minecraft:player");
+            set(game, 30, vec![41, 7]);
+            assert_x(seats(game).0, 0.6);
+            set(game, 31, vec![41]);
+            assert_x(seats(game).0, 0.0);
         });
     }
 }

@@ -256,11 +256,12 @@ impl log::Log for Capture {
 static LOG: Capture = Capture(Mutex::new(Vec::new()));
 
 #[test]
+#[ignore = "daily"]
 fn structure_transform_placement_rotations_mirrors_unset_and_refusal() {
     // The logger is process-global; isolate this assertion from other log-capture tests.
     if std::env::var_os("HORIZON_STRUCTURE_TRANSFORM_LOG_CHILD").is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "game::native_block_entity_transform_tests::structure_transform_placement_rotations_mirrors_unset_and_refusal", "--nocapture"])
+            .args(["--include-ignored", "--exact", "game::native_block_entity_transform_tests::structure_transform_placement_rotations_mirrors_unset_and_refusal", "--nocapture"])
             .env("HORIZON_STRUCTURE_TRANSFORM_LOG_CHILD", "1")
             .status().unwrap();
         assert!(status.success());
@@ -492,7 +493,7 @@ fn structure_transform_hostile_output_keeps_original_identity() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn structure_transform_survives_real_datapack_reload_with_its_registry() {
     use crate::game::{native_entity_refs::tests::with_game, world_loading::WorldRequest};
     let calls = Calls::default();

@@ -4,9 +4,7 @@
 use super::*;
 use std::collections::HashMap;
 mod compiler;
-mod custom;
 mod seeded;
-pub use custom::{CustomDensity, CustomId};
 #[cfg(test)]
 mod tests;
 pub use compiler::DensityCompiler;
@@ -79,8 +77,6 @@ pub enum GraphNode {
     },
     BlendedNoise(BlendedNoise),
     EndIslands,
-    /// A density type registered from outside the engine.
-    Custom(CustomId),
     WorldField(WorldField),
     BlendDensity(FunctionId),
     /// A direct holder compares by value; a registry holder by identity.
@@ -168,7 +164,6 @@ impl GraphNode {
             | Self::OffsetNoise { .. }
             | Self::BlendedNoise(_)
             | Self::EndIslands
-            | Self::Custom(_)
             | Self::WorldField(_) => vec![],
             Self::Noise {
                 shift_x,
@@ -222,7 +217,6 @@ impl GraphNode {
                 None => vec![22, 0, id(input)],
             },
             Self::EndIslands => vec![17],
-            Self::Custom(custom) => vec![23, custom.0 as u64],
             Self::WorldField(field) => vec![20, field as u64],
             Self::BlendDensity(input) => vec![21, id(input)],
             Self::Power { base, exponent } => vec![19, id(base), id(exponent)],
@@ -349,7 +343,6 @@ pub enum CompileError {
     UnpreparedCache,
     InvalidIntervals,
     UnknownNoise,
-    UnknownCustom,
     DuplicateNoise,
     DuplicateFunction,
     UnknownHolder,
@@ -387,11 +380,22 @@ impl std::fmt::Display for CompileError {
 }
 impl std::error::Error for CompileError {}
 
+/// A density node whose sampler needs the world seed, which decoding doesn't have: a seeded
+/// compiler asks for it with its own seed (a mod's density function type).
+pub trait SeededDensity: std::fmt::Debug + Send + Sync {
+    fn sampler(&self, seed: i64) -> Arc<dyn DensitySampler>;
+}
+
 #[derive(Clone, Debug)]
 enum Definition {
     Node(GraphNode),
     Bound {
         sampler: Arc<dyn DensitySampler>,
+        range: Interval,
+        axes: u8,
+    },
+    Seeded {
+        factory: Arc<dyn SeededDensity>,
         range: Interval,
         axes: u8,
     },
@@ -409,7 +413,6 @@ pub struct DensityGraph {
     interned: HashMap<(Vec<u64>, bool), FunctionId>,
     equal: HashMap<Vec<u64>, FunctionId>,
     noises: Vec<seeded::NoiseEntry>,
-    customs: Vec<custom::CustomEntry>,
     noise_names: HashMap<String, NoiseId>,
     holders: Vec<FunctionId>,
     function_names: HashMap<String, FunctionId>,
@@ -429,9 +432,6 @@ impl DensityGraph {
         }
         if let GraphNode::Noise { noise, .. } | GraphNode::OffsetNoise { noise, .. } = node {
             self.noise_entry(noise)?;
-        }
-        if let GraphNode::Custom(custom) = node {
-            self.custom_entry(custom)?;
         }
         if let GraphNode::IntervalSelect {
             thresholds,
@@ -537,6 +537,30 @@ impl DensityGraph {
         });
         Ok(id)
     }
+    /// [`Self::bind`] for a node whose sampler a seeded compiler makes with its seed; an unseeded
+    /// compiler refuses it with [`CompileError::MissingSeededContext`].
+    pub fn bind_seeded(
+        &mut self,
+        factory: Arc<dyn SeededDensity>,
+        range: Interval,
+        axes: u8,
+    ) -> Result<FunctionId, CompileError> {
+        if axes & !7 != 0 {
+            return Err(CompileError::InvalidAxes);
+        }
+        let id = FunctionId(self.entries.len());
+        self.entries.push(Entry {
+            definition: Definition::Seeded {
+                factory,
+                range,
+                axes,
+            },
+            depth: 1,
+            equality_id: id,
+            hash_variant: false,
+        });
+        Ok(id)
+    }
     fn entry(&self, id: FunctionId) -> Result<&Entry, CompileError> {
         self.entries.get(id.0).ok_or(CompileError::UnknownFunction)
     }
@@ -596,14 +620,11 @@ impl DensityGraph {
     }
     pub fn domain_axes(&self, id: FunctionId) -> Result<u8, CompileError> {
         let mut node = match &self.entry(id)?.definition {
-            Definition::Bound { axes, .. } => return Ok(*axes),
+            Definition::Bound { axes, .. } | Definition::Seeded { axes, .. } => return Ok(*axes),
             Definition::Node(node) => node.clone(),
         };
         let mask = match node {
             GraphNode::EndIslands => return Ok(5),
-            GraphNode::Custom(custom) => {
-                return Ok(self.custom_entry(custom)?.instance.domain_axes());
-            }
             GraphNode::WorldField(field) => return Ok(field.domain_axes()),
             GraphNode::OffsetNoise { kind, .. } => {
                 return Ok(if kind == ShiftNoiseKind::Shift { 7 } else { 5 });
@@ -636,15 +657,13 @@ impl DensityGraph {
     }
     pub fn range(&self, id: FunctionId) -> Result<Interval, CompileError> {
         let node = match &self.entry(id)?.definition {
-            Definition::Bound { range, .. } => return Ok(*range),
+            Definition::Bound { range, .. } | Definition::Seeded { range, .. } => {
+                return Ok(*range);
+            }
             Definition::Node(node) => node,
         };
         Ok(match *node {
             GraphNode::EndIslands => Interval::new(-0.84375, 0.5625)?,
-            GraphNode::Custom(custom) => {
-                let [min, max] = self.custom_entry(custom)?.instance.range();
-                Interval::new(min, max)?
-            }
             GraphNode::WorldField(field) => field.range(),
             GraphNode::Noise { noise, .. } => {
                 let [min, max] = self.noise_entry(noise)?.definition.range();
@@ -785,13 +804,13 @@ impl DensityGraph {
         Ok(Some(bounds))
     }
     /// The node `id` names, past registry and direct references; `None` for
-    /// a bound sampler.
+    /// a bound or seeded sampler.
     fn resolve_references(&self, mut id: FunctionId) -> Result<Option<&GraphNode>, CompileError> {
         loop {
             match &self.entry(id)?.definition {
                 Definition::Node(GraphNode::Reference { input, .. }) => id = *input,
                 Definition::Node(node) => return Ok(Some(node)),
-                Definition::Bound { .. } => return Ok(None),
+                Definition::Bound { .. } | Definition::Seeded { .. } => return Ok(None),
             }
         }
     }

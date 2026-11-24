@@ -291,6 +291,7 @@ fn run_output(family: Family, output: Output) {
             "borrowed-panic:hit".into(),
             0,
             horizon_client::brewing::Category::Neutral,
+            None,
         )]);
     });
     eprintln!("BORROWED_ASSERTIONS_DISABLED:{}", !cfg!(debug_assertions));
@@ -749,12 +750,12 @@ macro_rules! cases {
 cases!(damage => Damage, shield => Shield, totem => Totem, movement => Movement, breathing => Breathing, goal => Goal, mounted_goal => MountedGoal, knockback => Knockback, landing => Landing);
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_egg() {
     run_output(Family::Damage, Output::Egg);
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_guest() {
     run_output(Family::Damage, Output::Guest);
 }
@@ -771,7 +772,7 @@ impl mod_api::Hooks for ConsumerPanic {
     }
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_consumer_tail() {
     crate::entry::install_client_hooks();
     for dim in [Dim::Overworld, Dim::Nether] {
@@ -838,19 +839,19 @@ fn retained_consumer_tail() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_push() {
     run_output(Family::Damage, Output::Push);
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_conditional_context() {
     run_conditional(false);
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_nested_tail() {
     run_conditional(true);
 }
@@ -970,7 +971,7 @@ fn run_conditional(nested: bool) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_stale_push_target() {
     let scratch =
         Scratch(std::env::temp_dir().join(format!("horizon-stale-push-{}", std::process::id())));
@@ -1000,12 +1001,12 @@ fn retained_stale_push_target() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_mixed_order() {
     run_output(Family::Damage, Output::Mixed);
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn retained_reset() {
     run_output(Family::Damage, Output::Reset);
 }

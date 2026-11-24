@@ -13,6 +13,7 @@ use horizon_core::random::{
 
 /// Why a noise could not be built.
 #[derive(Clone, Debug, PartialEq, Eq)]
+// no wire: the mod only reads it from a failed noise build, never passes it to the game
 #[non_exhaustive]
 pub struct NoiseError(pub String);
 
@@ -26,6 +27,7 @@ impl std::error::Error for NoiseError {}
 
 /// Vanilla's `XoroshiroRandom` (Xoroshiro128++).
 #[derive(Clone, Debug)]
+// no wire: a process-local handle over the engine's random; never sent between processes
 #[non_exhaustive]
 pub struct XoroshiroRandom(EngineRandom);
 
@@ -50,6 +52,7 @@ impl XoroshiroRandom {
 
 /// Vanilla's `XoroshiroRandomSource.XoroshiroPositionalRandomFactory`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// no wire: a process-local handle over the engine's random; never sent between processes
 #[non_exhaustive]
 pub struct PositionalRandom(XoroshiroPositionalRandom);
 
@@ -66,6 +69,7 @@ impl PositionalRandom {
 
 /// Vanilla's `ImprovedNoise`: one octave of Perlin noise.
 #[derive(Clone, Debug)]
+// no wire: a process-local handle over the engine's noise; never sent between processes
 #[non_exhaustive]
 pub struct PerlinNoise(EnginePerlin);
 
@@ -86,6 +90,7 @@ impl PerlinNoise {
 
 /// A `NormalNoise` seeded from a random: vanilla's `NormalNoise.create`.
 #[derive(Clone, Debug)]
+// no wire: a process-local handle over the engine's noise; never sent between processes
 #[non_exhaustive]
 pub struct NoiseStack(EngineStack);
 
@@ -106,6 +111,7 @@ impl NoiseStack {
 
 /// Vanilla's `NormalNoise.NoiseParameters`: the octaves and amplitudes of a noise, before it is seeded.
 #[derive(Clone, Debug)]
+// no wire: a process-local handle over the engine's noise; never sent between processes
 #[non_exhaustive]
 pub struct NormalNoise(EngineNormal);
 

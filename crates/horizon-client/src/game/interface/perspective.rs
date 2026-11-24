@@ -11,7 +11,7 @@ use horizon_client::{
 use horizon_client::{
     entities::nameplate::NameplateDistances,
     hud::HudBatch,
-    mobs::{Anim, Brain, Mob, MobType},
+    mobs::{Anim, Brain, Mob, MobType, VisualShape},
     mouse::Rotation,
     pose::Pose,
 };
@@ -97,25 +97,25 @@ impl RayWorld for VisualRays<'_, '_> {
         p: BlockPos,
         _: RayBlockMode,
     ) -> io::Result<VoxelShape> {
-        let facts = self.facts.get(state);
-        let name = &*facts.name;
-        // TransparentBlock (glass, stained and tinted glass, copper grates),
-        // IronBarsBlock (bars and panes) and PowderSnowBlock: nothing;
-        // SoulSandBlock and MudBlock: a full block; SnowLayerBlock and
-        // FenceBlock: their outline.
-        if name.ends_with("glass")
-            || name.ends_with("glass_pane")
-            || name.ends_with("_bars")
-            || name.ends_with("copper_grate")
-            || name == "minecraft:powder_snow"
-        {
-            return Ok(VoxelShape::empty());
-        }
-        if name == "minecraft:soul_sand" || name == "minecraft:mud" {
-            return Ok(VoxelShape::block());
-        }
-        if name == "minecraft:snow" || name.ends_with("_fence") {
-            return ray_shape_from_boxes(&facts.outline);
+        match horizon_client::mobs::visual_shape(self.facts, state) {
+            VisualShape::Empty => return Ok(VoxelShape::empty()),
+            VisualShape::Block => return Ok(VoxelShape::block()),
+            VisualShape::Outline(boxes) => {
+                let mut shape = VoxelShape::empty();
+                for b in boxes {
+                    let b = b.map(f64::from);
+                    let part = VoxelShape::from_box(Aabb::new(
+                        Vec3::new(b[0], b[1], b[2]),
+                        Vec3::new(b[3], b[4], b[5]),
+                    ))
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                    shape = shape
+                        .join(&part, ShapeOp::OR)
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                }
+                return Ok(shape);
+            }
+            VisualShape::Collision => {}
         }
         self.inner.block_shape(state, p, RayBlockMode::Collider)
     }
@@ -142,6 +142,13 @@ impl RayWorld for VisualRays<'_, '_> {
 /// (#3788); a world in the frame has only the effect.
 fn own_invisible(effects: &horizon_client::effects::PlayerEffects, shared_flag: bool) -> bool {
     shared_flag || effects.get("invisibility").is_some()
+}
+/// `Entity.isCurrentlyGlowing` for the window's player: shared flag 6 as its server
+/// sets it (`shared_flag`), from the Glowing effect or the `Glowing` tag a command or
+/// a plugin's `setGlowing` gives, which no effect shows (#18838); a world in the frame
+/// has only the effect.
+fn own_glowing(effects: &horizon_client::effects::PlayerEffects, shared_flag: bool) -> bool {
+    shared_flag || effects.get("glowing").is_some()
 }
 /// `LivingEntityRenderer.isBodyVisible` and `isInvisibleTo` for the player's
 /// own body, seen by itself: an invisible player (`own_invisible`) hides it
@@ -186,6 +193,7 @@ pub(super) fn player_type_with_document(
 fn load_player_type(models: &horizon_client::mobs::EntityModelDocument) -> Option<Arc<MobType>> {
     models.model("minecraft:player#main").map(|model| {
         Arc::new(MobType {
+            shadow: None,
             id: "minecraft:player".into(),
             // Players render as a humanoid; the species only drives local AI.
             species: horizon_client::mobs::Species::Zombie,
@@ -206,6 +214,7 @@ fn load_player_type(models: &horizon_client::mobs::EntityModelDocument) -> Optio
             jump_strength: 0.42,
             attributes: Default::default(),
             item_stack_limits: Default::default(),
+            attribute_bounds: Default::default(),
             gravity: 0.08,
             safe_fall_distance: 3.0,
             fall_damage_multiplier: 1.0,
@@ -402,7 +411,10 @@ impl Game<'_> {
         let (yaw, pitch) = self
             .posed_rotation
             .unwrap_or((self.view.y_rot, self.view.x_rot));
-        super::camera_rotation(CameraType::FirstPerson, yaw, pitch)
+        super::rolled_camera(
+            super::camera_rotation(CameraType::FirstPerson, yaw, pitch),
+            self.posed_roll,
+        )
     }
     /// The player as `Camera.alignWithEntity` sees it.
     fn player_camera_entity(&mut self) -> Option<CameraEntity> {
@@ -431,7 +443,7 @@ impl Game<'_> {
                 _ => None,
             })
         });
-        // Camera.setup: the living mount's scale and camera distance
+        // Camera.update: the living mount's scale and camera distance
         // attributes (the happy ghast's is 8, the default 4).
         let mount = self
             .riding
@@ -511,6 +523,13 @@ impl Game<'_> {
             self.player_model = Some(m);
         }
         let pose = p.pose;
+        // The server's pose for the own player, while the local pose is the one it came over.
+        let own_pose = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.own_pose)
+            .filter(|&(_, local)| local == pose)
+            .map(|(shown, _)| shown);
         let crouching = pose == Pose::Crouching;
         let position = p.position;
         let (fall_flying, fly_ticks, velocity) = (p.fall_flying, p.fall_fly_ticks, p.velocity);
@@ -637,7 +656,7 @@ impl Game<'_> {
         }
         m.extra.crouching = crouching;
         // Guests and server players take their pose from DATA_POSE, not here.
-        m.extra.avatar_pose = pose;
+        m.extra.avatar_pose = own_pose.unwrap_or(pose);
         // What custom entity model animations read of the fluids (`is_in_water`, crawling).
         m.fluids.in_water = in_water;
         m.fluids.in_lava = in_lava;
@@ -755,7 +774,7 @@ impl Game<'_> {
     pub(super) fn player_model_shown(&self) -> bool {
         (self.own_body_in_view()
             || shadow_pass_takes_own_model(
-                self.pack_shadow_casters.1,
+                self.occlusion.shadow_casters.1,
                 self.pack_ids.is_some(),
                 self.spectator(),
             ))
@@ -778,23 +797,40 @@ impl Game<'_> {
             self.remote.as_ref().is_some_and(|r| r.own_invisible),
         )
     }
+    /// `Entity.isCurrentlyGlowing` for the player itself (`own_glowing`).
+    fn own_glowing(&self) -> bool {
+        own_glowing(
+            &self.potions.effects,
+            self.remote.as_ref().is_some_and(|r| r.own_glowing),
+        )
+    }
     /// Whether the player's own body is drawn (`body_visible`).
     pub(super) fn own_body_visible(&self) -> bool {
         body_visible(self.own_invisible(), self.own_team())
     }
-    /// The player's model for the entity pass in third person.
+    /// The local player's model for the world entity pass (or the shadow-only pass).
     pub(super) fn player_model_geometry(
         &self,
         camera: glam::DVec3,
         alpha: f64,
+        first_person: Option<&mod_api::FirstPersonBody>,
         out: &mut Vec<horizon_client_render::render_geometry::Vertex>,
     ) {
-        if !self.player_model_shown() {
+        use mod_api::FirstPersonBodyLayer as Layer;
+
+        if first_person.is_none() && !self.player_model_shown() {
             return;
         }
         let Some(m) = self.player_model.as_ref() else {
             return;
         };
+        let offset =
+            first_person.map_or(glam::Vec3::ZERO, |body| glam::Vec3::from_array(body.offset));
+        let world_camera = camera;
+        // These helpers work in camera-relative world space. Moving their origin together
+        // translates all model, equipment and hook meshes without changing the simulation.
+        let camera = world_camera - offset.as_dvec3();
+        let shows = |layer| first_person.is_none_or(|body| !body.layer_hidden(layer));
         let eye = self
             .player
             .as_ref()
@@ -806,28 +842,45 @@ impl Game<'_> {
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let start = out.len();
         let body = self.own_body_visible();
-        // `native_player_submit`: a native mod's own model for this player,
-        // in place of the vanilla one and its layers (an invisible player is
-        // not asked, as for the others).
+        // The mods' pre hooks (`render_player_pre`, then `render_living_pre`), as for the other
+        // players: a cancel skips the rest of this player's drawing and its post hooks, and the
+        // frame's later passes (flames, name tag) leave it out too.
         let name = self.own_profile_name();
         let who = PlayerRender {
             name: &name,
             local: true,
         };
-        let (drawn, hidden) = match body {
-            true => self.mod_player_geometry(m, who, alpha as f32, camera, packed, out),
-            false => (false, mod_api::HiddenParts::default()),
-        };
-        if drawn {
+        let hooks = self.mob_render_listened();
+        let pre = self.mod_render_pre(
+            m,
+            Some(who),
+            hooks,
+            alpha as f32,
+            camera,
+            packed,
+            first_person.map_or_else(Default::default, |body| body.hidden),
+            out,
+        );
+        let Some(hidden) = pre else {
             return;
-        }
-        // `native_mob_layer`'s posed parts, kept from the draw below while a mod listens.
+        };
+        // The mods' layers' posed parts, kept from the draw below while they want them.
         let mut parts = None;
-        let listened = self.mob_render_listened();
+        let layers = if shows(Layer::CustomLayers) {
+            self.mod_layers(m)
+        } else {
+            None
+        };
+        let want_parts = hooks.any_post_for(true) || layers.is_some();
+        let armor = if shows(Layer::Helmet) {
+            self.player_armor_layers()
+        } else {
+            self.player_armor_layers_without_helmet()
+        };
         // A spectator still draws its own model in third person: the poses'
         // visibility (set by player_model_visibility) hides body parts, and
         // translucent_body marks the body OIT for the ghostly look. Only first
-        // person and dead players skip it.
+        // person without opt-in and dead players skip the world draw.
         if body || self.spectator() {
             horizon_client::mobs::render::render_with_hidden(
                 m,
@@ -836,9 +889,10 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
-                &self.player_armor_layers(),
+                &Default::default(),
+                &armor,
                 hidden,
-                listened.then_some(&mut parts),
+                want_parts.then_some(&mut parts),
                 out,
             );
         } else {
@@ -849,57 +903,91 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
-                &self.player_armor_layers(),
-                listened.then_some(&mut parts),
+                &Default::default(),
+                &armor,
+                want_parts.then_some(&mut parts),
                 out,
             );
         }
         // AvatarRenderer.shouldRenderLayers: a spectator draws no layers.
         if horizon_client::mobs::render::layers_shown(m) {
             let chest = self.armor[1].as_ref().map(|s| &*s.item);
-            // CapeLayer: no cape on an invisible player (`isInvisible`, whoever looks).
-            if !self.own_invisible() {
+            // CapeLayer: no cape on an invisible player (`isInvisible`, whoever looks), nor
+            // when a mod's `render_player_pre` hid it.
+            if !self.own_invisible() && !horizon_client::mobs::render::hides_cape(m, &hidden) {
                 self.player_cape_geometry(m, chest, camera, alpha as f32, packed, out);
             }
-            self.player_ears_geometry(
+            if shows(Layer::Ears) {
+                self.player_ears_geometry(m, &name, camera, alpha as f32, packed, out);
+            }
+            if shows(Layer::Cosmetics) {
+                self.own_layers_geometry(
+                    m,
+                    horizon_hooks::players::Pass::World,
+                    world_camera,
+                    offset,
+                    alpha as f32,
+                    packed,
+                    out,
+                );
+            }
+            if shows(Layer::Elytra) {
+                self.player_elytra_geometry(m, chest, camera, alpha as f32, packed, out);
+            }
+            self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
+            self.shoulder_parrots_geometry(m, camera, alpha as f32, packed, out);
+            if shows(Layer::StuckItems) {
+                self.stuck_in_body_geometry(
+                    m,
+                    self.own_entity_id(),
+                    camera,
+                    alpha as f32,
+                    packed,
+                    out,
+                );
+            }
+            if shows(Layer::HeldItems) {
+                self.held_item_geometry(m, camera, alpha, packed, true, None, out);
+            }
+            // CustomHeadLayer: a pumpkin, skull or other head item.
+            if shows(Layer::HeadItem) {
+                self.head_item_geometry(m, camera, alpha, packed, true, out);
+            }
+            // Mods' layers (`register_entity_layers`), over vanilla's.
+            self.mod_layer_geometry(
                 m,
-                &self.own_profile_name(),
-                camera,
+                Some(who),
+                parts,
+                layers,
                 alpha as f32,
+                camera,
                 packed,
                 out,
             );
-            let world = horizon_hooks::players::Pass::World;
-            self.own_layers_geometry(m, world, camera, alpha as f32, packed, out);
-            self.player_elytra_geometry(m, chest, camera, alpha as f32, packed, out);
-            self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
-            self.shoulder_parrots_geometry(m, camera, alpha as f32, packed, out);
-            self.stuck_in_body_geometry(m, self.own_entity_id(), camera, alpha as f32, packed, out);
-            self.held_item_geometry(m, camera, alpha, packed, true, None, out);
-            // CustomHeadLayer: a pumpkin, skull or other head item.
-            self.head_item_geometry(m, camera, alpha, packed, true, out);
-            // `native_mob_layer`: a native mod's layer, over the vanilla ones.
-            self.mod_mob_layer_geometry(m, Some(who), parts, alpha as f32, camera, packed, out);
         }
-        // LivingEntity.isCurrentlyGlowing: the Glowing effect.
+        // The post hooks, whether or not the layers drew (a spectator draws none).
+        self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
+        // Entity.isCurrentlyGlowing on a client: shared flag 6 (`own_glowing`).
         let vanilla = self
-            .potions
-            .effects
-            .get("glowing")
-            .map(|_| super::glowing::team_color(self.own_team()));
+            .own_glowing()
+            .then(|| super::glowing::team_color(self.own_team()));
         let id = u32::try_from(self.own_entity_id()).unwrap_or(0);
         if let Some(color) = self.entity_outline(id, "minecraft:player", vanilla) {
             // LivingEntityRenderer.getRenderType: an invisible glowing body
             // still draws its outline.
             if !body {
                 let mut silhouette = Vec::new();
-                horizon_client::mobs::render::render(
+                horizon_client::mobs::render::render_with_hidden(
                     m,
                     alpha as f32,
                     camera,
                     &lookup,
                     packed,
                     self.res.mob_data(),
+                    &Default::default(),
+                    &[],
+                    first_person.map_or_else(Default::default, |_| hidden),
+                    None,
                     &mut silhouette,
                 );
                 self.mark_outline(&silhouette, color);
@@ -961,11 +1049,28 @@ impl Game<'_> {
             let light = 240 | 240 << 8;
             if body {
                 horizon_client::mobs::render::render_with(
-                    &m, 1.0, camera, &lookup, light, data, &armour, &mut verts,
+                    &m,
+                    1.0,
+                    camera,
+                    &lookup,
+                    light,
+                    data,
+                    &Default::default(),
+                    &armour,
+                    &mut verts,
                 );
             } else {
                 horizon_client::mobs::render::render_layers(
-                    &m, 1.0, camera, &lookup, light, data, &armour, None, &mut verts,
+                    &m,
+                    1.0,
+                    camera,
+                    &lookup,
+                    light,
+                    data,
+                    &Default::default(),
+                    &armour,
+                    None,
+                    &mut verts,
                 );
             }
         });
@@ -982,7 +1087,15 @@ impl Game<'_> {
             &mut verts,
         );
         let picture = horizon_hooks::players::Pass::Picture;
-        self.own_layers_geometry(&m, picture, camera, 1.0, 240 | 240 << 8, &mut verts);
+        self.own_layers_geometry(
+            &m,
+            picture,
+            camera,
+            glam::Vec3::ZERO,
+            1.0,
+            240 | 240 << 8,
+            &mut verts,
+        );
         // `WingsLayer` draws through `RenderTypes.armorCutoutNoCull`: the
         // wings' faces show from both sides (the elytra texture is empty on
         // the face that looks at the body).
@@ -1451,7 +1564,7 @@ impl Game<'_> {
 /// (-0.2, -1, 0), with the 0.6 light power and 0.4 ambient. `normal` is the
 /// face's outward normal in the preview's screen space (x right, y down, z
 /// towards the viewer), where a face that looks up has a negative y.
-fn entity_in_ui_shade(normal: glam::Vec3) -> f32 {
+pub(super) fn entity_in_ui_shade(normal: glam::Vec3) -> f32 {
     const LIGHT_0: glam::Vec3 = glam::Vec3::new(0.2, -1.0, 1.0);
     const LIGHT_1: glam::Vec3 = glam::Vec3::new(-0.2, -1.0, 0.0);
     let light = LIGHT_0.normalize().dot(normal).max(0.0) + LIGHT_1.normalize().dot(normal).max(0.0);
@@ -1918,7 +2031,7 @@ mod preview_tests {
     }
 
     #[test]
-    #[ignore = "requires prepared model data in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn player_render_transform_uses_vanilla_avatar_scale() {
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
@@ -1970,6 +2083,21 @@ mod preview_tests {
         assert!(body_visible(own_invisible(&effects, true), Some(team)));
     }
 
+    /// #18838: `/data merge entity @s {Glowing:1b}` or a plugin's `setGlowing(true)` sets
+    /// only the server's shared flag 6, which outlines the own body as the effect does.
+    #[test]
+    fn the_servers_glowing_flag_outlines_the_own_body_without_the_effect() {
+        use horizon_client::effects::EffectInstance;
+        let mut effects = horizon_client::effects::PlayerEffects::default();
+        assert!(!own_glowing(&effects, false));
+        assert!(own_glowing(&effects, true));
+        let id = horizon_client::brewing::effect("minecraft:glowing")
+            .unwrap()
+            .id;
+        effects.add(EffectInstance::new(id, 3600, 0));
+        assert!(own_glowing(&effects, false));
+    }
+
     /// LivingEntityRenderer.submit: an invisible body is not drawn, its
     /// HumanoidArmorLayer is.
     #[test]
@@ -1997,18 +2125,35 @@ mod preview_tests {
             pois: Default::default(),
             species_placements: Default::default(),
             mod_spawns: Default::default(),
-            pathfindable_overrides: Default::default(),
+            resolved: Default::default(),
         };
         let draw = |body: bool| {
             let mut out = Vec::new();
             let at = glam::DVec3::ZERO;
             if body {
                 horizon_client::mobs::render::render_with(
-                    &m, 1.0, at, &atlas, 0xF0F0, &data, &armour, &mut out,
+                    &m,
+                    1.0,
+                    at,
+                    &atlas,
+                    0xF0F0,
+                    &data,
+                    &Default::default(),
+                    &armour,
+                    &mut out,
                 );
             } else {
                 horizon_client::mobs::render::render_layers(
-                    &m, 1.0, at, &atlas, 0xF0F0, &data, &armour, None, &mut out,
+                    &m,
+                    1.0,
+                    at,
+                    &atlas,
+                    0xF0F0,
+                    &data,
+                    &Default::default(),
+                    &armour,
+                    None,
+                    &mut out,
                 );
             }
             out
@@ -2032,6 +2177,7 @@ mod preview_tests {
                 &atlas,
                 0xF0F0,
                 &data,
+                &Default::default(),
                 armour,
                 None,
                 out,

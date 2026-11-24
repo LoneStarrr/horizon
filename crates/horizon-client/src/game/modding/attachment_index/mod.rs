@@ -15,6 +15,8 @@ pub(super) type Indexes = HashMap<Dim, Arc<Mutex<AttachmentIndex<AttachmentHolde
 mod players;
 
 #[cfg(test)]
+mod attached_storage_tests;
+#[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
 mod mob_tests;
@@ -132,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn chunk_residency_uses_the_owning_level_through_cow_and_swaps() {
         use horizon_client::chunk::{Chunk, ChunkExtras};
         use horizon_mod_runtime::attachments::{AttachmentError, AttachmentType, Holder};
@@ -218,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn loaded_levels_keep_independent_index_through_swaps_and_close() {
         with_game(|game| {
             let key = ("test".into(), "mana".into());

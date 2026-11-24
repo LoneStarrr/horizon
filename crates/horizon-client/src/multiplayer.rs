@@ -142,11 +142,15 @@ pub enum Screen {
     /// A page a crate registered at the title screen's Friends icon, as a form.
     Page(Form),
     Disconnected {
-        reason: String,
+        /// The server's or a mod's reason, rendered in the player's language when drawn.
+        reason: Text,
         /// Auto-reconnect's next attempt, until it is cancelled.
         retry: Option<crate::reconnect::Retry>,
         /// Wrapped reason lines, set by the last draw; the buttons sit below them.
         lines: std::cell::Cell<usize>,
+        /// Back leads to the title screen, not the server list: the world was single player
+        /// (`ClientCommonPacketListenerImpl.createDisconnectScreen` without `ServerData`).
+        to_title: bool,
     },
 }
 mod page;
@@ -403,7 +407,10 @@ fn entry_address(servers: &[ServerEntry], lan: &Scanner, index: usize) -> Option
             .games()
             .into_iter()
             .nth(index - servers.len())
-            .map(|g| (g.address, true)),
+            // A LAN game joins its sender's IP and announced port, never the
+            // listed text as a host name. One that names no port passes its
+            // listed text, which the LAN connection refuses as an invalid address.
+            .map(|g| (g.join.map_or(g.address, |a| a.to_string()), true)),
     }
 }
 
@@ -426,6 +433,42 @@ const FOOTER: f32 = 60.0;
 /// ServerSelectionList: rows 305 wide and 36 high.
 const ROW_WIDTH: f32 = 305.0;
 const ROW_HEIGHT: f32 = 36.0;
+
+/// One saved server at its actual position in this frame's list.
+#[doc(hidden)]
+pub struct SavedServerRow<'a> {
+    pub server: &'a ServerEntry,
+    pub rect: [f32; 4],
+    pub visible_rect: [f32; 4],
+    pub mouse: Option<[f32; 2]>,
+}
+
+/// Paint a saved row and optionally return its hover tooltip lines.
+#[doc(hidden)]
+pub type DecorateServerRow<'a> = dyn FnMut(SavedServerRow<'_>, &mut HudBatch) -> Vec<Text> + 'a;
+
+impl<'a> SavedServerRow<'a> {
+    fn visible(
+        server: &'a ServerEntry,
+        rect: [f32; 4],
+        (top, bottom, width): (f32, f32, f32),
+        (mx, my): (f32, f32),
+    ) -> Option<Self> {
+        let [x, y, w, h] = rect;
+        let (x0, y0) = (x.max(0.0), y.max(top));
+        let (x1, y1) = ((x + w).min(width), (y + h).min(bottom));
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        Some(Self {
+            server,
+            rect,
+            visible_rect: [x0, y0, x1 - x0, y1 - y0],
+            mouse: ((x0..x1).contains(&mx) && (y0..y1).contains(&my)).then_some([mx, my]),
+        })
+    }
+}
+
 /// One row of the list: the saved servers, the LAN header, the LAN games.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
@@ -590,7 +633,13 @@ fn player_list_tooltip(
 
 impl Screen {
     /// Draw after the list and footer so the tooltip is neither clipped nor covered.
-    pub fn draw_tooltip(&self, atlas: &HudAtlas, batch: &mut HudBatch, cursor: (f32, f32)) {
+    pub fn draw_tooltip(
+        &self,
+        atlas: &HudAtlas,
+        batch: &mut HudBatch,
+        cursor: (f32, f32),
+        mut decorations: Vec<Text>,
+    ) {
         let Self::List {
             servers,
             pings,
@@ -610,13 +659,18 @@ impl Screen {
             content_height(servers.len(), lan.games().len()),
         );
         let pings = pings.lock().unwrap();
-        let lines = match ping_tooltip(servers, &pings, size, scroll.amount, cursor) {
+        let mut lines = match ping_tooltip(servers, &pings, size, scroll.amount, cursor) {
             Some(text) => vec![text],
             None => player_list_tooltip(servers, &pings, size, scroll.amount, cursor, |t| {
                 atlas.font.width_text(t)
             })
             .unwrap_or_default(),
         };
+        if lines.is_empty() {
+            lines = decorations;
+        } else {
+            lines.append(&mut decorations);
+        }
         crate::ui::tooltip(batch, atlas, &lines, cursor);
     }
 
@@ -726,7 +780,7 @@ impl Screen {
                     quarter(h) + 96.0 + 18.0,
                     200.0,
                     &crate::lang::get_or("gui.done", "Done"),
-                    servers::parse_address(address).is_some(),
+                    servers::is_valid_address(address),
                     50,
                 ),
                 b(
@@ -767,7 +821,7 @@ impl Screen {
                     quarter(h) + 96.0 + 12.0,
                     200.0,
                     &crate::lang::get_or("selectServer.select", "Join Server"),
-                    servers::parse_address(address).is_some(),
+                    servers::is_valid_address(address),
                     52,
                 ),
                 b(
@@ -908,7 +962,10 @@ impl Screen {
             // DisconnectedScreen: its title and the reason.
             Self::Disconnected { reason, .. } => ScreenInfo::new(
                 "multiplayer/disconnected",
-                join(&[&get("disconnect.lost", "Connection Lost"), reason]),
+                join(&[
+                    &get("disconnect.lost", "Connection Lost"),
+                    &reason_plain(reason),
+                ]),
             ),
         }
     }
@@ -972,6 +1029,7 @@ impl Screen {
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         crate::widgets::join_for_narration(&parts)
     }
+    #[allow(clippy::too_many_arguments)]
     #[horizon_mod_api_macros::replaceable]
     pub fn draw(
         &self,
@@ -981,11 +1039,15 @@ impl Screen {
         focused_at: Instant,
         cursor: (f32, f32),
         hide_address: bool,
-    ) {
+        phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
+        decorate_server_row: Option<&mut DecorateServerRow<'_>>,
+    ) -> Vec<Text> {
+        let mut row_tooltip = Vec::new();
         let (w, h) = (batch.width, batch.height);
         let max = self.max_length();
         crate::widgets::begin_screen(|| self.narration());
         crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+        phases(crate::screen_draw::RenderPhase::Background, batch);
         // GuiGraphicsExtractor.centeredText at width / 2: x - width(text) / 2.
         let centered = |batch: &mut HudBatch, text: &str, y: f32, color: u32| {
             let tw = HudBatch::text_width(atlas, text);
@@ -1071,11 +1133,19 @@ impl Screen {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis());
                 let gray = rgba(128, 128, 128, 255);
-                for (i, row) in rows(servers.len(), games.len()).enumerate() {
-                    let y = top + 2.0 - scroll.amount.trunc() + i as f32 * ROW_HEIGHT;
-                    if y + ROW_HEIGHT < top || y > bottom {
-                        continue;
-                    }
+                let start = top + 2.0 - scroll.amount.trunc();
+                let drawn_rows = || {
+                    rows(servers.len(), games.len())
+                        .enumerate()
+                        .map(move |(i, row)| {
+                            let y = start + i as f32 * ROW_HEIGHT;
+                            (i, row, [left, y, ROW_WIDTH, ROW_HEIGHT])
+                        })
+                        .skip_while(move |&(_, _, [_, y, _, h])| y + h < top)
+                        .take_while(move |&(_, _, [_, y, _, _])| y <= bottom)
+                };
+                for (i, row, rect) in drawn_rows() {
+                    let y = rect[1];
                     let index = match row {
                         Row::Server(k) => Some(k),
                         Row::Lan(k) => Some(servers.len() + k),
@@ -1085,7 +1155,6 @@ impl Screen {
                         && y + ROW_HEIGHT / 2.0 > top
                         && y + ROW_HEIGHT / 2.0 < bottom
                     {
-                        let rect = [left, y, ROW_WIDTH, ROW_HEIGHT];
                         // The control socket's widget tree names the row.
                         let name = match row {
                             Row::Server(k) => servers[k].name.as_str(),
@@ -1118,7 +1187,7 @@ impl Screen {
                             batch.text(atlas, &server.name, cx + 35.0, cy + 1.0, u32::MAX, true);
                             // OnlineServerEntry: up to two lines of MOTD, the
                             // player count left of the status icon, all with
-                            // GuiGraphics.text's shadow.
+                            // GuiGraphicsExtractor.text's shadow.
                             let (motd, status, sprite) = match pings.get(&server.ip) {
                                 Some(Ping::Ok {
                                     motd, players, ms, ..
@@ -1241,19 +1310,34 @@ impl Screen {
                             batch.text(atlas, &game.motd, cx + 35.0, cy + 12.0, gray, false);
                             // NetworkServerEntry.extractContent: `hideServerAddress`
                             // draws HIDDEN_ADDRESS_TEXT in the address's place.
-                            let hidden;
                             let address = if hide_address {
-                                hidden =
-                                    crate::lang::get_or("selectServer.hiddenAddress", "(Hidden)");
-                                &hidden
+                                crate::lang::get_or("selectServer.hiddenAddress", "(Hidden)")
                             } else {
-                                &game.address
+                                game.shown_address()
                             };
-                            batch.text(atlas, address, cx + 35.0, cy + 23.0, gray, false);
+                            batch.text(atlas, &address, cx + 35.0, cy + 23.0, gray, false);
                         }
                     }
                 }
                 batch.clip_since(first, 0.0, top, w, bottom);
+                drop(icons);
+                drop(pings);
+                // Use the very same placements as the list above, but leave
+                // its ping locks and batch clip behind before invoking mods.
+                if let Some(decorate) = decorate_server_row {
+                    for (_, row, rect) in drawn_rows() {
+                        let Row::Server(k) = row else { break };
+                        if let Some(row) =
+                            SavedServerRow::visible(&servers[k], rect, (top, bottom, w), cursor)
+                        {
+                            let hovered = row.mouse.is_some();
+                            let tooltip = decorate(row, batch);
+                            if hovered {
+                                row_tooltip = tooltip;
+                            }
+                        }
+                    }
+                }
                 crate::ui::separators(batch, atlas, top, bottom, false);
                 crate::ui::scrollbar(
                     batch,
@@ -1395,9 +1479,12 @@ impl Screen {
                 reason,
                 retry,
                 lines,
+                ..
             } => {
-                // DisconnectedScreen: the reason wraps to width - 50.
-                let wrapped = wrap(reason, (w.ceil() - 50.0).max(1.0), atlas);
+                // DisconnectedScreen: the reason wraps to width - 50, rendered in the language
+                // the player has now, not the one it was resolved in.
+                let reason = reason_plain(reason);
+                let wrapped = wrap(&reason, (w.ceil() - 50.0).max(1.0), atlas);
                 lines.set(wrapped.len());
                 let l = disconnected_layout(h, wrapped.len(), retry.is_some());
                 centered(
@@ -1415,6 +1502,7 @@ impl Screen {
                 }
             }
         }
+        row_tooltip
     }
     /// `DirectJoinServerScreen.keyPressed`: Enter joins the typed address
     /// while the Join Server button is active. On the server list it is
@@ -1423,12 +1511,10 @@ impl Screen {
     pub fn confirm(&self) -> Outcome {
         match self {
             Self::Page(form) => form.confirm(),
-            Self::Direct { address } if servers::parse_address(address).is_some() => {
-                Outcome::Connect {
-                    address: direct_address(address),
-                    lan: false,
-                }
-            }
+            Self::Direct { address } if servers::is_valid_address(address) => Outcome::Connect {
+                address: direct_address(address),
+                lan: false,
+            },
             Self::List {
                 servers,
                 selected,
@@ -1684,6 +1770,7 @@ impl Screen {
                 },
                 Some(57),
             ) => return Outcome::Back,
+            (Self::Disconnected { to_title: true, .. }, Some(54)) => return Outcome::Back,
             (
                 Self::Edit { .. }
                 | Self::Direct { .. }
@@ -2012,7 +2099,8 @@ impl Screen {
             | Self::Page(_)
             | Self::Friend {
                 from_title: true, ..
-            } => Outcome::Back,
+            }
+            | Self::Disconnected { to_title: true, .. } => Outcome::Back,
             // ConfirmScreen.keyPressed: Escape answers no.
             Self::ConfirmDelete { list, .. } => Outcome::Open(list.clone()),
             _ => Outcome::Open(Box::new(Self::list(saves))),
@@ -2042,7 +2130,7 @@ pub fn remember_direct_join(saves: &Path, address: &str) {
 
 /// Direct Connection's address; a full invite code pasted there joins the
 /// friend (a short relay code could be a host name, so it needs Join a Friend).
-fn direct_address(address: &str) -> String {
+pub(crate) fn direct_address(address: &str) -> String {
     let code: String = address.chars().filter(|c| !c.is_whitespace()).collect();
     if crate::net::is_invite(&code, true) {
         format!("{}{code}", crate::net::FRIEND)
@@ -2070,6 +2158,22 @@ fn disconnected_layout(h: f32, lines: usize, retry: bool) -> DisconnectedLayout 
         message: top + 39.0,
         retry: top + 29.0 + message_h + 2.0,
         buttons: top + 29.0 + message_h + retry_h + 2.0,
+    }
+}
+
+/// `Component.getString` of a disconnect reason, in the language active now.
+///
+/// A `Text` caches the spans of the language it was built under, so resolving it once — when the
+/// server turned the player away — and drawing those spans later would keep reading in that
+/// language. The screen keeps the component itself (`Screen::Disconnected::reason`), so it is
+/// decoded again here, at the moment it draws and narrates, as `DisconnectedScreen` renders its
+/// own component every frame.
+pub fn reason_plain(reason: &Text) -> String {
+    match reason.source_component() {
+        // The resolver `Text::from(Value)` uses: a selector reads as its own text.
+        Some(source) => crate::component::to_text(source, &mut |s| Text::literal(s)).plain(),
+        // Span-only text keeps no component to resolve again: nothing in it to translate.
+        None => reason.plain(),
     }
 }
 
@@ -2217,6 +2321,7 @@ mod tests {
             lan: Scanner::for_tests(vec![crate::lan::discovery::LanGame {
                 motd: "LAN".into(),
                 address: address.into(),
+                join: address.parse().ok(),
             }]),
             scroll: Default::default(),
             held: None,
@@ -2249,6 +2354,39 @@ mod tests {
             direct.confirm(),
             Outcome::Connect { lan: false, .. }
         ));
+    }
+
+    #[test]
+    fn done_and_join_server_follow_server_address_is_valid_address() {
+        let enabled = |screen: &Screen, id: u8| {
+            screen
+                .buttons(427.0, 240.0)
+                .iter()
+                .find(|b| b.5 == id)
+                .map(|b| b.4)
+        };
+        for (address, valid) in [
+            ("play.example.org:25570", true),
+            ("play..example.org", false),
+        ] {
+            let edit = Screen::Edit {
+                index: None,
+                name: "Server".into(),
+                address: address.into(),
+                focus: 1,
+                packs: None,
+            };
+            assert_eq!(enabled(&edit, 50), Some(valid), "Done: {address}");
+            let direct = Screen::Direct {
+                address: address.into(),
+            };
+            assert_eq!(enabled(&direct, 52), Some(valid), "Join Server: {address}");
+            assert_eq!(
+                matches!(direct.confirm(), Outcome::Connect { .. }),
+                valid,
+                "confirm: {address}"
+            );
+        }
     }
 
     #[test]
@@ -2336,9 +2474,10 @@ mod tests {
         };
         assert_eq!(at(&friend, 427.0, 253.0), [(113.0, 177.0), (113.0, 201.0)]);
         let lost = Screen::Disconnected {
-            reason: String::new(),
+            reason: Text::empty(),
             retry: None,
             lines: std::cell::Cell::new(1),
+            to_title: false,
         };
         assert_eq!(at(&lost, 427.0, 253.0), [(113.0, 145.0)]);
         // Taller messages push the button down instead of under the text.
@@ -2438,6 +2577,29 @@ mod tests {
     }
 
     #[test]
+    fn saved_row_hover_uses_the_visible_part_of_the_drawn_rect() {
+        let server = ServerEntry::new("Example", "127.0.0.1");
+        // At high GUI scale the window can be narrower than the row. A scrolled
+        // row can touch either list edge or lie entirely behind the header.
+        let viewport = (33.0, 180.0, 270.0);
+        let top = [-17.0, 25.0, ROW_WIDTH, ROW_HEIGHT];
+        let clip = |rect, mouse| SavedServerRow::visible(&server, rect, viewport, mouse);
+        let row = clip(top, (0.0, 33.0)).unwrap();
+        assert_eq!(row.rect, top);
+        assert_eq!(row.visible_rect, [0.0, 33.0, 270.0, 28.0]);
+        assert_eq!(row.mouse, Some([0.0, 33.0]));
+        assert!(clip(top, (1.0, 32.9)).unwrap().mouse.is_none());
+        assert!(clip(top, (270.0, 33.0)).unwrap().mouse.is_none());
+        assert!(clip([-17.0, -3.0, ROW_WIDTH, ROW_HEIGHT], (1.0, 33.0)).is_none());
+        let bottom = [-17.0, 169.0, ROW_WIDTH, ROW_HEIGHT];
+        assert_eq!(
+            clip(bottom, (1.0, 179.9)).unwrap().visible_rect,
+            [0.0, 169.0, 270.0, 11.0]
+        );
+        assert!(clip(bottom, (1.0, 180.0)).unwrap().mouse.is_none());
+    }
+
+    #[test]
     fn loading_dots_step_every_300_ms() {
         let frames: Vec<&str> = [0, 299, 300, 600, 900, 1200].map(loading_dots).to_vec();
         assert_eq!(
@@ -2477,6 +2639,7 @@ mod tests {
     /// `ServerData.validateIcon`: a PNG up to 1024x1024 is kept for
     /// servers.dat, though only a 64x64 one is drawn.
     #[test]
+    #[ignore = "daily"]
     fn an_icon_up_to_1024_square_is_kept() {
         assert!(valid_icon(&png(64)));
         assert!(valid_icon(&png(128)));
@@ -2499,6 +2662,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn arrow_keys_select_servers_and_shift_moves_them() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-keys-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2548,6 +2712,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn enter_joins_the_selected_server() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-enter-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2583,6 +2748,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_server_dragged_by_its_row_moves_and_is_saved_on_release() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-drag-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2647,6 +2813,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn icon_arrows_join_and_move_servers() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-arrows-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2720,6 +2887,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn delete_asks_before_removing_the_server() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-delete-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2789,6 +2957,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn edit_cycles_and_saves_the_server_resource_pack_setting() {
         let dir = std::env::temp_dir().join(format!("horizon-mp-packs-{}", std::process::id()));
         let saves = dir.join("saves");
@@ -2840,5 +3009,105 @@ mod tests {
         click(&mut screen, Some(42), 0.0, 0.0, size, &saves);
         assert_eq!(cycle(&screen).unwrap().3, "Server Resource Packs: Prompt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DisconnectedScreen.getNarrationMessage: the reason reads as the player's language
+    /// renders it, and a plain-text reason is unchanged.
+    /// #18380: `createDisconnectScreen` without `ServerData` (single player) returns to the
+    /// title screen, so Back never opens the server list and its LAN discovery.
+    #[test]
+    fn back_from_a_single_player_disconnect_goes_to_the_title() {
+        let saves =
+            std::env::temp_dir().join(format!("horizon-mp-disconnect-back-{}", std::process::id()));
+        let lost = |to_title| Screen::Disconnected {
+            reason: Text::literal("Disconnected"),
+            retry: None,
+            lines: std::cell::Cell::new(1),
+            to_title,
+        };
+        let size = (427.0, 240.0);
+        assert!(matches!(
+            lost(true).click(Some(54), 0.0, 0.0, size, &saves),
+            Outcome::Back
+        ));
+        assert!(matches!(lost(true).escape(&saves), Outcome::Back));
+        assert!(matches!(
+            lost(false).click(Some(54), 0.0, 0.0, size, &saves),
+            Outcome::Open(list) if matches!(*list, Screen::List { .. })
+        ));
+    }
+
+    #[test]
+    fn disconnect_screen_narrates_a_translated_reason() {
+        let language = crate::lang::Language::of(
+            "fr_fr",
+            [
+                ("disconnect.lost".into(), "Connexion perdue".into()),
+                ("mymod.kicked".into(), "Expulsé par le mod".into()),
+            ],
+        );
+        let ((), _missed) = crate::lang::scoped(language, || {
+            let translated = Screen::Disconnected {
+                reason: Text::translate("mymod.kicked", &[]),
+                retry: None,
+                lines: std::cell::Cell::new(1),
+                to_title: false,
+            };
+            assert_eq!(
+                translated.narration().title,
+                "Connexion perdue. Expulsé par le mod"
+            );
+            let plain = Screen::Disconnected {
+                reason: Text::literal("You were kicked"),
+                retry: None,
+                lines: std::cell::Cell::new(1),
+                to_title: false,
+            };
+            assert_eq!(plain.narration().title, "Connexion perdue. You were kicked");
+        });
+    }
+
+    /// The reason is rendered where the screen draws and narrates, not where it was built: a
+    /// `Text` caches the spans of the language it was resolved in, so a reason built under one
+    /// language must read in the one active when it is drawn or narrated.
+    #[test]
+    fn a_reason_built_in_one_language_is_narrated_in_another() {
+        let french = crate::lang::Language::of(
+            "fr_fr",
+            [
+                ("disconnect.lost".into(), "Connexion perdue".into()),
+                ("mymod.kicked".into(), "Expulsé par le mod".into()),
+            ],
+        );
+        let english = crate::lang::Language::of(
+            "en_us",
+            [
+                ("disconnect.lost".into(), "Connection Lost".into()),
+                ("mymod.kicked".into(), "Kicked by the mod".into()),
+            ],
+        );
+        // Built while the game speaks French, as a server turning a French player away does.
+        let (screen, _missed) = crate::lang::scoped(french, || {
+            let reason = Text::translate("mymod.kicked", &[]);
+            assert_eq!(reason.plain(), "Expulsé par le mod");
+            Screen::Disconnected {
+                reason,
+                retry: None,
+                lines: std::cell::Cell::new(1),
+                to_title: false,
+            }
+        });
+        let ((), _missed) = crate::lang::scoped(english, || {
+            let Screen::Disconnected { reason, .. } = &screen else {
+                unreachable!("a disconnected screen was just built")
+            };
+            // The player switches language while the screen is up: what it draws and
+            // narrates follows the language now, not the one the reason was resolved in.
+            assert_eq!(reason_plain(reason), "Kicked by the mod");
+            assert_eq!(
+                screen.narration().title,
+                "Connection Lost. Kicked by the mod"
+            );
+        });
     }
 }

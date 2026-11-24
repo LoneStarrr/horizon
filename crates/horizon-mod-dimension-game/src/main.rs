@@ -11,13 +11,14 @@
 //!
 //! A crate and not an example of horizon-client: an example builds with the dev-dependencies, whose
 //! `testing` feature keeps the mods per thread, and the server thread would see none.
-use horizon_mod_package::{Side, runtime::BuiltMod};
+use mod_api::__private::native::BuiltMod;
+use mod_api::Side;
 use mod_api::{
     BlockKey, ChunkAccess, ChunkGenerator, CommandArgumentValue, CommandSource, ConfiguredFeature,
-    CustomDensity, DensityFunctionType, DensitySampler, DimensionSettings, FeatureRandom,
-    FeatureRegion, FeatureType, Flow, FoliageAttachment, FoliagePlacer, FoliagePlacerType, Hooks,
-    ModEntry, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
-    ServerHost, ServerTickEvent, ServerTickPhase, Text, TreeAxis, TreeContext, TreeDecorator,
+    DensityFunction, DensityFunctionType, DimensionSettings, FeatureRandom, FeatureRegion,
+    FeatureType, Flow, FoliageAttachment, FoliagePlacer, FoliagePlacerType, Hooks, ModEntry,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+    ServerTickEvent, ServerTickPhase, Text, TreeAxis, TreeContext, TreeDecorator,
     TreeDecoratorType, TreeRandom, TrunkPlacer, TrunkPlacerType,
 };
 use std::sync::{Arc, Mutex};
@@ -57,7 +58,8 @@ struct Band;
 struct BandAt([i32; 2]);
 
 impl DensityFunctionType for Band {
-    fn decode(&self, config: &serde_json::Value) -> Result<Arc<dyn CustomDensity>, String> {
+    fn decode(&self, json: &str) -> Result<Arc<dyn DensityFunction>, String> {
+        let config: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let edge = |name: &str| {
             config[name]
                 .as_i64()
@@ -68,21 +70,11 @@ impl DensityFunctionType for Band {
     }
 }
 
-impl CustomDensity for BandAt {
+impl DensityFunction for BandAt {
     fn range(&self) -> [f32; 2] {
         [-1.0, 1.0]
     }
-    /// Only y matters.
-    fn domain_axes(&self) -> u8 {
-        2
-    }
-    fn compile(&self, _: i64) -> Arc<dyn DensitySampler> {
-        Arc::new(*self)
-    }
-}
-
-impl DensitySampler for BandAt {
-    fn sample_value(&self, [_, y, _]: [i32; 3]) -> f32 {
+    fn sample(&self, [_, y, _]: [i32; 3], _: i64) -> f32 {
         if (self.0[0]..=self.0[1]).contains(&y) {
             1.0
         } else {
@@ -243,7 +235,7 @@ impl Hooks for DimProbe {
         let stone = r.block_key("minecraft:stone");
         let gold = r.block_key("minecraft:gold_block");
         r.register_chunk_generator("slab", Slab { stone, gold });
-        r.register_density_function("band", Band);
+        r.register_density_function_type("band", Band);
         r.register_feature_type("marker", Marker);
         r.register_trunk_placer("spiral", Spiral);
         r.register_foliage_placer("cross", Cross);

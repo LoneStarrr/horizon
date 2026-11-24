@@ -2,9 +2,10 @@ use super::*;
 use crate::game::{Audio, Options, Progress, Settings, load_resources};
 use horizon_client::motion::PlayerMotion;
 use horizon_core::geometry::Vec3;
+use std::collections::HashSet;
 
 /// A server-side game that runs commands, its world in a scratch folder.
-fn with_command_game(name: &str, test: impl FnOnce(&mut Game<'_>)) {
+pub(super) fn with_command_game(name: &str, test: impl FnOnce(&mut Game<'_>)) {
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let settings = Settings::default();
     let loaded = load_resources(
@@ -46,6 +47,10 @@ fn with_command_game(name: &str, test: impl FnOnce(&mut Game<'_>)) {
     std::fs::create_dir_all(&scratch).unwrap();
     game.world_root = scratch.clone();
     game.player = Some(PlayerMotion::new(game.motion, Vec3::new(10.5, 200.0, 0.5)).unwrap());
+    game.reset_entity_residency();
+    game.native_lifecycle
+        .begin_open(mod_api::Authority::IntegratedServer);
+    crate::game::native_entity_refs::tests::bind_local_player(&mut game, 1, 1);
     game.build_registries();
     game.set_allow_commands(true);
     test(&mut game);
@@ -54,7 +59,7 @@ fn with_command_game(name: &str, test: impl FnOnce(&mut Game<'_>)) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn tag_commands_and_explicit_empty_loads_save_without_empty_tags() {
     with_command_game("tags", tag_commands_and_explicit_empty);
 }
@@ -117,7 +122,7 @@ fn tag_commands_and_explicit_empty(game: &mut Game<'_>) {
 /// `/data get` on a cloud that was never saved shows `Entity.saveWithoutId`'s
 /// common fields, as 26.3 prints them (#13057).
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_live_area_effect_cloud_reads_with_the_common_entity_fields() {
     with_command_game("cloud", |game| {
         assert!(game.run_command("summon area_effect_cloud 4.5 200 4.5 {UUID:[I;328,0,0,3]}"));
@@ -130,5 +135,214 @@ fn a_live_area_effect_cloud_reads_with_the_common_entity_fields() {
         assert_eq!(read.get("OnGround"), Some(&Tag::Byte(0)));
         assert_eq!(read.get("Invulnerable"), Some(&Tag::Byte(0)));
         assert_eq!(read.get("PortalCooldown"), Some(&Tag::Int(0)));
+    });
+}
+
+/// What `command` told the player.
+fn say(game: &mut Game<'_>, command: &str) -> Vec<Text> {
+    game.chat_capture = Some(Vec::new());
+    assert!(game.run_command(command), "{command}");
+    game.chat_capture.take().unwrap_or_default()
+}
+
+/// The `Tags` key of the compound the entity saves (`Entity.saveWithoutId`).
+fn saved_tags(game: &mut Game<'_>, target: Target) -> Option<Tag> {
+    game.data_of(&DataRef::Entity(target))
+        .unwrap()
+        .get("Tags")
+        .cloned()
+}
+
+fn tag_list(tags: &[&str]) -> Tag {
+    Tag::List(tags.iter().map(|t| Tag::String((*t).into())).collect())
+}
+
+/// `TagCommand.listTags` sends through `CommandResponseTracker.sendFeedback`'s
+/// default element type, `NON_ZERO`: one entity of the selection holding tags
+/// prints the single-target form, and the count in the multiple form is the
+/// number of entities with tags, not the number of targets.
+#[test]
+#[ignore = "daily"]
+fn tag_list_counts_only_the_entities_that_have_tags() {
+    with_command_game("tag-list", |game| {
+        for (uuid, x) in [("1", "4.5"), ("2", "8.5")] {
+            assert!(game.run_command(&format!(
+                "summon pig {x} 200 4.5 {{UUID:[I;329,0,0,{uuid}],NoAI:1b,Silent:1b,NoGravity:1b}}"
+            )));
+        }
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000001 add audit"));
+        let said = say(game, "tag @e[type=minecraft:pig] list");
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].translation_key(),
+            Some("commands.tag.list.single.success")
+        );
+        assert_eq!(said[0].plain(), "Pig has 1 tag(s): audit");
+        // Both tagged: the multiple form, counting the tagged entities.
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000002 add audit"));
+        let said = say(game, "tag @e[type=minecraft:pig] list");
+        assert_eq!(
+            said[0].translation_key(),
+            Some("commands.tag.list.multiple.success")
+        );
+        assert_eq!(said[0].plain(), "The 2 entities have 1 total tag(s): audit");
+    });
+}
+
+/// `TagCommand.listTags` sends through `sendFeedback(source, false, …)`,
+/// while `addTag`/`removeTag` pass `true` (`CommandSourceStack.sendSuccess`):
+/// only a change is repeated to the operators.
+#[test]
+#[ignore = "daily"]
+fn tag_list_is_not_repeated_to_the_operators() {
+    with_command_game("tag-list-broadcast", |game| {
+        assert!(game.run_command(
+            "summon pig 4.5 200 4.5 {UUID:[I;329,0,0,4],NoAI:1b,Silent:1b,NoGravity:1b}"
+        ));
+        // A source that informs the operators (`shouldInformAdmins`).
+        game.console_broadcast = Some(true);
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000004 add audit"));
+        assert_eq!(game.admin_feedback.len(), 1);
+        game.admin_feedback.clear();
+        let said = say(game, "tag @e[type=minecraft:pig] list");
+        assert_eq!(said.len(), 1);
+        assert_eq!(game.admin_feedback.len(), 0);
+    });
+}
+
+/// `TagCommand.addTag`/`removeTag` store a tag on an ominous item spawner
+/// (`OminousItemSpawner.readAdditionalSaveData` keeps the compound, its chunk
+/// saves it), and `Entity.saveWithoutId` writes `Tags` only for a nonempty set,
+/// so removing the last tag of a player or any entity leaves no key.
+#[test]
+#[ignore = "daily"]
+fn the_last_tag_leaves_no_key_and_a_spawner_keeps_its_tags() {
+    with_command_game("tag-remove", |game| {
+        assert!(game.run_command("tag @s add audit"));
+        assert_eq!(saved_tags(game, Target::Player), Some(tag_list(&["audit"])));
+        assert!(game.run_command("tag @s remove audit"));
+        assert_eq!(saved_tags(game, Target::Player), None);
+
+        assert!(game.run_command(
+            "summon ominous_item_spawner 4.5 200 4.5 {UUID:[I;329,0,0,3],NoGravity:1b}"
+        ));
+        let spawner = game.target_with_uuid([329, 0, 0, 3]).unwrap();
+        assert!(matches!(spawner, Target::Spawner(_)));
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000003 add audit"));
+        assert_eq!(game.tags_of(spawner), ["audit"]);
+        assert_eq!(saved_tags(game, spawner), Some(tag_list(&["audit"])));
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000003 remove audit"));
+        assert_eq!(saved_tags(game, spawner), None);
+        assert!(game.run_command("tag 00000149-0000-0000-0000-000000000003 add audit"));
+        // The entity the chunk saves carries it, and loading it back keeps it.
+        let chunks = game.entity_chunks(&HashSet::from([(0, 0)]), false);
+        let saved = chunks
+            .iter()
+            .flat_map(|(_, entities)| entities)
+            .find(|t| t.get("id") == Some(&Tag::String("minecraft:ominous_item_spawner".into())))
+            .cloned()
+            .expect("the spawner's saved entity");
+        assert_eq!(saved.get("Tags"), Some(&tag_list(&["audit"])));
+        let before = game.ominous_spawners.len();
+        game.load_ominous_item_spawner(saved);
+        assert_eq!(game.ominous_spawners.len(), before + 1);
+        let reloaded = game.ominous_spawners.last().unwrap().id;
+        assert_eq!(game.tags_of(Target::Spawner(reloaded)), ["audit"]);
+    });
+}
+
+/// 26.3's BlockInput and BlockDataAccessor load the same explicit map.
+#[test]
+#[ignore = "daily"]
+fn block_entity_components_survive_commands_and_chunk_reload() {
+    with_command_game("block-entity-components", |game| {
+        use horizon_client::chunk::Chunk;
+        use horizon_core::position::ChunkPos;
+        use std::sync::Arc;
+
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert!(game.run_command("forceload add 0 0"));
+        assert!(game.run_command("tick freeze"));
+        let initial = r#"{"minecraft:custom_data":{a:1b},"minecraft:rarity":"rare","minecraft:lock":{items:"minecraft:stick"},"minecraft:custom_name":"Nest","minecraft:container":[{slot:0,item:{id:"minecraft:stone"}}]}"#;
+        let expected = r#"{"minecraft:custom_data":{a:1b,b:2s},"minecraft:rarity":"rare","minecraft:lock":{items:"minecraft:stick"},"minecraft:custom_name":"Nest","minecraft:container":[{slot:0,item:{id:"minecraft:stone"}}]}"#;
+        let read = |game: &mut Game<'_>, pos: [i32; 3], expected: &str| {
+            let [x, y, z] = pos;
+            assert!(game.run_command(&format!("data get block {x} {y} {z} components")));
+            let saved = game.block_entity_nbt(pos).unwrap();
+            let expected = parse_snbt(expected).unwrap().0;
+            assert_eq!(saved.get("components"), Some(&expected));
+            saved
+        };
+        let hive = [4, 200, 4];
+        assert!(game.run_command(&format!(
+            "setblock 4 200 4 bee_nest{{components:{initial}}} strict"
+        )));
+        let saved = read(game, hive, initial);
+        assert!(saved.get("CustomName").is_none());
+        assert!(saved.get("lock").is_none());
+        assert!(saved.get("Items").is_none());
+
+        assert!(game.run_command(
+            r#"data merge block 4 200 4 {components:{"minecraft:custom_data":{b:2s}}}"#
+        ));
+        read(game, hive, expected);
+
+        let chest = [6, 200, 4];
+        assert!(game.run_command(r#"setblock 6 200 4 chest{CustomName:"Implicit",components:{"minecraft:custom_name":"Explicit"}} strict"#));
+        let explicit = r#"{"minecraft:custom_name":"Explicit"}"#;
+        let saved = read(game, chest, explicit);
+        assert_eq!(
+            saved.get("CustomName"),
+            Some(&Tag::String("Implicit".into()))
+        );
+        let comparator = [8, 200, 4];
+        assert!(game.run_command(
+            r#"setblock 8 200 4 comparator{components:{rarity:"rare",custom_data:7}} strict"#
+        ));
+        let rare = r#"{"minecraft:rarity":"rare"}"#;
+        read(game, comparator, rare);
+
+        let pot = [10, 200, 4];
+        assert!(game.run_command("setblock 10 200 4 decorated_pot strict"));
+        let explicit_item_data = r#"{"minecraft:custom_data":{a:1b}}"#;
+        for (pos, id) in [(comparator, "comparator"), (pot, "decorated_pot")] {
+            let stack = save::item_from_nbt(
+                &parse_snbt(&format!(
+                    r#"{{id:"minecraft:{id}",count:1,components:{explicit_item_data}}}"#
+                ))
+                .unwrap()
+                .0,
+            )
+            .unwrap();
+            game.apply_placed_item(pos, &stack, false);
+            read(game, pos, explicit_item_data);
+        }
+
+        let live = game.world.chunks.get(&(0, 0)).unwrap().clone();
+        let chunk = game.with_entities([&live]).remove(0);
+        let registry = game.pack.assets.registry;
+        let encoded = save::encode(&chunk, registry, game.res.biomes());
+        let mut reloaded = save::decode(&encoded, registry, game.res.biomes()).unwrap();
+        game.world.install_chunk_block_entities(&mut reloaded);
+        game.world.chunks.insert((0, 0), Arc::new(reloaded));
+        for (pos, components) in [
+            (hive, expected),
+            (chest, explicit),
+            (comparator, explicit_item_data),
+            (pot, explicit_item_data),
+        ] {
+            read(game, pos, components);
+        }
+
+        assert!(game.run_command("data remove block 4 200 4 components"));
+        read(game, hive, "{}");
+        assert!(game.run_command("setblock 6 200 4 air strict"));
+        assert!(game.run_command("setblock 6 200 4 chest strict"));
+        read(game, chest, "{}");
     });
 }

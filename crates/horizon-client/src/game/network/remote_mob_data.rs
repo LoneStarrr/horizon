@@ -171,6 +171,11 @@ pub(super) fn apply(
                 m.extra.sitting_pose = flags & 1 != 0;
                 m.extra.tame = flags & 4 != 0;
             }
+            // TamableAnimal.DATA_OWNERUUID_ID: the owner follows its flags.
+            // An empty value clears the cached owner on the client.
+            (Species::Wolf | Species::Cat | Species::Parrot, 19, Value::OptUuid(owner)) => {
+                m.extra.owner = owner.map(horizon_client::lan::playerdata::uuid_ints);
+            }
             // Cat.IS_LYING and RELAX_STATE_ONE.
             (Species::Cat, 21, Value::Bool(lying)) => m.extra.flag = *lying,
             (Species::Cat, 22, Value::Bool(relaxing)) => m.extra.relax_one = *relaxing,
@@ -551,11 +556,15 @@ mod tests {
             "minecraft:ravager" => Species::Ravager,
             "minecraft:zombie" => Species::Zombie,
             "minecraft:enderman" => Species::Enderman,
+            "minecraft:wolf" => Species::Wolf,
+            "minecraft:cat" => Species::Cat,
+            "minecraft:parrot" => Species::Parrot,
             _ => panic!("unknown fixture species"),
         };
         // Metadata needs no AI or model. Avoid the resource loader, which also
         // initializes process-wide item tags used by unrelated mob tests.
         let kind = Arc::new(MobType {
+            shadow: None,
             id: kind.into(),
             species,
             width: 0.6,
@@ -575,6 +584,7 @@ mod tests {
             jump_strength: 0.42,
             attributes: Arc::default(),
             item_stack_limits: Arc::default(),
+            attribute_bounds: Default::default(),
             gravity: 0.08,
             safe_fall_distance: 3.0,
             fall_damage_multiplier: 1.0,
@@ -723,6 +733,7 @@ mod tests {
                     position: [0.0; 3],
                     view_distance: 10,
                     chunks: &chunks,
+                    sources: None,
                     tracker: &mut tracker,
                     out: &mut packets,
                     gone: None,
@@ -886,6 +897,7 @@ mod tests {
                     position: [0.0; 3],
                     view_distance: 10,
                     chunks: &chunks,
+                    sources: None,
                     tracker: &mut tracker,
                     out: &mut packets,
                     gone: None,
@@ -1021,7 +1033,7 @@ mod tests {
         assert!(!m.is_invisible());
     }
 
-    /// #2920: a server's horse is moved by its rider's client, which jumps
+    /// arismoko/horizon#2920: a server's horse is moved by its rider's client, which jumps
     /// it by the type's jump strength (`createBaseHorseAttributes`,
     /// `createBaseChestedHorseAttributes`) until the server syncs its own.
     #[test]
@@ -1133,6 +1145,14 @@ mod tests {
                 "minecraft:parrot#main": {}}"#,
         )
         .unwrap();
+        fs::write(
+            root.join("attributes.json"),
+            format!(
+                r#"{{"data_version": {}, "attributes": [], "entities": {{}}}}"#,
+                horizon_core::version::DATA_VERSION
+            ),
+        )
+        .unwrap();
         let mut types = MobTypes::load(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
         for kind in ["minecraft:happy_ghast", "minecraft:nautilus"] {
@@ -1182,6 +1202,14 @@ mod tests {
         fs::write(
             root.join("entity-models.json"),
             r#"{"minecraft:bat#main": {"children": {"right_wing": {}, "head": {}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("attributes.json"),
+            format!(
+                r#"{{"data_version": {}, "attributes": [], "entities": {{}}}}"#,
+                horizon_core::version::DATA_VERSION
+            ),
         )
         .unwrap();
         let mut types = MobTypes::load(&root).unwrap();
@@ -1245,6 +1273,26 @@ mod tests {
         );
         assert!(m.extra.tame && m.extra.sitting_pose);
         assert_eq!(m.extra.color, 11);
+    }
+
+    #[test]
+    fn tame_owner_metadata_sets_and_clears_the_client_owner() {
+        let uuid = 0x0000_0001_0000_0002_0000_0003_0000_0004;
+        let expected = Some(horizon_client::lan::playerdata::uuid_ints(uuid));
+        for kind in ["minecraft:wolf", "minecraft:cat", "minecraft:parrot"] {
+            let mut mob = fixture_mob(kind);
+            apply(
+                &mut mob,
+                &[(19, s::OPTIONAL_LIVING_ENTITY_REFERENCE, Value::OptUuid(Some(uuid)))],
+            );
+            assert_eq!(mob.extra.owner, expected, "{kind} receives its owner");
+
+            apply(
+                &mut mob,
+                &[(19, s::OPTIONAL_LIVING_ENTITY_REFERENCE, Value::OptUuid(None))],
+            );
+            assert_eq!(mob.extra.owner, None, "{kind} clears a removed owner");
+        }
     }
 
     /// Wolf.DATA_INTERESTED_ID: the begging flag reaches the client, whose
@@ -1554,6 +1602,14 @@ mod tests {
         fs::write(
             root.join("entity-models.json"),
             r#"{"minecraft:pig#main": {}, "minecraft:strider#main": {}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("attributes.json"),
+            format!(
+                r#"{{"data_version": {}, "attributes": [], "entities": {{}}}}"#,
+                horizon_core::version::DATA_VERSION
+            ),
         )
         .unwrap();
         let mut types = MobTypes::load(&root).unwrap();

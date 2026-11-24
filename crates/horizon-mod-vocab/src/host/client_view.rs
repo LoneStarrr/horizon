@@ -17,10 +17,24 @@ pub trait ClientViewClientHost {
     #[access(ClientSetup)]
     fn hud_mode(&self) -> HudMode;
     /// Side: client.
+    /// Whether F3's debug screen leaves `corner` free this frame for a box `render_gui_post`
+    /// places: false for a corner it takes (`DebugScreenOverlay`), both top corners while it
+    /// is open (its left and right columns) and a bottom corner while one of its charts is
+    /// drawn there. Only F3: read [`Self::hud_mode`] for whether the HUD is drawn at all (F1).
+    #[access(ClientSetup)]
+    fn native_corner_shown(&self, corner: Corner) -> bool;
+    /// Side: client.
     /// Select HUD and hand visibility, including after vanilla F1 input handling.
     /// Other first-person hand restrictions and render cancellation still apply.
     #[access(ClientSetup)]
     fn set_hud_mode(&mut self, mode: HudMode);
+    /// Side: client.
+    /// Show styled `line` in this client's action bar, replacing the previous overlay
+    /// message and restarting its normal 60-tick lifetime. Available while playing,
+    /// including from local key callbacks on a remote server; sends nothing to the server.
+    /// An invalid component returns [`TextFormError`] without changing the overlay.
+    #[access(WorldOnly)]
+    fn show_action_bar(&mut self, line: Text) -> Result<(), TextFormError>;
     /// Side: client.
     /// The window's camera type (`Options.getCameraType`), including its latest pending request.
     #[access(ClientSetup)]
@@ -58,6 +72,32 @@ pub trait ClientViewClientHost {
     #[access(ClientSetup)]
     fn camera(&self) -> Option<Camera>;
     /// Side: client.
+    /// World point `at` projected on this frame's screen (`GameRenderer.projectPointToScreen`):
+    /// normalised device x and y, -1 to 1 across the screen (x to the right, y up), and depth z
+    /// (reversed: nearer is larger). The view is the camera's rotation without bob or spin, as
+    /// vanilla's. Unlike vanilla, None for a point behind the camera or a non-finite `at`; also None
+    /// outside a world, before extraction, and between render frames. Supported during GUI,
+    /// screen and world drawing after camera extraction. In GUI pixels of a [`DrawContext`] of size
+    /// `[w, h]`: `((x + 1) / 2 * w, (1 - y) / 2 * h)`.
+    #[access(ClientSetup)]
+    fn project(&self, at: [f64; 3]) -> Option<[f32; 3]>;
+    /// Side: client.
+    /// The local player's item use as the client sees it: the hand, ticks used and ticks left
+    /// (`isUsingItem`, `getUsedItemHand`, `getTicksUsingItem`, `getUseItemRemainingTicks`).
+    /// None when the player uses no item or no client world is open. Sends nothing.
+    #[access(ClientSetup)]
+    fn local_item_use(&self) -> Option<ItemUse>;
+    /// Side: client.
+    /// Turns the local player's view to `yaw` and `pitch` (degrees), as `setYRot` and `setXRot`
+    /// store them: yaw as given (not wrapped; the server wraps it), pitch `% 360` then clamped to
+    /// -90..90. The previous-frame angles move by the same amount, as `Entity.turn` does for the
+    /// mouse, so the view doesn't jump for a frame. Sends no packet: the game's own player sync of
+    /// this client tick sends the look in its one move packet, only while the camera is the player
+    /// (the rotation-only packet when riding); a call after that step goes out the next tick.
+    /// `NotFinite`, changing nothing, for a NaN or infinite value; `NoWorld` outside a client world.
+    #[access(WorldOnly)]
+    fn set_local_rotation(&mut self, yaw: f32, pitch: f32) -> Result<(), LocalRotationError>;
+    /// Side: client.
     /// The entity the view follows (`Minecraft.getCameraEntity`): the entity a server attached
     /// the camera to, else the local player. None outside a client world.
     #[access(ClientSetup)]
@@ -74,6 +114,60 @@ pub trait ClientViewClientHost {
         columns: &[(i32, i32)],
         heightmap: Heightmap,
     ) -> Result<Vec<Option<i32>>, String>;
+    /// Side: client.
+    /// The surface of each requested `(x, z)` column, in input order (including repeats).
+    /// Uses the same first free Y as `client_surface_heights`; block, biome and light are
+    /// read from the client level's retained data at the surface, not from generation.
+    /// None for a column whose chunk this client does not hold; never loads a chunk.
+    /// `Err` without reading any column if there is no client world or more than 65,536
+    /// columns (`MAX_COLUMNS`) were requested.
+    #[access(WorldOnly)]
+    fn client_surface_columns(
+        &self,
+        columns: &[(i32, i32)],
+        heightmap: Heightmap,
+    ) -> Result<Vec<Option<SurfaceColumn>>, String>;
+    /// Side: client.
+    /// Chunk arrivals, changes and removals in the current client level (including
+    /// singleplayer). Each touched key occurs once with its current residency.
+    /// Pass None for a full snapshot; a cursor from another level or map, or outside
+    /// the retained history, also returns a full snapshot. A stale or unavailable
+    /// level handle returns None. Loads nothing.
+    #[access(WorldOnly)]
+    fn level_chunk_deltas(
+        &self,
+        level: LevelRef,
+        since: Option<ChunkDeltaCursor>,
+    ) -> Option<ChunkDeltas>;
+    /// Side: client.
+    /// For a client mod drawing a map past the loaded chunks: each column's surface as this window's far
+    /// terrain (the LOD Distance setting) holds it, whether or not the chunk is loaded. It is the finest
+    /// far tile sampled there, so a far column is the reduced surface of a cell up to many blocks wide, and
+    /// it comes from wherever the far terrain does (this world's generator, the server's offer, the chunks
+    /// kept from earlier visits). None for a column no tile covers yet, and for every
+    /// column while far terrain is off or not started; the tiles follow the camera, so a column far from it
+    /// can go back to None. Inside the loaded chunks read them instead (`client_surface_heights`): a tile can
+    /// lag an edit. `Err`, reading nothing, for no client world (the title screen) or more than 65,536
+    /// columns (`MAX_COLUMNS`).
+    #[access(WorldOnly)]
+    fn client_far_surface(
+        &self,
+        columns: &[(i32, i32)],
+    ) -> Result<Vec<Option<TerrainColumn>>, String>;
+    /// Side: client.
+    /// Read the CPU footprints of exact far-terrain tiles by `(tile_x, tile_z, level)`.
+    /// A tile's world origin is `(tile_x, tile_z) * (16 << level)`; each response
+    /// corresponds to one input. `None` means that exact tile is unavailable
+    /// or far terrain is off, not that its cells are empty. A ready tile still
+    /// covers the terrain the renderer keeps, which can lag live chunk edits.
+    /// It does not generate, request, or load anything and never substitutes
+    /// another level. Returns `Err` before reading if there is no client
+    /// world or more than 256 tiles (65,536 cells) were requested.
+    #[access(WorldOnly)]
+    fn client_lod_columns(
+        &self,
+        tiles: &[(i32, i32, u8)],
+    ) -> Result<Vec<Option<LodTileFootprint>>, String>;
     /// Side: client.
     /// Points the view at `entity` (`Minecraft.setCameraEntity`), as a server's camera packet
     /// does; the local player's own ref puts it back. True when the view now follows it; false,
@@ -93,7 +187,8 @@ pub trait ClientViewClientHost {
     fn crosshair_target(&self) -> Option<CrosshairTarget>;
     /// Side: client.
     /// Current targeting controls. Stale entity overrides are omitted. Reach comes from the
-    /// player's vanilla interaction-range attributes, including server and equipment modifiers.
+    /// player's vanilla interaction-range attributes, including server and equipment modifiers:
+    /// this is the read for the player's block and entity reach.
     #[access(WorldOnly)]
     fn targeting(&self) -> ClientTargeting;
     /// Side: client.

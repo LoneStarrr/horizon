@@ -25,6 +25,8 @@ impl Game<'_> {
         {
             attachments.replace_contents(copy);
         }
+        // NeoForge's clone keeps only the `PlayerPersisted` part of a mod's saved compound.
+        self.keep_only_player_persisted(conn);
         self.reinitialize_server_player(uuid, conn);
         // The new `ServerPlayer` is filed where it is placed, untold.
         self.entity_section_forget(entity_id as u32);
@@ -33,11 +35,10 @@ impl Game<'_> {
         // AbstractContainerScreen.tick / ServerPlayer.closeContainer: the dead
         // player's open container goes with it, so a chest's lid (its opener
         // count) falls instead of staying up for a player who is gone.
-        self.guest_container_closed(conn);
+        self.guest_close_menus_and_tell(conn);
         let Some(host) = self.lan.as_mut() else {
             return;
         };
-        host.hub.close_container(conn);
         // PlayerList.respawn builds a new `ServerPlayer`, whose `lastEquipmentItems` starts
         // empty: the mods hear each worn item again from empty (`native_players_equipment`).
         if let Some(play) = host.play.get_mut(&conn) {
@@ -134,6 +135,7 @@ impl Game<'_> {
                 level: g.xp_level,
                 progress: g.xp_progress,
                 total: g.xp_total,
+                score: g.score,
             };
             let keep_inventory = self
                 .ui
@@ -142,7 +144,8 @@ impl Game<'_> {
                 || g.game_mode == SPECTATOR;
             xp.respawn(keep_inventory);
             g.effects = Default::default();
-            (g.xp_level, g.xp_progress, g.xp_total) = (xp.level, xp.progress, xp.total);
+            (g.xp_level, g.xp_progress, g.xp_total, g.score) =
+                (xp.level, xp.progress, xp.total, xp.score);
             // PlayerEvent.Clone, at the end of `restoreFrom`: the data is copied,
             // the new player not yet placed.
             (g.uuid, g.name.clone())
@@ -152,6 +155,9 @@ impl Game<'_> {
                 game.native_player_clone(cloned, &name, true, original);
             });
         }
+        // sendLevelInfo reads the level's respawn data when it sends, after the
+        // Clone hook, which may have moved it.
+        let world_spawn = self.world_spawn_position();
         let clock_rate = self.network_clock_rate();
         let ctx = TickCtx {
             world: &mut self.world,
@@ -159,8 +165,9 @@ impl Game<'_> {
             next_entity: &mut self.next_entity,
             // PlayerList.respawn / sendLevelInfo send level respawn data,
             // independently of the personal destination passed to Hub::respawn.
-            spawn: world,
+            spawn: world_spawn,
             spawn_angle: self.level.world_spawn_angle,
+            spawn_dimension: self.level.spawn_dimension(),
             sea_level: self.end.locator().map_or(63, |terrain| terrain.sea_level()),
             difficulty: i32::from(self.ui.difficulty),
             difficulty_locked: self.level.difficulty_locked,
@@ -190,19 +197,15 @@ impl Game<'_> {
                     crate::game::game_mode::mode_from_id(g.game_mode),
                 )
             };
-            let mut cancel = false;
+            let (mut cancel, mut to) = (false, GameMode::Spectator);
             if from != GameMode::Spectator {
-                self.native_player_game_mode_changed(
-                    uuid,
-                    &name,
-                    from,
-                    GameMode::Spectator,
-                    &mut cancel,
-                );
+                self.native_player_game_mode_changed(uuid, &name, from, &mut to, &mut cancel);
+                // A redirect to the mode the player has is no change: nothing is sent.
+                cancel |= to == from;
             }
             if !cancel && let Some(host) = self.lan.as_mut() {
                 host.hub
-                    .set_game_mode(conn, SPECTATOR, &self.world, Some(self.collision));
+                    .set_game_mode(conn, to.id(), &self.world, Some(self.collision));
             }
         }
         // PlayerList.respawn: `copyRespawnPosition` hands the new player the
@@ -251,7 +254,7 @@ impl Game<'_> {
             && self.world.loaded(c.pos[0], c.pos[2])
         {
             let found = self
-                .as_guest(conn, |g| g.resolve_server_respawn(c))
+                .as_guest(conn, |g| g.resolve_server_respawn(c, true))
                 .flatten();
             let world = self
                 .level
@@ -315,26 +318,12 @@ impl Game<'_> {
         // The killing blow, for the death hooks.
         let blow = (dying && !mod_api::__private::mods().is_empty())
             .then(|| self.guest_damage_source(conn));
-        if let Some((damage_type, attacker)) = &blow {
-            // LivingDeathEvent: a canceled death keeps the player at 1 health.
-            let entity = host.hub.guests[gi].entity_id;
-            let mut cancel = false;
-            self.native_living_death(
-                entity as u32,
-                "minecraft:player",
-                damage_type,
-                *attacker,
-                &mut cancel,
-            );
-            if cancel {
-                if let Some(host) = self.lan.as_mut() {
-                    {
-                        let value = 1.0;
-                        host.hub.guests.update(gi, |guest| guest.health = value);
-                    }
-                }
-                return;
-            }
+        // The hit `living_death` hears with it, for the drops too.
+        let hit = blow
+            .as_ref()
+            .and_then(|(damage_type, _)| self.guest_death_hit(gi, damage_type));
+        if dying && self.guest_death_canceled(gi, conn) {
+            return;
         }
         let Some(host) = self.lan.as_ref() else {
             return;
@@ -345,6 +334,10 @@ impl Game<'_> {
             if let Some(play) = self.lan.as_mut().and_then(|host| host.play.get_mut(&conn)) {
                 play.hook.discard();
             }
+            // ServerPlayer.die: shoulder parrots are dropped at the death
+            // spot before the loot and the death message. `host`'s borrow
+            // ends with the condition, so as_guest may take `&mut self`.
+            self.as_guest(conn, |game| game.remove_entities_on_shoulder());
         }
         let Some(host) = self.lan.as_mut() else {
             return;
@@ -362,6 +355,7 @@ impl Game<'_> {
                 level: g.xp_level,
                 progress: g.xp_progress,
                 total: g.xp_total,
+                score: g.score,
             }
             .death_reward(
                 self.ui
@@ -465,9 +459,24 @@ impl Game<'_> {
                 entity: id as u32,
                 kind: "minecraft:player",
                 player: Some(uuid),
-                source: killing.as_ref().map(|(damage_type, attacker)| {
-                    crate::game::creatures::death_hurt_source(damage_type, attacker.unwrap_or(0))
-                }),
+                // `dropAllDeathLoot(level, source)`: every death has a source, so
+                // with mods loaded the drops hear the blow `living_death` heard,
+                // `/kill`'s generic_kill and an unrecorded death's generic
+                // included. Without mods `blow` is `None` and the combat record's
+                // blow stays, so `drop_death_items` keeps today's draw order.
+                source: blow
+                    .as_ref()
+                    .map(|(damage_type, causing)| {
+                        super::death_state::death_source(hit.as_deref(), damage_type, *causing)
+                    })
+                    .or_else(|| {
+                        killing.as_ref().map(|(damage_type, attacker)| {
+                            crate::game::creatures::death_hurt_source(
+                                damage_type,
+                                attacker.unwrap_or(0),
+                            )
+                        })
+                    }),
                 recently_hit,
             };
             // LivingEntity.die: the death is heard, and a sculk catalyst
@@ -483,8 +492,9 @@ impl Game<'_> {
             if consumed && catalyst_xp > 0 {
                 self.guest_catalyst_trigger(gi, conn, at);
             }
-            // ServerPlayer.die: the drops, then the deathCount objectives, then
-            // the `deaths` statistic and the two timers it resets.
+            // ServerPlayer.die: the drops, the deathCount objectives, the
+            // experience (`dropAllDeathLoot`), then a kill credit's `killed_by`,
+            // awardKillScore and wither rose, then `deaths` and the two timers.
             self.as_guest(conn, |game| {
                 if let Some(eyes) = drops {
                     game.drop_inventory(eyes, &dropping);
@@ -494,12 +504,9 @@ impl Game<'_> {
                     game.award_stat("killed_by", kind, 1);
                 }
             });
-            self.guest_killed_player_trigger(conn, at, killing);
-            self.as_guest(conn, |game| {
-                game.award_custom_stat("deaths", 1);
-                game.stats.reset_death_timers();
-            });
-            // ServerPlayer.die: a spectator never reaches dropAllDeathLoot.
+            // ServerPlayer.die: a spectator never reaches dropAllDeathLoot. The
+            // experience the catalyst took does not drop (`Player.skipDropExperience`),
+            // and `dropAllDeathLoot` drops it before the rose.
             if drops.is_some() {
                 // LivingEntity.dropExperience: Player.isAlwaysExperienceDropper.
                 let now = self.world.game_time;
@@ -521,6 +528,12 @@ impl Game<'_> {
                     self.spawn_orbs(at, reward as u32);
                 }
             }
+            self.guest_killed_player_trigger(conn, at, killing);
+            self.guest_award_kill_score(conn, at);
+            self.as_guest(conn, |game| {
+                game.award_custom_stat("deaths", 1);
+                game.stats.reset_death_timers();
+            });
             // `ServerPlayer.die`'s `broadcastEntityEvent`, after the message,
             // the loot and the experience: Fabric's AFTER_DEATH. The blow is
             // the one `living_death` heard, so a death it cancelled returns
@@ -774,8 +787,8 @@ impl Game<'_> {
             })
     }
 
-    /// The killing blow of a guest as `LivingDeathEvent` names it: the
-    /// damage type and the causing entity's id (0 for none).
+    /// The scalar death-tail/death-message source. `living_death` uses the
+    /// full accepted hit retained on the body instead.
     pub(super) fn guest_damage_source(&self, conn: u32) -> (String, u32) {
         let (damage_type, attacker) = match self
             .lan

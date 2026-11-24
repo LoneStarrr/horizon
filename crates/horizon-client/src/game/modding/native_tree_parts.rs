@@ -4,7 +4,7 @@ use horizon_world::registry::BlockStateId;
 use horizon_world::worldgen::mod_tree_parts::{
     ModFoliageAttachment, ModFoliagePlacer, ModFoliagePlacerType, ModTreeContext, ModTreeDecorator,
     ModTreeDecoratorType, ModTreeParts, ModTreeRandom, ModTrunkPlacer, ModTrunkPlacerType,
-    TreeAxis as EngineAxis,
+    TreeAxis as EngineAxis, install_mod_tree_parts,
 };
 use mod_api::{
     FoliageAttachment, FoliagePlacer, FoliagePlacerType, TreeAxis, TreeContext, TreeDecorator,
@@ -220,6 +220,13 @@ pub(in crate::game) fn installed_tree_parts() -> ModTreeParts {
                 )
             })
             .collect(),
+    }
+}
+
+/// Hand the tree parts the mods registered to the engine, before any world opens.
+pub(in crate::game) fn install() {
+    if install_mod_tree_parts(installed_tree_parts()).is_err() {
+        log::warn!("Mod tree parts already installed; keeping the first table");
     }
 }
 

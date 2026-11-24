@@ -94,10 +94,7 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
         &[],
         &[],
     );
-    game.world_tables = game
-        .build_world_tables(&stack, false, &root, false)
-        .unwrap()
-        .0;
+    game.world_tables = game.stage_world_tables(&stack, false, &root).unwrap().0;
     let _ = horizon_client::structure_blocks::load_thread_loot_data(
         &game.options.resources,
         &game.pack_files(),
@@ -144,7 +141,7 @@ fn give(game: &mut Game<'_>, table: &str) -> (bool, Option<String>, i32, i32, i3
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn an_inline_reference_to_a_missing_table_fails_the_parse() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -188,7 +185,7 @@ fn an_inline_reference_to_a_missing_table_fails_the_parse() {
 /// inline is refused while the pack loads, as `CommandFunction.parseCommand`.
 /// `[fail-before]` marks the assertions the pristine source fails.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn inline_references_follow_the_codec_and_the_reloaded_registry() {
     let mut resources = None;
     let mut game = game(&mut resources);

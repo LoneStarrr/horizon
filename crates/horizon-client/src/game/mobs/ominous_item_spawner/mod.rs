@@ -89,16 +89,28 @@ impl Game<'_> {
     }
     /// A saved spawner, as `readAdditionalSaveData` leaves it: its tick
     /// count starts again from 0.
-    pub(super) fn load_ominous_item_spawner(&mut self, mut tag: horizon_core::nbt::Tag) {
+    pub(super) fn load_ominous_item_spawner(&mut self, tag: horizon_core::nbt::Tag) {
+        self.load_ominous_item_spawner_transferred(tag, None);
+    }
+    pub(super) fn load_ominous_item_spawner_transferred(
+        &mut self,
+        mut tag: horizon_core::nbt::Tag,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         let Some((item, at, spawn_item_after)) =
             horizon_client::entity_nbt::ominous_item_spawner_from_nbt(&tag)
         else {
             return;
         };
+        let mut item = item;
+        self.clean_stack(&mut item);
         self.next_entity += 1;
         let id = self.next_entity;
         let saved = horizon_client::entity_nbt::uuid(&tag);
         // Its saved UUID and the attachments saved under it (#7398).
+        if let Some(state) = transferred {
+            self.adopt_transferred_entity_state(id, state);
+        }
         self.remember_uuid(id, saved, &tag);
         // Entity.load's `setXRot` keeps the pitch in -90..90 and its `setRot`
         // takes both `% 360`; the save writes the rotation back from this tag.
@@ -131,7 +143,12 @@ impl Game<'_> {
         let mut spawners = self.ominous_spawners.lift();
         #[cfg(test)]
         super::entity::taken_pass_tests::after_take(self);
+        // ServerLevel.tick: only entities in entity-ticking chunks tick.
+        let ticking = self.entity_ticking_area();
         spawners.retain_mut(|s| {
+            if !ticking(s.position[0].floor() as i32, s.position[2].floor() as i32) {
+                return true;
+            }
             s.tick_count += 1;
             let at = block(s.position);
             let center = at.map(|v| f64::from(v) + 0.5);
@@ -146,7 +163,7 @@ impl Game<'_> {
             }
             if s.tick_count >= s.spawn_item_after {
                 self.spawn_ominous_item(s);
-                return false;
+                return self.forget_finished_spawner(s.id);
             }
             if self.world.game_time % 5 == 0 {
                 self.ominous_spawner_particles(s.position);
@@ -267,3 +284,31 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod warning_tests;
+
+#[cfg(test)]
+mod saved_item_tests {
+    use crate::game::game_tests::tests::server_game;
+    use horizon_client::items::ItemStack;
+
+    /// A saved spawner's item is taken in against the world's item prototypes, so
+    /// the item it spawns stacks with the player's.
+    #[test]
+    #[ignore = "daily"]
+    fn a_saved_spawners_item_is_the_worlds_stack() {
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        game.build_registries();
+        let tag = horizon_core::nbt::parse_snbt(concat!(
+            r#"{id:"minecraft:ominous_item_spawner",Pos:[0.5d,70d,0.5d],spawn_item_after_ticks:60L,"#,
+            r#"item:{id:"minecraft:iron_ore",count:3,components:{"minecraft:max_stack_size":64}}}"#
+        ))
+        .unwrap()
+        .0;
+        game.load_ominous_item_spawner(tag);
+        let item = (&game.ominous_spawners)
+            .into_iter()
+            .last()
+            .map(|s| s.item.clone());
+        assert_eq!(item, Some(ItemStack::new("minecraft:iron_ore", 3)));
+    }
+}

@@ -1,5 +1,5 @@
 //! Real wasm capability providers within and across dependency groups.
-// Generated fixtures exercise every shape; TODO(#2273): make the generator emit clippy-clean code.
+// Generated fixtures exercise every shape; TODO(arismoko/horizon#2273): make the generator emit clippy-clean code.
 #![allow(clippy::all, unused_comparisons, unreachable_patterns, dead_code)]
 #[path = "support/no_hooks.rs"]
 mod no_hooks;
@@ -89,7 +89,7 @@ fn capability_is_answered_only_within_its_group() {
                 mod_api::PackageKind::Code,
                 mod_api::Side::Both,
                 vec![manifest.id.clone()],
-                manifest.dependencies.keys().cloned().collect(),
+                Vec::new(),
             ));
             horizon_mod_wasm::WasmPackage {
                 manifest,

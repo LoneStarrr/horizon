@@ -39,6 +39,78 @@ impl Game<'_> {
         Some(horizon_client::lang::code())
     }
 
+    /// `PlayerInfo.getLatency` of the local player in milliseconds, 0 before the server's first
+    /// measurement; None outside a logged-in client world or before the server lists the player.
+    pub(super) fn native_client_latency(&self) -> Option<u32> {
+        self.native_session()?;
+        let latency = self.own_latency()?;
+        Some(u32::try_from(latency).unwrap_or(0))
+    }
+
+    /// The player list as the Tab overlay draws it ([`tab_list`]); None outside a logged-in
+    /// client world.
+    pub(super) fn native_client_tab_list(&self) -> Option<mod_api::ClientTabList> {
+        let remote = self.native_session()?;
+        Some(tab_list(
+            &remote.listed_tab_players(),
+            &self.score.board,
+            self.tab_list.header.as_ref(),
+            self.tab_list.footer.as_ref(),
+        ))
+    }
+
+    /// The locator bar's tracked waypoints ([`waypoints`]); None outside a logged-in
+    /// client world.
+    pub(super) fn native_client_waypoints(&self) -> Option<mod_api::ClientWaypoints> {
+        self.native_session()?;
+        Some(waypoints(&self.waypoints))
+    }
+
+    /// The local player's item use (`isUsingItem`, `getUsedItemHand`, `getTicksUsingItem`,
+    /// `getUseItemRemainingTicks`); None when no item is in use or outside a logged-in client
+    /// world.
+    pub(in crate::game) fn local_item_use(&self) -> Option<mod_api::ItemUse> {
+        self.native_session()?;
+        let (_, ticks) = self.using?;
+        let ticks_used = i32::try_from(ticks).unwrap_or(i32::MAX);
+        let hand = match self.used_hand()? {
+            horizon_client::first_person::Hand::Main => mod_api::Hand::Main,
+            horizon_client::first_person::Hand::Off => mod_api::Hand::Off,
+        };
+        Some(mod_api::ItemUse::new(
+            hand,
+            ticks_used,
+            self.use_duration.saturating_sub(ticks_used),
+        ))
+    }
+
+    /// `setYRot` / `setXRot` of the local player by a client mod: yaw as given, pitch `% 360`
+    /// clamped to -90..90, the previous angles moved by as much (`Entity.turn`). Sends nothing:
+    /// the tick's player sync (`remote_send_state`) carries the look.
+    pub(in crate::game) fn set_local_rotation(
+        &mut self,
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<(), mod_api::LocalRotationError> {
+        if self.native_session().is_none() || self.player.is_none() {
+            return Err(mod_api::LocalRotationError::NoWorld);
+        }
+        if !(yaw.is_finite() && pitch.is_finite()) {
+            return Err(mod_api::LocalRotationError::NotFinite);
+        }
+        let pitch = (pitch % 360.0).clamp(-90.0, 90.0);
+        let (turned_yaw, turned_pitch) = (yaw - self.yaw, pitch - self.pitch);
+        self.rope_rot_old.0 += turned_yaw;
+        self.rope_rot_old.1 += turned_pitch;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        if let Some(model) = self.player_model.as_mut() {
+            model.previous_head_pitch += turned_pitch;
+            model.head_pitch = pitch;
+        }
+        Ok(())
+    }
+
     /// Existing local frame counters; None outside a logged-in client world.
     /// This read collects no history and sends nothing anywhere.
     pub(super) fn native_client_frame_stats(&self) -> Option<ClientFrameStats> {
@@ -84,10 +156,238 @@ impl Game<'_> {
     }
 }
 
+/// `PlayerTabOverlay`'s list: the overlay's own order and cap (`tab_list::sorted_players`) and
+/// names (`tab_list::name_for_display`), so the read cannot drift from what is drawn.
+fn tab_list(
+    players: &[horizon_client::tab_list::TabPlayer],
+    board: &horizon_client::scoreboard::Scoreboard,
+    header: Option<&horizon_client::text::Text>,
+    footer: Option<&horizon_client::text::Text>,
+) -> mod_api::ClientTabList {
+    use super::api_values::TryIntoApi;
+    use horizon_client::tab_list::{name_for_display, sorted_players};
+    // A text too deep for the API reads as its plain words rather than dropping the entry.
+    let text = |text: &horizon_client::text::Text| {
+        text.try_into_api()
+            .unwrap_or_else(|_| mod_api::Text::literal(text.plain()))
+    };
+    let entries = sorted_players(players, board)
+        .into_iter()
+        .map(|p| {
+            mod_api::ClientTabListEntry::new(
+                p.name.clone(),
+                p.uuid,
+                // `GameType.byId`: an id it lacks is survival.
+                mod_api::GameMode::from_id(p.game_mode).unwrap_or(mod_api::GameMode::Survival),
+                p.latency,
+                text(&name_for_display(p, board)),
+            )
+        })
+        .collect();
+    mod_api::ClientTabList::new(entries, header.map(text), footer.map(text))
+}
+/// `ClientWaypointManager`'s table: the tracked waypoints in the order the server sent them,
+/// so the read cannot drift from what the bar holds.
+fn waypoints(waypoints: &horizon_client::locator_bar::ClientWaypoints) -> mod_api::ClientWaypoints {
+    use horizon_protocol::packets::play::{WaypointId, WaypointTarget};
+    let entries = waypoints
+        .entries()
+        .iter()
+        .map(|w| {
+            let id = match &w.id {
+                WaypointId::Uuid(uuid) => mod_api::ClientWaypointId::Uuid(*uuid),
+                WaypointId::Name(name) => mod_api::ClientWaypointId::Name(name.clone()),
+            };
+            let target = match w.target {
+                WaypointTarget::Empty => mod_api::ClientWaypointTarget::Empty,
+                WaypointTarget::Block([x, y, z]) => {
+                    mod_api::ClientWaypointTarget::Block(mod_api::BlockPos::new(x, y, z))
+                }
+                WaypointTarget::Chunk([x, z]) => mod_api::ClientWaypointTarget::Chunk([x, z]),
+                WaypointTarget::Azimuth(angle) => mod_api::ClientWaypointTarget::Azimuth(angle),
+            };
+            // `Ident::read` validates the style on the wire, so a server-sent style always
+            // parses; keep the entry on the default style rather than dropping it.
+            let style = mod_api::Identifier::parse(&w.style).unwrap_or_else(|_| {
+                mod_api::Identifier::parse("minecraft:default")
+                    .expect("the default waypoint style is a valid identifier")
+            });
+            mod_api::ClientWaypointEntry::new(
+                id,
+                target,
+                style,
+                // The packet stores the colour as ARGB; the API takes RGB, as
+                // `living_set_waypoint_color` does.
+                w.color.map(|c| (c as u32) & 0x00FF_FFFF),
+            )
+        })
+        .collect();
+    mod_api::ClientWaypoints::new(entries)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::native_entity_refs::tests::with_client_game;
     use super::*;
+
+    /// The Tab overlay's names, order, cap, header and footer, as `client_tab_list` reads them.
+    #[test]
+    fn the_tab_list_reads_as_the_overlay_draws_it() {
+        use horizon_client::{
+            scoreboard::Scoreboard, tab_list::TabPlayer, text::Text as EngineText,
+        };
+        let mut board = Scoreboard::default();
+        let team = board.add_team("red");
+        team.prefix = serde_json::json!("[R] ");
+        team.suffix = serde_json::json!(" *");
+        board.add_to_team("Alex", "red");
+        let mut named = TabPlayer::new(1, "Steve");
+        named.display_name = Some(serde_json::json!({"text": "Captain"}));
+        named.latency = 42;
+        let teamed = TabPlayer::new(2, "Alex");
+        let mut watcher = TabPlayer::new(3, "Bob");
+        watcher.game_mode = 3;
+        let mut first = TabPlayer::new(4, "Zed");
+        first.list_order = 5;
+        let header = EngineText::literal("Welcome");
+        let list = tab_list(
+            &[watcher, named, teamed, first],
+            &board,
+            Some(&header),
+            None,
+        );
+        let names: Vec<_> = list.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Zed", "Steve", "Alex", "Bob"],
+            "list order, then spectators last"
+        );
+        fn plain(text: &mod_api::Text) -> String {
+            let own = match &text.content {
+                mod_api::text::TextContent::Literal(words) => words.as_str(),
+                _ => "",
+            };
+            text.children
+                .iter()
+                .map(plain)
+                .fold(own.to_owned(), |all, c| all + &c)
+        }
+        assert_eq!(plain(&list.entries[1].display), "Captain");
+        assert_eq!(list.entries[1].latency, 42);
+        assert_eq!(list.entries[1].uuid, 1);
+        assert_eq!(plain(&list.entries[2].display), "[R] Alex *");
+        assert_eq!(list.entries[3].game_mode, mod_api::GameMode::Spectator);
+        assert_eq!(list.entries[0].game_mode, mod_api::GameMode::Survival);
+        assert_eq!(list.header.as_ref().map(plain).as_deref(), Some("Welcome"));
+        assert_eq!(list.footer, None);
+        let crowd: Vec<_> = (0..100)
+            .map(|i| TabPlayer::new(i, format!("p{i:03}")))
+            .collect();
+        let list = tab_list(&crowd, &board, None, None);
+        assert_eq!(list.entries.len(), 80, "the overlay draws 80");
+        assert_eq!(list.entries[0].name, "p000");
+        assert_eq!(list.entries[79].name, "p079");
+        assert_eq!(list.header, None);
+        let mut overlay = horizon_client::tab_list::TabList::default();
+        overlay.header = Some(EngineText::literal("Header"));
+        overlay.footer = Some(EngineText::literal("Footer"));
+        let set = tab_list(
+            &[],
+            &board,
+            overlay.header.as_ref(),
+            overlay.footer.as_ref(),
+        );
+        assert_eq!(set.header.as_ref().map(plain).as_deref(), Some("Header"));
+        assert_eq!(set.footer.as_ref().map(plain).as_deref(), Some("Footer"));
+        overlay.reset();
+        let cleared = tab_list(
+            &[],
+            &board,
+            overlay.header.as_ref(),
+            overlay.footer.as_ref(),
+        );
+        assert_eq!(cleared.header, None);
+        assert_eq!(cleared.footer, None);
+    }
+    /// The waypoint table as `client_waypoints` reads it: every tracked entry, in sent order.
+    #[test]
+    fn the_waypoints_read_as_the_bar_holds_them() {
+        use horizon_client::locator_bar::ClientWaypoints;
+        use horizon_protocol::packets::play::{
+            TrackedWaypoint, WaypointId, WaypointTarget, waypoint_operation,
+        };
+        let tracked = |id, style: &str, color, target| TrackedWaypoint {
+            operation: waypoint_operation::TRACK,
+            id,
+            style: style.into(),
+            color,
+            target,
+        };
+        let mut table = ClientWaypoints::default();
+        table.apply(&tracked(
+            WaypointId::Uuid(7),
+            "minecraft:default",
+            Some(0xFF10_2030u32 as i32),
+            WaypointTarget::Block([4, 5, 6]),
+        ));
+        table.apply(&tracked(
+            WaypointId::Name("home".into()),
+            "minecraft:default",
+            None,
+            WaypointTarget::Azimuth(0.5),
+        ));
+        table.apply(&tracked(
+            WaypointId::Uuid(9),
+            "minecraft:default",
+            Some(0xFF00_FF00u32 as i32),
+            WaypointTarget::Chunk([3, -2]),
+        ));
+        let list = waypoints(&table);
+        assert_eq!(
+            list.entries.len(),
+            3,
+            "every tracked waypoint, in sent order"
+        );
+        let first = &list.entries[0];
+        assert_eq!(first.id, mod_api::ClientWaypointId::Uuid(7));
+        assert_eq!(
+            first.target,
+            mod_api::ClientWaypointTarget::Block(mod_api::BlockPos::new(4, 5, 6))
+        );
+        assert_eq!(first.style.to_string(), "minecraft:default");
+        assert_eq!(
+            first.color,
+            Some(0x10_2030),
+            "ARGB on the wire reads as RGB"
+        );
+        assert_eq!(
+            list.entries[1].id,
+            mod_api::ClientWaypointId::Name("home".into())
+        );
+        assert_eq!(
+            list.entries[1].target,
+            mod_api::ClientWaypointTarget::Azimuth(0.5)
+        );
+        assert_eq!(list.entries[1].color, None, "no colour sent stays none");
+        assert_eq!(
+            list.entries[2].target,
+            mod_api::ClientWaypointTarget::Chunk([3, -2])
+        );
+        // Untracking drops the entry; the read follows the table.
+        table.apply(&TrackedWaypoint {
+            operation: waypoint_operation::UNTRACK,
+            id: WaypointId::Uuid(9),
+            style: "minecraft:default".into(),
+            color: None,
+            target: WaypointTarget::Empty,
+        });
+        let list = waypoints(&table);
+        assert_eq!(list.entries.len(), 2, "untracked waypoints leave the table");
+        assert_eq!(
+            list.entries[1].id,
+            mod_api::ClientWaypointId::Name("home".into())
+        );
+    }
 
     pub(in crate::game) fn logged_client(
         game: &mut Game<'_>,
@@ -102,7 +402,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn client_session_reads_follow_connection_language_and_frame_state() {
         with_client_game(|game| {
             assert_eq!(game.client_session().client_server(), None);
@@ -205,7 +505,46 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn latency_and_item_use_read_the_local_player_as_the_client_sees_it() {
+        with_client_game(|game| {
+            assert_eq!(game.client_session().client_latency(), None);
+            assert_eq!(game.local_item_use(), None);
+            let _server = logged_client(game);
+            assert_eq!(
+                game.client_session().client_latency(),
+                None,
+                "not listed yet"
+            );
+            game.remote.as_mut().unwrap().list_self(0);
+            assert_eq!(game.client_session().client_latency(), Some(0));
+            game.remote.as_mut().unwrap().list_self(87);
+            assert_eq!(game.client_session().client_latency(), Some(87));
+
+            // A bow (use duration 72000) drawn in the main hand for 7 ticks.
+            game.using = Some((game.selected, 7));
+            game.use_duration = 72_000;
+            assert_eq!(
+                game.local_item_use(),
+                Some(mod_api::ItemUse::new(mod_api::Hand::Main, 7, 71_993))
+            );
+            game.using = Some((super::super::shield::OFFHAND_SLOT, 3));
+            assert_eq!(
+                game.local_item_use().map(|u| u.hand),
+                Some(mod_api::Hand::Off)
+            );
+            game.using = None;
+            assert_eq!(game.local_item_use(), None, "released");
+
+            game.remote.as_mut().unwrap().logged_in = false;
+            assert_eq!(game.client_session().client_latency(), None);
+            game.using = Some((game.selected, 7));
+            assert_eq!(game.local_item_use(), None, "no world");
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn local_player_status_tracks_mining_mood_and_refuses_other_handles() {
         with_client_game(|game| {
             let _server = logged_client(game);

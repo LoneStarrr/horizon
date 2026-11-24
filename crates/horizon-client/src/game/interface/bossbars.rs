@@ -9,7 +9,7 @@ use horizon_client::{
     command::{Arg, Context},
     mobs::Species,
     save,
-    scoreboard::{self as sb, Comp, json_to_tag},
+    scoreboard::{self as sb, Comp, canonical_component, json_to_tag},
     scoreboard_cmd::format_list,
     text::Text,
 };
@@ -25,6 +25,8 @@ pub(super) struct BossState {
     loaded: bool,
     /// What each viewer was last sent, so a change becomes one packet.
     sent: HashMap<u128, HashMap<u128, Offer>>,
+    /// The last custom name of the fight dragon.
+    dragon_name: Option<Tag>,
 }
 
 impl BossState {
@@ -139,6 +141,8 @@ impl Game<'_> {
     /// the progress is clamped.
     pub(in crate::game) fn set_bossbar_value(&mut self, id: &str, value: bool, v: i32) {
         if let Some(b) = self.bosses.bars.get_mut(id) {
+            // CustomBossEvent.setValue/setMax store the number verbatim and
+            // clamp only the progress derived from it.
             if value {
                 b.value = v;
             } else {
@@ -303,7 +307,8 @@ impl Game<'_> {
             "bossbar.set.name" => {
                 let name = self.component_json(ctx, "name")?;
                 let b = self.bosses.bars.get_mut(bar).expect("checked");
-                if b.name == name {
+                // BossBarCommands.setName: Component.equals, not its JSON spelling.
+                if canonical_component(&b.name) == canonical_component(&name) {
                     return Err(err("commands.bossbar.set.name.unchanged", &[]));
                 }
                 b.name = name;
@@ -468,7 +473,9 @@ impl Game<'_> {
                 if out.iter().any(|(uuid, _)| *uuid == ints) {
                     continue;
                 }
-                out.push((ints, Text::literal(g.name.clone())));
+                // `Player::getDisplayName`: the team's formatting, the
+                // `/tell` click, the entity hover and the name for shift-click.
+                out.push((ints, self.player_text(&g.name, g.uuid)));
             }
         }
         out
@@ -489,6 +496,19 @@ impl Game<'_> {
 
     // ---- ServerBossEvent delivery ------------------------------------------------
 
+    /// Mirrors the four boss-bar sources checked in [`Self::boss_events_for`]:
+    /// custom `/bossbar`s, dimensions with an Ender Dragon fight, active Overworld raids,
+    /// and live Wither mobs.
+    fn has_boss_bar_sources(&self) -> bool {
+        !self.bosses.bars.bars.is_empty()
+            || self.dimension_type().has_ender_dragon_fight
+            || (self.dim == Dim::Overworld && !self.raiding.raids.map.is_empty())
+            || self
+                .mobs
+                .iter()
+                .any(|m| !m.removed && m.alive() && m.species() == Species::Wither)
+    }
+
     /// Tell every viewer the boss events they should be seeing. The window
     /// that simulates the world applies them to its own overlay; everyone
     /// else gets `ClientboundBossEventPacket`s.
@@ -497,6 +517,10 @@ impl Game<'_> {
             return;
         }
         self.load_bossbars();
+        if !self.has_boss_bar_sources() && self.bosses.sent.is_empty() {
+            return;
+        }
+        self.update_dragon_bar_name();
         let now = boss_overlay::now_millis();
         let viewers = self.boss_viewers();
         let live: HashSet<u128> = viewers.iter().map(|v| v.uuid).collect();
@@ -522,8 +546,31 @@ impl Game<'_> {
             host.hub.send_to(*conn, packet);
         }
     }
+    /// `EnderDragonFight.updateDragon`: the fight's dragon's custom name
+    /// becomes the bar's, and stays after the name is removed.
+    fn update_dragon_bar_name(&mut self) {
+        // `EnderDragon.aiStep` calls `updateDragon` only while it has AI (and
+        // is alive); `kill`/`tickDeath` call it too, so a dead dragon updates.
+        let ticks = self.dragon.as_ref().is_some_and(|d| !d.alive() || !d.no_ai);
+        if !ticks || !self.is_fight_dragon() {
+            return;
+        }
+        let custom = self
+            .dragon
+            .as_ref()
+            .filter(|d| d.id != 0)
+            .and_then(|d| self.persist_raw(d.id))
+            .and_then(|raw| raw.get("CustomName"))
+            .cloned();
+        if let Some(custom) = custom {
+            self.bosses.dragon_name = Some(json_to_tag(
+                &horizon_client::entity_nbt::name_text(&custom).component(),
+            ));
+        }
+    }
     fn boss_viewers(&self) -> Vec<Viewer> {
-        let mut out = Vec::new();
+        let mut out =
+            Vec::with_capacity(1 + self.lan.as_ref().map_or(0, |host| host.hub.guests.len()));
         // While `as_guest` has swapped a guest in, the host's own position
         // is not in place. Their overlay updates once the tick puts it back.
         let local =
@@ -590,7 +637,11 @@ impl Game<'_> {
         {
             out.push(Offer {
                 id: bossbar::stable_uuid("minecraft:ender_dragon"),
-                name: translate_tag("entity.minecraft.ender_dragon"),
+                name: self
+                    .bosses
+                    .dragon_name
+                    .clone()
+                    .unwrap_or_else(|| translate_tag("entity.minecraft.ender_dragon")),
                 progress,
                 color: 0,
                 overlay: 0,
@@ -636,34 +687,37 @@ impl Game<'_> {
                 });
             }
         }
-        if viewer.here
-            && let Some((id, name, progress)) = self.raid_boss_at(viewer.at, viewer.alive)
-        {
-            out.push(Offer {
-                id: bossbar::stable_uuid(&format!("raid:{id}")),
-                name,
-                progress,
-                color: 2,
-                overlay: 2,
-                darken: false,
-                music: false,
-                fog: false,
-                scope: Scope::Level(self.dim),
-            });
+        if viewer.here {
+            for (id, name, progress) in self.raid_bars_at(viewer.uuid) {
+                out.push(Offer {
+                    id: bossbar::stable_uuid(&format!("raid:{id}")),
+                    name,
+                    progress,
+                    color: 2,
+                    overlay: 2,
+                    darken: false,
+                    music: false,
+                    fog: false,
+                    scope: Scope::Level(self.dim),
+                });
+            }
         }
         out
     }
     /// The packets that take `viewer` from what it was last sent to `desired`
     /// (`ServerBossEvent`'s broadcasts).
     fn diff_boss_events(&mut self, viewer: &Viewer, desired: Vec<Offer>) -> Vec<play::BossEvent> {
-        let full = viewer.local;
-        let dim = self.dim;
+        if desired.is_empty() && !self.bosses.sent.contains_key(&viewer.uuid) {
+            return Vec::new();
+        }
         let sent = self.bosses.sent.entry(viewer.uuid).or_default();
         let mut out = Vec::new();
         let event = |id, action| play::BossEvent { id, action };
-        sent.retain(|id, prev| {
-            let owned = full || prev.scope == Scope::Global || prev.scope == Scope::Level(dim);
-            let keep = !owned || desired.iter().any(|e| e.id == *id);
+        // Every offer in this Game's `sent` map was issued by this Game;
+        // `sent` survives a level swap, so a level-scoped bar whose level is
+        // no longer current must still be removed, not silently kept.
+        sent.retain(|id, _| {
+            let keep = desired.iter().any(|e| e.id == *id);
             if !keep {
                 out.push(event(*id, BossAction::Remove));
             }
@@ -707,6 +761,10 @@ impl Game<'_> {
                 ));
             }
             sent.insert(id, offer);
+        }
+        let empty = sent.is_empty();
+        if empty {
+            self.bosses.sent.remove(&viewer.uuid);
         }
         out
     }
@@ -758,6 +816,8 @@ struct Offer {
     darken: bool,
     music: bool,
     fog: bool,
+    /// Kept for the offer's recorded scope; removal no longer keys on it.
+    #[allow(dead_code)]
     scope: Scope,
 }
 
@@ -782,6 +842,7 @@ pub(super) mod audience_tests {
             max_players: 20,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         };
         game.lan_host(
             super::super::lan::LanSettings {
@@ -828,7 +889,7 @@ pub(super) mod audience_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fake_players_are_not_boss_viewers() {
         super::super::native_entity_refs::tests::with_game(|game| {
             add_real_and_fake(game);
@@ -841,7 +902,79 @@ pub(super) mod audience_tests {
             assert!(!viewers.iter().any(|v| v.uuid == 2));
         });
     }
+
+    #[test]
+    #[ignore = "daily"]
+    fn non_end_dimension_with_dragon_fight_does_not_skip_boss_bars() {
+        use horizon_core::LevelKey;
+        use horizon_world::dimension_type::DimensionFacts;
+
+        crate::game::in_own_process(
+            "game::bossbars::audience_tests::non_end_dimension_with_dragon_fight_does_not_skip_boss_bars",
+            || {
+                struct ResetLevelFacts;
+                impl Drop for ResetLevelFacts {
+                    fn drop(&mut self) {
+                        DimensionFacts::set_levels(Vec::new());
+                    }
+                }
+
+                super::super::native_entity_refs::tests::with_game(|game| {
+                    assert_eq!(game.dim, super::Dim::Overworld);
+                    assert!(!game.dimension_type().has_ender_dragon_fight);
+                    assert!(!game.has_boss_bar_sources());
+
+                    let _guard = ResetLevelFacts;
+                    let mut own = DimensionFacts::overworld().clone();
+                    own.has_ender_dragon_fight = true;
+                    DimensionFacts::set_levels(vec![(LevelKey::OVERWORLD, own)]);
+                    assert!(game.dimension_type().has_ender_dragon_fight);
+                    assert!(game.has_boss_bar_sources());
+                });
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn removing_all_boss_bars_prunes_sent_entries_and_reenables_skip() {
+        use horizon_client::{boss_overlay, motion::PlayerMotion, scoreboard as sb};
+        use horizon_core::geometry::Vec3;
+
+        super::super::native_entity_refs::tests::with_game(|game| {
+            game.player =
+                Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            game.load_bossbars();
+            assert!(!game.has_boss_bar_sources());
+            assert!(game.bosses.sent.is_empty());
+
+            assert!(game.bosses.add_bar("test:skip_reset", sb::literal("Test")));
+            let ints = game.level.player_uuid.unwrap_or_else(|| game.acting_uuid());
+            game.bosses
+                .bars
+                .get_mut("test:skip_reset")
+                .unwrap()
+                .players
+                .push(ints);
+            game.publish_boss_bars();
+            assert!(!game.bosses.sent.is_empty());
+            assert!(!game.boss_overlay.bars(boss_overlay::now_millis()).is_empty());
+
+            game.bosses.remove_bar("test:skip_reset");
+            game.publish_boss_bars();
+            assert!(!game.has_boss_bar_sources());
+            assert!(
+                game.bosses.sent.is_empty(),
+                "empty viewer maps must be pruned so publish_boss_bars can skip again"
+            );
+            assert!(game.boss_overlay.bars(boss_overlay::now_millis()).is_empty());
+        });
+    }
 }
+
+#[cfg(test)]
+#[path = "tests/bossbar_names_tests.rs"]
+mod bossbar_names_tests;
 
 #[cfg(test)]
 mod listing_tests {
@@ -901,3 +1034,7 @@ mod listing_tests {
         assert_eq!(ids(&state), ["audit:second", "audit:test"]);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/bossbar_store_tests.rs"]
+mod bossbar_store_tests;

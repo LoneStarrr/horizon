@@ -83,10 +83,10 @@ fn shown(
     let frame = hdr.frame(device, SIZE);
     let mut encoder = device.create_command_encoder(&Default::default());
     paint(&mut encoder, &frame);
-    hdr.keep_world(&mut encoder, None);
+    hdr.hud_backdrop(&mut encoder, None);
     super::super::hud_coverage::clear(&mut encoder, &hdr.coverage_view().unwrap());
     let image = if screenshot {
-        hdr.capture(device, queue, &mut encoder, true).unwrap()
+        hdr.capture(device, queue, &mut encoder).unwrap()
     } else {
         let image = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -98,7 +98,7 @@ fn shown(
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        hdr.present(queue, &mut encoder, &image, true, None);
+        hdr.present(queue, &mut encoder, &image, None);
         image
     };
     let row = SIZE[0] * image.format().block_copy_size(None).unwrap();
@@ -166,6 +166,7 @@ fn rows_are_flat(bytes: &[u8]) -> bool {
 
 #[test]
 fn a_slow_gradient_gets_grain_instead_of_bands_on_hdr10() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = gpu() else {
         return;
     };
@@ -232,6 +233,7 @@ fn a_slow_gradient_gets_grain_instead_of_bands_on_hdr10() {
 
 #[test]
 fn hdr10s_dither_keeps_both_ends_exact_and_leans_to_them_in_their_last_code() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = gpu() else {
         return;
     };
@@ -302,6 +304,7 @@ fn hdr10s_dither_keeps_both_ends_exact_and_leans_to_them_in_their_last_code() {
 
 #[test]
 fn scrgb_and_screenshots_get_no_dither() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = gpu() else {
         return;
     };

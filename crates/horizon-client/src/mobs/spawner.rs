@@ -292,7 +292,7 @@ pub trait SpawnerExt: Sized {
         l: &L,
         random: &mut R,
         pos: [i32; 3],
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<SpawnerAdded>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<SpawnerAdded>,
         events: &mut Vec<SpawnerEvent>,
     );
     /// `clientTick`: with a player near and a mob to show, a smoke and flame
@@ -464,7 +464,7 @@ impl SpawnerExt for Spawner {
         l: &L,
         random: &mut R,
         pos: [i32; 3],
-        spawn: &mut dyn FnMut(&L, &SpawnerSpawn, &mut R) -> Option<SpawnerAdded>,
+        spawn: &mut dyn FnMut(&L, &mut R, &SpawnerSpawn) -> Option<SpawnerAdded>,
         events: &mut Vec<SpawnerEvent>,
     ) {
         if !self.near_player(l, pos) || !l.spawner_blocks_work() {
@@ -603,7 +603,7 @@ impl SpawnerExt for Spawner {
                 equipment: data.equipment.as_ref(),
                 trial: false,
             };
-            let Some(result) = spawn(l, &request, random) else {
+            let Some(result) = spawn(l, random, &request) else {
                 self.delay(random, events);
                 return;
             };
@@ -712,7 +712,9 @@ pub fn entity_position(s: Species, at: [f64; 3]) -> [f64; 3] {
     }
 }
 
-/// `Vec3.CODEC`: a list of three doubles.
+/// `Vec3.CODEC`: a list of three doubles. A spawner's saved `Pos` is a spawn
+/// spot, not a loaded entity: vanilla snaps the spawn to it verbatim
+/// (`BaseSpawner.spawn`), so it stays raw here.
 pub(crate) fn read_pos(tag: Option<&Tag>) -> Option<[f64; 3]> {
     let Tag::List(v) = tag? else {
         return None;

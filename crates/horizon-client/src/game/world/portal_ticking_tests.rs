@@ -11,7 +11,7 @@ use horizon_core::geometry::Vec3;
 use std::sync::Arc;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn mobs_past_the_simulation_distance_neither_enter_portals_nor_cool_down() {
     with_game(|game| {
         game.world
@@ -39,6 +39,7 @@ fn mobs_past_the_simulation_distance_neither_enter_portals_nor_cool_down() {
             game.world
                 .chunks
                 .insert((cx, 0), Arc::new(Chunk::empty(cx, 0)));
+            game.load_ticking_neighbourhood(cx, 0);
             for z in [8, 12] {
                 game.world.set(x, 63, z, stone).unwrap();
             }

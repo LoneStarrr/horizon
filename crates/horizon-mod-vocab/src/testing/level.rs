@@ -1,6 +1,6 @@
 //! The level fake: blocks, block entities with the game's storages, and entities.
 use super::FAKE_EPOCH;
-use crate::{BlockEntityTypeKey, FluidStack, ItemStack, LevelRef, WorldEpoch};
+use crate::{BlockEntityTypeKey, FluidKey, FluidStack, ItemStack, LevelRef, WorldEpoch};
 use std::collections::{BTreeMap, HashMap};
 
 // no wire: in-process testing harness state, not a mod boundary payload.
@@ -13,7 +13,20 @@ pub struct FakeLevel {
     level: LevelRef,
     blocks: HashMap<[i32; 3], String>,
     block_entities: BTreeMap<[i32; 3], FakeBlockEntity>,
-    entities: BTreeMap<u32, FakeEntity>,
+    pub(super) entities: BTreeMap<u32, FakeEntity>,
+    /// Bucket sounds and game events queued for the outermost commit
+    /// ([`LevelRef::play_fluid_effects`](crate::LevelRef::play_fluid_effects)): kept with the
+    /// level, so an abort drops them.
+    pub(super) fluid_effects: Vec<QueuedFluidEffects>,
+}
+
+/// A bucket's sound and game event waiting for the outermost commit.
+#[derive(Clone, Debug)]
+pub(super) struct QueuedFluidEffects {
+    pub(super) at: [f64; 3],
+    pub(super) fluid: &'static str,
+    pub(super) pickup: bool,
+    pub(super) player: Option<crate::PlayerRef>,
 }
 
 impl Default for FakeLevel {
@@ -34,13 +47,17 @@ impl FakeLevel {
             blocks: HashMap::new(),
             block_entities: BTreeMap::new(),
             entities: BTreeMap::new(),
+            fluid_effects: Vec::new(),
         }
     }
     /// The handle of this level.
     pub fn level(&self) -> LevelRef {
         self.level
     }
-    /// Puts block `name` (`minecraft:stone`) at `pos`.
+    /// Puts block `name` (`minecraft:stone`) at `pos`. A block named after a resolved fluid
+    /// (`minecraft:water`) is that fluid's source, which
+    /// [`LevelRef::pickup_fluid`](crate::LevelRef::pickup_fluid) takes away and
+    /// [`LevelRef::place_fluid`](crate::LevelRef::place_fluid) puts where nothing is.
     pub fn set_block(&mut self, pos: [i32; 3], name: &str) -> &mut Self {
         self.blocks.insert(pos, name.to_owned());
         self
@@ -58,13 +75,24 @@ impl FakeLevel {
         self.block_entities.get(&pos)
     }
     /// Entity `id` of type `kind` (`minecraft:pig`) in this level, put there if missing; its
-    /// UUID is its id until set.
+    /// UUID is its id until set. After explicit entity-type resolution, an undeclared kind
+    /// panics at setup rather than silently becoming an unresolvable entity.
     pub fn entity(&mut self, id: u32, kind: &str) -> &mut FakeEntity {
         let level = self.level;
-        self.entities.entry(id).or_insert_with(|| FakeEntity {
-            kind: kind.to_owned(),
-            level,
-            uuid: u128::from(id),
+        self.entities.entry(id).or_insert_with(|| {
+            if crate::parts::installed()
+                .is_some_and(|installed| installed.resolved_entity_types.get().is_some())
+            {
+                assert!(
+                    crate::content::registry_keys::resolved_entity_type_key(kind).is_some(),
+                    "fake entity kind {kind} was not declared before entity-type resolution"
+                );
+            }
+            FakeEntity {
+                kind: kind.to_owned(),
+                level,
+                uuid: u128::from(id),
+            }
         })
     }
 
@@ -73,6 +101,32 @@ impl FakeLevel {
             .then(|| self.blocks.get(&pos))
             .flatten()
             .map(String::as_str)
+    }
+    /// The fluid source block at `pos` taken away: its fluid (never `minecraft:empty`, which has
+    /// no world form).
+    pub(super) fn take_source(&mut self, level: LevelRef, pos: [i32; 3]) -> Option<FluidKey> {
+        let id = self
+            .block_at(level, pos)
+            .filter(|id| *id != "minecraft:empty")?;
+        let fluid = crate::content::registry_keys::fluid_key(id)?;
+        self.blocks.remove(&pos);
+        Some(fluid)
+    }
+    /// A source of `fluid` put at `pos`, where no block or block entity is: whether it went.
+    pub(super) fn put_source(&mut self, level: LevelRef, pos: [i32; 3], fluid: FluidKey) -> bool {
+        let Some(id) =
+            crate::content::registry_keys::fluid_id(fluid).filter(|id| *id != "minecraft:empty")
+        else {
+            return false;
+        };
+        if level != self.level
+            || self.blocks.contains_key(&pos)
+            || self.block_entities.contains_key(&pos)
+        {
+            return false;
+        }
+        self.blocks.insert(pos, id.to_owned());
+        true
     }
     pub(super) fn standing(&self, level: LevelRef, pos: [i32; 3]) -> Option<&FakeBlockEntity> {
         (level == self.level)

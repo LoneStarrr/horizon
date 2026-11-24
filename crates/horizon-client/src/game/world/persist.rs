@@ -16,6 +16,11 @@ mod unload_sweep;
 #[cfg(test)]
 #[path = "persist/anger_tests.rs"]
 mod anger_tests;
+#[cfg(test)]
+#[path = "persist/completion_tests.rs"]
+mod completion_tests;
+#[path = "persist/passenger_graph.rs"]
+mod passenger_graph;
 #[path = "persist/hurt_by_refs.rs"]
 mod hurt_by_refs;
 #[cfg(test)]
@@ -48,9 +53,17 @@ use {
     horizon_world::{level::MovingPiston, registry::BlockStateId},
 };
 
+/// One place in a vehicle's `Passengers` list: a live object ID (possibly
+/// refused level residency), or a compound retained without a live object.
+#[derive(Clone, Debug)]
+pub(super) enum PassengerSlot {
+    Live(u32),
+    Saved(Tag),
+}
+
 /// An entity object retained by passenger links but refused level residency.
 /// Queries and tracking never visit this store; internal topology and saving do.
-/// A boat or minecart is only ever a root here: mobs are the only modeled riders.
+/// Boats and minecarts can also be retained as refused transferred riders.
 pub(super) enum OffLevel {
     Mob(Mob),
     Boat(super::boats::Boat),
@@ -181,6 +194,10 @@ pub struct EntityMemory {
     /// Full rejected passenger objects, not resident entities or frozen NBT copies.
     /// Kept with the level while any live object graph still refers to them.
     pub(super) off_level: HashMap<u32, OffLevel>,
+    /// Passengers that ride a vehicle, in load order: live entity IDs or unspawned tags.
+    /// (`passenger_graph.rs`; mob riders also keep `extra.mount`, which stays authoritative
+    /// for the mob objects above.)
+    pub(super) passenger_slots: HashMap<u32, Vec<PassengerSlot>>,
     /// Removed boat/cart objects are never part of level residency.
     pub(super) removed_vehicles: HashMap<u32, RemovedVehicle>,
     /// Destruction callbacks already consumed for geometry retained after removal.
@@ -193,7 +210,14 @@ pub struct EntityMemory {
     pub(super) destroying_vehicles: HashSet<super::commands::Target>,
     /// Synched entity-data entries dirtied by forced writes since the last sync.
     pub(super) forced_meta: HashMap<u32, [u64; 4]>,
-    /// Passengers that ride a vehicle, in load order: live entity IDs or unspawned tags.
+    /// `Entity.noPhysics` a native mod wrote for a kind whose own struct keeps
+    /// no field for it (the dragon, an area-effect cloud, an ominous item
+    /// spawner, a shulker bullet): the value replaces the kind's constructor
+    /// default and is never saved.
+    pub(super) no_physics: HashMap<u32, bool>,
+    /// The entities a mod kept out of the saves (`entity_set_saved`), by id;
+    /// forgotten with the entity.
+    pub(super) unsaved: HashSet<u32>,
     /// Entities of types Horizon does not simulate, kept per chunk and
     /// written back unchanged.
     unknown: HashMap<(i32, i32), Vec<Tag>>,
@@ -233,21 +257,25 @@ impl EntityMemory {
         if let Some(forced) = self.forced_meta.remove(&id) {
             destination.forced_meta.insert(id, forced);
         }
+        if let Some(slots) = self.passenger_slots.remove(&id) {
+            destination.passenger_slots.insert(id, slots);
+        }
         if self.score_destroyed.remove(&id) {
             destination.score_destroyed.insert(id);
         }
     }
 }
 
-/// Runtime ownership paired with the serialized tree out of band. UUIDs are
-/// admission identities, not keys for matching these distinct object states.
+/// Runtime ownership paired with serialized nodes by one object walk. UUIDs
+/// are admission identities, never keys for matching distinct object states.
 #[derive(Debug)]
 pub(super) struct TransferredVehicleTree {
     source_id: u32,
     kind: VehicleTreeKind,
     name: String,
     state: super::entity_initialization::TransferredEntityState,
-    passengers: Vec<TransferredVehicleTree>,
+    /// `None` is an unspawned saved slot, at exactly the same NBT child index.
+    passengers: Vec<Option<TransferredVehicleTree>>,
 }
 
 pub(super) struct RestoredVehicleTree {
@@ -260,6 +288,7 @@ enum VehicleTreeKind {
     Mob,
     Boat,
     Cart,
+    Other,
 }
 
 /// The boundary has paired each modeled NBT node with exactly one captured
@@ -270,7 +299,12 @@ struct PreparedVehicleTransfer {
     kind: VehicleTreeKind,
     name: String,
     state: super::entity_initialization::TransferredEntityState,
-    passengers: Vec<PreparedVehicleTransfer>,
+    passengers: Vec<PreparedVehiclePassenger>,
+}
+
+enum PreparedVehiclePassenger {
+    Object(PreparedVehicleTransfer),
+    Saved(Tag),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -388,7 +422,11 @@ pub(super) fn with_raw(mut modelled: Tag, raw: Option<&Tag>) -> Tag {
 fn read_attachments(
     tag: &Tag,
     id: u32,
-    maps: &mut HashMap<u32, horizon_mod_runtime::attachments::Attachments>,
+    maps: &mut HashMap<
+        u32,
+        horizon_mod_runtime::attachments::Attachments,
+        impl std::hash::BuildHasher,
+    >,
     live: bool,
 ) {
     if let Ok(Some(data)) = attachment_compound(tag.get(ATTACHMENTS_KEY)) {
@@ -410,7 +448,7 @@ fn read_attachments(
 pub(super) fn write_attachments(
     tag: &mut Tag,
     id: u32,
-    maps: &HashMap<u32, horizon_mod_runtime::attachments::Attachments>,
+    maps: &HashMap<u32, horizon_mod_runtime::attachments::Attachments, impl std::hash::BuildHasher>,
 ) {
     if let Tag::Compound(root) = tag
         && let Some(map) = maps.get(&id)
@@ -627,7 +665,7 @@ impl Game<'_> {
         }
         extras.last_update = time;
         // PistonMovingBlockEntity.saveAdditional: a block caught mid-move is
-        // saved with its chunk (#3310).
+        // saved with its chunk (arismoko/horizon#3310).
         for (p, piston) in &self.block_ticks.moving_pistons {
             if (p.x >> 4, p.z >> 4) != (chunk.x, chunk.z) {
                 continue;
@@ -711,16 +749,18 @@ impl Game<'_> {
             self.tick_chunks.wait(key);
         }
         // The saved list is consumed: later saves take the scheduler's ticks.
-        if loaded && let Some(c) = self.world.chunks.get_mut(&key) {
-            let c = Arc::make_mut(c);
-            if let Some(s) = c.saved.as_mut() {
-                let s = Arc::make_mut(s);
-                s.block_ticks.clear();
-                s.fluid_ticks.clear();
-            }
+        if loaded {
+            self.world.chunks.mutate_chunk(key, |c| {
+                let c = Arc::make_mut(c);
+                if let Some(s) = c.saved.as_mut() {
+                    let s = Arc::make_mut(s);
+                    s.block_ticks.clear();
+                    s.fluid_ticks.clear();
+                }
+            });
         }
         // PistonMovingBlockEntity.loadAdditional: blocks saved mid-move carry
-        // on moving; later saves take them from the level (#3310).
+        // on moving; later saves take them from the level (arismoko/horizon#3310).
         let pistons: Vec<_> = saved.as_deref().map_or_else(Vec::new, |s| {
             s.block_entities
                 .iter()
@@ -733,7 +773,7 @@ impl Game<'_> {
         for &(pos, piston) in &pistons {
             self.restore_moving_piston(pos, piston, saved.as_deref());
         }
-        if let Some(c) = self.world.chunks.get_mut(&key) {
+        self.world.chunks.mutate_chunk(key, |c| {
             let c = Arc::make_mut(c);
             if let Some(s) = c.saved.as_mut() {
                 Arc::make_mut(s).block_entities.retain(|tag| {
@@ -741,23 +781,7 @@ impl Game<'_> {
                     !pistons.iter().any(|(p, _)| [p.x, p.y, p.z] == at)
                 });
             }
-        }
-    }
-    /// `PistonMovingBlockEntity.saveAdditional`.
-    pub(super) fn moving_piston_to_nbt(&self, pos: BlockPos, piston: &MovingPiston) -> Tag {
-        let flag = |b: bool| Tag::Byte(i8::from(b));
-        Tag::compound([
-            ("id", Tag::String("minecraft:piston".into())),
-            ("x", Tag::Int(pos.x)),
-            ("y", Tag::Int(pos.y)),
-            ("z", Tag::Int(pos.z)),
-            ("blockState", self.state_to_nbt(piston.moved_state)),
-            // Direction.LEGACY_ID_CODEC: the 3D data value as a byte.
-            ("facing", Tag::Byte(piston.direction as i8)),
-            ("progress", Tag::Float(piston.progress_o.to_bits())),
-            ("extending", flag(piston.extending)),
-            ("source", flag(piston.source)),
-        ])
+        });
     }
     /// `PistonMovingBlockEntity.loadAdditional`, for a `minecraft:piston`
     /// entity whose block is still a moving piston.
@@ -798,19 +822,34 @@ impl Game<'_> {
     }
     /// The kinds `entity_lists!` does not hold: `Err` hands the compound back
     /// when `kind` is not one of them.
-    fn load_unlisted(
+    pub(super) fn load_unlisted(
         &mut self,
         key: ChunkKey,
         kind: &str,
         uuid: Option<[i32; 4]>,
         tag: Tag,
     ) -> std::result::Result<(), Tag> {
+        self.load_unlisted_transferred(key, kind, uuid, tag, &mut None)
+    }
+    pub(super) fn load_unlisted_transferred(
+        &mut self,
+        key: ChunkKey,
+        kind: &str,
+        uuid: Option<[i32; 4]>,
+        tag: Tag,
+        transferred: &mut Option<super::entity_initialization::TransferredEntityState>,
+    ) -> std::result::Result<(), Tag> {
         if !UNLISTED_KINDS.contains(&kind) {
             return Err(tag);
         }
         match kind {
             "minecraft:area_effect_cloud" => {
-                if let Some(id) = self.load_potion_cloud(&tag) {
+                let id = if let Some(state) = transferred.take() {
+                    self.load_potion_cloud_transferred(&tag, Some(state))
+                } else {
+                    self.load_potion_cloud(&tag)
+                };
+                if let Some(id) = id {
                     let uuid = with_constructor_uuid(uuid);
                     self.remember(id, uuid, tag);
                 }
@@ -821,6 +860,9 @@ impl Game<'_> {
                     let id = self.next_entity;
                     let delay = horizon_client::save::number(tag.get("Warmup")).unwrap_or(0) as i32;
                     let owner = self.loaded_fangs_owner(&tag);
+                    if let Some(state) = transferred.take() {
+                        self.adopt_transferred_entity_state(id, state);
+                    }
                     self.insert_fangs(
                         id,
                         [at.x, at.y, at.z],
@@ -832,12 +874,48 @@ impl Game<'_> {
                     self.remember(id, uuid, tag);
                 }
             }
-            "minecraft:ominous_item_spawner" => self.load_ominous_item_spawner(tag),
-            "minecraft:ender_dragon" => self.load_dragon(tag, uuid),
-            "minecraft:end_crystal" => self.load_crystal(tag, uuid),
-            "minecraft:item_frame" | "minecraft:glow_item_frame" => self.load_item_frame(tag, uuid),
-            "minecraft:cushion" => self.load_cushion(tag, uuid),
-            "minecraft:painting" => self.load_painting(tag, uuid, key),
+            "minecraft:ominous_item_spawner" => {
+                if let Some(state) = transferred.take() {
+                    self.load_ominous_item_spawner_transferred(tag, Some(state));
+                } else {
+                    self.load_ominous_item_spawner(tag);
+                }
+            }
+            "minecraft:ender_dragon" => {
+                if let Some(state) = transferred.take() {
+                    self.load_dragon_transferred(tag, uuid, Some(state));
+                } else {
+                    self.load_dragon(tag, uuid);
+                }
+            }
+            "minecraft:end_crystal" => {
+                if let Some(state) = transferred.take() {
+                    self.load_crystal_transferred(tag, uuid, Some(state));
+                } else {
+                    self.load_crystal(tag, uuid);
+                }
+            }
+            "minecraft:item_frame" | "minecraft:glow_item_frame" => {
+                if let Some(state) = transferred.take() {
+                    self.load_item_frame_transferred(tag, uuid, Some(state));
+                } else {
+                    self.load_item_frame(tag, uuid);
+                }
+            }
+            "minecraft:cushion" => {
+                if let Some(state) = transferred.take() {
+                    self.load_cushion_transferred(tag, uuid, Some(state));
+                } else {
+                    self.load_cushion(tag, uuid);
+                }
+            }
+            "minecraft:painting" => {
+                if let Some(state) = transferred.take() {
+                    self.load_painting_transferred(tag, uuid, key, Some(state));
+                } else {
+                    self.load_painting(tag, uuid, key);
+                }
+            }
             _ => return Err(tag),
         }
         Ok(())
@@ -938,10 +1016,25 @@ impl Game<'_> {
 
     /// A saved armor stand.
     pub(super) fn load_armor_stand(&mut self, tag: Tag, uuid: Option<[i32; 4]>) {
+        self.load_armor_stand_transferred(tag, uuid, None)
+    }
+    pub(super) fn load_armor_stand_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         self.next_entity += 1;
         if let Some(mut a) = entity_nbt::armor_stand_from_nbt(&tag, self.next_entity) {
+            a.equipment
+                .iter_mut()
+                .flatten()
+                .for_each(|stack| self.clean_stack(stack));
             a.live
                 .retain_supplier(&self.motion.attributes, "minecraft:armor_stand");
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(a.id, state);
+            }
             self.remember(a.id, uuid, tag);
             self.bind_saved_entity_attachments(a.id, &mut a.attachment_lifetime);
             self.armor_stands.push(a);
@@ -950,6 +1043,14 @@ impl Game<'_> {
 
     /// The saved ender dragon.
     pub(super) fn load_dragon(&mut self, tag: Tag, uuid: Option<[i32; 4]>) {
+        self.load_dragon_transferred(tag, uuid, None)
+    }
+    pub(super) fn load_dragon_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         // The loaded dragon's own random (`Entity.random`): loading draws
         // nothing from the level's.
         let seed = random_source::unique_seed();
@@ -962,6 +1063,9 @@ impl Game<'_> {
                 .retain_supplier(&self.motion.attributes, "minecraft:ender_dragon");
             d.id = self.next_entity + 1;
             self.next_entity += 9;
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(d.id, state);
+            }
             self.remember_tags(d.id, &tag);
             self.remember_uuid(d.id, uuid, &tag);
             d.join = horizon_client::join_seq::JoinSeq::next();
@@ -971,6 +1075,14 @@ impl Game<'_> {
 
     /// A saved end crystal.
     pub(super) fn load_crystal(&mut self, tag: Tag, uuid: Option<[i32; 4]>) {
+        self.load_crystal_transferred(tag, uuid, None)
+    }
+    pub(super) fn load_crystal_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         let drawn = self.world.random.next_int_bound(100_000).unwrap_or(0);
         if let Some(mut c) = super::dragon::Crystal::from_nbt(&tag, drawn) {
             c.time = super::dragon::Crystal::start_time(c.position, drawn, self.clock.still());
@@ -978,6 +1090,9 @@ impl Game<'_> {
             // entity counter.
             self.next_entity += 1;
             c.id = self.next_entity;
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(c.id, state);
+            }
             self.remember_tags(c.id, &tag);
             self.remember_uuid(c.id, uuid, &tag);
             self.crystals.push(c);
@@ -986,10 +1101,24 @@ impl Game<'_> {
 
     /// A saved item frame.
     pub(super) fn load_item_frame(&mut self, tag: Tag, uuid: Option<[i32; 4]>) {
+        self.load_item_frame_transferred(tag, uuid, None)
+    }
+    pub(super) fn load_item_frame_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         self.next_entity += 1;
         if let Some(mut f) = entity_nbt::item_frame_from_nbt(&tag, self.next_entity) {
-            let item = f.item.take();
+            let mut item = f.item.take();
+            if let Some(stack) = item.as_mut() {
+                self.clean_stack(stack);
+            }
             f.set_item(item);
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(f.id, state);
+            }
             self.remember(f.id, uuid, tag);
             self.bind_saved_entity_attachments(f.id, &mut f.attachment_lifetime);
             self.item_frames.push(f);
@@ -998,25 +1127,45 @@ impl Game<'_> {
 
     /// A saved cushion.
     pub(super) fn load_cushion(&mut self, tag: Tag, uuid: Option<[i32; 4]>) {
+        self.load_cushion_transferred(tag, uuid, None)
+    }
+    pub(super) fn load_cushion_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
         self.next_entity += 1;
         if let Some(c) = entity_nbt::cushion_from_nbt(&tag, self.next_entity) {
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(c.id, state);
+            }
             self.remember(c.id, uuid, tag);
             self.cushions.push(c);
         }
     }
 
-    /// A saved painting, or its compound when its variant is unknown.
+    /// A saved painting, or its compound when its block position is unreadable.
     pub(super) fn load_painting(&mut self, tag: Tag, uuid: Option<[i32; 4]>, key: ChunkKey) {
-        // Painting.defineSynchedData: a painting without a saved variant keeps
-        // VariantUtils.getAny, the registry's first one.
+        self.load_painting_transferred(tag, uuid, key, None)
+    }
+    pub(super) fn load_painting_transferred(
+        &mut self,
+        tag: Tag,
+        uuid: Option<[i32; 4]>,
+        key: ChunkKey,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) {
+        // Painting.readAdditionalSaveData: a `variant` that does not resolve
+        // leaves Painting.defineSynchedData's VariantUtils.getAny in place.
         if let Some((pos, facing, variant)) = entity_nbt::painting_from_nbt(&tag)
-            && let Some(v) = match variant {
-                Some(variant) => self.painting_variants.get(&variant).cloned(),
-                None => self.painting_variants.all.first().cloned(),
-            }
+            && let Some(v) = self.painting_variants.saved_or_default(variant.as_deref())
         {
             self.next_entity += 1;
             let id = self.next_entity;
+            if let Some(state) = transferred {
+                self.adopt_transferred_entity_state(id, state);
+            }
             self.remember(id, uuid, tag);
             let mut painting = horizon_client::entities::Painting {
                 attachment_lifetime: Default::default(),
@@ -1059,43 +1208,57 @@ impl Game<'_> {
         self.load_mob_transferred(tag, mount, None)
     }
 
-    /// A passenger `take_mob_passengers` takes to load as a mob rider.
-    fn loads_as_rider(&self, passenger: &Tag) -> bool {
-        entity_nbt::kind(passenger).is_some_and(|k| self.res.mob_types().contains_key(&k))
-    }
     /// The UUIDs `spawn_entity_from_nbt` would add for `tag`, in
     /// `Entity.getSelfAndPassengers` order: the root's, then those of the
     /// riders its loader takes, read as the loaders read them (a malformed
     /// UUID is none). Passengers the loaders keep unloaded have none here.
-    pub(in crate::game) fn summon_tree_uuids(&self, tag: &Tag) -> Vec<[i32; 4]> {
+    pub(in crate::game) fn summon_tree_uuids(&mut self, tag: &Tag) -> Vec<[i32; 4]> {
+        self.load_entity_types();
         let mut uuids: Vec<[i32; 4]> = entity_nbt::uuid(tag).into_iter().collect();
-        let kind = entity_nbt::kind(tag).unwrap_or_default();
-        if !UNLISTED_KINDS.contains(&kind.as_str()) && self.listed_kind_takes_riders(&kind) {
-            self.rider_uuids(tag, &mut uuids);
-        }
+        self.rider_uuids(tag, &mut uuids);
         uuids
     }
     fn rider_uuids(&self, tag: &Tag, uuids: &mut Vec<[i32; 4]>) {
+        if !self.saved_vehicle_accepts(tag) {
+            return;
+        }
         if let Some(Tag::List(list)) = tag.get("Passengers") {
-            for p in list.iter().filter(|p| self.loads_as_rider(p)) {
+            for p in list.iter().filter(|p| self.passenger_creatable(p)) {
                 uuids.extend(entity_nbt::uuid(p));
                 self.rider_uuids(p, uuids);
             }
         }
     }
 
-    pub(super) fn put_mob_passengers(&mut self, tag: &mut Tag, id: u32) {
-        let riders = self
-            .mob_passenger_objects(id)
-            .into_iter()
-            .map(|object| self.mob_object_tree_nbt(object))
-            .collect();
+    /// `Entity.shouldBeSaved`: serialize the ordered object graph once per rider.
+    /// Slots retain mixed-kind load order; mob mounts also retain off-level objects.
+    pub(in crate::game) fn put_mob_passengers(&mut self, tag: &mut Tag, id: u32) {
+        let mut riders = Vec::new();
+        for slot in self.ordered_passenger_slots(id) {
+            match slot {
+                PassengerSlot::Live(rider_id) => {
+                    if let Some(object) = self.mob_object_slot(rider_id) {
+                        riders.push(self.mob_object_tree_nbt(object));
+                    } else if let Some(body) = self.saved_passenger_body(rider_id) {
+                        riders.push(body);
+                    }
+                }
+                PassengerSlot::Saved(saved_tag) => {
+                    if entity_nbt::kind(&saved_tag)
+                        .is_none_or(|kind| super::spawner::entity_type_saves(&kind))
+                    {
+                        riders.push(saved_tag);
+                    }
+                }
+            }
+        }
         add_passengers(tag, riders);
     }
 
-    /// Read an unsimulated entity without assigning it a new identity.
+    /// Read an unsimulated entity without assigning it a new identity. An eye of ender's
+    /// item is set in `tag`, the compound the entity is kept with.
     pub(super) fn other_from_nbt(
-        tag: &Tag,
+        tag: &mut Tag,
         id: u32,
         kind: &str,
     ) -> Option<super::commands::OtherEntity> {
@@ -1112,7 +1275,7 @@ impl Game<'_> {
         }
         let interaction = super::interactions::is_interaction(kind)
             .then(|| super::interactions::InteractionState::from_tag(tag));
-        let rotation = entity_nbt::rotation(tag);
+        let rotation = entity_nbt::loaded_rotation(tag);
         Some(super::commands::OtherEntity {
             attachment_lifetime: Default::default(),
             join: Default::default(),
@@ -1124,19 +1287,34 @@ impl Game<'_> {
             item_transformation,
             interaction,
             knot_check,
-            eye: (kind == "minecraft:eye_of_ender")
-                .then(|| super::end::SummonedEye::load(&mut tag.clone())),
+            eye: (kind == "minecraft:eye_of_ender").then(|| super::end::SummonedEye::load(tag)),
         })
     }
 
     /// An entity of a type Horizon does not simulate, kept as its compound.
-    fn load_other(&mut self, mut tag: Tag, kind: &str) -> Option<u32> {
+    fn load_other(&mut self, tag: Tag, kind: &str) -> Option<u32> {
+        self.load_other_transferred(tag, kind, None)
+    }
+    pub(super) fn load_other_transferred(
+        &mut self,
+        mut tag: Tag,
+        kind: &str,
+        transferred: Option<super::entity_initialization::TransferredEntityState>,
+    ) -> Option<u32> {
+        // A missing mod's record is opaque, not a vanilla fallback entity to normalize.
+        let quarantined = super::general::quarantined_kind(kind).then(|| tag.clone());
         strip_finalize(&mut tag);
         let id = self.next_entity + 1;
-        let other = Self::other_from_nbt(&tag, id, kind)?;
+        let other = Self::other_from_nbt(&mut tag, id, kind)?;
         self.next_entity = id;
         let uuid = with_constructor_uuid(entity_nbt::uuid(&tag));
+        if let Some(state) = transferred {
+            self.adopt_transferred_entity_state(id, state);
+        }
         self.remember(id, uuid, tag);
+        if let Some(original) = quarantined {
+            self.persist.raw.insert(id, original);
+        }
         self.others.push(other);
         Some(id)
     }
@@ -1211,7 +1389,7 @@ impl Game<'_> {
         {
             entity_nbt::fill_common_defaults(&mut tag);
         }
-        tag
+        with_raw(tag, None) // Entity.saveWithoutId's flags, as booleans.
     }
     /// The root of a stack of riders (`Entity.getRootVehicle`).
     fn mob_root(&self, mut object: MobObject) -> MobObject {
@@ -1230,21 +1408,33 @@ impl Game<'_> {
     /// `Entity.getVehicle` of entity `id`: the mob, boat or minecart a mob
     /// rides (only a mob rides another entity here).
     fn vehicle_of(&self, id: u32) -> Option<u32> {
-        let v = self.mob_object(id)?.extra.mount?;
-        let there = self.mob_objects().any(|m| m.id == v)
-            || self.boat_object(v).is_some()
-            || self.cart_object(v).is_some();
-        there.then_some(v)
+        // A mob rider: its mount, when the vehicle is still an object of the level (the
+        // object memory also holds riders refused residency).
+        if let Some(mob) = self.mob_object(id) {
+            let v = mob.extra.mount?;
+            let there = self.mob_objects().any(|m| m.id == v)
+                || self.boat_object(v).is_some()
+                || self.cart_object(v).is_some()
+                || self.passenger_present(v);
+            return there.then_some(v);
+        }
+        // A rider of any other kind: the vehicle whose slots name it.
+        self.passenger_vehicle(id)
     }
-    /// The root vehicle `root` with its passengers (`Entity.save`).
+    /// The actual root, using the existing per-kind data writers.
     pub(super) fn vehicle_tree_nbt(&mut self, root: u32) -> Option<Tag> {
         if let Some(object) = self.mob_object_slot(root) {
             return Some(self.mob_object_tree_nbt(object));
         }
-        if self.boats.iter().any(|b| b.id == root)
-            && self
-                .resident_source_target_visible(self.dim.key(), super::commands::Target::Boat(root))
-        {
+        if self.boat_object(root).is_some() {
+            if !self.persist.off_level.contains_key(&root)
+                && !self.resident_source_target_visible(
+                    self.dim.key(),
+                    super::commands::Target::Boat(root),
+                )
+            {
+                return None;
+            }
             let uuid = self.uuid_for(root);
             let b = self.boat_object(root)?;
             let mut tag = b.to_nbt(uuid, self.persist.raw.get(&root));
@@ -1252,18 +1442,24 @@ impl Game<'_> {
             write_attachments(&mut tag, root, &self.entity_attachments);
             return Some(tag);
         }
-        if !self.carts.iter().any(|c| c.id == root)
-            || !self
-                .resident_source_target_visible(self.dim.key(), super::commands::Target::Cart(root))
-        {
-            return None;
+        if self.cart_object(root).is_some() {
+            if !self.persist.off_level.contains_key(&root)
+                && !self.resident_source_target_visible(
+                    self.dim.key(),
+                    super::commands::Target::Cart(root),
+                )
+            {
+                return None;
+            }
+            let uuid = self.uuid_for(root);
+            let c = self.cart_object(root)?;
+            let mut tag = c.to_nbt(uuid, self.persist.raw.get(&root));
+            self.put_mob_passengers(&mut tag, root);
+            write_attachments(&mut tag, root, &self.entity_attachments);
+            return Some(tag);
         }
-        let uuid = self.uuid_for(root);
-        let c = self.cart_object(root)?;
-        let mut tag = c.to_nbt(uuid, self.persist.raw.get(&root));
-        self.put_mob_passengers(&mut tag, root);
-        write_attachments(&mut tag, root, &self.entity_attachments);
-        Some(tag)
+        // Any other kind of root vehicle, with its passengers.
+        self.saved_passenger_body(root)
     }
     /// `ServerPlayer.saveParentVehicle`: a player riding `vehicle` saves
     /// RootVehicle {Attach: that mount's UUID, Entity: the root vehicle with
@@ -1277,6 +1473,11 @@ impl Game<'_> {
     ) -> Option<(Tag, u32, [i32; 4])> {
         let vehicle = vehicle?;
         let root = parent_vehicle_root(vehicle, others, |id| self.vehicle_of(id))?;
+        // A root vehicle a mod kept out of the saves (`entity_set_saved`) is not in the
+        // rider's file either, or it would come back with the player.
+        if self.persist.unsaved.contains(&root) {
+            return None;
+        }
         let entity = self.vehicle_tree_nbt(root)?;
         let attach = self.uuid_for(vehicle);
         Some((root_vehicle_tag(attach, entity), root, attach))
@@ -1290,7 +1491,13 @@ impl Game<'_> {
             .filter(|m| !m.removed)
             .map(|m| (m.id, m.extra.mount))
             .collect();
-        let gone = vehicle_tree(root, &mounts);
+        let mut gone = vehicle_tree(root, &mounts);
+        // And the riders of other kinds that the slots name.
+        for id in self.passenger_tree(root) {
+            if !gone.contains(&id) {
+                gone.push(id);
+            }
+        }
         self.mobs.retain(|m| !gone.contains(&m.id));
         self.persist.off_level.retain(|id, _| !gone.contains(id));
         for &id in &gone {
@@ -1298,6 +1505,8 @@ impl Game<'_> {
         }
         self.boats.retain(|b| !gone.contains(&b.id));
         self.carts.retain(|c| !gone.contains(&c.id));
+        // Entities of the other kinds, the slots and the links of the whole tree.
+        self.discard_passenger_entities(&gone);
         for g in gone {
             self.forget_entity(g);
         }
@@ -1316,7 +1525,12 @@ impl Game<'_> {
                         && self.resident_source_target_visible(
                             self.dim.key(),
                             super::commands::Target::Cart(id),
-                        ))))
+                        ))
+                    // A vehicle of another kind (an armor stand, a display...).
+                    || (!(self.mobs.iter().any(|mob| mob.id == id)
+                        || self.boats.iter().any(|boat| boat.id == id)
+                        || self.carts.iter().any(|cart| cart.id == id))
+                        && self.passenger_present(id))))
             .then_some(id)
         })
     }
@@ -1340,11 +1554,8 @@ impl Game<'_> {
         }
         let tag = raw?.get("RootVehicle")?.get("Entity")?.clone();
         let root_uuid = entity_nbt::uuid(&tag)?;
-        let kind = entity_nbt::kind(&tag)?;
-        if !self.res.mob_types().contains_key(&kind)
-            && super::boats::any_boat_wood(&kind).is_none()
-            && super::minecarts::CartKind::from_id(&kind).is_none()
-        {
+        self.load_entity_types();
+        if !self.passenger_creatable(&tag) {
             return None;
         }
         if self.vehicle_by_uuid(root_uuid).is_none() {
@@ -1354,7 +1565,7 @@ impl Game<'_> {
                 (at.z.floor() as i32).div_euclid(16),
             );
             self.persist.restored.insert(root_uuid);
-            self.world.loaded_entities.push((key, vec![tag]));
+            self.world.queue_entity_nbt(key, vec![tag]);
             self.spawn_loaded_entities();
         }
         self.persist.restored.insert(uuid);
@@ -1394,10 +1605,11 @@ impl Game<'_> {
         self.forget_entity_initialization(mod_api::Holder::Entity(id));
         self.entity_attachments.remove(&id);
         self.persist.raw.remove(&id);
+        self.persist.no_physics.remove(&id);
+        self.persist.unsaved.remove(&id);
     }
     /// Detach a travelling entity without discarding its in-memory attachments.
     pub(super) fn detach_entity(&mut self, id: u32) {
-        self.combat.death_weapons.remove(&id);
         self.persist.score_destroyed.remove(&id);
         self.persist.uuids.remove(&id);
         self.persist.raw.remove(&id);
@@ -1412,9 +1624,14 @@ impl Game<'_> {
     }
     /// `Entity.applyEffectsFromBlocks` on a fire-immune entity that is not
     /// burning (`EndCrystal.tick`): the loaded `Fire` is reset to
-    /// `-getFireImmuneTicks()`, which is 0.
+    /// `-getFireImmuneTicks()`, which is 0. Only a crystal that ticked: one in
+    /// an entity-ticking chunk.
     pub(super) fn clear_crystal_fire(&mut self) {
+        let ticking = self.entity_ticking_area();
         for c in &self.crystals {
+            if !ticking(c.position.x.floor() as i32, c.position.z.floor() as i32) {
+                continue;
+            }
             let key = anon_key("minecraft:end_crystal", c.position);
             if let Some((_, Tag::Compound(raw))) = self.persist.anon.get_mut(&key)
                 && let Some(fire) = raw.get_mut(&"Fire".into())
@@ -1426,30 +1643,6 @@ impl Game<'_> {
     /// The compound an entity was loaded with (and commands have edited).
     pub(super) fn persist_raw(&self, id: u32) -> Option<&Tag> {
         self.persist.raw.get(&id)
-    }
-    /// A loaded chest minecart with a loot table and no items: the table
-    /// rolled now, as generated containers are (Horizon does not unpack on
-    /// first open), and kept to save it again while unchanged.
-    pub(in crate::game) fn roll_cart_loot(&self, cart: &mut super::minecarts::Minecart, tag: &Tag) {
-        let Some(table) = horizon_client::save::text(tag.get("LootTable")) else {
-            return;
-        };
-        if cart.items.is_empty() || cart.items.iter().any(Option::is_some) {
-            return;
-        }
-        let loot = self.server_loot.get();
-        let p = cart.position;
-        let pos = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
-        let biome = self.biome_name_at(p).unwrap_or_default();
-        let seed = horizon_client::structure_blocks::loot_seed(tag);
-        cart.loot = Some(horizon_client::structure_blocks::roll_container(
-            &mut cart.items,
-            loot.as_deref(),
-            table,
-            seed,
-            pos,
-            &biome,
-        ));
     }
     /// An entity Horizon keeps no compound for (orbs, projectiles, the
     /// crystals and the dragon) still keeps its `Tags`, by entity id, so
@@ -1476,6 +1669,14 @@ impl Game<'_> {
             if let Some(v) = tag.get(key) {
                 map.insert(key.into(), v.clone());
             }
+        }
+        // `Entity.saveWithoutId` writes `TicksFrozen` only while it is positive,
+        // and only a `LivingEntity` thaws, so these entities keep it unchanged.
+        // Read as an int (`NumericTag.intValue`) and written back as one, whatever tag type was loaded.
+        if let Some(ticks) = horizon_client::save::number(tag.get("TicksFrozen"))
+            && ticks as i32 > 0
+        {
+            map.insert("TicksFrozen".into(), Tag::Int(ticks as i32));
         }
         if !map.is_empty() {
             self.persist.raw.insert(id, Tag::Compound(map));
@@ -1724,8 +1925,15 @@ impl Game<'_> {
                     .get(&o.id)
                     .copied()
                     .unwrap_or_else(random_uuid);
-                let mut tag = self.other_to_nbt(o, uuid);
-                write_attachments(&mut tag, o.id, &self.entity_attachments);
+                let tag = if super::general::quarantined_kind(&o.kind)
+                    && let Some(raw) = self.persist.raw.get(&o.id)
+                {
+                    raw.clone()
+                } else {
+                    let mut tag = self.other_to_nbt(o, uuid);
+                    write_attachments(&mut tag, o.id, &self.entity_attachments);
+                    tag
+                };
                 roots
                     .entry(chunk_of(o.position))
                     .or_default()
@@ -1737,16 +1945,43 @@ impl Game<'_> {
         // yet given an id is not a lookup member: its join stands in.
         let mut out: HashMap<(i32, i32), Vec<Tag>> =
             keys.iter().map(|k| (*k, Vec::new())).collect();
+        let orb_entries: HashMap<_, _> = self
+            .orbs
+            .iter()
+            .filter(|orb| keys.contains(&chunk_of(orb.position)))
+            .map(|orb| (orb.join, orb.section_order))
+            .collect();
         {
             let admission = self.resident_entities.table.get_mut().admission_order();
-            for (key, mut tags) in roots {
+            for tags in roots.values_mut() {
                 tags.sort_by_cached_key(|(id, join, tag)| {
                     (section_order(tag), admission(*id).unwrap_or(*join))
                 });
-                out.entry(key)
-                    .or_default()
-                    .extend(tags.into_iter().map(|(_, _, tag)| tag));
             }
+        }
+        for (key, mut tags) in roots {
+            if !orb_entries.is_empty() {
+                // Reorder only the root-orb slots so pickups preserve section entry
+                // order across reload. Passenger orbs are written with their vehicles.
+                let mut slots = Vec::new();
+                let mut orbs = Vec::new();
+                for (_, join, tag) in &mut tags {
+                    if let Some(&entry) = orb_entries.get(join)
+                        && self.saved_entity_is_root(tag)
+                    {
+                        let order = (section_order(tag), entry);
+                        orbs.push((order, std::mem::replace(tag, Tag::End)));
+                        slots.push(tag);
+                    }
+                }
+                orbs.sort_by_key(|(order, _)| *order);
+                for (slot, (_, tag)) in slots.into_iter().zip(orbs) {
+                    *slot = tag;
+                }
+            }
+            out.entry(key)
+                .or_default()
+                .extend(tags.into_iter().map(|(_, _, tag)| tag));
         }
         for key in keys {
             let unknown = if remove {
@@ -1758,8 +1993,38 @@ impl Game<'_> {
                 out.entry(*key).or_default().extend(list);
             }
         }
+        for tags in out.values_mut() {
+            // A rider is saved inside its vehicle, not as a root of the chunk.
+            tags.retain(|tag| self.saved_entity_is_root(tag));
+            for tag in tags {
+                // The kinds whose own writers already save their riders stay as written.
+                if let Some(id) = entity_nbt::uuid(tag).and_then(|u| self.vehicle_by_uuid(u))
+                    && !matches!(
+                        self.level_entity(id as i32),
+                        Some(
+                            super::commands::Target::Mob(_)
+                                | super::commands::Target::Boat(_)
+                                | super::commands::Target::Cart(_)
+                                | super::commands::Target::Tnt(_)
+                        )
+                    )
+                {
+                    self.put_mob_passengers(tag, id);
+                }
+            }
+        }
         if remove {
+            // The trees of the vehicles leaving, found before any of them is removed.
+            let tree_ids: Vec<u32> = out
+                .values()
+                .flatten()
+                .filter_map(entity_nbt::uuid)
+                .filter_map(|u| self.vehicle_by_uuid(u))
+                .filter(|id| Some(*id) != self.riding)
+                .flat_map(|id| self.passenger_tree(id))
+                .collect();
             self.unload_removed_entities(keys);
+            self.discard_passenger_entities(&tree_ids);
         }
         out.into_iter().collect()
     }
@@ -1971,12 +2236,24 @@ impl Game<'_> {
         keys.contains(&chunk_of(o.position)).then(|| {
             let raw = anon_raw(&self.persist, "minecraft:experience_orb", o.position);
             let uuid = saved_uuid(&self.persist, o.id);
-            let tag = with_raw(
+            let mut tag = with_raw(
                 with_raw(entity_nbt::orb_to_nbt(o, uuid), raw.as_ref()),
                 self.persist.raw.get(&o.id),
             );
+            self.save_portal_cooldown(o.id, &mut tag);
             (chunk_of(o.position), tag)
         })
+    }
+    /// `Projectile.addAdditionalSaveData`'s `Owner`: the reference the projectile was loaded
+    /// with, else the UUID of the mob that shot it (a shulker's bullet), which the mob keeps
+    /// for its own save. A player's is left to the callers that write it.
+    pub(in crate::game) fn projectile_owner_uuid(&mut self, i: usize) -> Option<[i32; 4]> {
+        let p = &self.creatures.projectiles[i];
+        match (p.owner_uuid, p.owner) {
+            (Some(uuid), _) => Some(uuid),
+            (None, Some(Who::Mob(id))) => Some(self.uuid_for(id)),
+            _ => None,
+        }
     }
     pub(super) fn save_projectile(
         &mut self,
@@ -1987,6 +2264,8 @@ impl Game<'_> {
         if !keys.contains(&chunk_of(p.position)) || !entity_nbt::saved_with_chunk(p) {
             return None;
         }
+        let owner = self.projectile_owner_uuid(i);
+        let p = &self.creatures.projectiles[i];
         // `ShulkerBullet`'s target, over the UUID bridge: a mob the level has
         // no UUID for writes no `Target` rather than a made-up one.
         let target = match &p.kind {
@@ -1996,7 +2275,6 @@ impl Game<'_> {
             } => self.save_who_uuid(*who),
             _ => None,
         };
-        let owner = p.owner_uuid;
         let raw = anon_raw(&self.persist, p.kind.id(), p.position);
         let uuid = saved_uuid(&self.persist, p.id);
         let in_block = p
@@ -2132,7 +2410,8 @@ impl Game<'_> {
         let a = &self.armor_stands[i];
         keys.contains(&chunk_of(a.position)).then(|| {
             let uuid = self.saved_uuid_or_random(a.id);
-            let tag = entity_nbt::armor_stand_to_nbt(a, uuid, self.persist.raw.get(&a.id));
+            let mut tag = entity_nbt::armor_stand_to_nbt(a, uuid, self.persist.raw.get(&a.id));
+            self.save_portal_cooldown(a.id, &mut tag);
             (chunk_of(a.position), tag)
         })
     }
@@ -2274,7 +2553,7 @@ mod interaction_saved_defaults_tests {
     use crate::game::{Audio, Options, Progress, Settings, commands::Target, load_resources};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn registered_interactions_save_default_and_loaded_settings() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -2482,7 +2761,7 @@ mod loaded_tag_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn loaded_pig_tags_cap_before_dedup_and_live_rewrites_adopt_the_set() {
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
@@ -2798,7 +3077,7 @@ mod item_display_saved_transform_tests {
         id
     }
     #[test]
-    #[ignore = "prepared resources; actual item-display registered load and no-raw save"]
+    #[ignore = "daily"]
     fn omitted_item_display_transformation_is_saved_as_typed_identity() {
         with_game(|game| {
             let clock = game.world.game_time;
@@ -2819,7 +3098,7 @@ mod item_display_saved_transform_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; actual explicit load must survive removal of raw source"]
+    #[ignore = "daily"]
     fn admitted_compound_item_transforms_are_actual_saved_state() {
         with_game(|game| {
             let clock = game.world.game_time;
@@ -2851,7 +3130,7 @@ mod item_display_saved_transform_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; actual native setter, stale raw and no-raw writer"]
+    #[ignore = "daily"]
     fn existing_native_item_display_setter_carries_only_transform_state() {
         use mod_api::Transformation;
         with_game(|game| {
@@ -2914,7 +3193,7 @@ mod item_display_saved_transform_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; matrix and malformed transforms through actual summon"]
+    #[ignore = "daily"]
     fn item_display_matrices_and_invalid_values_save_a_typed_transformation() {
         with_game(|game| {
             for (n, form) in [
@@ -2989,6 +3268,7 @@ mod baby_modifier_mutation_tests {
             assert!(game.run_command("forceload add 0 0"));
             assert!(game.run_command("difficulty normal"));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
+            game.load_ticking_neighbourhood(0, 0);
             game.creative = true;
             test(game);
         });
@@ -3024,7 +3304,7 @@ mod baby_modifier_mutation_tests {
     /// setBaby (an IsBaby merge that changes it) replaces a permanent one
     /// with the transient modifier, and an adult has none.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn the_baby_speed_modifier_answers_add_and_remove_like_any_other() {
         with_game(|game| {
             let attr = "minecraft:movement_speed";
@@ -3111,7 +3391,7 @@ mod baby_modifier_mutation_tests {
     /// minecraft:baby and, for a baby, adds the transient one; an unrelated
     /// permanent modifier stays.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn set_baby_in_place_replaces_a_permanent_baby_modifier() {
         with_game(|game| {
             assert!(game.run_command(
@@ -3183,7 +3463,7 @@ mod baby_modifier_mutation_tests {
     /// reload (a /data merge, whose Entity.load runs setBaby) and an
     /// in-place setBaby bring it back; an adult made a baby gets it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_removed_baby_modifier_stays_removed_until_set_baby() {
         with_game(|game| {
             let attr = "minecraft:movement_speed";
@@ -3269,6 +3549,7 @@ mod attribute_instance_save_tests {
                 .unwrap();
             assert!(game.run_command("forceload add 0 0"));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
+            game.load_ticking_neighbourhood(0, 0);
             game.creative = true;
             test(game);
         });
@@ -3296,7 +3577,7 @@ mod attribute_instance_save_tests {
     /// movement_speed (aiStep -> removeFrost -> getAttribute); an instance it
     /// was loaded with stays.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_mob_saves_the_attribute_instances_it_has() {
         with_game(|game| {
             let speed = || vec!["minecraft:movement_speed".to_string()];
@@ -3352,7 +3633,7 @@ mod attribute_instance_save_tests {
     /// its first tick. Ids are compared as sets: vanilla's order is its
     /// map's.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn load_created_and_loaded_instances_stay_and_an_empty_list_is_saved() {
         with_game(|game| {
             // The hostile summons need a non-Peaceful difficulty.
@@ -3456,6 +3737,7 @@ mod mob_inventory_merge_tests {
                 .unwrap();
             assert!(game.run_command("forceload add 0 0"));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
+            game.load_ticking_neighbourhood(0, 0);
             game.creative = true;
             test(game);
         });
@@ -3523,7 +3805,7 @@ mod mob_inventory_merge_tests {
     /// stacks of the same item and components up to the limit, then empty
     /// slots, and drops what does not fit in the eight.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_piglin_and_a_villager_merge_their_saved_inventory_stacks() {
         with_game(|game| {
             let it = |id: &str, n: u32| format!("{{id:\"minecraft:{id}\",count:{n}}}");
@@ -3695,6 +3977,7 @@ mod invalid_passenger_tests {
                 .unwrap();
             assert!(game.run_command("forceload add 0 0"));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
+            game.load_ticking_neighbourhood(0, 0);
             game.creative = true;
             let time = game.world.game_time;
             test(game);
@@ -3706,7 +3989,7 @@ mod invalid_passenger_tests {
     /// EntityType.loadPassengersRecursive keeps only the entries that load,
     /// and Entity.saveWithoutId saves the riders the entity has.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn passengers_that_do_not_load_are_not_saved() {
         with_game(|game| {
             let mut failures = Vec::new();
@@ -3899,6 +4182,7 @@ mod h262_enderman_absolute_anger_tests {
             game.run_command("summon pig 13.5 200 2.5 {UUID:[I;262,0,0,99],NoAI:1b,NoGravity:1b}")
         );
         game.world.random.set_seed(262);
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     fn load(game: &mut Game<'_>, n: i32, end: Option<i64>) -> (u32, usize) {
@@ -3959,7 +4243,7 @@ mod h262_enderman_absolute_anger_tests {
         assert!(saved.get("CustomName").is_some());
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn h262_loaded_noai_enderman_actual_ticks_and_model_projection() {
         with_game(|game| {
             game.world.game_time = 100;
@@ -4005,7 +4289,7 @@ mod h262_enderman_absolute_anger_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn h262_noai_enderman_absent_zero_past_and_future_are_actual_longs() {
         with_game(|game| {
             game.world.game_time = 100;
@@ -4027,7 +4311,7 @@ mod h262_enderman_absolute_anger_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn h262_live_enderman_write_uses_actual_decoded_timestamp() {
         with_game(|game| {
             game.world.game_time = 100;
@@ -4048,7 +4332,7 @@ mod h262_enderman_absolute_anger_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn h262_existing_ai_and_other_neutral_counter_projection_is_unchanged() {
         with_game(|game| {
             game.world.game_time = 100;
@@ -4137,6 +4421,7 @@ mod sulfur_body_attribute_tests {
         assert!(game.run_command("scoreboard objectives add h192 dummy"));
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
         game.creative = true;
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     /// `/attribute <cube> <attribute> get 1000`, read back through a score.
@@ -4154,7 +4439,7 @@ mod sulfur_body_attribute_tests {
     /// defaults until a tick adopts its body (collectEquipmentChanges); then the
     /// body's archetype modifiers count (oak planks: bouncy).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_sulfur_cube_reads_its_body_archetype_modifiers_after_a_tick() {
         with_game(|game| {
             for (n, body) in [
@@ -4162,9 +4447,9 @@ mod sulfur_body_attribute_tests {
                 (2, ""),
             ] {
                 assert!(game.run_command(&format!(
-                    "summon minecraft:sulfur_cube {}.5 200 4.5 {{UUID:[I;192,0,0,{n}],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1{body}}}",
-                    3 * n
-                )));
+                        "summon minecraft:sulfur_cube {}.5 200 4.5 {{UUID:[I;192,0,0,{n}],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1{body}}}",
+                        3 * n
+                    )));
             }
             let attrs = [
                 "knockback_resistance",
@@ -4204,12 +4489,12 @@ mod sulfur_body_attribute_tests {
     /// modifier on the cached resistance its physics reads
     /// (Mob::knockback_resistance falls back to attrs.knockback_resistance).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_bodiless_cube_keeps_its_command_knockback_resistance_effect() {
         with_game(|game| {
             assert!(game.run_command(
-                "summon minecraft:sulfur_cube 4.5 200 8.5 {UUID:[I;192,0,0,9],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1}"
-            ));
+                    "summon minecraft:sulfur_cube 4.5 200 8.5 {UUID:[I;192,0,0,9],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1}"
+                ));
             let sel = "@e[type=minecraft:sulfur_cube,nbt={UUID:[I;192,0,0,9]},limit=1]";
             let cached = |game: &Game<'_>| {
                 let m = game
@@ -4265,7 +4550,7 @@ mod sulfur_body_attribute_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_readded_archetype_id_updates_the_bodiless_physics_cache() {
         with_game(|game| {
             assert!(game.run_command(
@@ -4307,7 +4592,7 @@ mod sulfur_body_attribute_tests {
     /// on a bodiless and a bodied cube reach the cached resistance, which never
     /// takes the body archetype's transient modifiers (bouncy: -2).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn command_knockback_changes_reach_the_cache_without_archetype_values() {
         with_game(|game| {
             for (n, body) in [
@@ -4315,9 +4600,9 @@ mod sulfur_body_attribute_tests {
                 (11, ",equipment:{body:{id:\"minecraft:oak_planks\"}}"),
             ] {
                 assert!(game.run_command(&format!(
-                    "summon minecraft:sulfur_cube {}.5 200 8.5 {{UUID:[I;192,0,0,{n}],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1{body}}}",
-                    n - 8
-                )));
+                        "summon minecraft:sulfur_cube {}.5 200 8.5 {{UUID:[I;192,0,0,{n}],NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Size:1{body}}}",
+                        n - 8
+                    )));
             }
             game.tick_world(true).unwrap();
             let cached = |game: &Game<'_>, n: i32| {
@@ -4433,6 +4718,7 @@ mod summoned_knot_tests {
             game.run_command("summon pig 13.5 200 2.5 {UUID:[I;129,0,0,99],NoAI:1b,NoGravity:1b}")
         );
         game.world.random.set_seed(129);
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     fn knot_id(game: &Game<'_>, n: i32) -> u32 {
@@ -4452,7 +4738,7 @@ mod summoned_knot_tests {
         [1, 2, 3].map(|n| knot_id(game, n))
     }
     #[test]
-    #[ignore = "prepared resources; registered explicit knot load and real saved projection"]
+    #[ignore = "daily"]
     fn summoned_knots_adopt_normalized_position_and_save_common_defaults() {
         with_game(|game| {
             let clock = game.world.game_time;
@@ -4500,7 +4786,7 @@ mod summoned_knot_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; actual Game world ticks and support removal"]
+    #[ignore = "daily"]
     fn summoned_knots_check_actual_fence_support_on_tick_101() {
         with_game(|game| {
             let clock = game.world.game_time;
@@ -4560,15 +4846,11 @@ mod summoned_knot_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; negative fractional registered position"]
+    #[ignore = "daily"]
     fn negative_fractional_knot_position_uses_floor_before_centering() {
         with_game(|game| {
-            game.world
-                .chunks
-                .insert((-1, -1), Arc::new(Chunk::empty(-1, -1)));
-            game.block_ticks
-                .add_empty_chunk(ChunkPos::new(-1, -1))
-                .unwrap();
+            // Chunk (-1, -1) is already loaded by the fixture's neighbourhood.
+            assert!(game.world.chunks.contains_key(&(-1, -1)));
             assert!(game.run_command("setblock -2 199 -3 stone strict"));
             assert!(game.run_command("setblock -2 200 -3 oak_fence strict"));
             assert!(game.run_command("summon leash_knot -1.2 200.8 -2.1 {UUID:[I;129,0,0,5]}"));
@@ -4580,7 +4862,7 @@ mod summoned_knot_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; paused and actual ticket-excluded ticks"]
+    #[ignore = "daily"]
     fn explicit_knot_check_counts_only_running_entity_ticking_turns() {
         with_game(|game| {
             let ids = summon_knots(game);
@@ -4617,7 +4899,7 @@ mod summoned_knot_tests {
         });
     }
     #[test]
-    #[ignore = "prepared resources; existing natural lead/knot adapter control"]
+    #[ignore = "daily"]
     fn explicit_knot_removal_preserves_a_real_lead_created_knot() {
         with_game(|game| {
             use horizon_client::mobs::leash::Holder;
@@ -4657,7 +4939,7 @@ mod camel_pose_saved_tests {
     use crate::game::{Audio, Options, Progress, Settings, load_resources};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn loaded_camel_pose_timestamps_survive_actual_save_and_tick() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -4798,7 +5080,9 @@ mod camel_pose_saved_tests {
             .into_iter()
             .flat_map(|(_, tags)| tags)
             .collect();
-        game.world.loaded_entities.push(((0, 0), written));
+        game.world
+            .loaded_entities
+            .push(((0, 0), written.into_iter().map(Into::into).collect()));
         game.spawn_loaded_entities();
         for step in 0..8 {
             for number in 1..=cases.len() as i32 {
@@ -4841,6 +5125,7 @@ mod mob_hurt_cooldown_tests {
             assert!(game.run_command("forceload add 0 0"));
             assert!(game.run_command("difficulty normal"));
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
+            game.load_ticking_neighbourhood(0, 0);
             game.creative = true;
             test(game);
         });
@@ -4866,7 +5151,7 @@ mod mob_hurt_cooldown_tests {
     /// inside the cooldown a hit is compared, and lastHurt kept, by its amount
     /// before armor and Resistance; actuallyHurt reduces only the difference.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn the_hurt_cooldown_compares_the_incoming_damage_before_its_reductions() {
         with_game(|game| {
             let full = summon(game, 1, 2);
@@ -4920,7 +5205,7 @@ mod restored_vehicle_transfer_tests {
     use horizon_mod_runtime::attachments::{AttachmentCodec, AttachmentType, Attachments, Holder};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn runtime_transfers_do_not_alias_a_saved_player_vehicle_with_the_same_uuid() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             let runtime = AttachmentType {
@@ -4978,9 +5263,13 @@ mod restored_vehicle_transfer_tests {
                 runtime.set(&mut map, Holder::Level, 41).unwrap();
                 saved.set(&mut map, Holder::Level, 51).unwrap();
                 game.entity_attachments.insert(source, map);
-                let index = game.mobs.iter().position(|m| m.id == source).unwrap();
-                let incoming = game.mob_tree_nbt(index);
-                let tree = (!generic).then(|| game.capture_vehicle_tree_state(source).unwrap());
+                let (incoming, tree) = if generic {
+                    let index = game.mobs.iter().position(|m| m.id == source).unwrap();
+                    (game.mob_tree_nbt(index), None)
+                } else {
+                    let (tag, tree) = game.take_vehicle_tree_transfer(source).unwrap();
+                    (tag, Some(tree))
+                };
                 let state = generic.then(|| game.take_transferred_entity_state(source));
                 game.mobs
                     .retain(|m| m.id != source && Some(m.id) != source_child);
@@ -5120,6 +5409,7 @@ mod trader_llama_discard_tests {
         game.block_ticks
             .add_empty_chunk(ChunkPos::new(0, 0))
             .unwrap();
+        game.load_ticking_neighbourhood(0, 0);
         assert!(game.run_command("forceload add 0 0"));
         assert!(game.run_command("difficulty normal"));
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
@@ -5131,7 +5421,7 @@ mod trader_llama_discard_tests {
     /// after the fifth tick and a delay of 0 after the first; a tame and a
     /// persistent llama stay.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and a scratch HORIZON_HOME"]
+    #[ignore = "daily"]
     fn a_trader_llama_leaves_the_level_in_the_tick_its_delay_runs_out() {
         with_game(|game| {
             for (n, extra) in [

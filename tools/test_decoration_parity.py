@@ -51,7 +51,7 @@ def corpus(resources):
             f=fixture(biomes,rng.randrange(-2**63,2**63),mode,selected)
             f['cx']=rng.randrange(-1875000,1875000);f['cz']=rng.randrange(-1875000,1875000)
             yield f
-    # A mod feature inserted into bundled steps (#815): the oracle pins how global
+    # A mod feature inserted into bundled steps (arismoko/horizon#815): the oracle pins how global
     # indices, and so the feature seeds of the vanilla features after it, move.
     added=len(names)
     def insert(steps,where):
@@ -91,9 +91,9 @@ def main():
         with (build/(name+'.log')).open('w',encoding='utf-8') as log:base.run(list(map(str,command)),stdout=log,stderr=subprocess.STDOUT)
     dependency_path=os.pathsep.join(map(str,libraries))
     run(['javac','--release',lock['minecraft']['java_major'],'-proc:none','-sourcepath',str(lab.ROOT/'mods/horizon/src/test/java'),'-cp',str(jars['server'])+os.pathsep+dependency_path,'-d',classes,oracle,helper],'compile-java')
-    run(['cargo','build','--release','-p','horizon-world','--example','world_probe'],'compile-rust')
+    run(['cargo','build','--profile','fast','-p','horizon-world','--example','world_probe'],'compile-rust')
     metadata=json.loads(subprocess.check_output(['cargo','metadata','--no-deps','--format-version','1'],cwd=lab.ROOT,text=True))
-    binary=Path(metadata['target_directory'])/'release/examples'/('world_probe.exe' if os.name=='nt' else 'world_probe')
+    binary=Path(metadata['target_directory'])/'fast/examples'/('world_probe.exe' if os.name=='nt' else 'world_probe')
     run([binary,'decoration_fixture',build],'rust');references=[]
     for side,jar in jars.items():
         run(['java','-Xmx768M','-cp',os.pathsep.join([str(classes),str(jar),dependency_path]),'dev.horizonlab.parity.VanillaDecorationOracle',side,build],side)

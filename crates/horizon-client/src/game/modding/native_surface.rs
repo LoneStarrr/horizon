@@ -102,7 +102,7 @@ mod tests {
             no_gravity: false,
             vertical_collision: false,
             horizontal_collision: false,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(0)),
         };
         let step = item.tick_move(
             &game.world,
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_block_part_answers_the_friction_an_entity_reads() {
         // The fixture's parts: glass is 0.98 to a player only, white wool 0.98 to every entity,
         // red wool NaN, blue wool 3.0, green wool infinity and black wool -0.5.
@@ -178,7 +178,12 @@ mod tests {
                 };
                 let coefficient = LivingAirWorld::block_friction(&mut world, floor).unwrap();
                 calls.store(0, Ordering::SeqCst);
-                travel_in_air(&mut world, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+                travel_in_air(
+                    &mut world,
+                    &mut horizon_world::move_gate::MoveGate::new(),
+                    Vec3::new(1.0, 0.0, 0.0),
+                )
+                .unwrap();
                 let reads = calls.load(Ordering::SeqCst);
                 (
                     coefficient,
@@ -255,7 +260,7 @@ mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn mob_travel_and_both_leash_sites_use_the_parts_answer_once() {
         use super::super::boats::Boat;
         use horizon_client::mobs::{Mob, leash};
@@ -277,7 +282,11 @@ mod tests {
             ] {
                 let state = game.pack.assets.registry.default_state(block).unwrap();
                 game.world.set(5, 64, 5, state).unwrap();
-                let snapshot: Vec<_> = game.mobs.iter().map(|m| m.seen(None)).collect();
+                let snapshot: Vec<_> = game
+                    .mobs
+                    .iter()
+                    .map(|m| m.seen(None, game.items()))
+                    .collect();
                 {
                     let world = game.mob_world_base(&snapshot);
                     let mut mob = Mob::new(10, horse.clone(), at, 0.0);

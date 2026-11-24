@@ -6,6 +6,7 @@ use crate::{
         Arg, CmdResult, CommandError, Context,
         args::{ScoreHolderArg, Selector},
     },
+    component_codec::canonical_text_component,
     scoreboard::{
         self as sb, Comp, NumberFormat, RenderType, Scoreboard, Visibility, comp_text,
         criteria_read_only, literal,
@@ -51,8 +52,12 @@ pub trait Env {
 pub fn err(key: &str, args: &[&dyn std::fmt::Display]) -> CommandError {
     CommandError::tr(key, args)
 }
-/// `ComponentUtils.formatList` with the gray ", " separator.
-pub fn format_list(items: Vec<Text>) -> Text {
+/// `ComponentUtils.formatList` with the gray ", " separator: one item is that item
+/// itself (`formatList`'s `size() == 1` branch), not a component wrapping it.
+pub fn format_list(mut items: Vec<Text>) -> Text {
+    if items.len() == 1 {
+        return items.remove(0);
+    }
     let mut out = Text::empty();
     for (i, t) in items.into_iter().enumerate() {
         if i > 0 {
@@ -221,7 +226,8 @@ pub fn resolve_holders(
             if tracked.is_empty() {
                 return Err(err("argument.scoreHolder.empty", &[]));
             }
-            return Ok(tracked.iter().map(|n| env.named(n)).collect());
+            // `Scoreboard.getTrackedPlayers`: name-only holders (`ScoreHolder.forNameOnly`), no display name.
+            return Ok(tracked.iter().map(|n| Holder::named(n)).collect());
         }
         ScoreHolderArg::Name(n) => vec![env.named(n)],
         ScoreHolderArg::Selector(s) => env.select(s),
@@ -297,7 +303,10 @@ fn scoreboard(id: &str, ctx: &Context, env: &mut dyn Env) -> CmdResult<i32> {
             let name = objective_name(ctx, env, "objective")?;
             let display = component(ctx, "displayName", env)?;
             let o = env.sb_mut().objective_mut(&name).expect("checked");
-            if o.display_name != display {
+            // ScoreboardCommand.setDisplayName compares decoded components.
+            if o.display_name != display
+                && canonical_text_component(&o.display_name) != canonical_text_component(&display)
+            {
                 o.display_name = display;
                 let shown = o.formatted_display_name();
                 env.feedback(tr(
@@ -738,6 +747,10 @@ fn players(id: &str, ctx: &Context, env: &mut dyn Env) -> CmdResult<i32> {
             let op = string(ctx, "operation");
             let sources = holders(ctx, "source", env, true)?;
             let source_objective = objective_name(ctx, env, "sourceObjective")?;
+            let source_read_only = env
+                .sb()
+                .objective(&source_objective)
+                .is_some_and(|o| criteria_read_only(&o.criteria));
             let mut tracker = Tracker::default();
             for t in &targets {
                 for s in &sources {
@@ -747,6 +760,14 @@ fn players(id: &str, ctx: &Context, env: &mut dyn Env) -> CmdResult<i32> {
                     env.sb_mut()
                         .set_with(&t.name, &target_objective, na, t.display.as_ref());
                     if op == "><" {
+                        // `ScoreAccess.set` on a source score created without
+                        // `forceWritable` throws after the target's write; the
+                        // exception is not a `CommandSyntaxException`, so the
+                        // command reports `command.failed` and no result
+                        // callback runs (`Commands.performCommand`).
+                        if source_read_only {
+                            return Err(CommandError::unexpected());
+                        }
                         env.sb_mut().set(&s.name, &source_objective, nb);
                     }
                 }
@@ -915,8 +936,13 @@ fn team(id: &str, ctx: &Context, env: &mut dyn Env) -> CmdResult<i32> {
             let mut tracker = Tracker::default();
             for m in &members {
                 let joined = env.sb_mut().add_to_team(&m.name, &name);
-                // The message reads the display name after the change.
-                tracker.track(&env.named(&m.name), i32::from(joined));
+                // The message reads the display name after the change; a name-only holder has none.
+                let shown = if m.display.is_some() {
+                    env.named(&m.name)
+                } else {
+                    Holder::named(&m.name)
+                };
+                tracker.track(&shown, i32::from(joined));
             }
             let shown = formatted(env, &name);
             tracker.send(
@@ -942,7 +968,12 @@ fn team(id: &str, ctx: &Context, env: &mut dyn Env) -> CmdResult<i32> {
             let mut tracker = Tracker::default();
             for m in &members {
                 let left = env.sb_mut().remove_from_team(&m.name);
-                tracker.track(&env.named(&m.name), i32::from(left));
+                let shown = if m.display.is_some() {
+                    env.named(&m.name)
+                } else {
+                    Holder::named(&m.name)
+                };
+                tracker.track(&shown, i32::from(left));
             }
             tracker.send(
                 env,

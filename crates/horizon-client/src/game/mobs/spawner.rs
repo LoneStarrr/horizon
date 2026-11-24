@@ -2,10 +2,13 @@
 //! `clientTick` for every spawner (`mobs::spawner`), the mobs they add, a
 //! spawn egg used on one (`SpawnEggItem.useOn`), their events and the mob
 //! spinning inside (`SpawnerRenderer`).
+#[path = "spawner/entity_registry.rs"]
+mod entity_registry;
 use super::{
     Game,
     creatures::{Finalized, SpawnReason},
 };
+pub(super) use entity_registry::entity_type_saves;
 use horizon_client::{
     Result,
     containers::BlockEntity,
@@ -40,44 +43,14 @@ pub(super) enum Planned {
 pub(super) struct SpawnerState {
     /// Every entity type id (`EntityType.byString`), read once.
     entity_types: Option<HashSet<String>>,
+    /// Dimensions from the same loaded entity-type registry, not a second loader.
+    entity_dimensions: HashMap<String, [f32; 2]>,
     /// The mob shown in each spawner and the id it was made for
     /// (`getOrCreateDisplayEntity`).
     displays: HashMap<Pos, (String, Mob)>,
 }
 
 impl Game<'_> {
-    /// `EntityType.byString`: the type is in the registry.
-    pub(super) fn entity_type_exists(&self, id: &str) -> bool {
-        self.spawners
-            .entity_types
-            .as_ref()
-            .is_some_and(|t| t.contains(id))
-    }
-    /// Whether `entity_type_exists` has a registry to answer from.
-    pub(super) fn entity_types_loaded(&self) -> bool {
-        self.spawners
-            .entity_types
-            .as_ref()
-            .is_some_and(|t| !t.is_empty())
-    }
-    pub(super) fn load_entity_types(&mut self) {
-        if self.spawners.entity_types.is_some() {
-            return;
-        }
-        let path = self.options.resources.join("entity-types.json");
-        let types = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| {
-                v.as_object().map(|o| {
-                    o.keys()
-                        .map(|k| horizon_client::command::args::normalize(k))
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
-        self.spawners.entity_types = Some(types);
-    }
     /// The server tick of the spawner at `key`. Its client tick comes after
     /// every block entity's (`client_tick_spawners`).
     ///
@@ -157,8 +130,8 @@ impl Game<'_> {
                 pos: mod_api::BlockPos::new(key.0, key.1, key.2),
             });
             let mut spawn = |l: &super::natural_spawning::GameLevel,
-                             r: &SpawnerSpawn,
-                             rng: &mut LevelRandom| {
+                             rng: &mut LevelRandom,
+                             r: &SpawnerSpawn| {
                 l.game.plan_spawner_mob(l, r, source, &mut planned, rng)
             };
             spawner.server_tick(&level, &mut random, pos, &mut spawn, &mut events);
@@ -374,6 +347,8 @@ impl Game<'_> {
     /// `sendBlockUpdated`: the clients load the new update tag (the client
     /// copy's delay follows it, its display mob is made again).
     fn spawner_block_updated(&mut self, key: Pos) {
+        self.world
+            .path_type_block_updated(horizon_core::position::BlockPos::new(key.0, key.1, key.2));
         if let Some(BlockEntity::Spawner(s)) = self.world.block_entities.get_mut(&key) {
             s.client_loaded();
         }
@@ -558,6 +533,37 @@ impl Game<'_> {
             .unwrap_or(self.ui.registries.permission)
             > 0
     }
+    /// `EntityType.createDefaultStackConfig` on an entity an item made (a
+    /// vehicle, a hanging entity, an armor stand): the item's custom name and
+    /// custom data (`applyComponentsFromItemStack`:
+    /// `Entity.applyImplicitComponent`'s two, saved as `CustomName` and
+    /// `data`), then its `minecraft:entity_data` merged over the entity's own
+    /// compound and loaded (`updateCustomEntityTag`) when it names this type.
+    /// An op-only type (command block and spawner minecarts) takes it from an
+    /// op player only, never from a dispenser (`by_player` false).
+    pub(super) fn apply_item_stack_config(
+        &mut self,
+        target: super::commands::Target,
+        kind: &str,
+        stack: &horizon_client::items::ItemStack,
+        by_player: bool,
+    ) {
+        let op = by_player && self.acting_player_is_op();
+        let configures = stack
+            .data()
+            .is_some_and(|d| d.custom_name.is_some() || d.other("minecraft:custom_data").is_some())
+            || horizon_client::block_entity_item::spawn_egg_entity_data(stack, kind, op).is_some();
+        if !configures {
+            return;
+        }
+        let Some(own) = self.command_target_nbt(target) else {
+            return;
+        };
+        let tag =
+            horizon_client::block_entity_item::stack_configured_entity_by(stack, kind, &own, op);
+        // The entity's own compound, its name and data merged in: it loads back.
+        let _ = self.apply_entity_nbt(target, tag);
+    }
     /// Ticks spawners, trial spawners and vaults near the player on a remote
     /// client (`tick_remote`).
     pub(super) fn tick_remote_spawners(&mut self) {
@@ -569,8 +575,17 @@ impl Game<'_> {
             p.position.y.floor() as i32,
             p.position.z.floor() as i32,
         ];
-        let (keys, trial_keys, vault_keys) =
-            nearby_remote_spawner_keys(&self.world.block_entities, center);
+        let (keys, trial_keys, vault_keys) = {
+            use horizon_client::block_entities::Listed;
+            let listed = &self.world.block_entities;
+            nearby_remote_spawner_keys(
+                listed
+                    .listed(Listed::Spawner)
+                    .chain(listed.listed(Listed::TrialSpawner))
+                    .chain(listed.listed(Listed::Vault)),
+                center,
+            )
+        };
         self.client_tick_spawners(&keys);
         for key in trial_keys {
             self.client_tick_trial_spawner(key);
@@ -596,7 +611,7 @@ impl Game<'_> {
         let shadow_sections = self
             .renderer
             .as_ref()
-            .filter(|_| self.pack_ids.is_some() && self.pack_shadow_casters.0);
+            .filter(|_| self.pack_ids.is_some() && self.occlusion.shadow_casters.0);
         for (key, (_, mob)) in &self.spawners.displays {
             let at = glam::DVec3::new(f64::from(key.0), f64::from(key.1), f64::from(key.2));
             if at.distance_squared(camera) >= 64.0 * 64.0 {
@@ -632,6 +647,7 @@ impl Game<'_> {
                 * glam::Mat4::from_scale(glam::Vec3::splat(scale));
             let light = self.world.light(key.0, key.1, key.2);
             let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
+            let start = out.len();
             if mob.species() == horizon_client::mobs::Species::SulfurCube {
                 self.sulfur_cube_body_geometry(
                     mob,
@@ -648,8 +664,10 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
+                &self.mob_armor_layers(mob),
                 out,
             );
+            self.lit_entity(start..out.len());
         }
     }
 }
@@ -693,7 +711,7 @@ mod tests {
     /// adding no mob. At 0 the spawn runs: with nothing to spawn it calls
     /// `delay`, which draws the next delay in [MinSpawnDelay, MaxSpawnDelay).
     #[test]
-    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    #[ignore = "daily"]
     fn a_running_delay_counts_down_without_drawing() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.options.dedicated = Some(Vec::new());

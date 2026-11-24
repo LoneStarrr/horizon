@@ -59,7 +59,7 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
     },
     "shader": {
       "api": [
-        "0.1"
+        "0.2"
       ],
       "schema": 1
     }
@@ -69,7 +69,8 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
     0,
     1,
     2,
-    101
+    101,
+    75
   ],
   "horizon": "<version>",
   "launch_api": "0.1.1",
@@ -131,7 +132,7 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
 }
 ```
 
-`content` is what this build loads ([content.md](content.md)), so a launcher offers only what works on it: content mods of the manifest `api` lines in `mod.api`; native mods built for this exact game build (`native_mod.exact_build`), which need the game rebuilt (`rebuild`); shader packs of `shader.schema` and the lines in `shader.api` (a newer line is read, not drawn); resource and data packs of `format` (`[major, minor]`; others still load, marked too old or too new as vanilla marks them); modpacks of `modpack.format`; the mod index of `index.schema`.
+`content` is what this build loads ([content.md](content.md)), so a launcher offers only what works on it: content mods of the manifest `api` lines in `mod.api`; native mods built for this exact game build (`native_mod.exact_build`), which need the game rebuilt (`rebuild`); shader packs of `shader.schema` and the lines in `shader.api` (a pack for another is refused); resource and data packs of `format` (`[major, minor]`; others still load, marked too old or too new as vanilla marks them); modpacks of `modpack.format`; the mod index of `index.schema`.
 
 ## Exit codes
 
@@ -141,5 +142,6 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
 | 1 | The game stopped on an error. A crash report was saved. |
 | 2 | The command line was refused: an unknown option, a missing or bad value. No crash report. |
 | 101 | The game panicked. A crash report was saved. |
+| 75 | A dedicated server saved and stopped on `/restart`: horizon-server starts it again. |
 
 When a crash report is saved, the last line on stderr is `Horizon: crash report saved to` followed by the report's path.

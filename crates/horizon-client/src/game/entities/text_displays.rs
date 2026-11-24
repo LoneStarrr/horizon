@@ -56,7 +56,7 @@ pub(super) struct RemoteTextDisplay {
 }
 
 /// `Display.RENDER_STATE_IDS` and `TextDisplay.TEXT_RENDER_STATE_IDS`: the
-/// data a render state is built from (not the view range, size or glow).
+/// data that updates the interpolated render state. Culling and glow use live metadata.
 fn renders(id: u8) -> bool {
     matches!(id, 11..=16 | 18 | 19 | 23..=27)
 }
@@ -88,6 +88,23 @@ impl RemoteTextDisplay {
             last_progress: 0.0,
             lines: None,
             vehicle: None,
+        }
+    }
+    /// `Camera.alignWithEntity`'s view of a display, a server cutscene's
+    /// usual camera: its interpolated position and rotation (`Display`'s
+    /// `InterpolationHandler` moves both), with `EntityType.*_DISPLAY`'s
+    /// `sized(0.0F, 0.0F)` putting its eyes at its feet; it is not living.
+    pub(super) fn camera_view(&self) -> horizon_client::camera::CameraEntity {
+        horizon_client::camera::CameraEntity {
+            position: self.position.to_array(),
+            previous: self.previous.to_array(),
+            x_rot: self.rotation[1],
+            y_rot: self.rotation[0],
+            x_rot_o: self.old_rotation[1],
+            y_rot_o: self.old_rotation[0],
+            eye_height: 0.0,
+            living: None,
+            mount: None,
         }
     }
     /// Where a passenger of this display sits, this tick and the last
@@ -250,12 +267,28 @@ impl Game<'_> {
         data: &TextDisplayData,
         view_scale: f64,
     ) -> bool {
+        (self.display_sight(camera, origin, data, view_scale)).is_some_and(|s| s.camera)
+    }
+
+    /// `display_in_view`, and whether the ray scene's entity layer reaches the display
+    /// (`entity_sight`).
+    fn display_sight(
+        &self,
+        camera: glam::DVec3,
+        origin: glam::DVec3,
+        data: &TextDisplayData,
+        view_scale: f64,
+    ) -> Option<super::entity_culling::Sight> {
         let range = f64::from(data.view_range) * 64.0 * view_scale;
         if text_display::no_culling(data.width, data.height) {
-            return (origin - camera).length_squared() < range * range;
+            let near = (origin - camera).length_squared() < range * range;
+            return near.then_some(super::entity_culling::Sight {
+                camera: true,
+                rays: false,
+            });
         }
         let (lo, hi) = text_display::culling_box(origin, data.width, data.height);
-        self.entity_in_view(camera, origin, range, lo, hi)
+        self.entity_sight(camera, origin, range, lo, hi)
     }
 
     /// `DisplayRenderer.BlockDisplayRenderer` and `ItemDisplayRenderer`: the
@@ -281,9 +314,11 @@ impl Game<'_> {
                 display.last_progress = display.progress(partial as f32);
                 let d = display.shown.blend(&display.from, display.last_progress);
                 let position = display.previous.lerp(display.position, partial);
-                if !self.display_in_view(camera, position, &d, scale) {
+                // An item display out of view has nothing of the ray scene's entity layer.
+                let sight = self.display_sight(camera, position, &display.data, scale);
+                let Some(seen) = sight.filter(|s| s.camera || display.block.is_some()) else {
                     continue;
-                }
+                };
                 let rotation = std::array::from_fn(|i| {
                     display.old_rotation[i]
                         + angle(display.rotation[i] - display.old_rotation[i]) * partial as f32
@@ -294,6 +329,7 @@ impl Game<'_> {
                     continue;
                 }
                 let light = Self::display_light(&self.world, &d, position);
+                let start = out.len();
                 if let Some(state) = display.block {
                     // BlockModelResolver.update: model seed 42.
                     self.block_model_vertices(state, 42, matrix, light, true, out);
@@ -310,6 +346,11 @@ impl Game<'_> {
                         let packed =
                             ((((light & 0xFF) / 16) << 4) | (((light >> 8) & 0xFF) / 16)) as u8;
                         self.special_block_model(state, matrix, packed, out);
+                    }
+                    if seen.camera {
+                        self.lit_entity(start..out.len());
+                    } else {
+                        self.ray_only(out, start);
                     }
                 } else if let Some(stack) = &display.item {
                     let context = match display.item_display {
@@ -329,11 +370,20 @@ impl Game<'_> {
                     let pose = matrix * glam::Mat4::from_rotation_y(std::f32::consts::PI);
                     self.submit_item_world(&state, pose, light, out);
                 }
+                // The outline color comes from the latest metadata, outside the interpolated pose.
+                if seen.camera
+                    && start != out.len()
+                    && let Some(rgb) =
+                        self.display_outline(*id as u32, kind, display.data.glow_color)
+                {
+                    self.mark_outline(&out[start..], rgb);
+                }
             }
         }
         self.mark_entity(out.len(), "");
         self.text_displays = displays;
     }
+    /// `TextDisplayRenderer.submitInner` uses zero for the text outline color.
     pub(super) fn text_display_geometry(
         &mut self,
         camera: glam::DVec3,
@@ -351,7 +401,7 @@ impl Game<'_> {
             display.last_progress = display.progress(partial as f32);
             let d = display.shown.blend(&display.from, display.last_progress);
             let position = display.previous.lerp(display.position, partial);
-            if d.text.is_empty() || !self.display_in_view(camera, position, &d, scale) {
+            if d.text.is_empty() || !self.display_in_view(camera, position, &display.data, scale) {
                 // Out of view: its glyphs stay cached for when it comes back.
                 continue;
             }
@@ -380,7 +430,7 @@ impl Game<'_> {
             if !matrix.is_finite() {
                 continue;
             }
-            if text_display::no_culling(d.width, d.height) {
+            if text_display::no_culling(display.data.width, display.data.height) {
                 let (lo, hi) = cached.transformed_bounds(matrix);
                 if cached.batch.vertices.is_empty()
                     || self
@@ -568,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn handle_teleport_keeps_display_easing() {
         use crate::game::{commands::OtherEntity, native_entity_refs::tests::with_game};
         use horizon_core::geometry::Vec3;

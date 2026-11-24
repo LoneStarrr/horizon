@@ -1,7 +1,7 @@
-//! EditWorldScreen, and its Horizon opt-in (#2554): when the installed mods' biome regions
+//! EditWorldScreen, and its Horizon opt-in (arismoko/horizon#2554): when the installed mods' biome regions
 //! differ from the ones the world saved, the world's owner may adopt them for new chunks. The
 //! choice is written into the world before it opens again; chunks that exist keep their biomes.
-//! Design: `docs/modding/src/concepts/mod-biome-regions.md`.
+//! Design: `docs/design/mod-api/mod-biome-regions.md`.
 use super::*;
 
 #[cfg(test)]
@@ -39,8 +39,10 @@ impl Title {
         (w, h): (f32, f32),
         name: &str,
         focused: bool,
+        phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
     ) {
         crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+        phases(crate::screen_draw::RenderPhase::Background, batch);
         centered(
             atlas,
             batch,
@@ -78,7 +80,7 @@ impl Title {
         else {
             return;
         };
-        if name.trim().is_empty() {
+        if horizon_core::java_character::is_blank(name) {
             return;
         }
         let folder = world.folder.clone();
@@ -93,8 +95,10 @@ impl Title {
         atlas: &HudAtlas,
         batch: &mut HudBatch,
         (w, h): (f32, f32),
+        phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
     ) {
         crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+        phases(crate::screen_draw::RenderPhase::Background, batch);
         let description = lang::get("horizon.biome_regions.adopt.description");
         let lines = wrapped(atlas, &description, w - 50.0);
         self.message_lines.set(lines.len());

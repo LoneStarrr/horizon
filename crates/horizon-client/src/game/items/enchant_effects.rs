@@ -7,13 +7,18 @@
 //! Speed's `location_changed` and `tick` effects and the
 //! `minecraft:location_changed` disk effect (frost walker).
 use super::Game;
+use super::durability::Wearer;
 use horizon_client::{
     enchant::{EffectContext, Enchantments, level_value},
-    items::ItemStack,
+    items::{ItemStack, Items},
     mobs::{Damage, DamageKind, Who},
     random_source,
 };
-use horizon_core::{geometry::Vec3, position::BlockPos, random::RandomSource};
+use horizon_core::{
+    geometry::Vec3,
+    position::BlockPos,
+    random::{LegacyRandom, RandomSource},
+};
 use horizon_world::{fluid::FluidKind, level::LevelAccess, registry::BlockStateId};
 use serde_json::Value;
 
@@ -161,10 +166,16 @@ impl Game<'_> {
         }
         (0.2 * (1.0 + total)) as f32
     }
-    /// The wear `ItemStack.hurtAndBreak` goes on to apply for `amount` points:
-    /// what Unbreaking leaves (`EnchantmentHelper.processDurabilityChange`),
-    /// then what the item's parts make of it (`IItemExtension.damageItem`).
-    pub(super) fn durability_loss(&mut self, stack: &ItemStack, amount: u32) -> u32 {
+    /// The wear `ItemStack.hurtAndBreak` goes on to apply for `amount` points
+    /// on the stack `wearer` wears or uses: what Unbreaking leaves
+    /// (`EnchantmentHelper.processDurabilityChange`), then what the item's
+    /// parts make of it (`IItemExtension.damageItem`).
+    pub(super) fn durability_loss(
+        &mut self,
+        stack: &ItemStack,
+        amount: u32,
+        wearer: Wearer,
+    ) -> u32 {
         let loss = self.unbreaking_loss(stack, amount);
         if loss == 0 || self.remote.is_some() {
             return loss;
@@ -174,10 +185,7 @@ impl Game<'_> {
         if !mod_api::__private::item_listens(mod_api::HookId::DamageItem, &stack.item) {
             return loss;
         }
-        let mut points = loss.min(i32::MAX as u32) as i32;
-        let mut canceled = false;
-        self.native_damage_item(stack, &mut points, &mut canceled);
-        if canceled { 0 } else { points.max(0) as u32 }
+        self.damage_item_loss(stack, loss, wearer)
     }
     /// `EnchantmentHelper.processDurabilityChange` (unbreaking) for `amount` points.
     fn unbreaking_loss(&mut self, stack: &ItemStack, amount: u32) -> u32 {
@@ -211,7 +219,7 @@ impl Game<'_> {
         {
             return 0;
         }
-        let loss = self.durability_loss(stack, amount);
+        let loss = self.durability_loss(stack, amount, Wearer::Player);
         if loss > 0 {
             self.trigger_item_durability(stack, (stack.damage as i32).wrapping_add(loss as i32));
         }
@@ -334,11 +342,18 @@ impl Game<'_> {
         self.world.random = random;
         value
     }
-    /// `Player.attack`'s extra knockback: `getKnockback` (the weapon's knockback
-    /// enchantment, halved) plus 0.5 for a sprinting full-strength hit, and
-    /// whether the hit is that knockback attack.
+    /// `Player.attack`'s extra knockback: `getKnockback` (the ATTACK_KNOCKBACK
+    /// attribute, plus the weapon's knockback enchantment, halved) plus 0.5 for a
+    /// sprinting full-strength hit, and whether the hit is that knockback attack.
     pub(super) fn extra_knockback(&mut self, target_kind: &str, scale: f32) -> (f32, bool) {
         let sprinting = self.player.as_ref().is_some_and(|p| p.sprinting);
+        // LivingEntity.getKnockback: `(float)getAttributeValue(ATTACK_KNOCKBACK)`, which
+        // the weapon's knockback enchantment then adds to (EnchantmentHelper.modifyKnockback).
+        let base = self
+            .player
+            .as_mut()
+            .and_then(|p| p.attribute("minecraft:attack_knockback").ok())
+            .unwrap_or(0.0) as f32;
         let enchanted = match self.held().cloned() {
             Some(held) => {
                 let ctx = EffectContext {
@@ -354,10 +369,10 @@ impl Game<'_> {
                     "minecraft:knockback",
                     &ctx,
                     &mut self.world.random,
-                    0.0,
+                    base,
                 )
             }
-            None => 0.0,
+            None => base,
         };
         horizon_client::attack_strength::extra_knockback(enchanted, scale, sprinting)
     }
@@ -653,7 +668,12 @@ impl Game<'_> {
                 source: attributed.then_some(wielder),
                 owner: attributed.then_some(wielder),
             };
-            let _ = self.wind_burst(feet, radius, knockback, false, false, cause);
+            let _ = self.wind_burst(
+                feet,
+                radius,
+                knockback,
+                super::wind::Source::WIND_BURST.with_cause(cause),
+            );
         }
     }
     /// `EnchantmentHelper.doPostAttackEffects`' `VICTIM` loop after the mob
@@ -958,7 +978,7 @@ impl Game<'_> {
         }) else {
             return;
         };
-        let loss = self.durability_loss(&stack, amount);
+        let loss = self.durability_loss(&stack, amount, Wearer::Living(id));
         if loss == 0 {
             return;
         }
@@ -979,8 +999,10 @@ impl Game<'_> {
         self.lan_entity_event(id as i32, event, at);
     }
     /// `ExperienceOrb.repairPlayerItems`: returns the experience left over.
-    pub(super) fn mending(&mut self, amount: u32) -> u32 {
+    pub(in crate::game) fn mending(&mut self, amount: u32) -> u32 {
         let mut amount = amount;
+        let player = (self.serving.is_some() || self.options.dedicated.is_some())
+            .then(|| self.native_acting_id());
         loop {
             // EnchantmentHelper.getRandomItemWith(REPAIR_WITH_XP, damaged), in
             // EquipmentSlot order, drawn from the player's own random.
@@ -992,49 +1014,39 @@ impl Game<'_> {
             ) else {
                 return amount;
             };
-            let Some(stack) = self.player_slot(slot).clone() else {
+            let Some(mut stack) = self.player_slot(slot).clone() else {
                 return amount;
             };
-            let ctx = EffectContext {
-                items: Some(world_items!(self)),
-                ..Default::default()
-            };
-            let vanilla_repair = world_stations!(self).enchantments.modify_value(
-                Some(&stack),
-                "minecraft:repair_with_xp",
-                &ctx,
+            let vanilla_repair = repair_from_xp(
+                &world_stations!(self).enchantments,
+                Some(world_items!(self)),
+                &stack,
+                amount,
                 &mut self.world.random,
-                amount as f32,
-            ) as u32;
-            let to_repair_xp = self.xp_repair(&stack, amount, vanilla_repair);
-            // A hook can re-enter experience granting or replace the slot. Only
-            // repair the same eligible stack, using its current damage.
-            let eligible = self.player_slot(slot).as_ref().is_some_and(|current| {
-                mending_entries(current, slot, &world_stations!(self).enchantments) > 0
-            });
-            let Some(current) = self.player_slot_mut(slot).as_mut() else {
-                return amount;
-            };
-            let mut original = stack.clone();
-            original.damage = current.damage;
-            if *current != original || current.damage == 0 || !eligible {
-                return amount;
-            }
+            );
+            let to_repair_xp = self.xp_repair(player, &stack, amount, vanilla_repair);
+            // No re-check that the slot still holds the picked stack, eligible
+            // and damaged: nothing between the pick and here can change it. The
+            // `xp_repair_ratio` parts are asked through `&self` with a read-only
+            // host, and the `repair_with_xp` value only draws from the world's
+            // random. The repair is written back as the picked stack. A path that
+            // could change the slot in this window must bring the re-check back.
             if to_repair_xp == 0 {
                 // Vanilla consumes the XP when its own repair effect returns zero.
                 return if vanilla_repair == 0 { 0 } else { amount };
             }
-            let repaired = to_repair_xp.min(current.damage);
+            let (repaired, remaining) = repaired_and_left(amount, stack.damage, to_repair_xp);
             if repaired == 0 {
                 return amount;
             }
-            current.damage -= repaired;
-            let item = current.item.to_string();
-            let player = (self.serving.is_some() || self.options.dedicated.is_some())
-                .then(|| self.native_acting_id());
-            let remaining = amount.saturating_sub(
-                (u64::from(repaired) * u64::from(amount) / u64::from(to_repair_xp)) as u32,
-            );
+            // The XP vanilla spends on this repair. A listener can change how
+            // much durability is restored and how much of the orb is consumed;
+            // with no listener both values arrive unchanged, so the result is
+            // vanilla's. The event runs before the write so its answer is used.
+            let spent = amount.saturating_sub(remaining);
+            let item = stack.item.to_string();
+            let mut repair = repaired;
+            let mut experience = amount;
             if let Some(player) = player
                 && let Some(name) = self
                     .native_server_players()
@@ -1042,31 +1054,47 @@ impl Game<'_> {
                     .find(|p| p.uuid() == player)
                     .and_then(|p| self.player_name(p))
             {
-                self.native_player_item_mend(player, &name, &item, repaired, amount);
+                self.native_player_item_mend(player, &name, &item, &mut repair, &mut experience);
             }
-            if remaining == 0 {
+            stack.damage = stack.damage.saturating_sub(repair);
+            *self.player_slot_mut(slot) = Some(stack);
+            let left = experience.saturating_sub(spent);
+            // A listener can refuse the repair without spending XP. Nothing
+            // changed, so trying the same stack again would loop forever.
+            if repair == 0 && left >= amount {
+                return left;
+            }
+            if left == 0 {
                 return 0;
             }
-            amount = remaining;
+            amount = left;
         }
     }
     /// The repair Mending gives `stack` for `experience` points: `vanilla`
     /// (its `minecraft:repair_with_xp` repair) as the item's parts scale it
     /// (`IItemExtension.getXpRepairRatio`), `floor(experience × ratio)` within
     /// `0..=i32::MAX`. A ratio left as it arrived keeps `vanilla` exactly, and
-    /// one that isn't finite is refused for it.
-    fn xp_repair(&mut self, stack: &ItemStack, experience: u32, vanilla: u32) -> u32 {
+    /// one that isn't finite is refused for it. `player` is the acting player,
+    /// `None` when no server runs (no part is asked then).
+    fn xp_repair(
+        &self,
+        player: Option<u128>,
+        stack: &ItemStack,
+        experience: u32,
+        vanilla: u32,
+    ) -> u32 {
+        let Some(player) = player else {
+            return vanilla;
+        };
         // One table lookup tells whether any part of this item listens; with none,
         // the stack is not converted and no host is made.
         if experience == 0
-            || (self.serving.is_none() && self.options.dedicated.is_none())
             || !mod_api::__private::item_listens(mod_api::HookId::XpRepairRatio, &stack.item)
         {
             return vanilla;
         }
         let arrived = vanilla as f32 / experience as f32;
         let mut ratio = arrived;
-        let player = self.native_acting_id();
         self.native_xp_repair_ratio(player, stack, experience, &mut ratio);
         if ratio.to_bits() == arrived.to_bits() {
             return vanilla;
@@ -1256,6 +1284,16 @@ impl Game<'_> {
     /// for an armor stand: run location effects before travel (including a
     /// piston push), on landing, and for newly equipped items.
     pub(super) fn armor_stand_location_effects(&mut self, index: usize, landed: bool) {
+        // Nothing to tell: read without a `&mut`, which the list would count as a touch.
+        {
+            let stand = &self.armor_stands[index];
+            if !landed
+                && stand.enchantment_block == Some(BlockPos::containing(stand.position))
+                && (0..8).all(|i| stand.equipment[i] == stand.enchantment_equipment[i])
+            {
+                return;
+            }
+        }
         let stand = &mut self.armor_stands[index];
         let block = BlockPos::containing(stand.position);
         let moved = !landed && stand.enchantment_block.replace(block) != Some(block);
@@ -1624,6 +1662,46 @@ fn mending_entries(stack: &ItemStack, slot: PlayerSlot, enchantments: &Enchantme
         .count()
 }
 
+/// `EnchantmentHelper.modifyDurabilityToRepairFromXp`: the experience `amount`
+/// repairs at the stack's `repair_with_xp` xp-per-point rate. Vanilla's
+/// `Enchantment.itemContext` puts the repaired stack in
+/// `LootContextParams.TOOL`, so `minecraft:match_tool` judges that item.
+fn repair_from_xp(
+    enchantments: &Enchantments,
+    items: Option<&Items>,
+    stack: &ItemStack,
+    amount: u32,
+    random: &mut LegacyRandom,
+) -> u32 {
+    let ctx = EffectContext {
+        tool: Some(&stack.item),
+        items,
+        ..Default::default()
+    };
+    enchantments.modify_value(
+        Some(stack),
+        "minecraft:repair_with_xp",
+        &ctx,
+        random,
+        amount as f32,
+    ) as u32
+}
+
+/// `ExperienceOrb.repairPlayerItems`: the damage `to_repair` xp per point takes
+/// off a stack with `damage`, and the experience left over after it
+/// (`amount - repair * amount / toRepairFromXpAmount`, in vanilla's integer
+/// order). Vanilla divides only when it repairs something, so a rate of zero
+/// keeps all of `amount`.
+fn repaired_and_left(amount: u32, damage: u32, to_repair: u32) -> (u32, u32) {
+    let repaired = to_repair.min(damage);
+    if repaired == 0 {
+        return (0, amount);
+    }
+    let left = amount
+        .saturating_sub((u64::from(repaired) * u64::from(amount) / u64::from(to_repair)) as u32);
+    (repaired, left)
+}
+
 /// `EnchantmentHelper.getRandomItemWith(REPAIR_WITH_XP, player, ItemStack::isDamaged)`:
 /// collects damaged effect-bearing pieces in `EquipmentSlot.VALUES` order and picks
 /// one with the player's own random (`Entity.random`), never the level's.
@@ -1691,7 +1769,7 @@ mod tests {
     use horizon_core::geometry::Vec3;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; process-wide parts, run this test alone"]
+    #[ignore = "daily"]
     fn mob_armour_obeys_negative_cancel_and_breaking_answers() {
         with_wear_part("minecraft:iron_helmet", Rule::Set(-1), |game, wear| {
             let kind = game
@@ -1731,9 +1809,14 @@ mod tests {
         });
     }
 
-    use super::{armor_changes, block_break_speed_factor, pick_mending_slot, soul_speed_tick};
+    use super::{
+        Enchantments, armor_changes, block_break_speed_factor, pick_mending_slot, repair_from_xp,
+        repaired_and_left, soul_speed_tick,
+    };
+
     use horizon_client::items::ItemStack;
     use horizon_core::random::{LegacyRandom, RandomSource};
+    use horizon_world::loot::PackOverlay;
 
     /// The snapshot reports a newly worn piece once, then settles.
     #[test]
@@ -1753,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn thorns_and_boots_wear_break_the_equipped_piece() {
         use horizon_client::items::ItemStack;
         use horizon_client::motion::PlayerMotion;
@@ -1774,7 +1857,7 @@ mod tests {
         });
     }
 
-    /// #4094: `BLOCK_BREAK_SPEED` is a multiplier on the destroy speed.
+    /// arismoko/horizon#4094: `BLOCK_BREAK_SPEED` is a multiplier on the destroy speed.
     #[test]
     fn block_break_speed_is_a_destroy_speed_multiplier() {
         assert_eq!(block_break_speed_factor(None), 1.0);
@@ -1996,6 +2079,53 @@ mod tests {
         assert_eq!(out, (None, None));
         assert_eq!(l_rng.next_long(), expected_level.next_long());
         assert_eq!(w_rng.next_long(), expected_wearer.next_long());
+    }
+
+    /// A pack's `repair_with_xp` gated on swords: `Enchantment.itemContext`
+    /// hands the repaired stack to the conditions as `LootContextParams.TOOL`,
+    /// so the sword repairs at twice the xp and the axe at the plain rate.
+    #[test]
+    fn mending_repair_judges_match_tool_by_the_repaired_stack() {
+        let files = [(
+            "enchantment/pack:xp_repair".to_owned(),
+            vec![
+                br#"{"description":"xp repair","supported_items":"minecraft:diamond_sword","slots":["mainhand"],"effects":{"minecraft:repair_with_xp":[{"effect":{"type":"minecraft:multiply","factor":2.0},"requirements":{"type":"minecraft:match_tool","predicate":{"items":"minecraft:diamond_sword"}}}]}}"#
+                    .to_vec(),
+            ],
+        )];
+        let root = std::env::temp_dir().join(format!(
+            "horizon-mending-tool-context-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let e = Enchantments::load_with(&root, &PackOverlay::new(&files), &defaults).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        let gated = |id: &str| {
+            let mut stack = ItemStack::new(id, 1);
+            stack.damage = 20;
+            stack.set_crafting_enchantments(vec![("pack:xp_repair".into(), 1)]);
+            stack
+        };
+        let mut random = LegacyRandom::new(7);
+        // The sword matches: 5 xp repairs 10 of the stack's 20 damage and uses
+        // it all up; 2 damage would eat 1 xp (2 * 5 / 10, vanilla's integer
+        // order) and leave 4.
+        let sword = gated("minecraft:diamond_sword");
+        let to_repair = repair_from_xp(&e, None, &sword, 5, &mut random);
+        assert_eq!(to_repair, 10);
+        assert_eq!(repaired_and_left(5, sword.damage, to_repair), (10, 0));
+        assert_eq!(repaired_and_left(5, 2, to_repair), (2, 4));
+        // The axe matches no tool condition: 1 xp per damage point, so 5 xp
+        // repairs 5 damage; 2 damage would eat 2 xp and leave 3.
+        let axe = gated("minecraft:diamond_axe");
+        let to_repair = repair_from_xp(&e, None, &axe, 5, &mut random);
+        assert_eq!(to_repair, 5);
+        assert_eq!(repaired_and_left(5, axe.damage, to_repair), (5, 0));
+        assert_eq!(repaired_and_left(5, 2, to_repair), (2, 3));
+        // `minecraft:multiply` draws nothing: the level RNG is untouched.
+        assert_eq!(random.next_long(), LegacyRandom::new(7).next_long());
     }
 }
 

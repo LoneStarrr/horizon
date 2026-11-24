@@ -8,7 +8,8 @@ use crate::{
     advancements::{Progress, Tree},
     recipe_book::{Category, RecipeIndex, Settings, crafting_category, crafting_station},
 };
-use horizon_protocol::buf::Writer;
+use horizon_core::identifier::parse_or_keep;
+use horizon_protocol::buf::{Codec, Writer};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -56,12 +57,13 @@ impl ServerAdvancements {
         let tree = Tree::shared(&resources.join("data"), overlay);
         let kids = tree.children();
         let layout = tree.layout();
+        let displays = RecipeIndex::from_serialized(&recipes);
         Self {
             tree,
             kids,
             layout,
             recipes,
-            displays: RecipeIndex::load(resources, overlay),
+            displays,
             groups,
         }
     }
@@ -414,10 +416,12 @@ impl ServerAdvancements {
         if let Some(d) = &a.display {
             w.nbt(&json_to_nbt(&d.title));
             w.nbt(&json_to_nbt(&d.description));
-            w.varint(sync.id("minecraft:item", &d.icon).unwrap_or(0));
-            w.varint(1);
-            w.varint(0);
-            w.varint(0);
+            let icon = super::guest::network_stack(
+                &|name| sync.id("minecraft:item", name).unwrap_or(0),
+                &|registry, name| sync.id(registry, name),
+                &d.icon,
+            );
+            horizon_protocol::item::Template::write(&icon, w);
             w.varint(match d.frame {
                 crate::advancements::Frame::Task => 0,
                 crate::advancements::Frame::Challenge => 1,
@@ -550,13 +554,9 @@ impl ServerAdvancements {
         };
         // The result as its ItemStackSlotDisplay, the station as its item.
         let result = |w: &mut Writer| {
+            let id = horizon_world::loot::recipe_result_id(&r["result"]);
             w.varint(slot("minecraft:item_stack"));
-            w.varint(
-                item(
-                    horizon_world::loot::recipe_result_id(&r["result"]).unwrap_or("minecraft:air"),
-                )
-                .unwrap_or(0),
-            );
+            w.varint(item(id.as_deref().unwrap_or("minecraft:air")).unwrap_or(0));
             w.varint(r["result"]["count"].as_i64().unwrap_or(1) as i32);
             w.varint(0);
             w.varint(0);
@@ -757,8 +757,8 @@ impl ServerAdvancements {
         }
         let base = result["count"].as_i64().unwrap_or(1) as i32;
         let add = r["add_material_count_to_result"].as_bool().unwrap_or(false);
-        let result_items: Vec<i32> = match result["id"].as_str() {
-            Some(id) => vec![item(id)?],
+        let result_items: Vec<i32> = match horizon_world::loot::recipe_result_id(result) {
+            Some(id) => vec![item(&id)?],
             // Composite over the input's items, in the order clients get the tag.
             None => match input.as_str()? {
                 tag if tag.starts_with('#') => {
@@ -773,7 +773,7 @@ impl ServerAdvancements {
                         .ids
                         .clone()
                 }
-                one => vec![item(one)?],
+                one => vec![item(&parse_or_keep(one))?],
             },
         };
         let (shapeless, tag, empty_stack) = (
@@ -894,13 +894,14 @@ fn shrink(rows: &[Value]) -> Vec<Vec<char>> {
 
 /// ByteBufCodecs.holderSet for an ingredient: a tag by name, or the items.
 /// An item the registries do not know is left out, not sent as id 0.
+/// `Item.CODEC` reads an id before that lookup; a tag's name stays as written.
 fn holder_set(w: &mut Writer, v: &Value, item: &dyn Fn(&str) -> Option<i32>) {
     match v {
         Value::String(s) if s.starts_with('#') => {
             w.varint(0);
             w.string(&s[1..]);
         }
-        Value::String(s) => match item(s) {
+        Value::String(s) => match item(&parse_or_keep(s)) {
             Some(id) => {
                 w.varint(2);
                 w.varint(id);
@@ -908,7 +909,10 @@ fn holder_set(w: &mut Writer, v: &Value, item: &dyn Fn(&str) -> Option<i32>) {
             None => w.varint(1),
         },
         Value::Array(a) => {
-            let ids: Vec<i32> = a.iter().filter_map(|s| item(s.as_str()?)).collect();
+            let ids: Vec<i32> = a
+                .iter()
+                .filter_map(|s| item(&parse_or_keep(s.as_str()?)))
+                .collect();
             w.varint(ids.len() as i32 + 1);
             for id in ids {
                 w.varint(id);
@@ -996,6 +1000,14 @@ mod tests {
         for (id, json) in recipes {
             std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
         }
+        // The recipes name `#minecraft:dyes`; an ingredient whose tag is missing is no recipe.
+        let tags = root.join("data/minecraft/tags/item");
+        std::fs::create_dir_all(&tags).unwrap();
+        std::fs::write(
+            tags.join("dyes.json"),
+            r#"{"values":["minecraft:redstone"]}"#,
+        )
+        .unwrap();
         root
     }
 
@@ -1021,6 +1033,95 @@ mod tests {
     }
 
     #[test]
+    fn advancement_icons_roundtrip_count_damage_and_opposite_glint_overrides() {
+        use horizon_protocol::{
+            item::{Component, component},
+            packets::play::UpdateAdvancements,
+            registry::Ids,
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../horizon-client/tests/fixtures/advancement-icons/data");
+        let tree = Tree::load(&root);
+        let mut sync = SyncData::empty();
+        sync.advancements.kids = tree.children();
+        sync.advancements.layout = tree.layout();
+        sync.advancements.tree = std::sync::Arc::new(tree);
+        sync.builtin.registries.insert(
+            "minecraft:item".into(),
+            Ids::from_names(vec![
+                "minecraft:air".into(),
+                "minecraft:wooden_pickaxe".into(),
+            ]),
+        );
+        let mut types: Vec<_> = (0..=component::ENCHANTMENT_GLINT_OVERRIDE)
+            .map(|i| format!("test:unused_{i}"))
+            .collect();
+        types[component::DAMAGE as usize] = "minecraft:damage".into();
+        types[component::ENCHANTMENT_GLINT_OVERRIDE as usize] =
+            "minecraft:enchantment_glint_override".into();
+        sync.builtin.registries.insert(
+            "minecraft:data_component_type".into(),
+            Ids::from_names(types),
+        );
+        let mut progress = Progress::default();
+        for id in ["horizon_test:glint", "horizon_test:plain"] {
+            progress.grant(id, "done", "2026-01-01 00:00:00 +0000");
+        }
+        let (bytes, _) = sync.advancements.first_snapshot(&sync, &progress, &[], 0);
+        let mut reader = Reader::new(&bytes);
+        let packet = UpdateAdvancements::read(&mut reader).unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(packet.added.len(), 2);
+        for (id, foil) in [("horizon_test:glint", true), ("horizon_test:plain", false)] {
+            let wire = &packet
+                .added
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap()
+                .display
+                .as_ref()
+                .unwrap()
+                .icon;
+            assert_eq!((wire.item, wire.count, wire.damage()), (1, 3, 7));
+            assert_eq!(
+                wire.component(component::ENCHANTMENT_GLINT_OVERRIDE),
+                Some(&Component::Bool(foil)),
+            );
+            let icon = crate::item_sync::from_network(wire, &sync.builtin, &sync.dynamic);
+            assert_eq!(
+                (&*icon.item, icon.count, icon.damage),
+                ("minecraft:wooden_pickaxe", 3, 7)
+            );
+            assert_eq!(icon.has_foil(None), foil);
+            assert_eq!(
+                icon,
+                sync.advancements
+                    .definition(id)
+                    .unwrap()
+                    .display
+                    .as_ref()
+                    .unwrap()
+                    .icon
+            );
+        }
+        // Only the override changes: same advancement id, item, title, count and damage.
+        let tree = std::sync::Arc::get_mut(&mut sync.advancements.tree).unwrap();
+        let i = tree.by_id["horizon_test:glint"];
+        tree.list[i]
+            .display
+            .as_mut()
+            .unwrap()
+            .icon
+            .data_mut()
+            .set_other(
+                "minecraft:enchantment_glint_override",
+                Some(horizon_core::nbt::Tag::Byte(0)),
+            );
+        let (without_glint, _) = sync.advancements.first_snapshot(&sync, &progress, &[], 0);
+        assert_ne!(bytes, without_glint);
+    }
+
+    #[test]
     fn tick_grants_wait_for_listener_before_reward_and_recheck_progress() {
         use crate::advancements::{Advancement, Criterion, Display, Frame, Rewards};
         let mut tree = Tree::default();
@@ -1028,7 +1129,7 @@ mod tests {
             id: "test:tick".into(),
             parent: None,
             display: Some(Display {
-                icon: "minecraft:air".into(),
+                icon: crate::items::ItemStack::new("minecraft:air", 1),
                 title: serde_json::json!("Title"),
                 description: serde_json::json!("Description"),
                 frame: Frame::Task,
@@ -1055,6 +1156,12 @@ mod tests {
         sync.advancements.kids = tree.children();
         sync.advancements.layout = tree.layout();
         sync.advancements.tree = std::sync::Arc::new(tree);
+        // A reward names a recipe the server knows: an unknown id is never added to the book.
+        sync.advancements.displays =
+            crate::recipe_book::RecipeIndex::from_serialized(&BTreeMap::from([(
+                "test:reward".to_owned(),
+                r#"{"type":"minecraft:crafting_shapeless"}"#.into(),
+            )]));
         let advancement = &sync.advancements;
         let mut progress = Progress::default();
         let mut book = Settings::default();
@@ -1146,6 +1253,30 @@ mod tests {
             }
             other => panic!("not an item list: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An ingredient's id is read as `Item.CODEC` reads one, before the registry lookup.
+    #[test]
+    fn an_ingredient_id_is_read_before_the_item_lookup() {
+        let bare = r#"{"type":"minecraft:crafting_shapeless","ingredients":["raw_copper"],"result":{"id":"minecraft:copper_ingot"}}"#;
+        let tag = r##"{"type":"minecraft:crafting_shapeless","ingredients":["#minecraft:dyes"],"result":{"id":"minecraft:copper_ingot"}}"##;
+        let unknown = r#"{"type":"minecraft:crafting_shapeless","ingredients":["Stick"],"result":{"id":"minecraft:copper_ingot"}}"#;
+        let root = resources(
+            "ingredient_id",
+            &[("bare", bare), ("tag", tag), ("unknown", unknown)],
+        );
+        let (sync, e) = entry(&root, "minecraft:bare");
+        let copper = sync.id("minecraft:item", "minecraft:raw_copper").unwrap();
+        assert_eq!(e.requirements, Some(vec![HolderSet::Items(vec![copper])]));
+        // A `#`-tag keeps its name; an id no registry entry has still names no item.
+        let (_, e) = entry(&root, "minecraft:tag");
+        assert_eq!(
+            e.requirements,
+            Some(vec![HolderSet::Tag("minecraft:dyes".into())])
+        );
+        let (_, e) = entry(&root, "minecraft:unknown");
+        assert_eq!(e.requirements, Some(vec![HolderSet::Items(Vec::new())]));
         let _ = std::fs::remove_dir_all(&root);
     }
 

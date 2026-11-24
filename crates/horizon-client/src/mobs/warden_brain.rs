@@ -23,7 +23,7 @@ use super::{
 use crate::health::DamageLevel;
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{EntityRandom, LegacyRandom, RandomSource},
 };
 
 /// `WardenAi` timings.
@@ -173,7 +173,7 @@ enum B {
     Digging(Timed),
     SetRoarTarget(bool),
     TryToSniff(bool),
-    /// A mod's behavior (#824), wrapped by `mod_behaviors`.
+    /// A mod's behavior (arismoko/horizon#824), wrapped by `mod_behaviors`.
     Mod(super::mod_behaviors::ModBehavior),
     RunOne(Box<Gate>),
     Stroll(bool),
@@ -218,7 +218,7 @@ impl Brain {
     pub fn new(mob_id: &str, shuffle_seed: i64) -> Self {
         let mut list = activities(shuffle_seed);
         // The parts' behaviors join before the sort, so each lands after
-        // vanilla's of its priority (#824); the stable sort keeps vanilla's
+        // vanilla's of its priority (arismoko/horizon#824); the stable sort keeps vanilla's
         // own order. Nothing joins a type no part attached to, and nothing
         // is asked or built then.
         let before = list.len();
@@ -300,7 +300,7 @@ impl Brain {
         }
     }
     /// `Sensor.randomlyDelayStart` for both sensors, from the warden's random.
-    pub fn delay_sensors(&mut self, random: &mut LegacyRandom) {
+    pub fn delay_sensors(&mut self, random: &mut EntityRandom) {
         for s in &mut self.sensors {
             *s = i64::from(random.next_int_bound(20).unwrap_or(0));
         }
@@ -520,11 +520,11 @@ fn sense_entities(m: &mut Mob, w: &MobWorld) {
     let attackable = list
         .iter()
         .copied()
-        .find(|&e| e == Who::Player && warden::can_target(w, e))
+        .find(|&e| e == Who::Player && warden::can_target(w, m.id, e))
         .or_else(|| {
             list.iter()
                 .copied()
-                .find(|&e| e != Who::Player && warden::can_target(w, e))
+                .find(|&e| e != Who::Player && warden::can_target(w, m.id, e))
         });
     let mm = mem(m);
     mm.mobs.set_list(list.clone());
@@ -640,7 +640,7 @@ fn sound(m: &Mob, name: &'static str, volume: f32, pitch: f32, events: &mut Vec<
 
 // ---- Mod behaviors ------------------------------------------------------
 
-/// The parts' behaviors for this brain (#824): each joins the list with its
+/// The parts' behaviors for this brain (arismoko/horizon#824): each joins the list with its
 /// activity and priority, refused where this brain has no such activity.
 fn attach_behaviors(mob_id: &str, list: &mut Vec<Entry>) {
     struct Reg<'a> {
@@ -849,7 +849,7 @@ impl B {
                 let Some(target) = warden::entity_angry_at(m, cx.w) else {
                     return false;
                 };
-                if !warden::can_target(cx.w, target) {
+                if !warden::can_target(cx.w, m.id, target) {
                     return false;
                 }
                 let mm = mem(m);
@@ -977,7 +977,7 @@ impl B {
                     return false;
                 };
                 let alive = cx.w.target_info(target).is_some_and(|t| t.alive);
-                let can = warden::can_target(cx.w, target);
+                let can = warden::can_target(cx.w, m.id, target);
                 let angry = warden::anger_level(m).is_angry();
                 if can && alive && angry {
                     return true;
@@ -1076,7 +1076,7 @@ impl B {
                     return false;
                 }
                 mem(m).look_target.set(Tracker::Entity(target, true));
-                m.swing();
+                m.swing_for_attack(false);
                 warden::do_hurt_target(m, target, w, cx.level, cx.events);
                 mem(m)
                     .attack_cooling_down
@@ -1249,7 +1249,7 @@ impl B {
                 mem(m).is_sniffing.clear();
                 let w = cx.w;
                 if let Some(entity) = mem(m).nearest_attackable.value()
-                    && warden::can_target(w, entity)
+                    && warden::can_target(w, m.id, entity)
                     && let Some(info) = w.target_info(entity)
                 {
                     if closer_than(m, info.position, 6.0, 20.0) {
@@ -1606,7 +1606,7 @@ mod warden_owned_memory_tests {
         );
     }
     #[test]
-    #[ignore = "needs prepared resources; actual full Mob ticks, no skipped coverage"]
+    #[ignore = "daily"]
     fn actual_mob_ticks_expire_owned_memories_and_noai_retains_them() {
         let build = |world: &mut crate::world::World, registry: &BlockRegistry| {
             world
@@ -1661,6 +1661,7 @@ mod tests {
     /// a summon's `Passengers`) gets off so that it can dig. It was stubbed
     /// out, and such a warden stayed aboard for good (#8833).
     #[test]
+    #[ignore = "daily"]
     fn a_warden_forced_aboard_gets_off_to_dig() {
         let ran = crate::mobs::world::with_test_world(&[], |w, _| {
             let at = horizon_core::geometry::Vec3::new(0.5, 64.0, 0.5);
@@ -1687,6 +1688,6 @@ mod tests {
                 [MobEvent::EjectPassengers { mob: 1, .. }]
             ));
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 }

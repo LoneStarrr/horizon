@@ -11,6 +11,8 @@ use horizon_client::{
     hud::HudBatch,
     items::ItemStack,
     merchant::{self, MerchantOffer, TradeContext},
+    random_sequences::RandomSequences,
+    text::Text,
     widgets::{Cursor, request_cursor},
 };
 
@@ -31,7 +33,43 @@ pub(super) struct MerchantState {
     /// The trading mob (its offers and experience are written back on
     /// close) and its custom name.
     pub(super) mob: Option<u32>,
-    pub(super) name: Option<String>,
+    /// `Merchant.getDisplayName()`: the trading mob's custom name with its
+    /// style, else nothing (the profession's name is the default).
+    pub(super) name: Option<Text>,
+}
+/// `Merchant.getDisplayName`: the merchant's custom name (style and all), else
+/// the profession's or the wandering trader's.
+pub(super) fn merchant_display_name(
+    progress: bool,
+    profession: &str,
+    custom: Option<Text>,
+) -> Text {
+    custom.unwrap_or_else(|| {
+        if progress {
+            Text::translate_with_fallback(
+                &format!("entity.minecraft.villager.{profession}"),
+                profession,
+                &[],
+            )
+        } else {
+            Text::translate_with_fallback(
+                "entity.minecraft.wandering_trader",
+                "Wandering Trader",
+                &[],
+            )
+        }
+    })
+}
+/// `MerchantScreen.extractLabels`: a villager's title is `merchant.title` with
+/// the name and its level, so the name keeps the style it was given.
+pub(super) fn merchant_title(progress: bool, level: i32, name: Text) -> Text {
+    // `extractLabels` joins the level for levels 1 to 5 only (`VillagerData`
+    // clamps a villager to 1; a level past 5 draws the name alone).
+    if !progress || !(1..=5).contains(&level) {
+        return name;
+    }
+    let level = Text::translate_with_fallback(&format!("merchant.level.{level}"), "", &[]);
+    Text::translate_with_fallback("merchant.title", "%s - %s", &[name, level])
 }
 impl MerchantState {
     /// `Merchant.showProgressBar`: villagers only.
@@ -132,24 +170,43 @@ impl merchant::MapMaker for GameMaps<'_> {
     }
 }
 
-impl Game<'_> {
-    pub(super) fn random_sequences_path(&self) -> std::path::PathBuf {
-        self.world_root.join("data/minecraft/random_sequences.dat")
+/// The world's `data/minecraft/random_sequences.dat`.
+fn random_sequences_file(world_root: &std::path::Path) -> std::path::PathBuf {
+    world_root.join("data/minecraft/random_sequences.dat")
+}
+/// `RandomSequences` as opening the world reads it. A world with no file gets new data,
+/// which `MinecraftServer`'s `savedDataStorage.computeIfAbsent(RandomSequences.TYPE)` stores
+/// dirty (`SavedDataStorage.set`): its first save writes it.
+pub(super) fn read_random_sequences(world_root: &std::path::Path) -> RandomSequences {
+    horizon_client::save::read_dat(&random_sequences_file(world_root))
+        .and_then(|t| t.get("data").cloned())
+        .map(|d| RandomSequences::from_nbt(&d))
+        .unwrap_or_else(RandomSequences::new_dirty)
+}
+/// `SavedDataStorage.saveAndJoin` for `RandomSequences`: written only while dirty, with
+/// whatever it holds then, so the emptied map and the salt a `/random reset *` left reach
+/// the file after a draw, and not without one.
+pub(super) fn write_random_sequences(world_root: &std::path::Path, data: &mut RandomSequences) {
+    let Some(data) = data.take_dirty_nbt() else {
+        return;
+    };
+    let tag = horizon_core::nbt::Tag::compound([
+        ("data", data),
+        (
+            "DataVersion",
+            horizon_core::nbt::Tag::Int(horizon_world::DATA_VERSION),
+        ),
+    ]);
+    if let Err(e) = horizon_client::save::write_dat(&random_sequences_file(world_root), tag) {
+        log::warn!("the villager random sequences were not written: {e}");
     }
+}
+
+impl Game<'_> {
     /// `RandomSequences` as `random_sequences.dat` (not on a server's guest).
     pub(super) fn save_random_sequences(&mut self) {
-        if self.remote.is_some() || self.rand_sequences.ids().is_empty() {
-            return;
-        }
-        let tag = horizon_core::nbt::Tag::compound([
-            ("data", self.rand_sequences.to_nbt()),
-            (
-                "DataVersion",
-                horizon_core::nbt::Tag::Int(horizon_world::DATA_VERSION),
-            ),
-        ]);
-        if let Err(e) = horizon_client::save::write_dat(&self.random_sequences_path(), tag) {
-            log::warn!("the villager random sequences were not written: {e}");
+        if self.remote.is_none() {
+            write_random_sequences(&self.world_root, &mut self.rand_sequences);
         }
     }
     /// `AbstractVillager.addOffersFromTradeSet` with the world's random
@@ -312,7 +369,14 @@ impl Game<'_> {
         session.random.clone_from(&m.random);
         session.origin = [m.position.x, m.position.y, m.position.z];
         session.ambient_sound_time = m.ambient_timer;
-        let (id, name) = (m.id, m.custom_name.clone());
+        let (id, name) = (
+            m.id,
+            m.custom_name.as_ref().map(|plain| {
+                m.custom_name_text
+                    .clone()
+                    .unwrap_or_else(|| Text::literal(plain))
+            }),
+        );
         if villager {
             session.reputation = self.villager_reputation(id);
             session.hero = self.hero_amplifier();
@@ -327,6 +391,11 @@ impl Game<'_> {
         }
         // startTrading: updateSpecialPrices, then the screen opens.
         session.update_special_prices();
+        // The mob owns the live offers even while a menu is open.
+        {
+            let trade = self.mobs[index].extra.trade.get_or_insert_default();
+            trade.offers = session.offers.clone();
+        }
         // setTradingPlayer: a wandering trader stands still while trading, a
         // villager's brain follows and looks at the player
         // (LookAndFollowTradingPlayerSink).
@@ -341,9 +410,47 @@ impl Game<'_> {
         });
         Ok(true)
     }
-    /// `Villager.setTradingPlayer(null)`: the session goes back to the mob
-    /// (special prices stay as they were), the borrowed sequences to the world.
+    /// Apply the villager AI's request to generate its offers.
+    pub(super) fn merchant_offers_generated(&mut self, mob: u32) {
+        if let Some(i) = self.mobs.iter().position(|m| m.id == mob) {
+            self.ensure_offers(i);
+        }
+    }
+    /// `Villager.updateSpecialPrices` after restock: the live offers, result
+    /// slot and offer packet all change before the trading player's next click.
+    pub(super) fn merchant_restocked(&mut self, id: u32) {
+        self.merchant_refresh_local(id);
+        self.lan_merchant_reputation(id);
+    }
+    /// `Villager.updateSpecialPrices` for the current local trading player.
+    fn merchant_refresh_local(&mut self, id: u32) {
+        if !self
+            .station
+            .as_ref()
+            .and_then(|s| s.merchant.as_ref())
+            .is_some_and(|m| m.mob == Some(id))
+        {
+            return;
+        }
+        let Some(uuid) = self.player_uuid_of(self.lan_acting) else {
+            return;
+        };
+        let reputation = self.villager_reputation_of(id, uuid);
+        let hero = self.hero_amplifier();
+        self.menu_session(|menu, env, _| {
+            if let Some(session) = menu.merchant.as_mut() {
+                session.reputation = reputation;
+                session.hero = hero;
+                session.update_special_prices();
+            }
+            menu.merchant_update(env);
+            Some(true)
+        });
+    }
+    /// `Villager.setTradingPlayer(null)`: retain the current special prices;
+    /// the next opening recalculates them. Return borrowed sequences to the world.
     pub(super) fn merchant_closed(&mut self, state: &mut MerchantState) {
+        self.merchant_sync_in(&mut state.session, state.mob);
         let session = &mut state.session;
         for (id, r) in std::mem::take(&mut session.sequences) {
             self.rand_sequences.give_back(id, r);
@@ -361,7 +468,7 @@ impl Game<'_> {
             m.extra.villager_level = session.level.max(1);
         }
         m.extra.flag2 = false;
-        m.random = session.random.clone();
+        *m.random = session.random.clone();
         m.ambient_timer = session.ambient_sound_time;
         let trade = m.extra.trade.get_or_insert_default();
         trade.xp = session.xp;
@@ -401,11 +508,7 @@ impl Game<'_> {
         });
     }
     /// A server's trading window (no mob here: the server keeps it).
-    pub(super) fn open_remote_merchant(
-        &mut self,
-        session: merchant::Session,
-        name: Option<String>,
-    ) {
+    pub(super) fn open_remote_merchant(&mut self, session: merchant::Session, name: Option<Text>) {
         self.open_merchant_state(MerchantState {
             session: Box::new(session),
             scroll: 0,
@@ -429,6 +532,10 @@ impl Game<'_> {
             session.random.clone_from(&m.random);
             session.ambient_sound_time = m.ambient_timer;
             session.origin = [m.position.x, m.position.y, m.position.z];
+            if let Some(trade) = m.extra.trade.as_deref() {
+                session.offers = trade.offers.clone();
+                session.xp = trade.xp;
+            }
         }
     }
     /// After a menu click: the session back to the station, its random to
@@ -473,7 +580,7 @@ impl Game<'_> {
         let mut traded = Vec::new();
         let (villager, origin) = (session.villager, session.origin);
         if let Some(m) = mob.and_then(|id| self.mobs.iter_mut().find(|m| m.id == id)) {
-            m.random = session.random.clone();
+            *m.random = session.random.clone();
             m.ambient_timer = session.ambient_sound_time;
             if villager {
                 m.extra.villager_level = session.level.max(1);
@@ -511,6 +618,13 @@ impl Game<'_> {
                     self.audio.play(sound, Some(origin), 1.0, 1.0);
                 }
             }
+        }
+        // Offer hooks above may edit the live session. Publish that final state
+        // so the next click, AI restock and save all see the same offers.
+        if let Some(m) = mob.and_then(|id| self.mobs.iter_mut().find(|m| m.id == id)) {
+            let trade = m.extra.trade.get_or_insert_default();
+            trade.offers = session.offers.clone();
+            trade.xp = session.xp;
         }
         (session, traded)
     }
@@ -680,34 +794,23 @@ impl Game<'_> {
         let costs: Vec<ItemStack> = offers.iter().map(|o| o.cost_a(self.items())).collect();
         self.render_transparent_background("merchant", batch);
         let atlas = &self.gui.atlas;
-        if let Some(mut r) = atlas.sprites.get("gui/container/villager").copied() {
-            let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
-            r.u1 = r.u0 + 276.0 * du;
-            r.v1 = r.v0 + 166.0 * dv;
-            batch.rect_uv(ox + SHIFT, oy, 276.0, 166.0, r, u32::MAX);
-        }
+        // `MerchantScreen.extractBackground` uses a 512x256 source texture.
+        batch.texture_blit_baked(
+            atlas,
+            "gui/container/villager",
+            [ox + SHIFT, oy, 276.0, 166.0],
+            [0.0; 2],
+            [512.0, 256.0],
+        );
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let tr = |k: &str, f: &str| horizon_client::lang::get_or(k, f);
-        let name = custom.unwrap_or_else(|| {
-            if progress {
-                tr(
-                    &format!("entity.minecraft.villager.{profession}"),
-                    &profession,
-                )
-            } else {
-                tr("entity.minecraft.wandering_trader", "Wandering Trader")
-            }
-        });
+        let name = merchant_display_name(progress, &profession, custom);
         // The screen's title is the merchant's name; its label adds the level.
-        super::screen_info::name_container(|| name.clone());
-        let title = if progress {
-            tr("merchant.title", "%s - %s")
-                .replacen("%s", &name, 1)
-                .replacen("%s", &tr(&format!("merchant.level.{level}"), ""), 1)
-        } else {
-            name
-        };
-        let tw = HudBatch::text_width(atlas, &title);
-        batch.text(
+        super::screen_info::name_container(|| name.plain());
+        // `StringDecomposer.iterateFormatted`: `§` codes a name holds apply at draw time.
+        let title = merchant_title(progress, level, name).resolve_legacy();
+        let tw = atlas.font.width_text(&title);
+        batch.text_styled(
             atlas,
             &title,
             ox + SHIFT + (49.0 + 138.0 - (tw / 2.0).floor()),
@@ -902,6 +1005,8 @@ impl Game<'_> {
             && local.0 < 186.0 + SHIFT + 22.0 + 1.0
             && local.1 >= 35.0 - 1.0
             && local.1 < 35.0 + 21.0 + 1.0;
+        let browser_tip = self.draw_mod_browser(batch);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
         if self.carried.is_some() {
             self.draw_carried(batch);
             if let Some(stack) = tooltip.filter(|s| self.tooltip_with_carried(s)) {
@@ -917,6 +1022,9 @@ impl Game<'_> {
             self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
         } else if let Some(stack) = tooltip {
             self.draw_stack_tooltip(batch, &stack, self.cursor.0, self.cursor.1);
+        }
+        if let Some(tooltip) = browser_tip {
+            self.draw_mod_browser_tooltip(batch, tooltip);
         }
         true
     }
@@ -970,6 +1078,10 @@ fn drag_scroll(y: f32, offers: usize) -> usize {
 fn scrolled(scroll: usize, max: usize, d: f32) -> usize {
     ((scroll as f64 - f64::from(d)) as i32).clamp(0, max as i32) as usize
 }
+
+#[cfg(test)]
+#[path = "tests/random_sequences_save_tests.rs"]
+mod random_sequences_save_tests;
 
 #[cfg(test)]
 mod tests {

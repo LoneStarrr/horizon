@@ -260,7 +260,7 @@ impl ServerTickRateManager {
         self.base.set_frozen(self.previous_is_frozen);
         SprintReport {
             ticks_per_second,
-            milliseconds_per_tick: crate::java_text::format_fixed2(per_tick),
+            milliseconds_per_tick: horizon_core::java_number::format_fixed2(per_tick),
         }
     }
     /// `checkShouldSprintThisTick`: whether to run this tick without waiting,
@@ -408,14 +408,32 @@ impl FixedStep {
         let ticks = self.timer.advance_game_time(now_ms, |_| target_millis);
         ticks.clamp(0, 10) as u32
     }
+    /// Install the fixed clock's interpolation phase without re-quantizing its time or
+    /// capping the number of ticks. Keep the wall-clock timer's baseline current too.
+    pub fn advance_set(&mut self, sim: std::time::Duration, ticks: u32, partial: f32) -> u32 {
+        self.now += sim;
+        self.timer.last_ms = self.now_ms();
+        self.timer.delta_ticks = ticks as f32 + partial - self.timer.delta_tick_residual;
+        self.timer.delta_tick_residual = partial;
+        self.timer.paused_delta_tick_residual = partial;
+        ticks
+    }
     /// Restart pacing from now (after loading, so no backlog replays).
     pub fn reset(&mut self) {
         self.timer = Timer::new(20.0, self.now_ms());
         self.timer.update_pause_state(self.pause);
     }
+    /// `DeltaTracker.getGameTimeDeltaTicks` for the frame the game is drawing.
+    pub fn game_time_delta_ticks(&self) -> f32 {
+        self.timer.game_time_delta_ticks()
+    }
     /// The partial tick for interpolation (`getGameTimeDeltaPartialTick(false)`).
     pub fn fraction(&self) -> f64 {
         f64::from(self.timer.game_time_delta_partial_tick(false))
+    }
+    /// The window's interpolation, unaffected by pause or world freeze.
+    pub fn window_fraction(&self) -> f32 {
+        self.timer.delta_tick_residual
     }
     /// The camera entity's partial tick (`Camera.getCameraEntityPartialTicks`
     /// for a player, who is never frozen): `getGameTimeDeltaPartialTick(true)`,
@@ -547,6 +565,11 @@ impl FixedStep {
     pub fn average_nanos(&self) -> u64 {
         (self.aggregated / SAMPLES.min(self.tick_count.max(1) as usize) as i64).max(0) as u64
     }
+    /// `getTickTimesNanos`: the last 100 ticks' durations in nanoseconds, the tick numbered
+    /// `n` at index `n % 100` (0 where none was recorded yet).
+    pub fn tick_times(&self) -> Vec<u64> {
+        self.tick_times.iter().map(|&t| t.max(0) as u64).collect()
+    }
     /// The sorted `getTickTimesNanos` array (always 100 entries).
     pub fn sorted_samples(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self.tick_times.iter().map(|&t| t.max(0) as u64).collect();
@@ -558,6 +581,25 @@ impl FixedStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tick_times` lists the durations by `tick % 100`, not oldest first: the 101st tick
+    /// overwrites index 0.
+    #[test]
+    fn tick_times_hold_durations_by_tick_number_modulo_100() {
+        let mut clock = FixedStep::default();
+        for took in [7, 8, 9] {
+            clock.record(std::time::Duration::from_nanos(took));
+        }
+        let times = clock.tick_times();
+        assert_eq!(times.len(), 100);
+        assert_eq!(times[..4], [7, 8, 9, 0]);
+        for took in 10..=109 {
+            clock.record(std::time::Duration::from_nanos(took));
+        }
+        let times = clock.tick_times();
+        assert_eq!(times[..4], [107, 108, 109, 10]);
+        assert_eq!(times[99], 106);
+    }
 
     #[test]
     fn timer_carries_fractions_and_caps_nothing_itself() {
@@ -613,6 +655,18 @@ mod tests {
         clock.set_frozen(true);
         clock.world_runs();
         assert_eq!(clock.tick_target_millis(), 50.0);
+    }
+
+    #[test]
+    fn a_fixed_frame_sets_exact_time_and_interpolation_past_the_wall_clock_cap() {
+        let mut clock = FixedStep::client();
+        let elapsed = std::time::Duration::from_nanos(625_000_321);
+        let partial = 0.500_006_44;
+        assert_eq!(clock.advance_set(elapsed, 12, partial), 12);
+        assert_eq!(clock.now, elapsed);
+        assert_eq!(clock.window_fraction(), partial);
+        assert_eq!(clock.advance(std::time::Duration::ZERO, 50.0), 0);
+        assert_eq!(clock.window_fraction(), partial);
     }
 
     #[test]

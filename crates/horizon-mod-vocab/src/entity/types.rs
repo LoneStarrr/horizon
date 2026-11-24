@@ -45,12 +45,35 @@ pub enum AttributeRegistrationError {
 // exhaustive: its field is private, so only registration creates a key
 pub struct EffectKey(pub(crate) u32);
 
-/// A mob entity type (`minecraft:zombie`) in the built-in entity-type registry, in
-/// registration order. A key stays valid until the game exits.
-// no wire: decoding validates the u32 slot with EntityTypeKey::from_slot on the host; wasm carries the host-issued opaque token without consulting guest tables.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-// exhaustive: only the load-owned table creates keys
+/// An entity type (`minecraft:zombie`) in the built-in entity-type registry, in
+/// registration order. Returned by `EntityRef::kind`; Copy/Eq comparisons do not
+/// allocate. Request `key.id(host)` for its namespaced name (an owned diagnostic
+/// string). A key stays valid until the game exits.
+// The derived scalar codec validates host slots; wasm carries the host-issued token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, horizon_mod_api_macros::Wire)]
+#[wire(via = u32)]
+// exhaustive: incoming scalar slots are checked against the host's registry
 pub struct EntityTypeKey(pub(crate) u32);
+
+impl From<&EntityTypeKey> for u32 {
+    fn from(key: &EntityTypeKey) -> Self {
+        key.0
+    }
+}
+impl TryFrom<u32> for EntityTypeKey {
+    type Error = &'static str;
+    fn try_from(slot: u32) -> Result<Self, Self::Error> {
+        // A guest transports the host-issued identity; only the host can validate it.
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self(slot))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self::from_slot(slot)
+        }
+    }
+}
 
 /// A playing sound's channel, for `play_sound_source` and
 /// `play_streaming_source`: an id only, to tell sounds apart across the two
@@ -106,7 +129,10 @@ pub struct EntityUuid(pub u128);
 /// An entity of the open world, for the `Host` methods that read or change one
 /// (`entity.position(host)`). It holds the world's epoch and the entity's id: ids
 /// are shared by every server level and never reused while the server world is
-/// open, and an entity that changes dimension gets a new one, as in vanilla.
+/// open. An entity that changes dimension on its own (a lone mob, a general entity)
+/// is rebuilt under a new id, as in vanilla, so its old handle goes stale; a vehicle a
+/// player rides keeps its id, and its handle still resolves in the new level. Follow
+/// the entity's UUID across a change of level.
 /// On a client the epoch identifies one client level and changes when that level
 /// is replaced. Server reads and writes reject a handle from an earlier epoch,
 /// of an entity that is gone, or used on a client. `Host::entity` makes a server
@@ -727,7 +753,8 @@ impl FishingHookRef {
 }
 
 /// A villager or wandering trader (vanilla's `AbstractVillager`, a `Merchant`),
-/// narrowed from an entity with `host.merchant(entity)`. If a villager's saved
+/// narrowed from an entity with `host.merchant(entity)`, or on a client with
+/// `host.client_merchant(entity)` for what the server syncs of it. If a villager's saved
 /// profession is unresolved, offers read empty and merchant mutations are
 /// refused until its profession is available again; saved offers are retained.
 #[derive(horizon_mod_api_macros::Wire)]
@@ -895,6 +922,53 @@ impl NoBackend for PierceLevelError {
     }
 }
 
+/// Why a player's collision exclusions were not set (`EntityRef::set_collision_exclusions`,
+/// `ClientHost::set_collision_exclusions`). The boxes the player had stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum CollisionExclusionsError {
+    /// The handle is stale, or a client has no player of its own.
+    Stale,
+    /// The entity is not a player: only players keep collision exclusions.
+    NotAPlayer,
+    /// More than 64 boxes.
+    TooMany,
+    /// A coordinate that is NaN or infinite.
+    NotFinite,
+    /// A box whose minimum is above its maximum on an axis.
+    Inverted,
+}
+
+impl NoBackend for CollisionExclusionsError {
+    fn no_backend() -> Self {
+        Self::Stale
+    }
+}
+
+/// Why a client's hotbar selection was not made (`ClientHost::select_hotbar_slot`). The
+/// selection the player had stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+// exhaustive: the three refusals are the contract; a new reason is a breaking change
+pub enum HotbarSlotError {
+    /// The client shows no world, or has no player of its own.
+    NoWorld,
+    /// A slot above 8: vanilla's range is 0 to 8, and the server ignores others.
+    OutOfRange {
+        /// The slot the caller asked for.
+        slot: u8,
+    },
+    /// The number keys do nothing for the local player, as for a spectator (its keys open
+    /// the spectator menu instead).
+    Refused,
+}
+
+impl NoBackend for HotbarSlotError {
+    fn no_backend() -> Self {
+        Self::NoWorld
+    }
+}
+
 /// A vanilla `AbstractMinecart`, narrowed from an entity with `host.minecart(entity)`.
 #[derive(horizon_mod_api_macros::Wire)]
 #[wire(internal_field_layouts)]
@@ -1002,6 +1076,8 @@ pub enum RemovalReason {
 }
 
 /// An online player in one open server world, keyed by UUID.
+/// This is the player's identity, not a particular body: handles for the same
+/// player stay equal across respawn. Respawning does not invalidate a handle.
 /// A nested guest turn cannot re-enter a player active in an outer turn;
 /// operations requiring that player's swapped state report them unavailable.
 #[derive(horizon_mod_api_macros::Wire)]
@@ -1065,6 +1141,187 @@ pub struct PlayerFood {
     pub exhaustion: f32,
 }
 
+/// A player's game profile (authlib's `GameProfile`): the UUID, the name and the signed
+/// properties the server received at login, such as `textures` (the skin).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct GameProfile {
+    /// The player's UUID.
+    pub uuid: u128,
+    /// The player's name.
+    pub name: String,
+    /// The profile's properties in login order; empty for an offline-mode player.
+    pub properties: Vec<ProfileProperty>,
+}
+
+impl GameProfile {
+    /// A profile from its UUID, name and properties.
+    pub fn new(uuid: u128, name: String, properties: Vec<ProfileProperty>) -> Self {
+        Self {
+            uuid,
+            name,
+            properties,
+        }
+    }
+}
+
+/// One property of a [`GameProfile`] (authlib's `Property`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct ProfileProperty {
+    /// The property's name, such as `textures`.
+    pub name: String,
+    /// Its value, as the session server sent it (base64 for `textures`).
+    pub value: String,
+    /// The session server's signature, when the value is signed.
+    pub signature: Option<String>,
+}
+
+impl ProfileProperty {
+    /// A property from its name, value and optional signature.
+    pub fn new(name: String, value: String, signature: Option<String>) -> Self {
+        Self {
+            name,
+            value,
+            signature,
+        }
+    }
+}
+
+/// How a [`Profiles`] lookup stands: the game resolves profiles in the background, so a
+/// lookup's first call answers [`Pending`](Self::Pending) and a later one its answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum ProfileResolution {
+    /// The lookup is still running, or waiting for the resolver's per-minute budget; ask again
+    /// on a later tick.
+    Pending,
+    /// The services' answer: the profile, or `None` when there is no such account or the lookup
+    /// failed (for example, a rate-limited lookup). `None` does not prove the account is missing.
+    Done(Option<GameProfile>),
+}
+
+/// Why [`PlayerRef::open_mod_menu`] opened nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum OpenMenuError {
+    /// The menu type is not a content mod's (`data/<id>/horizon/menu/`).
+    NotModMenu,
+    /// The player is stale, not connected (a fake player), or their client lacks Horizon's
+    /// menu types (a vanilla client); also a host without a game.
+    PlayerUnavailable,
+    /// The extra data is past the 32 KiB a menu may carry.
+    TooLarge,
+    /// The title could not cross to the game.
+    Title(crate::text::TextFormError),
+}
+
+impl From<crate::text::TextFormError> for OpenMenuError {
+    fn from(error: crate::text::TextFormError) -> Self {
+        Self::Title(error)
+    }
+}
+
+impl NoBackend for OpenMenuError {
+    fn no_backend() -> Self {
+        Self::PlayerUnavailable
+    }
+}
+
+/// Why [`PlayerRef::open_station`] opened nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum OpenStationError {
+    /// The menu type is not a workstation the game opens without a block: the crafting
+    /// table's, the loom's, the grindstone's, the cartography table's, the stonecutter's,
+    /// the smithing table's or the anvil's.
+    NotStation,
+    /// The player is stale, not connected (a fake player), or not in the world; also a host
+    /// without a game.
+    PlayerUnavailable,
+    /// More `inputs` than the station has input slots.
+    TooManyInputs,
+    /// The player's station is asking the mods already, while it opens or takes a click: a
+    /// listener there (`prepare_item_craft`, `anvil_update`...) can't open another in its place.
+    Busy,
+    /// One of the inputs was refused at the game's item conversion boundary.
+    Stack(StackWriteError),
+}
+
+impl From<StackWriteError> for OpenStationError {
+    fn from(error: StackWriteError) -> Self {
+        Self::Stack(error)
+    }
+}
+
+impl NoBackend for OpenStationError {
+    fn no_backend() -> Self {
+        Self::PlayerUnavailable
+    }
+}
+
+/// Why [`PlayerRef::respawn`] respawned nobody. Nothing changed when one comes back; the checks
+/// run in the order the variants are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum RespawnRefusal {
+    /// The call was made on a client; the respawn is the server's.
+    Client,
+    /// A player's state is swapped in (the call came from inside a player's hook, such as a
+    /// command or a packet handler); call it from `server_tick`.
+    InPlayerHook,
+    /// The handle no longer identifies a player on this server: it is stale, or they left.
+    Stale,
+    /// The player has no connection of their own to press Respawn on: a fake player, or the
+    /// world's own player in a single-player world.
+    NoConnection,
+    /// The player has health above 0 and has not won the game: the case the Respawn button
+    /// ignores. A player who has won the game (the End poem is showing) is respawned even
+    /// alive, as the button does.
+    Alive,
+}
+
+impl NoBackend for RespawnRefusal {
+    fn no_backend() -> Self {
+        Self::Stale
+    }
+}
+
+/// Why `menu_set_items` replaced nothing. Nothing is sent when one comes back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum MenuItemsRefusal {
+    /// The call was made on a client; menus are the server's.
+    Client,
+    /// No player of that UUID is online and placed.
+    NoPlayer,
+    /// The window is not the player's open `open_menu` menu: another window, a menu the game
+    /// opened (a chest, a trade), or none open.
+    NotOpen,
+    /// One of the stacks was refused at the game's item conversion boundary: an item the world
+    /// lacks, a count or damage the item does not allow.
+    Stack(StackWriteError),
+}
+
+impl From<StackWriteError> for MenuItemsRefusal {
+    fn from(error: StackWriteError) -> Self {
+        Self::Stack(error)
+    }
+}
+
+impl NoBackend for MenuItemsRefusal {
+    fn no_backend() -> Self {
+        Self::NoPlayer
+    }
+}
+
 /// A player's experience (`Player.experienceLevel`, `experienceProgress`,
 /// `totalExperience`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1116,6 +1373,101 @@ impl ApplyEffectTickEvent<'_> {
     pub fn eat(&mut self, nutrition: i32, saturation_modifier: f32) {
         self.changes
             .push(EffectTickChange::Eat(nutrition, saturation_modifier));
+    }
+}
+
+/// A sidebar a server mod shows one player (`player_set_sidebar`): a title and
+/// up to 15 lines, top first.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct Sidebar {
+    /// The objective's display name over the lines.
+    pub title: Text,
+    /// The lines, top first; past 15 are not shown, as vanilla's sidebar shows 15.
+    pub lines: Vec<SidebarLine>,
+}
+impl Sidebar {
+    /// A sidebar with this title and lines.
+    pub fn new(title: Text, lines: Vec<SidebarLine>) -> Self {
+        Self { title, lines }
+    }
+}
+
+/// One sidebar line: its text on the left and, where a score's number would be,
+/// an optional text on the right (`NumberFormat` `fixed`; none shows nothing, `blank`).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct SidebarLine {
+    /// The line's text.
+    pub text: Text,
+    /// The text in the score's place on the right.
+    pub value: Option<Text>,
+}
+impl SidebarLine {
+    /// A line with this text and right-hand value.
+    pub fn new(text: Text, value: Option<Text>) -> Self {
+        Self { text, value }
+    }
+}
+
+/// What one viewer is sent in place of an entity's data (`player_send_entity_data`). Each field
+/// left `None` (and `remove_custom_name` left false) is not sent, so the viewer keeps what it has.
+/// Each field is replaced on its own and the server keeps no per-viewer override: a later change
+/// the server sends for one field (flags, say) shows its real value again while the other fields
+/// replaced here stay as sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct EntityViewData {
+    /// A custom name to show (`Entity.DATA_CUSTOM_NAME`).
+    pub custom_name: Option<Text>,
+    /// Shows no custom name at all; with `custom_name` set it refuses as `Conflict`.
+    pub remove_custom_name: bool,
+    /// Whether the name shows at any distance (`Entity.DATA_CUSTOM_NAME_VISIBLE`).
+    pub custom_name_visible: Option<bool>,
+    /// The shared flags byte (`Entity.DATA_SHARED_FLAGS_ID`): bit 0 on fire, 1 crouching,
+    /// 3 sprinting, 4 swimming, 5 invisible, 6 glowing, 7 gliding. The whole byte replaces the
+    /// one the viewer has, so a mod that changes one bit sends the others it wants kept.
+    pub flags: Option<u8>,
+    /// The pose the viewer draws (`Entity.DATA_POSE`).
+    pub pose: Option<Pose>,
+}
+impl EntityViewData {
+    /// Data that changes nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Why `player_send_entity_data` sent nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum EntityViewError {
+    /// The call was made on a client; this is the server's.
+    Client,
+    /// The viewer handle no longer identifies a player in the server's list.
+    Stale,
+    /// The viewer has no connection to send to (a fake player).
+    NoConnection,
+    /// The entity handle no longer names an entity in the world.
+    StaleEntity,
+    /// No field of the data is set.
+    Empty,
+    /// `custom_name` is set together with `remove_custom_name`.
+    Conflict,
+    /// The custom name is a text the boundary refuses (nested too deep, malformed...).
+    Text(TextFormError),
+    /// The custom name would not encode within the network limits (a string over 65,535 bytes of
+    /// modified UTF-8, or more than the client's network NBT quota); the client would drop the
+    /// connection, so nothing is sent.
+    TooLarge,
+}
+impl crate::NoBackend for EntityViewError {
+    fn no_backend() -> Self {
+        Self::Stale
     }
 }
 
@@ -1240,4 +1592,167 @@ pub enum Sentiment {
     Negative,
     /// Changes are neutral.
     Neutral,
+}
+
+/// Why an entity physically moves (`Entity.move`'s `MoverType`, the
+/// `entity_move` hook of arismoko/horizon#2308/#2414): itself, the player behind a position
+/// packet, a piston, a shulker box lid, a shulker mob's opening lid. Boats
+/// and minecarts pass `SelfMovement`, as vanilla's own kinds do; `Player` is
+/// the server packet sites only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum MoveCause {
+    /// `MoverType.SELF`: the body's own tick, travel or packet follow-up.
+    SelfMovement,
+    /// `MoverType.PLAYER`: the server applying a player's position or vehicle
+    /// packet.
+    Player,
+    /// `MoverType.PISTON`: a moving piston block pushes the body.
+    Piston,
+    /// `MoverType.SHULKER_BOX`: a shulker box's opening lid pushes it away.
+    ShulkerBox,
+    /// `MoverType.SHULKER`: a shulker mob's opening lid pushes it away.
+    Shulker,
+}
+
+impl MoveCause {
+    /// Every cause, in ordinal order.
+    pub const ALL: [Self; 5] = [
+        Self::SelfMovement,
+        Self::Player,
+        Self::Piston,
+        Self::ShulkerBox,
+        Self::Shulker,
+    ];
+}
+
+/// How a declared attribute's modifier lines read on item tooltips: NeoForge's
+/// `RangedAttribute`, `PercentageAttribute` and `BooleanAttribute`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// exhaustive: NeoForge's three display kinds, and the tooltip matches them all
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum AttributeDisplay {
+    /// Added values as numbers, multiplied ones as percentages: vanilla's.
+    #[default]
+    Ranged,
+    /// Added values as percentages too: `+0.05` reads `+5%`.
+    Percentage,
+    /// On or off: an added value above zero reads enabled, any other disabled.
+    Boolean,
+}
+
+/// How a declared attribute's tooltip lines read beyond their colour (NeoForge's
+/// `IAttributeExtension`). The default reads as vanilla's attributes do.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// exhaustive: mods build it with `..Default::default()`, and the game reads every field
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct AttributeTooltip {
+    /// How its modifier amounts read.
+    pub display: AttributeDisplay,
+    /// The namespaced id of the attribute's base modifier (`getBaseId`): a modifier with this
+    /// id reads as the green total of the player's base value and its amount, as
+    /// `minecraft:base_attack_damage` does for attack damage. Without a player (recipe search)
+    /// it reads as a plain line.
+    pub base_modifier: Option<String>,
+}
+#[cfg(test)]
+#[path = "entity_type_key_tests.rs"]
+mod entity_type_key_tests;
+
+/// Why a move-control wish was refused. The previous wish stays unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub enum WantedPositionError {
+    /// The host has no game backend (for example, a mod test double).
+    Unavailable,
+    /// A coordinate is NaN or infinite.
+    NonFinitePosition,
+    /// The speed is NaN or infinite. Finite negative speeds are accepted.
+    NonFiniteSpeed,
+}
+impl NoBackend for WantedPositionError {
+    fn no_backend() -> Self {
+        Self::Unavailable
+    }
+}
+
+/// A scoreboard team by name, as `team` and `add_team` return it. A handle resolves again on each call:
+/// it reads as `None` or `false` once the team is removed, and for a handle of an earlier open.
+#[derive(horizon_mod_api_macros::Wire)]
+#[wire(internal_field_layouts)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+// exhaustive: its fields are private, so mods cannot build or destructure it
+pub struct TeamRef {
+    pub(crate) epoch: WorldEpoch,
+    pub(crate) name: String,
+}
+
+/// The sixteen chat colours a team can take (`ChatFormatting` colours, `PlayerTeam.setColor`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub enum TeamColor {
+    /// `black`.
+    Black,
+    /// `dark_blue`.
+    DarkBlue,
+    /// `dark_green`.
+    DarkGreen,
+    /// `dark_aqua`.
+    DarkAqua,
+    /// `dark_red`.
+    DarkRed,
+    /// `dark_purple`.
+    DarkPurple,
+    /// `gold`.
+    Gold,
+    /// `gray`.
+    Gray,
+    /// `dark_gray`.
+    DarkGray,
+    /// `blue`.
+    Blue,
+    /// `green`.
+    Green,
+    /// `aqua`.
+    Aqua,
+    /// `red`.
+    Red,
+    /// `light_purple`.
+    LightPurple,
+    /// `yellow`.
+    Yellow,
+    /// `white`.
+    White,
+}
+
+/// Who or what a team holds: the scoreboard keeps a player by name and any other entity by UUID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub enum ScoreHolder {
+    /// A player, by their name.
+    Player(PlayerRef),
+    /// An entity, by its UUID (a player's name for a player).
+    Entity(EntityRef),
+    /// A name as written: what `/team join <team> <name>` takes, an offline player's included.
+    Name(String),
+}
+
+/// Why a team call was refused. Nothing changes then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub enum TeamError {
+    /// The host has no game backend (for example, a mod test double).
+    Unavailable,
+    /// The team handle is stale: the team is gone, or the handle is of an earlier open.
+    Stale,
+    /// A team of that name exists.
+    NameTaken,
+    /// The holder is not a player or entity the scoreboard can key, or is not there.
+    UnknownHolder,
+}
+impl NoBackend for TeamError {
+    fn no_backend() -> Self {
+        Self::Unavailable
+    }
 }

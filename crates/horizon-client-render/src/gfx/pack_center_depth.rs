@@ -4,7 +4,7 @@
 //! the GPU (as `timing.rs` reads its timestamps); `FrameUniforms` smooths the latest value.
 //! The target holds the depth's bits, not the float: OpenGL renders to `R32Uint` everywhere
 //! (GLES 3.0 core), while an `R32Float` target needs `EXT_color_buffer_float`, which llvmpipe
-//! and some drivers lack (#2386).
+//! and some drivers lack (arismoko/horizon#2386).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -199,7 +199,7 @@ impl CenterDepth {
 
     /// The readback of what the frame copied, to start by calling it right after the frame's
     /// submission: on the submit thread when the frame goes there, as culling's readback.
-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
+    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static + use<>> {
         let copied: Vec<_> = self
             .slots
             .iter()
@@ -225,19 +225,24 @@ impl CenterDepth {
     /// the next frame reads it: an error unless exactly that one sample was read back, never
     /// an older one.
     pub fn take_completed(&mut self, device: &wgpu::Device) -> Result<f32, String> {
+        self.poll_completed(device)?
+            .ok_or_else(|| "the frame's centre depth wasn't read back alone".into())
+    }
+
+    /// Take the same strict sample as a screenshot sequence once its mapping is ready.
+    pub(super) fn poll_completed(&mut self, device: &wgpu::Device) -> Result<Option<f32>, String> {
         device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| e.to_string())?;
         let state = |s: &Slot| s.state.load(Ordering::Acquire);
+        if self.slots.iter().any(|s| state(s) == PENDING) {
+            return Ok(None);
+        }
         let mut mapped = self.slots.iter().filter(|s| state(s) == MAPPED);
         let (Some(slot), None) = (mapped.next(), mapped.next()) else {
             return Err("the frame's centre depth wasn't read back alone".into());
         };
-        if self
-            .slots
-            .iter()
-            .any(|s| !matches!(state(s), FREE | MAPPED))
-        {
+        if self.slots.iter().any(|s| state(s) == COPIED) {
             return Err("the frame's centre depth wasn't read back alone".into());
         }
         let depth = slot
@@ -253,7 +258,7 @@ impl CenterDepth {
             return Err("the centre depth isn't finite".into());
         }
         self.latest = Some(depth.clamp(0.0, 1.0));
-        Ok(depth.clamp(0.0, 1.0))
+        Ok(self.latest)
     }
 
     /// The newest depth read back so far, `None` before the first arrives.
@@ -305,8 +310,9 @@ mod tests {
     /// Inline and on the submit thread: each finished frame's depth, then none left to
     /// take; several outstanding samples are refused.
     #[test]
-    #[ignore = "requires a host GPU"]
+    #[ignore = "daily"]
     fn a_finished_frame_s_depth_is_taken_alone_never_an_older_one() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, raw)) = test_device() else {
             return;
         };
@@ -346,6 +352,7 @@ mod tests {
                     assert!(queue.submit_later(job).is_ok());
                     queue.wait();
                 } else {
+                    assert_eq!(center.poll_completed(&device).unwrap(), None);
                     queue.submit([encoder.finish()]);
                     after();
                 }
@@ -355,7 +362,11 @@ mod tests {
                         timeout: Some(std::time::Duration::from_secs(30)),
                     })
                     .unwrap();
-                assert_eq!(center.take_completed(&device).unwrap(), value);
+                if threaded {
+                    assert_eq!(center.take_completed(&device).unwrap(), value);
+                } else {
+                    assert_eq!(center.poll_completed(&device).unwrap(), Some(value));
+                }
                 assert_eq!(center.collect(&device), Some(value));
                 assert!(
                     center.take_completed(&device).is_err(),
@@ -378,6 +389,7 @@ mod tests {
     /// follows the frames instead of keeping the first ones' depth.
     #[test]
     fn the_centre_depth_follows_frames_submitted_on_the_submit_thread() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = test_device() else {
             return;
         };
@@ -428,6 +440,7 @@ mod tests {
     /// later, without the frame waiting for it.
     #[test]
     fn the_centre_depth_comes_back() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = test_device() else {
             return;
         };

@@ -28,7 +28,7 @@ fn chats(receiver: &mpsc::Receiver<horizon_client::lan::Out>) -> Vec<horizon_cor
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+#[ignore = "daily"]
 fn added_issuer_actor_missing_guest_and_restoration_controls() {
     let mut resources = None;
     let mut game = tests::server_game(&mut resources);
@@ -78,6 +78,7 @@ fn added_issuer_actor_missing_guest_and_restoration_controls() {
             max_players: 4,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         },
     )
     .unwrap();

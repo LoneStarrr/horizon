@@ -5,7 +5,10 @@
 //! game builds the entity data it sends (so a handle reads what clients see),
 //! and a write changes the compound: the next tracking pass sends the changed
 //! entries as `SetEntityData`, and the save holds them.
-use super::{Game, commands::Target};
+use super::{
+    Game,
+    commands::{OtherEntity, Target},
+};
 use horizon_client::{
     items::ItemStack,
     save::item_from_nbt,
@@ -19,9 +22,19 @@ use mod_api::{
     Transformation,
 };
 use {
+    horizon_core::geometry::Aabb,
     horizon_core::nbt::{Compound, Tag},
     horizon_world::registry::BlockStateId,
 };
+
+impl OtherEntity {
+    /// The display's physical box is a single point at its feet. Its NBT width
+    /// and height only change the culling box used by the renderer.
+    pub(super) fn display_bounds(&self) -> Option<Aabb> {
+        DisplayKind::from_entity_type(&self.kind)?;
+        Some(Aabb::new(self.position, self.position))
+    }
+}
 
 /// The entity data entry `id` of a display's compound: what it sets, else the default.
 fn entry(kind: DisplayKind, tag: &Tag, id: u8) -> Option<Value> {
@@ -589,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn displays_narrow_by_kind_and_share_the_display_state() {
         with_game(|game| {
             let text = push(game, 21, "minecraft:text_display");
@@ -674,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn display_kinds_keep_their_own_state_and_refuse_the_others() {
         with_game(|game| {
             let text = push(game, 21, "minecraft:text_display");
@@ -777,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn display_writes_reach_entity_data_and_the_saved_entity() {
         with_game(|game| {
             let text = push(game, 21, "minecraft:text_display");
@@ -809,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn each_start_delay_write_forces_a_send_even_when_equal() {
         with_game(|game| {
             let text = push(game, 21, "minecraft:text_display");
@@ -832,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn stale_removed_and_client_displays_do_nothing() {
         with_game(|game| {
             let text = push(game, 21, "minecraft:text_display");

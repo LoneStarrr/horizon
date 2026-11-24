@@ -307,6 +307,7 @@ fn a_gated_title_asks_for_the_multiplayer_lists_steps() {
 }
 
 #[test]
+#[ignore = "daily"]
 fn f5_reloads_the_server_list() {
     let mut f = Fixture::new();
     f.click("Multiplayer");
@@ -550,7 +551,7 @@ fn backup_zip_preserves_nested_files_excludes_lock_and_keeps_duplicate_backups()
     )
     .unwrap();
     for _ in 0..2 {
-        assert!(world_management::backup(&f.title.saves, "World").unwrap() > 0);
+        assert!(world_management::backup(&f.title.saves, "World").unwrap().1 > 0);
     }
     let archives: Vec<_> = fs::read_dir(f.root.join("backups"))
         .unwrap()
@@ -1186,35 +1187,8 @@ fn delete_removes_links_without_following_them() {
     assert!(outside.join("keep.txt").is_file());
 }
 
-#[test]
-fn hovered_buttons_ask_for_the_hand_or_not_allowed() {
-    use crate::widgets::Cursor;
-    let mut f = Fixture::new();
-    let atlas =
-        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
-            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
-        ))
-        .unwrap();
-    let cursor_over = |title: &Title, label: Option<&str>| {
-        let mouse = label.map_or((0.0, 0.0), |label| {
-            let buttons = title.buttons(480.0, 262.0);
-            let b = buttons.iter().find(|b| b.label == label).unwrap();
-            (b.x + b.w / 2.0, b.y + 10.0)
-        });
-        let _ = crate::widgets::take_cursor();
-        title.draw(&atlas, &mut HudBatch::scratch([480, 262]), mouse, true);
-        crate::widgets::take_cursor()
-    };
-    assert_eq!(
-        cursor_over(&f.title, Some("Singleplayer")),
-        Cursor::PointingHand
-    );
-    assert_eq!(cursor_over(&f.title, None), Cursor::Arrow);
-    // The world list's footer is inactive until a world is selected.
-    f.world("A", "Alpha");
-    f.title.enter_singleplayer();
-    assert_eq!(cursor_over(&f.title, Some("Edit")), Cursor::NotAllowed);
-}
+#[path = "draw_cursor_tests.rs"]
+mod draw_cursor_tests;
 
 /// 26.3's en_us strings for the buttons' tooltips, standing in for the
 /// prepared resources.
@@ -1250,7 +1224,9 @@ fn draw_hovered(
         },
     );
     let english = crate::lang::Language::load(&[&TooltipStrings], "en_us");
-    crate::lang::scoped(english, || title.draw(atlas, &mut batch, mouse, true));
+    crate::lang::scoped(english, || {
+        title.draw(atlas, &mut batch, mouse, true, &mut |_, _| {})
+    });
     crate::widgets::end_frame(*frame + 1);
     *frame += 2;
     (
@@ -1364,7 +1340,7 @@ fn world_search_hint_is_gray_and_only_shown_empty_and_unfocused() {
         .unwrap();
     let draw = |title: &Title| {
         let mut batch = HudBatch::scratch([480, 262]);
-        title.draw(&atlas, &mut batch, (0.0, 0.0), true);
+        title.draw(&atlas, &mut batch, (0.0, 0.0), true, &mut |_, _| {});
         batch
     };
     let has_hint = |batch: &HudBatch| {
@@ -1407,7 +1383,8 @@ fn scrolled_world_list_draws_inside_the_list_and_drags_its_scroller() {
         ))
         .unwrap();
     let mut batch = HudBatch::scratch([480, 262]);
-    f.title.draw(&atlas, &mut batch, (0.0, 0.0), true);
+    f.title
+        .draw(&atlas, &mut batch, (0.0, 0.0), true, &mut |_, _| {});
     assert!(!batch.vertices.is_empty());
 }
 
@@ -1824,6 +1801,31 @@ fn world_list_names_every_game_mode_and_hardcore_in_red() {
     let creative = info("Creative");
     assert_eq!(creative.plain(), "Creative Mode, Commands, Version: 26.3");
     assert!(creative.spans.iter().all(|s| s.style.color.is_none()));
+}
+
+#[test]
+fn a_last_played_that_cannot_be_a_time_lists_the_world_with_its_files_time() {
+    let f = Fixture::new();
+    // i64::MAX milliseconds overflows SystemTime on Windows.
+    for (folder, millis) in [("Huge", i64::MAX), ("Negative", -5_000)] {
+        f.world(folder, folder);
+        let path = f.title.saves.join(folder).join("level.dat");
+        let mut root = crate::save::read_dat(&path).unwrap();
+        if let Some(Tag::Compound(data)) = root.get_mut("Data") {
+            data.insert("LastPlayed".into(), Tag::Long(millis));
+        }
+        crate::save::write_dat(&path, root).unwrap();
+    }
+
+    let worlds = list_worlds(&f.title.saves);
+    assert_eq!(worlds.len(), 2);
+    for w in &worlds {
+        let changed = fs::metadata(f.title.saves.join(&w.folder).join("level.dat"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        assert_eq!(w.modified, changed, "{}", w.folder);
+        assert!(!w.corrupted, "{}", w.folder);
+    }
 }
 
 #[test]
@@ -2429,6 +2431,7 @@ fn a_button_label_wider_than_its_button_stays_inside_it() {
         label: "Create Backup and Load the World Anyway".into(),
         enabled: true,
         id: 40,
+        agent_id: None,
         icon: None,
         trailing: None,
         action: None,
@@ -2645,6 +2648,7 @@ mod text_and_icon {
             label: label.into(),
             enabled: true,
             id: 0,
+            agent_id: None,
             icon: None,
             trailing: icon,
             action: None,
@@ -2747,7 +2751,8 @@ fn a_create_world_tab_label_wider_than_its_tab_stays_inside_it() {
     .unwrap();
     // 90 px wide: three 20 px tabs from x = 14, too narrow for "Game".
     let mut batch = HudBatch::scratch([90, 262]);
-    f.title.draw(&atlas, &mut batch, (0.0, 100.0), true);
+    f.title
+        .draw(&atlas, &mut batch, (0.0, 100.0), true, &mut |_, _| {});
     let labels: Vec<f32> = batch
         .vertices
         .iter()
@@ -2843,9 +2848,10 @@ fn the_multiplayer_screens_have_their_own_ids() {
     );
     assert_eq!(
         M::Disconnected {
-            reason: String::new(),
+            reason: Text::empty(),
             retry: None,
             lines: std::cell::Cell::new(1),
+            to_title: false,
         }
         .id(),
         "disconnected"
@@ -2864,7 +2870,7 @@ fn creation_rules_keep_injected_registry_and_selected_values() {
         max: 0,
     };
     let registry =
-        Arc::new(RuleRegistry::with_bool_rules(&["example:machines".into()], &[rule]).unwrap());
+        Arc::new(RuleRegistry::with_mod_rules(&["example:machines".into()], &[rule]).unwrap());
     let mut fixture = Fixture::new();
     fixture.title.set_rule_registry(registry.clone());
     fixture.title.enter_singleplayer();
@@ -2911,14 +2917,13 @@ fn recreate_rules_load_saved_values_and_default_new_rules() {
             .collect::<Vec<_>>()
     };
     let old = Arc::new(
-        RuleRegistry::with_bool_rules(&["example:machines".into()], &definitions(&["old"]))
-            .unwrap(),
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &definitions(&["old"])).unwrap(),
     );
     let mut rules = GameRules::with_registry(old, &[]);
     rules.set("example:old", Value::Bool(false));
     rules.save(&dir).unwrap();
     let current = Arc::new(
-        RuleRegistry::with_bool_rules(&["example:machines".into()], &definitions(&["old", "new"]))
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &definitions(&["old", "new"]))
             .unwrap(),
     );
     let options =
@@ -2957,7 +2962,7 @@ fn late_registry_handoff_preserves_open_creation_edits() {
         max: 0,
     };
     let registry = std::sync::Arc::new(
-        RuleRegistry::with_bool_rules(&["example:machines".into()], &[rule]).unwrap(),
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &[rule]).unwrap(),
     );
     let mut fixture = Fixture::new();
     fixture.title.enter_singleplayer();

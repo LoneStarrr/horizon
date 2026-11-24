@@ -2,6 +2,14 @@
 //! contacts, collisions, fluids and the world border.
 use super::*;
 
+pub(crate) struct ProjWorld<'a, 'w> {
+    pub(crate) w: &'a MobWorld<'w>,
+    pub(crate) targets: &'a [(Who, Aabb)],
+    /// The world border's [minX, minZ, maxX, maxZ], which stops the ray as a
+    /// block would (`clipIncludingBorder`); None: no border.
+    pub(crate) border: Option<[f64; 4]>,
+}
+
 impl ProjectileWorld for ProjWorld<'_, '_> {
     fn below_world_y(&self) -> f64 {
         self.w.world.below_world_y()
@@ -48,7 +56,7 @@ impl ProjectileWorld for ProjWorld<'_, '_> {
         self.w.pushed_by_currents(bounds, velocity)
     }
     fn targets(&self) -> &[(Who, Aabb)] {
-        &self.targets
+        self.targets
     }
     /// `BaseFireBlock.entityInside` for a thrown projectile: fire and soul
     /// fire set it alight for 160 ticks.
@@ -61,6 +69,23 @@ impl ProjectileWorld for ProjWorld<'_, '_> {
     }
     fn empty(&self, p: [i32; 3]) -> bool {
         self.w.facts.is_air(self.w.world.block(p[0], p[1], p[2]))
+    }
+    fn inside_collision(&self, at: Vec3) -> bool {
+        let p = BlockPos::containing(at);
+        let state = self.w.world.block(p.x, p.y, p.z);
+        if self.w.facts.is_air(state) {
+            return false;
+        }
+        let mut scene = SceneCollisions {
+            world: self.w.world,
+            binding: self.w.collision,
+            subject: None,
+        };
+        let origin = Vec3::new(f64::from(p.x), f64::from(p.y), f64::from(p.z));
+        self.w
+            .collision
+            .collision_shape(&mut scene, state, [p.x, p.y, p.z])
+            .is_ok_and(|s| s.boxes().iter().any(|b| b.move_by(origin).contains(at)))
     }
     /// `WebBlock.entityInside` and `PowderSnowBlock.entityInside`.
     fn stuck_speed(&self, p: [i32; 3]) -> Option<Vec3> {

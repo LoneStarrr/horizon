@@ -24,14 +24,13 @@ use {
 type ItemConsumable = Consumable<String, ConsumeEffect>;
 
 /// Capture once per effect, not once per attempted destination. A consuming stack
-/// is nonempty and registry-resolved; an invalid snapshot is an engine invariant
-/// violation, never permission to silently omit a promised listener callback.
+/// is normally registry-resolved; a saved stack with an unregistered id has no
+/// public snapshot, so the listener callback is skipped instead of panicking.
 fn consumed_snapshot(stack: &ItemStack) -> Option<mod_api::ItemStack> {
-    mod_api::__private::listened(mod_api::HookId::ItemConsumptionTeleport).then(|| {
-        stack
-            .try_into_api()
-            .expect("a consumed stack must have a complete public API snapshot")
-    })
+    if !mod_api::__private::listened(mod_api::HookId::ItemConsumptionTeleport) {
+        return None;
+    }
+    stack.try_into_api().ok()
 }
 
 /// `EntityEvent.USE_ITEM_COMPLETE`: the server finished the player's use.
@@ -834,7 +833,7 @@ mod teleport_hook_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated native-mod process"]
+    #[ignore = "daily"]
     fn consumption_hook_keeps_the_stack_before_use_and_cancellation_stops_attempts() {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let moved = Arc::new(AtomicBool::new(false));
@@ -1043,7 +1042,7 @@ mod fox_consumption_hook_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated native-mod process"]
+    #[ignore = "daily"]
     fn fox_consumption_adapter_uses_full_host_and_preserves_listener_writes() {
         let mode = Arc::new(AtomicU8::new(0));
         let heard = Arc::new(Mutex::new(Vec::new()));
@@ -1161,7 +1160,7 @@ mod fox_consumption_hook_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated native-mod process"]
+    #[ignore = "daily"]
     fn fox_tick_pauses_before_movement_and_next_actor_and_preserves_full_host_writes() {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let spawned = Arc::new(Mutex::new(Vec::new()));

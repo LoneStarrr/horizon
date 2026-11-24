@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List every place an engine crate touches a mod crate, for #2534's move of the mod host above the engine.
+"""List every place an engine crate touches a mod crate, for arismoko/horizon#2534's move of the mod host above the engine.
 
 Engine crates are the `engine` layer of tools/layers.json; mod crates are the workspace's `horizon-mod-*` crates.
 The scan reads `cargo metadata` and the Rust sources, without compiling, and finds:
@@ -36,7 +36,7 @@ import rust_text  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 STRANDS = ["loading", "host", "slots", "attachments", "content_render", "hooks"]
-# Each strand's #2534 phase; None where nothing moves: the engine keeps its Host impls (phase 2 dropped) and attachment
+# Each strand's arismoko/horizon#2534 phase; None where nothing moves: the engine keeps its Host impls (phase 2 dropped) and attachment
 # storage is already engine-layer (phase 4 dropped), owner 2026-11-10.
 PHASE = {"loading": 1, "host": None, "slots": 3, "attachments": None, "content_render": 5, "hooks": 6}
 # The host areas the scan inventories, as repo paths.
@@ -52,7 +52,7 @@ RULES = [
     ("loading", r"^mod_api::(ModEntry|Mods|ModFields|__private::(install|mods|set_mod_enabled|ModPhase|PhaseOwner"
                 r"|current_phase|LoadAccess|check_access|with_test_packages|loaded_mods|LoadedMods"
                 r"|installed_code_ids|mod_index\w*|mark_game_thread|command_argument_types))\b"),
-    ("slots", r"^(mod_points|horizon_mod_api_macros|horizon_mod_api_gen|point_shape|horizon_mod_point_emit)\b"),
+    ("slots", r"^(mod_points|horizon_mod_api_macros|horizon_mod_api_gen)\b"),
     ("attachments", r"^horizon_mod_runtime::(attachments|impl_attachment_lifetime)\b"),
     ("attachments", r"^mod_api::(Attachment\w*|attachment_queries|__private::attach\w*)\b"),
     ("host", r"^mod_api::(\w*Host|HostSide|Backend\w*|__private::(backend\w*|game))\b"),

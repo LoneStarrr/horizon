@@ -1,6 +1,25 @@
 //! The game's shared read-only tables: `Resources` (blocks, items, recipes, mob types, biomes),
 //! `UiResources` and `PackResources`.
 use super::*;
+use std::path::Path;
+
+pub(super) fn load_animate_tables(
+    root: &Path,
+    registry: &horizon_world::registry::BlockRegistry,
+    draws: bool,
+    biomes: &Biomes,
+) -> Result<(
+    horizon_client::animate_tick::AnimateTables,
+    horizon_client::fog::FogTables,
+)> {
+    let _step = startup::step("rest.animate_fog");
+    let animate = if draws {
+        horizon_client::animate_tick::AnimateTables::load(root, registry)?
+    } else {
+        Default::default()
+    };
+    Ok((animate, horizon_client::fog::FogTables::load(root, biomes)))
+}
 
 impl Resources {
     pub(super) fn rest(&self) -> &WorldRest {
@@ -125,6 +144,14 @@ impl Game<'_> {
     }
 }
 
+/// Whether the HUD atlas packs the mod image slot (`horizon/modimage`): whenever a client mod is
+/// loaded, native or wasm, since any of them can call `ClientHost::mod_image`, with no mixin and
+/// no opt-in (arismoko/horizon#4437). A game with no mod pays none of its 4 MiB. Read where the atlas is built:
+/// at the first load and on a resource reload.
+pub(in crate::game) fn mod_image_slot() -> bool {
+    !mod_api::__private::mods().is_empty()
+}
+
 impl UiResources {
     /// The resolved resource generation, including the base layer and pack filters.
     /// Its splash pool is empty until `with_splashes`.
@@ -137,7 +164,7 @@ impl UiResources {
                     horizon_client::gfx::panorama::Faces::load(root, root)
                 })
             });
-            let mod_image = horizon_client_render::render_slots::world_drawn_hooked();
+            let mod_image = mod_image_slot();
             let atlas = startup::time("ui.atlas", || {
                 HudAtlas::build_over_with_image(root, root, mod_image)
             });
@@ -227,6 +254,7 @@ impl PackResources {
             biomes,
             light: old.light.clone(),
             hidden_states: old.hidden_states.clone(),
+            part_tables: old.part_tables.clone(),
         })
     }
     /// The pack tables over their parts, which `load_resources` builds on
@@ -284,11 +312,27 @@ impl PackResources {
                 biomes,
                 light,
                 hidden_states: Arc::from([]),
+                part_tables: Default::default(),
             }),
             block_registries: native_block_states::block_registries(assets.registry),
             assets,
             render,
-            item_renderer: Arc::new(item_renderer),
+            item_renderer: {
+                let renderer = Arc::new(item_renderer);
+                // The pack's own item models baked on a worker, before they show in the world. It
+                // holds the renderer weakly, so an unloaded pack stops it, and starts only when
+                // there is work: a pack without models of its own leaves the renderer unshared.
+                let names = renderer.pack_model_names();
+                if !names.is_empty() {
+                    let ahead = Arc::downgrade(&renderer);
+                    let _ = std::thread::Builder::new()
+                        .name("Item models".into())
+                        .spawn(move || {
+                            horizon_client::item_render::ItemRenderer::bake_ahead(&ahead, names)
+                        });
+                }
+                renderer
+            },
             source: root.source().clone(),
             data_source: root.data().clone(),
             data_changes: root.data_changes().clone(),

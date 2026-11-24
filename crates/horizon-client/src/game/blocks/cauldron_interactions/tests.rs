@@ -214,7 +214,7 @@ fn unchanged(game: &Game<'_>, seen: &Seen) {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_syrup_applies_once() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_syrup_applies_once",
@@ -255,7 +255,7 @@ fn cauldron_syrup_applies_once() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_refused_fire_is_atomic() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_refused_fire_is_atomic",
@@ -271,7 +271,7 @@ fn cauldron_refused_fire_is_atomic() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_panicking_fire_is_atomic() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_panicking_fire_is_atomic",
@@ -302,7 +302,7 @@ fn cauldron_panicking_fire_is_atomic() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_outer_abort_discards_effects_and_drops() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_outer_abort_discards_effects_and_drops",
@@ -326,7 +326,7 @@ fn cauldron_outer_abort_discards_effects_and_drops() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_duplicates_name_both_owners() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_duplicates_name_both_owners",
@@ -375,7 +375,7 @@ fn cauldron_duplicates_name_both_owners() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_dye_tag_shadows_exact_handler_even_on_pass() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_dye_tag_shadows_exact_handler_even_on_pass",
@@ -412,7 +412,7 @@ fn cauldron_dye_tag_shadows_exact_handler_even_on_pass() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_transfer_awards_two_statistics_once() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_transfer_awards_two_statistics_once",
@@ -428,7 +428,7 @@ fn cauldron_transfer_awards_two_statistics_once() {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_client_skips_custom_prediction() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_client_skips_custom_prediction",
@@ -481,7 +481,7 @@ fn cauldron_client_skips_custom_prediction() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_register_to_all_and_admission_errors() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_register_to_all_and_admission_errors",
@@ -527,7 +527,7 @@ fn cauldron_register_to_all_and_admission_errors() {
             "test:syrup_cauldron",
         ] {
             assert!(
-                matches!(table.select(block,"test:syrup_bottle",false),Some(Entry::Mod(callback)) if callback.owner=="all_mod")
+                matches!(table.select(block,"test:syrup_bottle",false,|_| false),Some(Entry::Mod(callback)) if callback.owner=="all_mod")
             );
         }
         let mut registrar = make();
@@ -610,7 +610,7 @@ fn cauldron_register_to_all_and_admission_errors() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_world_close_discards_callbacks_before_failed_preparation() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_world_close_discards_callbacks_before_failed_preparation",
@@ -622,7 +622,7 @@ fn cauldron_world_close_discards_callbacks_before_failed_preparation() {
     fixture(false, false, false, |game, seen| {
         let old = snapshot();
         assert!(matches!(
-            old.select("minecraft:cauldron", "test:syrup_bottle", false),
+            old.select("minecraft:cauldron", "test:syrup_bottle", false, |_| false),
             Some(Entry::Mod(_))
         ));
         seen.fail_preparation.store(true, Ordering::SeqCst);
@@ -655,7 +655,7 @@ fn cauldron_world_close_discards_callbacks_before_failed_preparation() {
         ] {
             assert!(
                 snapshot()
-                    .select(block, "test:syrup_bottle", false)
+                    .select(block, "test:syrup_bottle", false, |_| false)
                     .is_none()
             );
         }
@@ -674,7 +674,7 @@ fn cauldron_world_close_discards_callbacks_before_failed_preparation() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cauldron_unknown_effect_keys_refuse_before_fire() {
     if run_fresh_cases(
         "game::cauldron_interactions::tests::cauldron_unknown_effect_keys_refuse_before_fire",
@@ -690,5 +690,115 @@ fn cauldron_unknown_effect_keys_refuse_before_fire() {
         assert!(game.use_on_cauldron(POS).unwrap());
         unchanged(game, seen);
         assert_eq!(seen.fire.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+#[ignore = "daily"]
+fn cauldron_tag_registration_normalizes_admits_and_expands_over_the_complete_set() {
+    if run_fresh_cases(
+        "game::cauldron_interactions::tests::cauldron_tag_registration_normalizes_admits_and_expands_over_the_complete_set",
+        "HORIZON_CAULDRON_CASE",
+        &["run"],
+    ) {
+        return;
+    }
+    fixture(false, false, false, |game, seen| {
+        use mod_api::CauldronInteractions as _;
+        use mod_api::CauldronRegistrationError as Error;
+        let handler: Arc<dyn mod_api::Interaction> = Arc::new(Syrup {
+            seen: seen.clone(),
+            refused: false,
+            panic: false,
+        });
+        let custom = mod_api::__private::block_key("test:syrup_cauldron").unwrap();
+        let make = || Registrar {
+            table: Table::default(),
+            items: game.items(),
+            registry: game.pack.assets.registry,
+            all: Vec::new(),
+            error: None,
+        };
+        let _owner = mod_api::__private::enter("tag_mod", "register_cauldron_interaction");
+        // The leading `#` is dropped, and the custom dispatcher is declared after the
+        // register_tag_to_all that expands over it.
+        let mut registrar = make();
+        registrar
+            .register_tag_to_all("#c:buckets/milk", handler.clone())
+            .unwrap();
+        registrar
+            .register_tag(custom, "c:foods", handler.clone())
+            .unwrap();
+        let table = registrar.finish().unwrap();
+        assert_eq!(table.blocks().len(), 5);
+        for block in [
+            "minecraft:cauldron",
+            "minecraft:water_cauldron",
+            "minecraft:lava_cauldron",
+            "minecraft:powder_snow_cauldron",
+            "test:syrup_cauldron",
+        ] {
+            assert!(
+                matches!(
+                    table.select(block, "test:anything", false, |tag| tag == "c:buckets/milk"),
+                    Some(Entry::Mod(callback)) if callback.owner == "tag_mod"
+                ),
+                "{block}"
+            );
+            assert!(
+                table
+                    .select(block, "test:anything", false, |_| false)
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            table.select("test:syrup_cauldron", "test:anything", false, |tag| tag
+                == "c:foods"),
+            Some(Entry::Mod(_))
+        ));
+        assert!(
+            table
+                .select("minecraft:cauldron", "test:anything", false, |tag| tag
+                    == "c:foods")
+                .is_none()
+        );
+        // Admission: a string that is no resource location is refused, and fails preparation.
+        let mut registrar = make();
+        assert_eq!(
+            registrar.register_tag(custom, "no tag here", handler.clone()),
+            Err(Error::InvalidTag)
+        );
+        assert_eq!(
+            registrar.register_tag_to_all("#no tag here", handler.clone()),
+            Err(Error::InvalidTag)
+        );
+        assert!(
+            registrar
+                .finish()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("InvalidTag")
+        );
+        // The same tag twice on one block is a duplicate, spelled with or without `#`.
+        let mut registrar = make();
+        registrar
+            .register_tag(custom, "c:foods", handler.clone())
+            .unwrap();
+        assert!(matches!(
+            registrar.register_tag(custom, "#c:foods", handler.clone()),
+            Err(Error::Duplicate { .. })
+        ));
+        // And so is one the expansion meets later.
+        let mut registrar = make();
+        registrar
+            .register_tag(custom, "c:foods", handler.clone())
+            .unwrap();
+        registrar.register_tag_to_all("c:foods", handler).unwrap();
+        let error = registrar.finish().err().unwrap().to_string();
+        assert!(
+            error.contains("Duplicate") && error.contains("tag_mod"),
+            "{error}"
+        );
     });
 }

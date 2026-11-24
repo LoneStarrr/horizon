@@ -85,8 +85,121 @@ impl Hooks for Registrant {
         }
     }
 }
+
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
+fn feature_flag_conditions_use_world_and_reload_features_for_recipes_and_carvers() {
+    let scratch = tempfile::tempdir().unwrap();
+    let module = scratch.path().join("content");
+    let data = module.join("data/feature_test");
+    std::fs::create_dir_all(data.join("recipe")).unwrap();
+    std::fs::create_dir_all(data.join("worldgen/carver")).unwrap();
+    std::fs::write(
+        module.join("horizon-mod.toml"),
+        "id='feature_test'\nname='Feature fixture'\nversion='1'\napi='0.2'\nside='both'\ncapabilities=['registries']\n",
+    )
+    .unwrap();
+    let vanilla = "minecraft:vanilla";
+    let redstone = "minecraft:redstone_experiments";
+    let minecart = "minecraft:minecart_improvements";
+    let feature = |flags: &[&str]| json!({"type":"neoforge:feature_flags_enabled","flags":flags});
+    let both = feature(&[vanilla, redstone, minecart]);
+    for (name, condition) in [
+        ("vanilla", feature(&["vanilla"])),
+        ("experiments", both.clone()),
+        (
+            "without_redstone",
+            json!({"type":"neoforge:not","value":feature(&[redstone])}),
+        ),
+        (
+            "malformed",
+            json!({"type":"neoforge:not","value":feature(&[redstone, "Invalid flag"])}),
+        ),
+    ] {
+        std::fs::write(
+            data.join(format!("recipe/{name}.json")),
+            json!({
+                "type":"minecraft:crafting_shapeless", "ingredients":["minecraft:flint"],
+                "result":{"id":"minecraft:stick"}, "neoforge:conditions":[condition]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let resources = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+    let carvers: Value =
+        serde_json::from_slice(&std::fs::read(resources.join("worldgen/carvers.json")).unwrap())
+            .unwrap();
+    let mut cave: Value =
+        serde_json::from_str(carvers["minecraft:cave"].as_str().unwrap()).unwrap();
+    cave["neoforge:conditions"] = json!([both]);
+    std::fs::write(
+        data.join("worldgen/carver/experimental.json"),
+        cave.to_string(),
+    )
+    .unwrap();
+
+    crate::game::native_entity_refs::tests::with_game(|game| {
+        let selected = horizon_mod_package::selection::SelectedPackage {
+            package: horizon_mod_package::Package::read(&module).unwrap(),
+            path: module.clone(),
+        };
+        game.mods.selected = vec![selected].into();
+        game.mods.dev.push(module);
+        let create = horizon_client::title::WorldOptions {
+            data_packs: vec![
+                "vanilla".into(),
+                "redstone_experiments".into(),
+                "minecart_improvements".into(),
+            ],
+            ..Default::default()
+        };
+        let mut request = crate::game::world_loading::WorldRequest::new(
+            "flag_conditions",
+            Some("feature fixture"),
+            Some(1),
+            true,
+            Some(&create),
+            Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
+        )
+        .unwrap();
+        request.save_root = scratch.path().join("save");
+        game.load_world(request).unwrap();
+        let check = |game: &crate::game::Game<'_>, experiments, without_redstone| {
+            assert!(game.recipes().recipe("feature_test:vanilla").is_some());
+            assert!(game.recipes().recipe("feature_test:malformed").is_none());
+            assert_eq!(
+                game.recipes().recipe("feature_test:experiments").is_some(),
+                experiments
+            );
+            assert_eq!(
+                game.recipes()
+                    .recipe("feature_test:without_redstone")
+                    .is_some(),
+                without_redstone
+            );
+            let bundle =
+                std::fs::read(game.options.resources.join("worldgen/carvers.json")).unwrap();
+            let carvers: Value = serde_json::from_slice(&bundle).unwrap();
+            assert_eq!(
+                carvers.get("feature_test:experimental").is_some(),
+                experiments
+            );
+        };
+        check(game, true, false);
+        let original = game.level.enabled_features.clone();
+        game.reload_datapacks(true, &[vanilla.into(), redstone.into()])
+            .unwrap();
+        check(game, false, false);
+        game.reload_datapacks(true, &[vanilla.into()]).unwrap();
+        check(game, false, true);
+        game.reload_datapacks(true, &original).unwrap();
+        check(game, true, false);
+    });
+}
+
+#[test]
+#[ignore = "daily"]
 fn load_conditions_recipe_reload_counts_and_failed_candidates_keep_old_recipes() {
     let scratch = tempfile::tempdir().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -132,7 +245,7 @@ fn load_conditions_recipe_reload_counts_and_failed_candidates_keep_old_recipes()
                     let stack = game
                         .reload_datapacks(true, &game.level.enabled_features.clone())
                         .unwrap();
-                    assert_eq!(count.load(Ordering::SeqCst), 6);
+                    assert_eq!(count.load(Ordering::SeqCst), 5);
                     assert!(game.recipes().recipe("testmod:not_false").is_some());
                     assert!(game.recipes().recipe("testmod:not_true").is_none());
                     assert!(game.recipes().recipe("testmod:nested").is_some());
@@ -157,10 +270,9 @@ fn load_conditions_recipe_reload_counts_and_failed_candidates_keep_old_recipes()
                 count.store(0, Ordering::SeqCst);
                 game.reload_datapacks(true, &game.level.enabled_features.clone())
                     .unwrap();
-                assert_eq!(count.load(Ordering::SeqCst), 6);
+                assert_eq!(count.load(Ordering::SeqCst), 5);
                 assert!(
-                    !game
-                        .items()
+                    game.items()
                         .block_tags
                         .get("testmod:flag")
                         .is_some_and(|tag| tag.contains("minecraft:stone"))
@@ -205,8 +317,8 @@ fn load_conditions_recipe_reload_counts_and_failed_candidates_keep_old_recipes()
                     assert!(game.recipes().recipe("testmod:enabled").is_some());
                 }
                 let host = game.lan.take();
-                crate::game::lan::forget_sync_data();
-                assert!(crate::game::lan::cached_reload_sync().is_none());
+                crate::game::lan::sync::forget_sync_data();
+                assert!(crate::game::lan::sync::cached_reload_sync().is_none());
                 mode.store(5, Ordering::SeqCst);
                 let error = format!(
                     "{:?}",
@@ -288,18 +400,18 @@ fn load_conditions_disabled_owner_does_not_execute_registered_handler() {
             let inventory = horizon_mod_package::enabled::EnabledMods::default();
             let file = json!({"neoforge:conditions":[{"type":"testmod:flag","value":true}]});
             assert!(
-                super::conditions_for_mods(&sources, &inventory)
+                super::conditions_for_mods(&sources, &inventory, None)
                     .unwrap()
                     .allows_file(&file, "flag.json")
             );
             assert!(mod_api::__private::set_mod_enabled("testmod", false));
-            let disabled = super::conditions_for_mods(&sources, &inventory).unwrap();
+            let disabled = super::conditions_for_mods(&sources, &inventory, None).unwrap();
             assert!(!disabled.allows_file(&file, "flag.json"));
             assert_eq!(disabled.check_errors(), Ok(()));
             assert_eq!(count.load(Ordering::SeqCst), 1);
             assert!(mod_api::__private::set_mod_enabled("testmod", true));
             assert!(
-                super::conditions_for_mods(&sources, &inventory)
+                super::conditions_for_mods(&sources, &inventory, None)
                     .unwrap()
                     .allows_file(&file, "flag.json")
             );

@@ -81,19 +81,33 @@ fn can_see_sky<L: SpawnLevel>(l: &L, x: i32, y: i32, z: i32) -> bool {
 }
 /// `LevelReader.canSeeSkyFromBelowWater`.
 fn can_see_sky_from_below_water<L: SpawnLevel>(l: &L, x: i32, y: i32, z: i32) -> bool {
-    let sea = l.sea_level();
+    sky_from_below_water(
+        l.sea_level(),
+        y,
+        |yy| can_see_sky(l, x, yy, z),
+        |yy| lets_the_sky_through(l.facts(), l.state(x, yy, z)),
+    )
+}
+/// `LevelReader.canSeeSkyFromBelowWater` at height `y` of one column: `sees_sky(y)` is
+/// `canSeeSky` at a height of the column and `clear(y)` whether its block there lets the scan
+/// down from sea level pass ([`lets_the_sky_through`]).
+pub fn sky_from_below_water(
+    sea: i32,
+    y: i32,
+    sees_sky: impl Fn(i32) -> bool,
+    clear: impl Fn(i32) -> bool,
+) -> bool {
     if y >= sea {
-        return can_see_sky(l, x, y, z);
+        return sees_sky(y);
     }
-    if !can_see_sky(l, x, sea, z) {
-        return false;
-    }
-    ((y + 1)..sea).all(|yy| {
-        let f = l.facts().get(l.state(x, yy, z));
-        // `BlockState.liquid()` is water, lava and the bubble column. Kelp,
-        // seagrass and waterlogged blocks hold water and still stop the scan.
-        f.dampening == 0 || liquid_block(&f.name)
-    })
+    sees_sky(sea) && ((y + 1)..sea).all(clear)
+}
+/// Whether `canSeeSkyFromBelowWater`'s scan passes `state`: it dampens no light or is
+/// `liquid()`. `BlockState.liquid()` is water, lava and the bubble column. Kelp, seagrass and
+/// waterlogged blocks hold water and still stop the scan.
+pub fn lets_the_sky_through(facts: &BlockFacts, state: BlockStateId) -> bool {
+    let f = facts.get(state);
+    f.dampening == 0 || liquid_block(&f.name)
 }
 /// `BlockState.liquid()`: the three blocks whose property is set.
 fn liquid_block(name: &str) -> bool {
@@ -200,11 +214,8 @@ pub fn is_valid_empty_spawn<L: SpawnLevel>(s: Species, l: &L, x: i32, y: i32, z:
     }
     let f = l.facts().get(l.state(x, y, z));
     let block = &*f.name;
-    let burning = l.block_tag("minecraft:fire", block)
-        || block == "minecraft:lava"
-        || block == "minecraft:magma_block"
-        || (block == "minecraft:campfire" || block == "minecraft:soul_campfire") && f.emission > 0
-        || block == "minecraft:lava_cauldron";
+    let burning =
+        data::vanilla_burning_block(block, f.emission > 0, l.block_tag("minecraft:fire", block));
     let other = matches!(
         block,
         "minecraft:wither_rose"
@@ -598,10 +609,10 @@ impl SpawnLevel for super::MobWorld<'_> {
         self.has_tag(tag, block)
     }
     fn biome_tag(&self, tag: &str, x: i32, y: i32, z: i32) -> bool {
-        let Some(chunk) = self.world.chunks.get(&(x >> 4, z >> 4)) else {
+        let Some(biome) = self.world.noise_biome(x, y, z) else {
             return false;
         };
-        let biome = &self.biomes.get(chunk.biome(x, y, z)).name;
+        let biome = &self.biomes.get(biome).name;
         self.data
             .biome_tags
             .get(tag.trim_start_matches('#'))
@@ -684,6 +695,7 @@ mod underwater_sky_tests {
     /// `liquid()`) makes it false. A bubble column is `liquid()`, so the scan
     /// continues and the roll is still required.
     #[test]
+    #[ignore = "daily"]
     fn kelp_hides_the_sky_from_a_guardian_and_a_bubble_column_does_not() {
         let ran = with_built_test_world(
             &[],
@@ -739,7 +751,7 @@ mod underwater_sky_tests {
         );
         // Without the vanilla data under .local/horizon-client the world
         // cannot be built: the test has nothing to check.
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 }
 
@@ -753,47 +765,51 @@ mod light_draw_tests {
     /// dimension type's light level draws as its provider does (uniform 0..=7 one
     /// bound-8 int, a constant none).
     #[test]
+    #[ignore = "daily"]
     fn dark_enough_draws_follow_the_dimension_type_provider() {
-        with_built_test_world(
-            &[],
-            |world, _| {
-                world.chunks.insert(
-                    (0, 0),
-                    std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
-                );
-            },
-            |w, _| {
-                for (type_id, draws) in [
-                    ("minecraft:overworld", &[32, 8][..]),
-                    ("minecraft:the_nether", &[32][..]),
-                    ("minecraft:the_end", &[32][..]),
-                ] {
-                    let level = MobWorld {
-                        dimension_type: DimensionFacts::vanilla(type_id).unwrap(),
-                        ..w.clone()
-                    };
-                    let mut random = LegacyRandom::new(42);
-                    let dark = is_dark_enough(&level, &mut random, 0, 70, 0);
-                    let mut expected = LegacyRandom::new(42);
-                    let rolls: Vec<i32> = draws
-                        .iter()
-                        .map(|bound| expected.next_int_bound(*bound).unwrap())
-                        .collect();
-                    assert_eq!(random.next_int(), expected.next_int(), "{type_id}");
-                    let light = level
-                        .block_light(0, 70, 0)
-                        .max(level.sky_light(0, 70, 0) - level.sky_darken());
-                    let test = rolls.get(1).copied().unwrap_or(match type_id {
-                        "minecraft:the_nether" => 7,
-                        _ => 15,
-                    });
-                    assert_eq!(
-                        dark,
-                        rolls[0] >= level.sky_light(0, 70, 0) && light <= test,
-                        "{type_id}"
+        assert!(
+            with_built_test_world(
+                &[],
+                |world, _| {
+                    world.chunks.insert(
+                        (0, 0),
+                        std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
                     );
-                }
-            },
+                },
+                |w, _| {
+                    for (type_id, draws) in [
+                        ("minecraft:overworld", &[32, 8][..]),
+                        ("minecraft:the_nether", &[32][..]),
+                        ("minecraft:the_end", &[32][..]),
+                    ] {
+                        let level = MobWorld {
+                            dimension_type: DimensionFacts::vanilla(type_id).unwrap(),
+                            ..w.clone()
+                        };
+                        let mut random = LegacyRandom::new(42);
+                        let dark = is_dark_enough(&level, &mut random, 0, 70, 0);
+                        let mut expected = LegacyRandom::new(42);
+                        let rolls: Vec<i32> = draws
+                            .iter()
+                            .map(|bound| expected.next_int_bound(*bound).unwrap())
+                            .collect();
+                        assert_eq!(random.next_int(), expected.next_int(), "{type_id}");
+                        let light = level
+                            .block_light(0, 70, 0)
+                            .max(level.sky_light(0, 70, 0) - level.sky_darken());
+                        let test = rolls.get(1).copied().unwrap_or(match type_id {
+                            "minecraft:the_nether" => 7,
+                            _ => 15,
+                        });
+                        assert_eq!(
+                            dark,
+                            rolls[0] >= level.sky_light(0, 70, 0) && light <= test,
+                            "{type_id}"
+                        );
+                    }
+                },
+            ),
+            "vanilla data is missing"
         );
     }
 }

@@ -78,13 +78,13 @@ fn roundtrip(kind: &str, custom: bool, texture: &str) {
         }
     );
     assert!(
-        render::layers(&client, 0.0)
+        render::layers(&client, 0.0, &Default::default())
             .iter()
             .any(|layer| layer.texture == texture)
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn engineer_metadata_and_villager_texture() {
     roundtrip(
         "minecraft:villager",
@@ -93,7 +93,7 @@ fn engineer_metadata_and_villager_texture() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn engineer_metadata_and_zombie_texture() {
     roundtrip(
         "minecraft:zombie_villager",
@@ -102,7 +102,7 @@ fn engineer_metadata_and_zombie_texture() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn vanilla_farmer_metadata_and_texture() {
     roundtrip(
         "minecraft:villager",
@@ -148,6 +148,7 @@ fn profession_hub(name: &str, vanilla_professions: bool) -> horizon_client::lan:
     let sync = std::sync::Arc::new(sync);
     let config = NetConfig {
         announce: false,
+        listen: false,
         ..NetConfig::loopback(0, name.into(), 2)
     };
     let lan = Lan::start_with(sync.clone(), config).unwrap();
@@ -170,6 +171,7 @@ fn profession_hub(name: &str, vanilla_professions: bool) -> horizon_client::lan:
         max_players: 20,
         integrated: false,
         levels: Default::default(),
+        level_seeds: Default::default(),
     };
     hub::Hub::new(
         lan,
@@ -206,7 +208,7 @@ fn encoded_receive(client: &mut Mob, values: Vec<(u8, i32, Value)>, table: &Reso
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_client_packet_slots_and_unresolved_identity() {
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let types = MobTypes::load(&root).unwrap();
@@ -264,7 +266,7 @@ fn villager_client_packet_slots_and_unresolved_identity() {
             );
             render::villager_client::install(&client_table, &Default::default());
             assert_eq!(
-                render::layers(&client, 0.0)
+                render::layers(&client, 0.0, &Default::default())
                     .iter()
                     .any(|layer| layer.texture.contains("/profession/")),
                 layer

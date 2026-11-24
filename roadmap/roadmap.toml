@@ -185,7 +185,7 @@ launcher (#3388, #3855); server-side hooks (#3878, #3706); mod-owned screens, in
 (templates, `native.py check`); the registry (#1634, #1642, #1659); machines with inventories and menus (#1189); mods \
 that read and change the world through the server. \
 docs/modding/src/how-to/native-mods.md."""
-links = ["#3855", "#3351", "#3353", "#3360", "#3706", "#3878", "#3345", "#3346", "#3388", "#3434", "#3435", "#1634", "#1642", "#1659", "#1596", "#1635", "docs/modding/src/how-to/native-mods.md"]
+links = ["docs/modding/src/how-to/native-mods.md"]
 
 [[item]]
 id = "server-tick"
@@ -320,7 +320,7 @@ shipped_in = "v0.2.70"
 area = "rendering"
 plain = """Horizon's own way to make shader packs, with tools to write and test them. Every pack is checked before it \
 runs, and the registry will list them."""
-dev = """`horizon-shader-api` (API 0.1, experimental): WGSL stages with typed inputs inside the renderer's passes, \
+dev = """`horizon-shader-api` (API 0.2, experimental): WGSL stages with typed inputs inside the renderer's passes, \
 options as WGSL override constants, and the `horizon-shader new|check|pack` tool with templates and the \
 example pack Golden Hour. Merged: the check every pack passes (#1820) and the tool, templates and guide \
 (#1822). In review: the post stage running in the game with hot reload (#1861), the sky stage (#1863) and \
@@ -329,6 +329,18 @@ last-good fallback on reload, a GPU-time overlay per stage and budgets (docs/sha
 docs/api/shaders.md). The Iris/OptiFine loader is a separate item, 'Shader packs, written again from \
 scratch'."""
 links = ["#1820", "#1822", "#1861", "#1863", "#1855", "docs/shaders.md", "docs/api/shaders.md"]
+
+[[item]]
+id = "discord-presence"
+title = "Discord Rich Presence"
+status = "shipped"
+shipped_in = "v0.2.58"
+area = "extras"
+announce = true
+plain = """Your Discord profile can show that you are playing Horizon, with a switch to turn it off."""
+dev = """A Discord IPC client on its own thread (#1787) and the presence with its setting (#1788). Merged: it ships \
+with the next release."""
+links = ["#1787", "#1788"]
 
 [[item]]
 id = "server-dialogs"
@@ -363,9 +375,10 @@ dev = """Redo the comparison after the current performance work (#1073); reliabi
 (#1346); a scene must count as loaded only once its first chunk arrives (#1749). Next: a performance history \
 across releases (an automatic comparison of each release with the last, on a timeline), more report fields \
 (server TPS and MSPT, power, battery drain, temperature, throttling) and more hardware (a MacBook on \
-battery, low-end laptops, community reports). Players run `--benchmark` and can share the local report \
-by hand (docs/benchmark.md); neither the game nor the launcher uploads reports."""
-links = ["#1073", "#1346", "#1749", "docs/benchmark.md"]
+battery, low-end laptops, community reports). Server scale is published in #12930 and \
+docs/performance/server-vs-vanilla.md. Players' reports come in through `--benchmark` and \
+`horizon-launcher data benchmark` (docs/benchmark.md)."""
+links = ["#1073", "#1346", "#1749", "#12930", "docs/benchmark.md", "docs/performance/server-vs-vanilla.md"]
 
 [[item]]
 id = "world-entry"
@@ -926,7 +939,7 @@ dev = """333 of the 496 mods in a big pack (ATM10) contain code. Issue #1854 ran
 entities, networking, rendering, menus, inventories) that unlock them in tiers, with machines first as the \
 recommended path. Code mods are native mods now (docs/modding/src/how-to/native-mods.md): each port is a horizon-mixins bundle. \
 The path isn't started yet (docs/modpacks.md)."""
-links = ["#1854", "docs/modpacks.md", "docs/modding/src/how-to/native-mods.md"]
+links = ["docs/modpacks.md", "docs/modding/src/how-to/native-mods.md"]
 
 [[item]]
 id = "datapack-browser"
@@ -1108,7 +1121,7 @@ status = "later"
 area = "servers"
 plain = """Install and run a Horizon dedicated server from a terminal with a single command, no launcher needed, for \
 VPSes and headless machines."""
-dev = """A player's idea (#horizon-ideas). `horizon-server` already runs headless; left: an install script \
+dev = """A player's idea (#suggestions). `horizon-server` already runs headless; left: an install script \
 (Linux/macOS shell, Windows PowerShell) that fetches the signed release, checks it, asks for or points at the \
 player's own game files and starts the server, documented in docs/hosting.md."""
 links = ["docs/hosting.md"]
@@ -1131,9 +1144,9 @@ status = "help-wanted"
 area = "performance"
 plain = """Run Horizon's built-in benchmark and share the report: every new computer makes the performance work \
 more accurate. No coding needed."""
-dev = """`horizon-launcher play --arg=--benchmark --arg=standard` writes a JSON report in the game's \
-benchmarks/ folder. Read it and share it by hand if you choose; the launcher never uploads it \
-(docs/telemetry.md)."""
+dev = """`horizon-launcher play --arg=--benchmark --arg=standard` writes a JSON report; `horizon-launcher data \
+benchmark <report>` shows what would be sent and uploads it (playhorizon.dev/docs/performance). Results from three \
+installs with the same hardware appear on the Benchmarks page. Example: #1711."""
 links = ["https://playhorizon.dev/docs/performance"]
 
 # ---------------------------------------------------------------------------------------------------- Shipped
@@ -1245,7 +1258,7 @@ status = "later"
 area = "extras"
 plain = """An optional look for the game's own menus and options that matches the Horizon launcher. Off by default: \
 the vanilla menus stay as they are."""
-dev = """A player's idea (#horizon-ideas). A built-in resource pack or a Horizon setting that restyles the title, \
+dev = """A player's idea (#suggestions). A built-in resource pack or a Horizon setting that restyles the title, \
 pause and options screens with the launcher's design tokens (crates/horizon-theme), following \
 docs/design-system.md; off by default because it changes the vanilla look."""
 links = ["docs/design-system.md"]
@@ -1256,7 +1269,7 @@ title = "A Nix flake"
 status = "later"
 area = "platforms"
 plain = """Install Horizon on NixOS through a Nix flake."""
-dev = """A player's idea (#horizon-ideas). The launcher's AppImage ships with each launcher release \
+dev = """A player's idea (#suggestions). The launcher's AppImage ships with each launcher release \
 (packaging/linux/appimage.sh): one file with the libraries GPUI needs, which replaces itself when it \
 updates. A flake.nix packaging the release binaries with their runtime libraries (Vulkan loader, \
 X11/Wayland, ALSA) is still missing, the way horizon-parity's NixOS setup runs them today."""

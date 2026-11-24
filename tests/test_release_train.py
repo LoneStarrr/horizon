@@ -1,13 +1,66 @@
 import datetime as dt
 import os
 import subprocess
+import sys
 import textwrap
+import tomllib
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 from tools import release_train as train
+
+sys.path.insert(0, str(train.ROOT / "tools/ci/vendor/pyyaml-6.0.3.zip"))
+import yaml  # noqa: E402
+
+
+def owning_workspace(folder):
+    """The manifest of the workspace a package belongs to: the nearest Cargo.toml at or above it with [workspace]."""
+    for candidate in (folder, *folder.parents):
+        manifest = candidate / "Cargo.toml"
+        if manifest.exists() and "workspace" in tomllib.loads(manifest.read_text(encoding="utf-8")):
+            return manifest
+    return None
+
+
+def path_closure(start):
+    """The package folders `start` reaches through `path`: every dependency kind of `start` (its tests build there
+    too), then normal and build dependencies (what Cargo builds of a dependency). An entry with `workspace = true`
+    takes its `path` from the owning workspace's [workspace.dependencies], relative to that manifest."""
+    start = start.resolve()
+    seen, todo = set(), [start]
+    while todo:
+        folder = todo.pop()
+        if folder in seen:
+            continue
+        seen.add(folder)
+        manifest = tomllib.loads((folder / "Cargo.toml").read_text(encoding="utf-8"))
+        kinds = ["dependencies", "build-dependencies"] + (["dev-dependencies"] if folder == start else [])
+        tables = [manifest.get(kind, {}) for kind in kinds]
+        tables += [target.get(kind, {}) for target in manifest.get("target", {}).values() for kind in kinds]
+        for table in tables:
+            for name, spec in table.items():
+                if not isinstance(spec, dict):
+                    continue
+                if spec.get("workspace") is True:
+                    workspace = owning_workspace(folder)
+                    inherited = tomllib.loads(workspace.read_text(encoding="utf-8")).get("workspace", {})
+                    spec = inherited.get("dependencies", {}).get(name)
+                    if isinstance(spec, dict) and "path" in spec:
+                        todo.append((workspace.parent / spec["path"]).resolve())
+                elif "path" in spec:
+                    todo.append((folder / spec["path"]).resolve())
+    return seen
+
+
+def launcher_path_crates():
+    """The crates/ folders the launcher's manifest reaches through `path`."""
+    folders = {folder.relative_to(train.ROOT.resolve()).as_posix() + "/" for folder in path_closure(train.ROOT / "launcher")}
+    outside = {folder for folder in folders if not folder.startswith(("crates/", "launcher/"))}
+    assert not outside, f"the launcher builds path crates outside crates/: {sorted(outside)}"
+    return {folder for folder in folders if folder.startswith("crates/")}
+
 
 NOW = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.timezone.utc)
 
@@ -20,7 +73,7 @@ def pr(number, title="Fix a thing", labels=(), paths=("crates/horizon-client/src
 
 def merged_node(number, commit):
     return {"number": number, "mergeCommit": {"oid": commit}, "title": " Fix a thing ",
-            "url": f"https://github.com/arismoko/horizon/pull/{number}",
+            "url": f"https://github.com/horizon-rust/horizon/pull/{number}",
             "mergedAt": (NOW - dt.timedelta(hours=9)).isoformat(), "author": {"login": "contributor"},
             "labels": {"nodes": []}, "closingIssuesReferences": {"nodes": []}}
 
@@ -31,7 +84,7 @@ def metadata_page(nodes):
 
 class ReleaseTrainTests(unittest.TestCase):
     def test_repository_merge_identity_before_metadata(self):
-        for repository in ("arismoko/horizon", "horizon-rust/horizon"):
+        for repository in ("horizon-rust/horizon", "someone/horizon"):
             with self.subTest(repository=repository), mock.patch.object(train, "REPO", repository), \
                     mock.patch.object(train, "run", return_value="root"), \
                     mock.patch.object(train, "merged_pull_requests", return_value=[
@@ -111,6 +164,77 @@ class ReleaseTrainTests(unittest.TestCase):
         api.assert_called_once()
         self.assertEqual(api.call_args.args[:4], ("api", "graphql", "--paginate", "--slurp"))
 
+    def test_the_launcher_paths_are_every_crate_the_launcher_builds_in(self):
+        listed = {path for path in train.LAUNCHER_PATHS if path.startswith("crates/")}
+        self.assertEqual(listed, launcher_path_crates(),
+                         "LAUNCHER_PATHS in tools/release_train.py must list launcher/Cargo.toml's path crates")
+
+    def test_the_launcher_release_paths_are_a_deliberate_choice(self):
+        # Changing what counts toward a launcher release is a decision, not a sync with LAUNCHER_PATHS (see its comment).
+        self.assertEqual(train.LAUNCHER_RELEASE_PATHS, [
+            "launcher/",
+            "crates/horizon-bench/",
+            "crates/horizon-friends/",
+            "crates/horizon-mcp/",
+            "crates/horizon-mod-api-gen/",
+            "crates/horizon-mod-package/",
+            "crates/horizon-port-pack/",
+            "crates/horizon-prepare/",
+            "crates/horizon-release-sign/",
+            "crates/horizon-system/",
+            "crates/horizon-theme/",
+            "packaging/icons/",
+            "packaging/linux/",
+            "packaging/macos/",
+        ])
+        self.assertFalse(train.player_facing("crates/horizon-world/src/lib.rs", "launcher"))
+
+    def test_every_launcher_release_path_runs_the_launcher_checks(self):
+        self.assertLessEqual(set(train.LAUNCHER_RELEASE_PATHS), set(train.LAUNCHER_PATHS))
+
+    def test_the_closure_follows_inline_and_workspace_inherited_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+
+            def write(folder, text):
+                (root / folder).mkdir(parents=True, exist_ok=True)
+                (root / folder / "Cargo.toml").write_text(textwrap.dedent(text))
+
+            write(".", """
+                [workspace]
+                members = ["crates/*"]
+                [workspace.dependencies]
+                inherited = { path = "crates/inherited" }
+            """)
+            write("app", """
+                [package]
+                name = "app"
+                [workspace]
+                [dependencies]
+                middle = { path = "../crates/middle" }
+                [dev-dependencies]
+                test-only = { path = "../crates/test-only" }
+            """)
+            write("crates/middle", """
+                [package]
+                name = "middle"
+                [dependencies]
+                inherited = { workspace = true }
+                [dev-dependencies]
+                not-built = { path = "../not-built" }
+            """)
+            for name in ("inherited", "test-only", "not-built"):
+                write(f"crates/{name}", f'[package]\nname = "{name}"\n')
+            self.assertEqual({folder.relative_to(root).as_posix() for folder in path_closure(root / "app")},
+                             {"app", "crates/middle", "crates/inherited", "crates/test-only"})
+
+    def test_the_launcher_workflow_runs_for_every_launcher_path(self):
+        workflow = yaml.safe_load((train.ROOT / ".github/workflows/launcher.yml").read_text(encoding="utf-8"))
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertEqual(set(triggers["push"]["paths"]),
+                         {path + "**" for path in train.LAUNCHER_PATHS} | {".github/workflows/launcher.yml"},
+                         "launcher.yml's push paths must be tools/release_train.py's LAUNCHER_PATHS")
+
     def test_launcher_decision_shell_fails_closed_and_succeeds_normally(self):
         workflow = (train.ROOT / ".github/workflows/launcher.yml").read_text()
         step = workflow.split("      - id: decide\n", 1)[1].split("\n  build:", 1)[0]
@@ -133,8 +257,7 @@ class ReleaseTrainTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-e", "-c", script], cwd=root, capture_output=True,
                                         text=True, env={**os.environ, "GITHUB_OUTPUT": str(output),
                                         "GITHUB_STEP_SUMMARY": str(root / "summary"), "GITHUB_SHA": "head",
-                                        "BASE": "", "EVENT": "workflow_dispatch", "DRY_RUN": "true",
-                                        "SOURCE_SHA": "head", "FORCE": ""})
+                                        "HEAD_SHA": "head", "FORCE": ""})
                 if status:
                     self.assertEqual(result.returncode, status, result.stderr)
                     self.assertEqual(output.read_text(), "")
@@ -267,6 +390,10 @@ class ReleaseTrainTests(unittest.TestCase):
         self.assertFalse(decide([pr(1, labels=["release-now", "skip-release"])]))
         self.assertFalse(decide([pr(1)], paused=True))
         self.assertTrue(decide([], paused=True, force=True))
+        launcher = lambda prs: train.decision("launcher", prs, NOW)[0]
+        self.assertFalse(launcher([pr(1, merged=50 * minute)]), "a lone launcher fix waits for others a while")
+        self.assertTrue(launcher([pr(1, merged=hour)]), "but only an hour")
+        self.assertFalse(launcher(five(2 * minute)), "a launcher batch still merging waits too")
 
     def test_an_open_release_blocker_holds_every_release_even_forced(self):
         release, why = train.decision("game", [pr(1, labels=["release-now"])], NOW, blockers=[7, 9])
@@ -276,7 +403,7 @@ class ReleaseTrainTests(unittest.TestCase):
         self.assertFalse(train.decision("game", [], NOW, new_line="0.3", blockers=[7])[0])
         self.assertTrue(train.decision("game", [pr(1)], NOW, blockers=[])[0])
 
-    @mock.patch.object(train, "REPO", "horizon-rust/horizon")
+    @mock.patch.object(train, "REPO", "someone/horizon")
     def test_game_releases_ship_only_what_parity_main_passed(self):
         def runs(parity, checks):
             def gh_json(*arguments):
@@ -309,107 +436,6 @@ class ReleaseTrainTests(unittest.TestCase):
         with runs([], [("c", "completed", "failure"), ("b", "completed", "success")]):
             self.assertIsNone(train.green_main_head(), "checks alone: main's newest finished checks must pass")
 
-    def test_launcher_manual_base_is_pinned_and_must_belong_to_main(self):
-        workflow = (train.ROOT / ".github/workflows/launcher.yml").read_text()
-        selection = workflow.split("          set -euo pipefail\n", 1)[1].split(
-            "          python3 tools/release_train.py decide", 1)[0]
-        script = "set -euo pipefail\n" + textwrap.dedent(selection) + '\nprintf "%s" "$HEAD_SHA"'
-        with tempfile.TemporaryDirectory() as folder:
-            def git(*args):
-                return subprocess.check_output(["git", *args], cwd=folder, text=True,
-                                               stderr=subprocess.DEVNULL).strip()
-            git("init", "-b", "main")
-            git("config", "user.name", "Test")
-            git("config", "user.email", "test@example.invalid")
-            git("commit", "--allow-empty", "-m", "main")
-            main = git("rev-parse", "HEAD")
-            git("remote", "add", "origin", folder)
-            git("checkout", "-b", "topic")
-            git("commit", "--allow-empty", "-m", "not main")
-            topic = git("rev-parse", "HEAD")
-            def select(base="", event="workflow_dispatch", dry_run="false"):
-                return subprocess.run(["bash", "-c", script], cwd=folder, text=True,
-                                      capture_output=True, env={**os.environ, "BASE": base,
-                                      "EVENT": event, "DRY_RUN": dry_run, "SOURCE_SHA": topic})
-            for dry_run in ("false", "true"):
-                result = select(main, dry_run=dry_run)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, main)
-            for invalid in ("does-not-exist", topic, "--help"):
-                result = select(invalid)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("::error::base", result.stdout)
-            self.assertEqual(select().stdout, "", "default real manual run uses the gate picker")
-            self.assertEqual(select(event="push").stdout, topic)
-            self.assertEqual(select(dry_run="true").stdout, topic)
-
-    @mock.patch.object(train, "REPO", "arismoko/horizon")
-    def test_fork_base_requires_same_sha_main_push_gate_jobs(self):
-        def record(sha, ident, event="push", branch="main"):
-            return dict(head_sha=sha, id=ident, event=event, head_branch=branch,
-                        status="completed", conclusion="failure")
-        def job(name, status="completed", conclusion="success"):
-            return dict(name=name, status=status, conclusion=conclusion)
-        gates = [job(name) for name in ("lint", "verify", "verify-static", "launcher", "pool-watch")]
-        records = [record("pr", 1, "pull_request"), record("topic", 2, branch="topic"),
-                   record("new", 3), record("good", 4), record("old", 5)]
-        jobs = {3: gates + [job("client-data", conclusion="failure")],
-                4: gates, 30: [job("fixture")], 40: [job("fixture")]}
-        fixture_sha = {"new": "different", "good": "good"}
-        def api(*arguments):
-            self.assertEqual(arguments[:4], ("api", "--paginate", "--slurp", arguments[3]))
-            path = arguments[3]
-            if "dyna-ci.yml/runs?" in path:
-                self.assertIn("branch=main&event=push", path)
-                return [{"workflow_runs": records[:3]}, {"workflow_runs": records[3:]}]
-            if "wasm-mods.yml/runs?" in path:
-                sha = path.split("head_sha=")[1].split("&")[0]
-                return [{"workflow_runs": [record(fixture_sha[sha], 30 if sha == "new" else 40)]}]
-            ident = int(path.split("/runs/")[1].split("/")[0])
-            self.assertIn("filter=latest", path)
-            return [{"jobs": jobs[ident][:2]}, {"jobs": jobs[ident][2:]}]
-        with mock.patch.object(train, "REPO", "arismoko/horizon"), \
-                mock.patch.object(train, "gh_json", side_effect=api) as requests:
-            self.assertEqual(train.green_main_head(parity=True), "good")
-            fixture_sha["new"] = "new"
-            self.assertEqual(train.green_main_head(), "new", "non-gate failure must not reject a build")
-            requests.reset_mock()
-            self.assertEqual(train.green_main_head(eligible=lambda sha: sha == "good"), "good")
-            paths = [call.args[3] for call in requests.call_args_list]
-            self.assertFalse(any("/runs/3/jobs" in path or "head_sha=new&" in path for path in paths))
-            self.assertTrue(any("/runs/4/jobs" in path for path in paths))
-            for status, conclusion in [("queued", None), ("in_progress", "success"),
-                                       ("completed", "skipped"), ("completed", "cancelled"),
-                                       ("completed", "failure"), ("completed", None),
-                                       ("completed", "unknown")]:
-                with self.subTest(status=status, conclusion=conclusion):
-                    jobs[3] = gates[:-1] + [job("pool-watch", status, conclusion)]
-                    self.assertEqual(train.green_main_head(), "good")
-                    jobs[3] = gates
-                    jobs[30] = [job("fixture", status, conclusion)]
-                    self.assertEqual(train.green_main_head(), "good")
-                    jobs[30] = [job("fixture")]
-            jobs[3] = gates[:-1]
-            self.assertEqual(train.green_main_head(), "good", "missing gate is not success")
-            for name in ("verify", "verify-static"):
-                for status, conclusion in [("queued", None), ("in_progress", "success"),
-                                           ("completed", "skipped"), ("completed", "cancelled"),
-                                           ("completed", "failure"), ("completed", "timed_out")]:
-                    with self.subTest(gate=name, status=status, conclusion=conclusion):
-                        jobs[3] = [entry for entry in gates if entry["name"] != name] + [job(name, status, conclusion)]
-                        self.assertEqual(train.green_main_head(), "good")
-                jobs[3] = [entry for entry in gates if entry["name"] != name]
-                self.assertEqual(train.green_main_head(), "good", f"missing {name} is not success")
-            records.insert(3, record("new", 99))
-            jobs[99] = gates
-            self.assertEqual(train.green_main_head(), "good", "an older run cannot override the latest run")
-            jobs[3] = gates
-            fixture_sha["new"] = "different"
-            fixture_sha["good"] = "different"
-            records[:] = records[:5]
-            self.assertIsNone(train.green_main_head(), "gates on different SHAs cannot be combined")
-            records[:] = records[:2]
-            self.assertIsNone(train.green_main_head(), "PR checks cannot supply a release base")
 
     def test_a_release_is_published_only_after_its_smoke_test_and_with_no_blocker(self):
         drew = {"error": None, "frames": 12710, "chunks": 81, "meshed_sections": 550, "player": [160.5, 71.0, 156.5]}
@@ -471,27 +497,6 @@ class ReleaseTrainTests(unittest.TestCase):
         self.assertNotIn(train.PLAYERS, body)
         self.assertNotIn(train.PLAYERS_FOOTER, body)
         self.assertIn("Your launcher updates itself.", body)
-
-    def test_fork_launcher_notes_use_supported_downloads_and_exact_verifier_tag(self):
-        import shlex
-        tag = "launcher@0.3.0"
-        title, body = train.notes("launcher", tag, [pr(3, "Fix launcher updates")], [],
-                                 previous="launcher-v0.17.0", repository="arismoko/horizon")
-        self.assertEqual(title, f"Horizon Fork Launcher (arismoko) {tag}")
-        self.assertTrue(body.startswith("# Horizon Fork Launcher (arismoko)\n"))
-        self.assertIn("### Fixed\n- Fix launcher updates (#3)", body)
-        self.assertNotIn(train.LAUNCHER_FOOTER, body)
-        self.assertNotIn("macOS", body)
-        self.assertNotIn("numbered with the game", body)
-        command = next(line for line in body.splitlines() if line.startswith("cargo run "))
-        self.assertEqual(shlex.split(command), [
-            "cargo", "run", "--locked", "-p", "horizon-release-sign", "--", "verify",
-            "--repository", "arismoko/horizon", "--tag", tag, "--publishing",
-            "/absolute/path/to/downloads",
-        ])
-        clone = next(line for line in body.splitlines() if line.startswith("git clone "))
-        self.assertEqual(shlex.split(clone)[3], tag)
-        self.assertNotIn("{tag}", body)
 
     def test_a_game_release_opens_with_the_way_to_the_launcher(self):
         # GitHub's latest is a game release: whoever lands on it is sent to the launcher first (#1647).
@@ -558,6 +563,46 @@ class NightlyTrainTests(unittest.TestCase):
         self.assertEqual(train.nightly_decision(True, "release-now: #2", urgent, None, 12), (True, "release-now: #2", True))
         self.assertTrue(train.nightly_decision(True, "forced", self.PRS, None, 30, force=True)[0])
         self.assertFalse(train.nightly_decision(True, "forced", self.PRS, 7, 0, force=True)[0])
+
+    def listing(self, runs):
+        """`gh run list` over `runs` (newest first), as GitHub answers it; records each call."""
+        calls = []
+
+        def gh_json(*arguments):
+            calls.append(arguments)
+            limit = int(arguments[arguments.index("--limit") + 1])
+            return [{"databaseId": n, "status": status} for n, status in runs][:limit]
+        return calls, mock.patch.object(train, "gh_json", gh_json)
+
+    def test_one_listing_finds_an_active_build_behind_finished_runs(self):
+        # Newest first: 150 finished dry runs, then the real cut waiting for its rerun.
+        runs = [(n, "completed") for n in range(1000, 850, -1)] + [(42, "waiting"), (41, "completed")]
+        calls, patch = self.listing(runs)
+        with patch:
+            self.assertEqual(train.nightly_building(NOW), 42)
+        # One snapshot: a run moving from waiting to in_progress can't fall between two queries.
+        self.assertEqual(len(calls), 1)
+        arguments = calls[0]
+        self.assertNotIn("--status", arguments)
+        self.assertEqual(arguments[arguments.index("--created") + 1], ">=2026-09-10")
+        self.assertEqual(arguments[arguments.index("--limit") + 1], str(train.NIGHTLY_LISTING))
+        calls, patch = self.listing([(n, "completed") for n in range(10)])
+        with patch:
+            self.assertIsNone(train.nightly_building(NOW))
+
+    def test_a_cut_off_listing_holds_the_train(self):
+        calls, patch = self.listing([(n, "completed") for n in range(train.NIGHTLY_LISTING + 5)])
+        with patch:
+            building = train.nightly_building(NOW)
+        self.assertTrue(building)
+        self.assertFalse(train.nightly_decision(True, "5", self.PRS, building, 0)[0])
+
+    def test_a_blank_listing_is_an_error_not_an_idle_train(self):
+        with mock.patch.object(train, "run", return_value=""):
+            with self.assertRaises(SystemExit):
+                train.nightly_building(NOW)
+        with mock.patch.object(train, "run", return_value="[]\n"):
+            self.assertIsNone(train.nightly_building(NOW))
 
     def test_the_cap_is_the_nightly_sets(self):
         from tools.ci import nightly_set

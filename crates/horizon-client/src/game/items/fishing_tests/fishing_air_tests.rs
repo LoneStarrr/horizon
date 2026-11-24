@@ -5,7 +5,7 @@ use super::{FISHING_TABLE, fishing_loot};
 use horizon_world::loot::LootStack;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cave_air_above_a_water_source_is_open_water_and_catches_treasure() {
     let mut resources = None;
     let mut game = crate::game::game_tests::tests::server_game(&mut resources);
@@ -65,7 +65,9 @@ fn cave_air_above_a_water_source_is_open_water_and_catches_treasure() {
         (0..400)
             .flat_map(|seed| {
                 let mut sequences = horizon_client::random_sequences::RandomSequences::default();
-                let mut level_random = horizon_core::random::LegacyRandom::new(seed);
+                let mut level_random = horizon_core::random::LevelRandom::for_level(
+                    horizon_core::random::LegacyRandom::new(seed),
+                );
                 fishing_loot(
                     &loot,
                     FISHING_TABLE,

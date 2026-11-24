@@ -51,6 +51,7 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
     game.block_ticks
         .add_empty_chunk(ChunkPos::new(0, 0))
         .unwrap();
+    game.load_ticking_neighbourhood(0, 0);
     assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
     game
 }
@@ -88,10 +89,7 @@ fn with_stick_table(game: &mut Game<'_>, name: &str) {
         &[],
         &[],
     );
-    game.world_tables = game
-        .build_world_tables(&stack, false, &root, false)
-        .unwrap()
-        .0;
+    game.world_tables = game.stage_world_tables(&stack, false, &root).unwrap().0;
     // World open warms the loot data with the world's packs (game.rs); the
     // break's roll reads that copy, here this test's own, so the stick reaches
     // no other test's stand (#14266).
@@ -137,7 +135,7 @@ fn burn(game: &mut Game<'_>, small: bool) {
 const STICK: &str = "execute if entity @e[type=item,x=2.5,y=100,z=8.5,distance=..3,nbt={Item:{id:\"minecraft:stick\"}}]";
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_burnt_out_stand_drops_its_loot_table() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -147,7 +145,7 @@ fn a_burnt_out_stand_drops_its_loot_table() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_small_burnt_out_stand_drops_no_loot() {
     // ArmorStand.isBaby is isSmall: LivingEntity.shouldDropLoot is false.
     let mut resources = None;
@@ -168,7 +166,7 @@ fn sticks(game: &mut Game<'_>) -> String {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn control_mob_drops_off_rolls_nothing() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -179,7 +177,7 @@ fn control_mob_drops_off_rolls_nothing() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn control_one_break_rolls_the_table_once() {
     let mut resources = None;
     let mut game = game(&mut resources);

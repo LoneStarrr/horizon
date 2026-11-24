@@ -3,10 +3,15 @@ use super::*;
 
 impl Game<'_> {
     pub(in crate::game) fn mob_world_base<'s>(&'s self, others: &'s [Seen]) -> MobWorld<'s> {
+        if self.is_logical_server() {
+            self.world.enable_path_type_cache();
+        }
         let (rain, thunder) = self.weather_levels(1.0);
         let weather = self.can_have_weather();
         let player = self.player_view();
         MobWorld {
+            mob_maps: self.mob_maps(),
+            section_writer: None,
             professions: self.stations().professions.as_ref(),
             loop_context: &self.loop_context,
             foreign: None,
@@ -32,6 +37,8 @@ impl Game<'_> {
             others_index: None,
             passenger_objects: &[],
             others_villagers: None,
+            village: None,
+            species_slots: None,
             others_solid: None,
             daylight: self.dim != Dim::Nether && self.sky_darken() < 4,
             // day.json: false from tick 12542, true from 23460 (a step track).
@@ -73,14 +80,21 @@ impl Game<'_> {
                 None
             },
             mob_hooks: (self.native_authoritative()
-                && [
+                && ([
                     mod_api::HookId::EndermanAnger,
                     mod_api::HookId::EntityMobGriefing,
                     mod_api::HookId::LivingVisibility,
                     mod_api::HookId::LivingChangeTarget,
                 ]
                 .into_iter()
-                .any(mod_api::__private::listened))
+                .any(mod_api::__private::listened)
+                    || [
+                        mod_api::HookId::CanEntityDestroy,
+                        mod_api::HookId::BlockPathType,
+                        mod_api::HookId::AdjacentBlockPathType,
+                    ]
+                    .into_iter()
+                    .any(mod_api::__private::has_scoped_hook)))
             .then_some(self as &dyn horizon_client::mobs::MobHooks),
             goal_host: (self.native_authoritative()
                 && (mod_api::__private::has_entity_parts()

@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn handles_create_update_list_and_go_stale_like_bossbar_commands() {
         with_game(|game| {
             let config = HubConfig {
@@ -299,6 +299,7 @@ mod tests {
                 max_players: 10,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             let mut net = NetConfig::lan(0, "test".into(), 10);
             net.listen = false;
@@ -476,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn generated_text_crossings_refuse_too_deep_before_boss_bar_writes() {
         with_game(|game| {
             let bar = mod_api::prelude::BossBarsServerHost::create_boss_bar(
@@ -553,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn saved_bars_are_found_before_any_tick() {
         with_game(|game| {
             let dir = std::env::temp_dir().join(format!("boss-early-{}", std::process::id()));

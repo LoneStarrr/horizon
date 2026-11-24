@@ -23,7 +23,7 @@ impl mod_api::Hooks for Redirect {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn redirect_to_another_guest_switches_view_and_tags_subsequent_events() {
     let redirect = Arc::new(Mutex::new(None));
     let mods = vec![mod_api::ModEntry::new(
@@ -96,6 +96,16 @@ fn redirect_to_another_guest_switches_view_and_tags_subsequent_events() {
             assert!(
                 matches!(after, MobEvent::ForPlayer { conn: Some(13), event }
                 if matches!(*event, MobEvent::AttackPlayer(..)))
+            );
+            // An alert (`HurtByTargetGoal.alertOthers`) hands over the redirected player too.
+            let alert = world.route_player_event(MobEvent::SetTarget {
+                mob: other.id,
+                target: Who::Player,
+                player: None,
+            });
+            assert!(
+                matches!(alert, MobEvent::ForPlayer { conn: Some(13), event }
+                if matches!(*event, MobEvent::SetTarget { target: Who::Player, .. }))
             );
 
             for invalid in [fake_target, LivingRef::new(EntityRef::new(epoch, 99999))] {

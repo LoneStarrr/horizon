@@ -1,5 +1,5 @@
 //! `smoke_source` answered by a block Part, as Farmer's Delight's head inject on
-//! `CampfireBlock.isSmokeSource` needs (#1027): the Part's answer replaces vanilla's both ways,
+//! `CampfireBlock.isSmokeSource` needs (arismoko/horizon#1027): the Part's answer replaces vanilla's both ways,
 //! and the campfire above takes it as the block under it changes.
 use super::native_entity_refs::tests::with_game;
 use mod_api::{self, BlockPart, Hooks, LevelHost, Registrar, SmokeSourceEvent};
@@ -40,7 +40,7 @@ fn signal_fire(game: &super::Game<'_>) -> bool {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_block_part_decides_whether_the_campfire_above_is_a_signal_fire() {
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new("smoke", Box::new(SmokeMod))].into();
     crate::game::api_values::install_parts(&mods).unwrap();

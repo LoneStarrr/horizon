@@ -23,21 +23,29 @@ use std::{
 mod buffet;
 mod confirm_experiments;
 mod create_world;
+mod draw;
 mod edit_world;
 mod experiments;
 mod flat;
 mod missing_biome_regions;
+mod missing_mods;
 mod onboarding;
 pub mod preset_editors;
 mod splash;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod title_request_tests;
 mod world_folder;
 pub mod world_management;
+#[cfg(test)]
+mod world_request_tests;
+mod world_toast;
 pub use buffet::State as BuffetEditor;
 pub use create_world::{DIFFICULTIES, WorldOptions};
 pub use flat::{FlatLayer, FlatSettings, State as FlatEditor};
 pub use onboarding::Onboarding;
+use world_toast::WorldToast;
 
 /// SelectWorldScreen's `HeaderAndFooterLayout(8 + 9 + 8 + 20 + 4, 60)`.
 const LIST_TOP: f32 = 49.0;
@@ -105,13 +113,14 @@ fn recover_issues(dir: &Path) -> [Option<crate::save::DatIssue>; 2] {
 /// `LogoRenderer.extractRenderState`: the logo's top 44 of 64 rows, then the
 /// edition banner's top 14 of 16 rows overlapping its bottom by 7.
 fn draw_logo(atlas: &HudAtlas, batch: &mut HudBatch, w: f32) {
-    batch.sprite_region(
+    batch.texture_blit(
         atlas,
         "gui/title/minecraft",
         [(w / 2.0).floor() - 128.0, 30.0, 256.0, 44.0],
-        256.0,
-        64.0,
+        [0.0; 2],
+        [256.0, 64.0],
     );
+    // The edition banner is generated in the atlas for Horizon's branding.
     batch.sprite_region(
         atlas,
         crate::title_edition::SPRITE,
@@ -157,37 +166,6 @@ fn translate(key: &str, fallback: &str, args: &[&dyn std::fmt::Display]) -> Stri
     format_translation(&lang::get_or(key, fallback), &args).plain()
 }
 
-enum WorldToast {
-    Created {
-        folder: String,
-        bytes: u64,
-    },
-    Failed(String),
-    /// `SystemToast.onWorldAccessFailure`: the folder of a world that couldn't be locked.
-    AccessFailure(String),
-}
-impl WorldToast {
-    fn text(&self) -> (Text, Text) {
-        match self {
-            Self::Created { folder, bytes } => (
-                Text::tr("selectWorld.edit.backupCreated", &[folder]),
-                Text::tr(
-                    "selectWorld.edit.backupSize",
-                    &[&((*bytes as f64 / 1_048_576.0).ceil() as u64)],
-                ),
-            ),
-            Self::Failed(error) => (
-                Text::translate("selectWorld.edit.backupFailed", &[]),
-                Text::literal(error),
-            ),
-            Self::AccessFailure(folder) => (
-                Text::translate("selectWorld.access_failure", &[]),
-                Text::literal(folder),
-            ),
-        }
-    }
-}
-
 /// Why `WorldOpenFlows.askForBackup` asks before a world opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StemIssue {
@@ -197,7 +175,7 @@ pub enum StemIssue {
     Experimental,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WorldEntry {
     pub folder: String,
     pub name: String,
@@ -223,6 +201,18 @@ pub struct WorldEntry {
     pub experimental: bool,
 }
 impl WorldEntry {
+    /// Whether `other` is the same save as this one: its folder, and the level data that names and dates it
+    /// (name, version, modified time, game mode, hardcore, corrupted). Play's own state (locked, files to fix)
+    /// is not part of it.
+    pub fn is_same_save(&self, other: &WorldEntry) -> bool {
+        self.folder == other.folder
+            && self.name == other.name
+            && self.modified == other.modified
+            && self.game_mode == other.game_mode
+            && self.hardcore == other.hardcore
+            && self.version == other.version
+            && self.corrupted == other.corrupted
+    }
     /// `LevelSummary.isCompatible`: the saved series is this build's.
     fn compatible(&self) -> bool {
         self.incompatible.is_none()
@@ -322,6 +312,15 @@ pub enum Mode {
     LowDiskSpace {
         world: WorldEntry,
     },
+    /// A native mod's `request_world`, asked of the player before anything opens: Yes goes through
+    /// Play's own checks (`play_from`) when the save is still the one shown, otherwise it is asked again with
+    /// the save as it is now; No or Escape returns to the main page with nothing touched.
+    WorldRequest {
+        /// The save as the question shows it: Yes compares it with the save on disk.
+        world: WorldEntry,
+        /// The calling mod, by its manifest name.
+        mods: String,
+    },
     /// Edit World's opt-in to the installed mods' biome regions (`edit_world`).
     AdoptBiomeRegions {
         world: WorldEntry,
@@ -331,6 +330,11 @@ pub enum Mode {
     MissingBiomeRegions {
         world: WorldEntry,
         missing: Vec<(String, String)>,
+    },
+    /// Saved mods not loaded now, whose blocks opening the world removes (`missing_mods`).
+    MissingMods {
+        world: WorldEntry,
+        missing: Vec<crate::save::level_mods::MissingMod>,
     },
     Delete {
         world: WorldEntry,
@@ -471,23 +475,31 @@ pub struct Title {
     ban_queue: std::collections::VecDeque<crate::ban_notice::Notice>,
     /// A ban notice's three buttons as last drawn (`ConfirmLinkScreen`'s row).
     ban_buttons: Cell<[(f32, f32); 3]>,
-    backup: Option<mpsc::Receiver<Result<u64, String>>>,
+    backup: Option<mpsc::Receiver<Result<(PathBuf, u64), String>>>,
     backup_shown: Cell<bool>,
     /// The backup a `BackupBeforeUpgrade` asked for opens its world when done; whether it
     /// was the question about customized or experimental settings, the last one asked.
     backup_then_open: Option<bool>,
+    /// The backup `MissingMods` asked for: its world opens only once the backup is made.
+    open_after_mods_backup: bool,
     /// The backup `OptimizeConfirm` asked for starts the optimization when done (with the
     /// Erase Cached Data choice).
     optimize_after_backup: Option<bool>,
     /// The backup `RecoverWorldDataScreen.attemptRestore` makes first; the restore runs when it
     /// is done, whether the backup worked or not.
     restore_after_backup: bool,
+    /// Where a native mod request's open returns to after a recovery (`Main`): set by Yes of
+    /// `Mode::WorldRequest`, used by Continue of `Mode::Recovered`, cleared by any ordinary Play.
+    recover_return: Option<Mode>,
     /// The running `WorldUpgrader` of `Mode::Optimize`.
     optimize: Option<WorldUpgrader>,
     /// The Erase Cached Data box as last drawn: x, y, width, height.
     erase_check: Cell<[f32; 4]>,
     /// The folder to open next, once that backup has finished.
     open_request: Option<String>,
+    /// The save a native mod's request is taking through Play's checks (Yes was answered): the alerts and the
+    /// backup questions of that open return to the main page, not to the world list.
+    request_folder: Option<String>,
     /// A Realm's checked address, once the Realms screen's join came back.
     connect_request: Option<String>,
     /// EditWorldScreen's and WorldOpenFlows' `SystemToast` and its slide.
@@ -522,6 +534,7 @@ pub(crate) struct Button {
     label: String,
     enabled: bool,
     id: u8,
+    agent_id: Option<&'static str>,
     icon: Option<(&'static str, f32)>,
     /// `SpriteIconButton.TextAndIcon`: the icon at the right end, the text
     /// centred in the room left of it.
@@ -530,6 +543,11 @@ pub(crate) struct Button {
     action: Option<crate::widgets::Action>,
 }
 impl Button {
+    fn identified(mut self, id: &'static str) -> Self {
+        self.agent_id = Some(id);
+        self
+    }
+
     fn does(mut self, action: crate::widgets::Action) -> Self {
         self.action = Some(action);
         self
@@ -598,46 +616,63 @@ pub fn list_worlds(saves: &Path) -> Vec<WorldEntry> {
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let path = e.path();
-            // findLevelCandidates: a folder with a level.dat or a level.dat_old.
-            let file = |name: &str| std::fs::metadata(path.join(name)).ok().filter(|m| m.is_file());
-            // getFileModificationTime: level.dat's, else level.dat_old's.
-            let file = file("level.dat").or_else(|| file("level.dat_old"))?;
-            let modified = file.modified().unwrap_or(std::time::UNIX_EPOCH);
             let folder = e.file_name().to_string_lossy().into_owned();
-            // readLevelSummary reads level.dat alone; when it fails the world is
-            // still listed, as a CorruptedLevelSummary named after its folder.
-            let level = Level::read_summary(&path);
-            let root = crate::save::read_dat(&path.join("level.dat"));
-            let (Some(level), Some(root)) = (level, root) else {
-                return Some(WorldEntry::corrupted(folder, modified));
-            };
-            let data = root.get("Data")?;
-            let modified = match data.get("LastPlayed") {
-                Some(horizon_core::nbt::Tag::Long(millis)) if *millis >= 0 => std::time::UNIX_EPOCH + std::time::Duration::from_millis(*millis as u64),
-                _ => modified,
-            };
-            Some(WorldEntry {
-                folder,
-                name: level.name,
-                game_mode: level.game_mode,
-                hardcore: level.hardcore,
-                modified,
-                commands: matches!(data.get("allowCommands"), Some(horizon_core::nbt::Tag::Byte(v)) if *v != 0),
-                version: data.get("Version").and_then(|v| v.get("Name"))
-                    .and_then(|v| match v { horizon_core::nbt::Tag::String(s) => Some(s.to_string_lossy()), _ => None })
-                    .unwrap_or_else(|| lang::get_or("selectWorld.versionUnknown", "Unknown")),
-                locked: crate::save::SessionLock::is_locked(&path),
-                corrupted: false,
-                incompatible: crate::save::incompatible_version(&path),
-                file_fixing: crate::save::needs_file_fixes(&path),
-                downgrade: crate::save::downgraded_from(&path).is_some(),
-                experimental: experimental_features(data),
-            })
+            read_world(&e.path(), folder)
         })
         .collect();
     worlds.sort_by_key(|w| std::cmp::Reverse(w.modified));
     worlds
+}
+/// The save in `path` (a folder under `saves`, named `folder`) as the title's list shows it, read on its own:
+/// None unless the folder holds a level.dat or a level.dat_old.
+fn read_world(path: &Path, folder: String) -> Option<WorldEntry> {
+    // findLevelCandidates: a folder with a level.dat or a level.dat_old.
+    let file = |name: &str| {
+        std::fs::metadata(path.join(name))
+            .ok()
+            .filter(|m| m.is_file())
+    };
+    // getFileModificationTime: level.dat's, else level.dat_old's.
+    let file = file("level.dat").or_else(|| file("level.dat_old"))?;
+    let modified = file.modified().unwrap_or(std::time::UNIX_EPOCH);
+    // readLevelSummary reads level.dat alone; when it fails the world is
+    // still listed, as a CorruptedLevelSummary named after its folder.
+    let level = Level::read_summary(path);
+    let root = crate::save::read_dat(&path.join("level.dat"));
+    let (Some(level), Some(root)) = (level, root) else {
+        return Some(WorldEntry::corrupted(folder, modified));
+    };
+    let data = root.get("Data")?;
+    let modified = match data.get("LastPlayed") {
+        // Past the year 9999 it can't be a time an edited or corrupt level.dat meant, and a huge
+        // value overflows `SystemTime` on Windows: the file's time stands in, as for a negative one.
+        Some(horizon_core::nbt::Tag::Long(millis @ 0..=253_402_300_799_999)) => {
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(*millis as u64)
+        }
+        _ => modified,
+    };
+    Some(WorldEntry {
+        folder,
+        name: level.name,
+        game_mode: level.game_mode,
+        hardcore: level.hardcore,
+        modified,
+        commands: matches!(data.get("allowCommands"), Some(horizon_core::nbt::Tag::Byte(v)) if *v != 0),
+        version: data
+            .get("Version")
+            .and_then(|v| v.get("Name"))
+            .and_then(|v| match v {
+                horizon_core::nbt::Tag::String(s) => Some(s.to_string_lossy()),
+                _ => None,
+            })
+            .unwrap_or_else(|| lang::get_or("selectWorld.versionUnknown", "Unknown")),
+        locked: crate::save::SessionLock::is_locked(path),
+        corrupted: false,
+        incompatible: crate::save::incompatible_version(path),
+        file_fixing: crate::save::needs_file_fixes(path),
+        downgrade: crate::save::downgraded_from(path).is_some(),
+        experimental: experimental_features(data),
+    })
 }
 /// `FeatureFlags.isExperimental` of `LevelStorageSource.parseFeatureFlagsFromSummary`:
 /// level.dat's `enabled_features` name a known flag other than `minecraft:vanilla`
@@ -782,7 +817,9 @@ impl Mode {
             Self::OptimizeConfirm { .. } => "world_optimize_confirm",
             Self::Optimize { .. } => "world_optimize",
             Self::LowDiskSpace { .. } => "low_disk_space",
+            Self::WorldRequest { .. } => "world_request",
             Self::MissingBiomeRegions { .. } => "missing_biome_regions",
+            Self::MissingMods { .. } => "missing_mods",
             Self::AdoptBiomeRegions { .. } => "adopt_biome_regions",
             Self::Delete { .. } => "world_delete",
             Self::Recover { .. } => "world_recover",
@@ -801,6 +838,9 @@ impl Title {
     /// different id waits in `requested` for the game; the same screen again
     /// (its id unchanged) is applied at once.
     pub fn set_mode(&mut self, mut mode: Mode) {
+        if matches!(mode, Mode::Main) {
+            self.request_folder = None;
+        }
         if let Mode::Create { options, .. } = &mut mode {
             options.set_additional_data_packs(self.additional_data_packs.clone());
             options.refresh_presets(&self.resources, self.preset_data.as_deref());
@@ -846,6 +886,27 @@ impl Title {
         }
         self
     }
+    /// The selected splash, if the main title is showing and splash text is enabled.
+    pub fn visible_splash(&self, hide_splash: bool) -> Option<&str> {
+        let splash = self.splash_text(hide_splash)?;
+        if !matches!(self.mode, Mode::Main)
+            || self.preparing
+            || self.rules.borrow().is_some()
+            || self.confirm_experiments.borrow().is_some()
+            || self.experiments.borrow().is_some()
+        {
+            return None;
+        }
+        Some(splash)
+    }
+
+    fn splash_text(&self, hide_splash: bool) -> Option<&str> {
+        if hide_splash {
+            return None;
+        }
+        self.splash.as_deref()
+    }
+
     /// `splashes` is the pool `crate::splashes::pool` built for the current resources.
     pub fn new(saves: PathBuf, resources: &Path, splashes: &str) -> Self {
         use chrono::Datelike;
@@ -887,11 +948,14 @@ impl Title {
             backup: None,
             backup_shown: Cell::new(false),
             backup_then_open: None,
+            open_after_mods_backup: false,
             optimize_after_backup: None,
             restore_after_backup: false,
+            recover_return: None,
             optimize: None,
             erase_check: Cell::new([0.0; 4]),
             open_request: None,
+            request_folder: None,
             connect_request: None,
             toast: None,
             pending_toast: None,
@@ -934,6 +998,36 @@ impl Title {
                 selected: None,
             }
         });
+    }
+    /// Multiplayer: TitleScreen.init opens SafetyScreen first, unless it was turned off.
+    pub fn open_server_list(&mut self) {
+        self.set_mode(if self.skip_multiplayer_warning {
+            Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
+        } else {
+            Mode::MultiplayerWarning { check: false }
+        });
+    }
+    /// Create New World from the main page (a native mod's `request_title`): the world generation data is read
+    /// first, as the world list's Create button does (`preparing`), and its Cancel comes back to the main page.
+    pub fn open_new_world(&mut self) {
+        self.create_return_to_main = true;
+        self.preparing = true;
+    }
+    /// Direct Connection's Join for `address` (a native mod's `request_title`): None for an address it would not
+    /// join; otherwise the address is kept as the last direct one and the join is the game's to run.
+    pub fn direct_join(&mut self, address: &str) -> Option<Action> {
+        if !horizon_protocol::servers::is_valid_address(address) {
+            return None;
+        }
+        // Direct Connection keeps what was typed for its next opening (`remember_direct_address`).
+        self.last_server = address.to_owned();
+        let address = crate::multiplayer::direct_address(address);
+        crate::multiplayer::remember_direct_join(&self.saves, &address);
+        Some(Action::Connect {
+            address,
+            lan: false,
+            realm: false,
+        })
     }
     pub(crate) fn new_world(&self) -> Mode {
         Mode::Create {
@@ -1069,6 +1163,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::SingleBiomeSurface;
                 options.single_biome = buffet.biome.clone();
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -1095,6 +1190,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::Flat;
                 options.flat_settings = Some(flat.settings);
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -1272,6 +1368,9 @@ impl Title {
             buffet::drag(buffet, cursor, size);
             return;
         }
+        if self.drag_missing_mods(cursor, size) {
+            return;
+        }
         if let Mode::Select { worlds, .. } = &self.mode {
             let (top, bottom, _, content) = self.world_list(worlds, size);
             let mut scroll = self.scroll.get();
@@ -1320,6 +1419,9 @@ impl Title {
             buffet::wheel(buffet, delta, cursor, size);
             return false;
         }
+        if self.wheel_missing_mods(delta, size) {
+            return false;
+        }
         // CycleButton.mouseScrolled reads only the vertical wheel.
         if let Mode::Create {
             creative, options, ..
@@ -1353,20 +1455,6 @@ impl Title {
         self.scroll.set(scroll);
         false
     }
-    /// The right stick's scroll: the open list moves wherever the hidden pointer
-    /// is, and Create World's buttons don't take the step.
-    pub fn stick_scroll(&mut self, delta: f32, cursor: (f32, f32), size: (f32, f32)) {
-        self.step_scroll(delta, crate::widgets::over_scroll_area(cursor), size);
-    }
-    /// A focus step past a list's edge: what the pointer is over scrolls, and
-    /// Create World's buttons don't take the step.
-    pub fn step_scroll(&mut self, delta: f32, cursor: (f32, f32), size: (f32, f32)) {
-        let open_rules = self.rules.get_mut().is_some();
-        if matches!(self.mode, Mode::Create { .. }) && !open_rules {
-            return;
-        }
-        self.scroll_worlds(delta, cursor, size);
-    }
     pub fn failed(&mut self, error: impl std::fmt::Display) {
         let return_to = Box::new(self.mode.clone());
         self.set_mode(Mode::Error {
@@ -1375,52 +1463,7 @@ impl Title {
             alert: None,
         });
     }
-    /// Polling is done once per rendered frame so filesystem work never blocks drawing.
-    pub fn poll_backup(&mut self) {
-        self.poll_realms();
-        self.poll_onboarding(std::time::Instant::now());
-        self.poll_account();
-        self.poll_optimize();
-        if !self.backup_shown.get() {
-            return;
-        }
-        let Some(receiver) = &self.backup else {
-            return;
-        };
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Backup worker stopped".into()),
-        };
-        self.backup = None;
-        if let Mode::Backup { world } = &self.mode {
-            let world = world.clone();
-            let folder = world.folder.clone();
-            if std::mem::take(&mut self.restore_after_backup) {
-                // `makeBackupAndShowToast(..).thenAcceptAsync(..)` in attemptRestore: the restore
-                // runs, backup failed or not.
-                self.attempt_restore(world.clone());
-            } else if let Some(erase_cache) = self.optimize_after_backup.take() {
-                // `conditionallyMakeBackupAndShowToast(..).thenAcceptAsync(..)`: the toast shows
-                // and OptimizeWorldScreen opens, backup failed or not.
-                self.begin_optimize(world.clone(), erase_cache);
-            } else {
-                self.return_to_list(Some(&folder));
-            }
-            // EditWorldScreen opens the world after the backup, failed or not: through the
-            // checks WorldOpenFlows still has to make.
-            if let Some(stem_asked) = self.backup_then_open.take()
-                && let Action::Play { folder } = self.after_prompt(world.clone(), stem_asked)
-            {
-                self.open_request = Some(folder);
-            }
-            let toast = match result {
-                Ok(bytes) => WorldToast::Created { folder, bytes },
-                Err(error) => WorldToast::Failed(error),
-            };
-            self.pending_toast = Some(toast);
-        }
-    }
+
     /// A client-lib decision for the game to admit before applying it.
     pub fn take_pending_toast(&mut self) -> Option<crate::toasts::SystemToast> {
         let (title, message) = self.pending_toast.take()?.text();
@@ -1480,6 +1523,58 @@ impl Title {
     pub fn take_open_request(&mut self) -> Option<String> {
         self.open_request.take()
     }
+    /// The title's turn for a native mod's request (`request_world`) on the main page: asks the player
+    /// whether `mods` may open `folder`. Returns false, and changes nothing, when `folder` is not an
+    /// existing save any more or never was one.
+    pub fn ask_world_request(&mut self, folder: &str, mods: String) -> bool {
+        let Some(world) = world_request_entry(&self.saves, folder) else {
+            return false;
+        };
+        self.request_folder = None;
+        self.set_mode(Mode::WorldRequest { world, mods });
+        self.scroll.set(Default::default());
+        true
+    }
+    /// Yes of `Mode::WorldRequest`: the save is looked up again. The same save as the question named opens
+    /// through Play's own checks (`play_from`), whose alerts return to the main page. A save replaced since
+    /// the question is asked again with its fresh details, and one that is gone returns to the main page;
+    /// neither opens anything, and nothing is created.
+    fn answer_world_request(&mut self) -> Action {
+        let Mode::WorldRequest { world: shown, mods } = &self.mode else {
+            return Action::None;
+        };
+        let (shown, mods) = (shown.clone(), mods.clone());
+        match world_request_entry(&self.saves, &shown.folder) {
+            Some(fresh) if fresh.is_same_save(&shown) => {
+                self.set_mode(Mode::Main);
+                self.request_folder = Some(fresh.folder.clone());
+                self.recover_return = Some(Mode::Main);
+                let action = self.play_from(fresh, Mode::Main);
+                if matches!(action, Action::Play { .. }) {
+                    self.request_folder = None;
+                }
+                action
+            }
+            Some(fresh) => {
+                self.set_mode(Mode::WorldRequest { world: fresh, mods });
+                self.scroll.set(Default::default());
+                Action::None
+            }
+            None => {
+                self.set_mode(Mode::Main);
+                Action::None
+            }
+        }
+    }
+    /// Back from a world's question or recovery screen: the world list with the world selected, or, for the
+    /// save a native mod's request is taking through Play's checks, the main page.
+    fn back_from_world(&mut self, folder: &str) {
+        if self.request_folder.as_deref() == Some(folder) {
+            self.set_mode(Mode::Main);
+        } else {
+            self.return_to_list(Some(folder));
+        }
+    }
     /// `WorldOpenFlows.openWorldLoadLevelData` for a world opened without the list (the control
     /// socket): level data that does not read shows RecoverWorldDataScreen. False when the world
     /// reads and opens as usual.
@@ -1504,6 +1599,13 @@ impl Title {
     /// another series is an alert, one whose file fixes are due or that a newer version
     /// saved asks for a backup first; any other opens at once.
     fn play(&mut self, world: WorldEntry) -> Action {
+        self.recover_return = None;
+        let back = self.mode.clone();
+        self.play_from(world, back)
+    }
+    /// `play`, with `return_to` as the main page an alert returns to (a request's Yes returns to Main, not to
+    /// its question).
+    fn play_from(&mut self, world: WorldEntry, return_to: Mode) -> Action {
         // LevelSummary.primaryActionActive: a world another copy has open cannot be joined.
         if world.locked {
             return Action::None;
@@ -1520,7 +1622,7 @@ impl Title {
                     "symlink_warning.message.world",
                     "You are trying to open a world whose folder holds links to other files. That can be a risk to the rest of your files, so the world stays closed.",
                 ),
-                return_to: Box::new(self.mode.clone()),
+                return_to: Box::new(return_to.clone()),
                 alert: Some(Alert::Symlink),
             });
             return Action::None;
@@ -1549,7 +1651,7 @@ impl Title {
                     "This world cannot be opened in this version.\nIt was last played in version %s.",
                     &[&version],
                 ),
-                return_to: Box::new(self.mode.clone()),
+                return_to: Box::new(return_to),
                 alert: Some(Alert::Incompatible),
             });
             return Action::None;
@@ -2013,6 +2115,13 @@ impl Title {
                     &[&world.name],
                 ),
             ),
+            Mode::WorldRequest { world, mods } => ScreenInfo::new(
+                "world_request",
+                join(&[
+                    &get("horizon.world_request.title", "Open a world for a mod?"),
+                    &world_request_text(mods, world),
+                ]),
+            ),
             // openWorldCheckDiskSpace's ConfirmScreen.
             Mode::LowDiskSpace { .. } => ScreenInfo::new(
                 "low_disk_space",
@@ -2031,6 +2140,7 @@ Running out of disk space while in game can lead to your world being damaged.",
             Mode::MissingBiomeRegions { missing, .. } => {
                 missing_biome_regions::screen_info(missing)
             }
+            Mode::MissingMods { missing, .. } => missing_mods::screen_info(missing),
             Mode::AdoptBiomeRegions { .. } => edit_world::adopt_screen_info(),
             // AccessibilityOnboardingScreen narrates its title.
             Mode::Onboarding(_) => ScreenInfo::new(
@@ -2198,828 +2308,6 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         }
     }
 
-    pub fn draw(
-        &self,
-        atlas: &HudAtlas,
-        batch: &mut HudBatch,
-        cursor: (f32, f32),
-        hide_splash: bool,
-    ) {
-        self.draw_with_items(atlas, None, batch, cursor, hide_splash, false);
-    }
-    /// [`Title::draw`] with the item models, which draw the item icons of the
-    /// Superflat screens the way `GuiGraphics.renderItem` does.
-    pub fn draw_with_items(
-        &self,
-        atlas: &HudAtlas,
-        items: Option<&crate::item_render::ItemRenderer>,
-        batch: &mut HudBatch,
-        cursor: (f32, f32),
-        hide_splash: bool,
-        hide_server_address: bool,
-    ) {
-        let (w, h) = (batch.width.ceil(), batch.height.ceil());
-        if let Some(rules) = self.rules.borrow_mut().as_mut() {
-            return rules.draw(batch, atlas, cursor);
-        }
-        if self.preparing {
-            // `CreateWorldScreen.openCreateWorldScreen`'s queued
-            // `GenericMessageScreen`: the menu background and the message
-            // alone, centred, no progress.
-            crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-            let text =
-                crate::lang::get_or("createWorld.preparing", "Preparing for world creation...");
-            let tw = atlas.font.width_text(&Text::literal(text.clone()));
-            let (tx, ty) = (w / 2.0 - tw / 2.0, h / 2.0 - 4.5);
-            // `FocusableTextWidget.builder(title, font, 12)`: 12 pixels of
-            // padding around the text, on a black box with a 1-pixel border.
-            let (bx, by) = (tx - 12.0, ty - 12.0);
-            let (bw, bh) = (tw + 24.0, 9.0 + 24.0);
-            batch.fill(atlas, bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0, 0xFFD0D0D0);
-            batch.fill(atlas, bx, by, bw, bh, 0xFF000000);
-            batch.text(atlas, &text, tx, ty, u32::MAX, false);
-            return;
-        }
-        if let Some(screen) = self.confirm_experiments.borrow().as_ref() {
-            return screen.draw(batch, atlas, cursor);
-        }
-        if let Some(screen) = self.experiments.borrow().as_ref() {
-            return screen.draw(batch, atlas, cursor);
-        }
-        let mut fade_from = None;
-        if crate::widgets::narrating()
-            && let Some(info) = self.narration()
-        {
-            crate::widgets::begin_screen(|| info);
-        }
-        match &self.mode {
-            Mode::Main => {
-                draw_logo(atlas, batch, w);
-                if !hide_splash && let Some(splash) = self.splash.as_deref() {
-                    let tw = HudBatch::text_width(atlas, splash);
-                    let start = batch.vertices.len();
-                    batch.text(
-                        atlas,
-                        splash,
-                        -(tw / 2.0).floor(),
-                        -8.0,
-                        rgba(255, 255, 0, 255),
-                        true,
-                    );
-                    let scale = (1.8
-                        - (self.started.elapsed().as_secs_f32() * std::f32::consts::TAU)
-                            .sin()
-                            .abs()
-                            * 0.1)
-                        * 100.0
-                        / (tw + 32.0);
-                    let (sin, cos) = (-20.0f32).to_radians().sin_cos();
-                    for v in &mut batch.vertices[start..] {
-                        let [x, y] = v.pos;
-                        v.pos = [
-                            w / 2.0 + 123.0 + scale * (x * cos - y * sin),
-                            69.0 + scale * (x * sin + y * cos),
-                        ];
-                    }
-                }
-                let version = format!("Horizon {} (Rust)", horizon_core::VANILLA_VERSION);
-                batch.text(atlas, &version, 2.0, h - 10.0, u32::MAX, true);
-                // A nightly names its build in the top-left corner, the one spot no button reaches at any GUI
-                // scale, so screenshots and reports say which build they come from.
-                if let Some(nightly) = horizon_core::release::nightly_label() {
-                    batch.text(atlas, &nightly, 2.0, 2.0, u32::MAX, true);
-                }
-                let notice = &lang::get_or(
-                    "horizon.title.not_affiliated",
-                    "Not affiliated with Mojang or Microsoft",
-                );
-                // TitleScreen.init's `PlainTextButton`: the text's width wide, 10
-                // high at `height - 10`; `extractContents` underlines it while
-                // hovered or focused, and its press opens the credits.
-                let tw = HudBatch::text_width(atlas, notice).ceil();
-                let rect = [w - tw - 2.0, h - 10.0, tw, 10.0];
-                self.credits_button.set(rect);
-                crate::widgets::record(notice, rect, true);
-                let inside = cursor.0 >= rect[0]
-                    && cursor.0 < rect[0] + rect[2]
-                    && cursor.1 >= rect[1]
-                    && cursor.1 < rect[1] + rect[3];
-                crate::widgets::widget_cursor(inside, true);
-                let mut text = Text::literal(notice);
-                if inside {
-                    text = text.underlined();
-                }
-                batch.text_styled(atlas, &text, rect[0], rect[1], u32::MAX, true);
-            }
-            Mode::Select { worlds, selected } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                centered(
-                    atlas,
-                    batch,
-                    &lang::get_or("selectWorld.title", "Select World"),
-                    8.0,
-                    u32::MAX,
-                );
-                self.caret.borrow_mut().draw(
-                    batch,
-                    atlas,
-                    (SEARCH, &self.search, 50),
-                    [(w / 2.0).floor() - 100.0, 21.0, 200.0, 20.0],
-                    self.search_focused,
-                    self.started,
-                );
-                crate::widgets::name_last_edit_box(|| narration_text("selectWorld.search", &[]));
-                if self.search.is_empty() && !self.search_focused {
-                    batch.text_styled(
-                        atlas,
-                        &Text::literal(lang::get_or("gui.selectWorld.search", "Search..."))
-                            .italic()
-                            .with_color(crate::text::GRAY),
-                        (w / 2.0).floor() - 96.0,
-                        27.0,
-                        u32::MAX,
-                        true,
-                    );
-                }
-                let (top, bottom, left, content) = self.world_list(worlds, (w, h));
-                let mut scroll = self.scroll.get();
-                scroll.clamp(top, bottom, content);
-                self.scroll.set(scroll);
-                let offset = scroll.amount.trunc();
-                // AbstractSelectionList: background, rows clipped to the
-                // list, separators, scrollbar.
-                crate::ui::list_background(batch, atlas, top, bottom, false);
-                let first = batch.vertices.len();
-                // Entry content sits 2 pixels inside its row.
-                let x = left + 2.0;
-                let mut slot = 0;
-                let hovered = self.world_row_at(worlds, cursor, (w, h));
-                // WorldSelectionList: the row under the mouse, else the
-                // selected one.
-                crate::widgets::narratable(|| {
-                    use crate::widgets::{ListKind, Narratable, Row};
-                    let rows: Vec<&WorldEntry> =
-                        self.visible_worlds(worlds).map(|(_, w)| w).collect();
-                    let row = |r: usize| Row::new(r, world_narration(rows[r]));
-                    let selected = self
-                        .visible_worlds(worlds)
-                        .position(|(i, _)| Some(i) == *selected);
-                    Narratable::list(
-                        ListKind::Object,
-                        rows.len(),
-                        hovered.map(|(r, _)| row(r)),
-                        selected.map(row),
-                        [0.0, top, w, bottom - top],
-                    )
-                    .key(crate::widgets::key_of(&"select_world/worlds"))
-                });
-                for (row, (i, world)) in self.visible_worlds(worlds).enumerate() {
-                    let y = top + 4.0 + row as f32 * ROW_HEIGHT - offset;
-                    if y + 32.0 <= top || y >= bottom {
-                        continue;
-                    }
-                    let mid = y - 2.0 + ROW_HEIGHT / 2.0;
-                    if mid > top && mid < bottom {
-                        let rect = [x - 2.0, y - 2.0, ROW_WIDTH, ROW_HEIGHT];
-                        // The control socket's widget tree names the row.
-                        crate::widgets::record_as(
-                            &world.name,
-                            rect,
-                            true,
-                            crate::widgets::Kind::Row,
-                        );
-                        crate::widgets::target_as(rect, crate::widgets::Kind::Row);
-                    }
-                    // extractSelection: white once the list has focus.
-                    if *selected == Some(i) {
-                        batch.fill(atlas, x - 2.0, y - 2.0, ROW_WIDTH, ROW_HEIGHT, u32::MAX);
-                        batch.fill(
-                            atlas,
-                            x - 1.0,
-                            y - 1.0,
-                            ROW_WIDTH - 2.0,
-                            ROW_HEIGHT - 2.0,
-                            rgba(0, 0, 0, 255),
-                        );
-                    }
-                    batch.text(atlas, &world.name, x + 35.0, y + 1.0, u32::MAX, true);
-                    let date: chrono::DateTime<chrono::Local> = world.modified.into();
-                    let line = format!("{} ({})", world.folder, date.format("%d/%m/%Y, %H:%M"));
-                    batch.text(
-                        atlas,
-                        &line,
-                        x + 35.0,
-                        y + 12.0,
-                        rgba(128, 128, 128, 255),
-                        true,
-                    );
-                    let details = world_info(world);
-                    batch.text_styled(
-                        atlas,
-                        &details,
-                        x + 35.0,
-                        y + 21.0,
-                        rgba(128, 128, 128, 255),
-                        true,
-                    );
-                    self.icon(atlas, batch, world, slot, x, y);
-                    slot = (slot + 1) % crate::hud::WORLD_ICON_SLOTS;
-                    // WorldListEntry.extractContent: a hovered row dims its
-                    // icon under the join arrow, lit under the pointer.
-                    if let Some((_, (rx, ry))) = hovered.filter(|(r, _)| *r == row) {
-                        batch.fill(atlas, x, y, 32.0, 32.0, 0xA0909090);
-                        let on_icon = (0.0..32.0).contains(&rx) && (0.0..32.0).contains(&ry);
-                        // The icon says what a click does.
-                        let names: &[&str] = if world.corrupted {
-                            &["error", "marked_join"]
-                        } else if world.disabled() {
-                            &["error"]
-                        } else if world.downgrade {
-                            &["marked_join", "error"]
-                        } else if world.should_backup() {
-                            &["marked_join"]
-                        } else {
-                            &["join"]
-                        };
-                        let lit = if on_icon { "_highlighted" } else { "" };
-                        for name in names {
-                            let sprite = format!("gui/sprites/world_list/{name}{lit}");
-                            batch.sprite_scaled(atlas, &sprite, x, y, 32.0, 32.0, u32::MAX);
-                        }
-                    }
-                }
-                // Clip list quads, including their UVs, to the content area.
-                for quad in batch.vertices[first..].as_chunks_mut::<6>().0 {
-                    let low = quad.iter().map(|v| v.pos[1]).fold(f32::INFINITY, f32::min);
-                    let high = quad
-                        .iter()
-                        .map(|v| v.pos[1])
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let uv_top = quad.iter().map(|v| v.uv[1]).fold(f32::INFINITY, f32::min);
-                    let uv_bot = quad
-                        .iter()
-                        .map(|v| v.uv[1])
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    for v in quad {
-                        v.pos[1] = v.pos[1].clamp(top, bottom);
-                        if high > low {
-                            v.uv[1] = uv_top + (uv_bot - uv_top) * (v.pos[1] - low) / (high - low);
-                        }
-                    }
-                }
-                crate::ui::separators(batch, atlas, top, bottom, false);
-                crate::ui::scrollbar(
-                    batch,
-                    atlas,
-                    left + ROW_WIDTH + 8.0,
-                    top,
-                    bottom,
-                    content,
-                    scroll.amount,
-                );
-            }
-            Mode::Create {
-                name,
-                seed,
-                focus,
-                options,
-                ..
-            } => self.draw_create(atlas, batch, cursor, name, seed, *focus, options),
-            Mode::CreateFlat { flat, .. } => flat::draw(self, atlas, items, batch, cursor, flat),
-            Mode::CreateBuffet { buffet, .. } => buffet::draw(self, atlas, batch, cursor, buffet),
-            Mode::CreatePreset { .. } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-            }
-            Mode::Edit { name, focused, .. } => {
-                self.draw_edit(atlas, batch, (w, h), name, *focused)
-            }
-            Mode::AdoptBiomeRegions { .. } => self.draw_adopt_regions(atlas, batch, (w, h)),
-            Mode::Delete { world } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let message = translate(
-                    "selectWorld.deleteWarning",
-                    "'%s' will be lost forever! (A long time!)",
-                    &[&world.name],
-                );
-                let lines = wrapped(atlas, &message, w - 50.0);
-                self.message_lines.set(lines.len());
-                let top = confirm_top(h, lines.len());
-                centered(
-                    atlas,
-                    batch,
-                    &lang::get_or(
-                        "selectWorld.deleteQuestion",
-                        "Are you sure you want to delete this world?",
-                    ),
-                    top,
-                    u32::MAX,
-                );
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
-                }
-            }
-            Mode::Recover { world, issues } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let dir = self.saves.join(&world.folder);
-                let title =
-                    Text::literal(lang::get_or("recover_world.title", "Failed to load world"))
-                        .bold();
-                let message = format_translation(
-                    &lang::get_or(
-                        "recover_world.message",
-                        "The following issues occurred while trying to read world folder \"%s\".\nIt might be possible to restore the world from an older state or you can report this issue on the bug tracker.",
-                    ),
-                    &[Text::colored(world.folder.clone(), GRAY)],
-                );
-                let message: Vec<Text> = atlas
-                    .font
-                    .split_lines(&message, w - 50.0)
-                    .into_iter()
-                    .map(|(line, _)| line)
-                    .collect();
-                let issues: Vec<Text> = [false, true]
-                    .into_iter()
-                    .zip(issues)
-                    .filter_map(|(old, issue)| recover_info(&dir, old, issue.as_ref()))
-                    .flat_map(|info| atlas.font.split_lines(&info, w - 50.0))
-                    .map(|(line, _)| line)
-                    .collect();
-                self.message_lines.set(message.len() + issues.len());
-                let row = recover_buttons_top(h, message.len() + issues.len());
-                let top = row - 8.0 - 8.0 - (message.len() + issues.len()) as f32 * 9.0 - 8.0 - 9.0;
-                let center =
-                    |text: &Text| (w / 2.0).floor() - (atlas.font.width_text(text) / 2.0).floor();
-                batch.text_styled(atlas, &title, center(&title), top, u32::MAX, true);
-                let mut y = top + 17.0;
-                for line in &message {
-                    batch.text_styled(atlas, line, center(line), y, u32::MAX, true);
-                    y += 9.0;
-                }
-                // The issues widget is left aligned, the widget centred.
-                let width = issues
-                    .iter()
-                    .map(|l| atlas.font.width_text(l))
-                    .fold(0.0, f32::max);
-                let x = (w / 2.0).floor() - (width / 2.0).floor();
-                for line in &issues {
-                    batch.text_styled(atlas, line, x, y + 8.0, u32::MAX, true);
-                    y += 9.0;
-                }
-            }
-            Mode::Recovered { success, .. } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let title = lang::get_or("recover_world.done.title", "Recovery done");
-                let message = if *success {
-                    lang::get_or("recover_world.done.success", "Recovery was successful!")
-                } else {
-                    lang::get_or(
-                        "recover_world.done.failed",
-                        "Failed to recover from previous state.",
-                    )
-                };
-                let lines = wrapped(atlas, &message, w - 50.0);
-                self.message_lines.set(lines.len());
-                // ConfirmScreen centres its column; AlertScreen puts the title at 70, the text at 90.
-                let (top, text_top) = if *success {
-                    let top = confirm_top(h, lines.len());
-                    (top, top + 17.0)
-                } else {
-                    (70.0, 90.0)
-                };
-                centered(atlas, batch, &title, top, u32::MAX);
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, text_top + i as f32 * 9.0, u32::MAX);
-                }
-            }
-            Mode::BackupBeforeUpgrade {
-                downgrade, stem, ..
-            } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                // BackupStatus.DOWNGRADE is severe: its question is red (-2142128).
-                let (question, warning, color) = match (downgrade, stem) {
-                    (None, Some(StemIssue::Customized)) => (
-                        lang::get_or(
-                            "selectWorld.backupQuestion.customized",
-                            "Customized worlds are no longer supported",
-                        ),
-                        lang::get_or(
-                            "selectWorld.backupWarning.customized",
-                            "Unfortunately, we do not support customized worlds in this version of Minecraft. We can still load this world and keep everything the way it was, but any newly generated terrain will no longer be customized. We're sorry for the inconvenience!",
-                        ),
-                        u32::MAX,
-                    ),
-                    (None, Some(StemIssue::Experimental)) => (
-                        lang::get_or(
-                            "selectWorld.backupQuestion.experimental",
-                            "Worlds using Experimental Settings are not supported",
-                        ),
-                        lang::get_or(
-                            "selectWorld.backupWarning.experimental",
-                            "This world uses experimental settings that could stop working at any time. We cannot guarantee it will load or work. Here be dragons!",
-                        ),
-                        u32::MAX,
-                    ),
-                    (Some(version), _) => (
-                        lang::get_or(
-                            "selectWorld.backupQuestion.downgrade",
-                            "Downgrading a world is not supported",
-                        ),
-                        translate(
-                            "selectWorld.backupWarning.downgrade",
-                            "This world was last played in version %s; you are on version %s. Downgrading a world could cause corruption - we cannot guarantee that it will load or work. If you still want to continue, please make a backup.",
-                            &[version, &crate::save::VERSION_NAME],
-                        ),
-                        rgba(223, 80, 80, 255),
-                    ),
-                    (None, None) => (
-                        lang::get_or(
-                            "selectWorld.backupQuestion.file_fixing_required",
-                            "Create a backup before upgrading this world?",
-                        ),
-                        lang::get_or(
-                            "selectWorld.backupWarning.file_fixing_required",
-                            "This world needs to be upgraded before you can play it. We strongly suggest creating a backup before continuing in case you experience world corruption.",
-                        ),
-                        u32::MAX,
-                    ),
-                };
-                let lines = wrapped(atlas, &warning, w - 50.0);
-                self.message_lines.set(lines.len());
-                // BackupConfirmScreen.extractRenderState: the title at 50, the text from 70.
-                centered(atlas, batch, &question, 50.0, color);
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, 70.0 + i as f32 * 9.0, u32::MAX);
-                }
-            }
-            Mode::OptimizeConfirm { erase_cache, .. } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let description = lang::get_or(
-                    "optimizeWorld.confirm.description",
-                    "This will attempt to optimize your world by making sure all data is stored in the most recent game format. This can take a very long time, depending on your world. Once done, your world may play faster but will no longer be compatible with older versions of the game. Are you sure you wish to proceed?",
-                );
-                let lines = wrapped(atlas, &description, w - 50.0);
-                self.message_lines.set(lines.len());
-                centered(
-                    atlas,
-                    batch,
-                    &lang::get_or("optimizeWorld.confirm.title", "Optimize World"),
-                    50.0,
-                    u32::MAX,
-                );
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, 70.0 + i as f32 * 9.0, u32::MAX);
-                }
-                // The Checkbox: at `width / 2 - 155 + 80`, `76 + textSize`.
-                let label = lang::get_or("selectWorld.backupEraseCache", "Erase Cached Data");
-                let width = BOX + 4.0 + HudBatch::text_width(atlas, &label).ceil();
-                let x = (w / 2.0).floor() - 155.0 + 80.0;
-                let y = 76.0 + (lines.len() as f32 + 1.0) * 9.0;
-                self.erase_check.set([x, y, width, BOX]);
-                crate::widgets::target([x, y, width, BOX]);
-                let hover = (x..x + width).contains(&cursor.0) && (y..y + BOX).contains(&cursor.1);
-                let sprite = match (*erase_cache, hover) {
-                    (true, true) => "gui/sprites/widget/checkbox_selected_highlighted",
-                    (true, false) => "gui/sprites/widget/checkbox_selected",
-                    (false, true) => "gui/sprites/widget/checkbox_highlighted",
-                    (false, false) => "gui/sprites/widget/checkbox",
-                };
-                batch.sprite_scaled(atlas, sprite, x, y, BOX, BOX, u32::MAX);
-                batch.text(
-                    atlas,
-                    &label,
-                    x + BOX + 4.0,
-                    y + 4.0,
-                    rgba(224, 224, 224, 255),
-                    true,
-                );
-            }
-            Mode::Optimize { world } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                self.draw_optimize(atlas, batch, w, h, &world.name);
-            }
-            Mode::LowDiskSpace { .. } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let message = lang::get_or(
-                    "selectWorld.warning.lowDiskSpace.description",
-                    "There is not much space left on your device.\nRunning out of disk space while in game can lead to your world being damaged.",
-                );
-                let lines = wrapped(atlas, &message, w - 50.0);
-                self.message_lines.set(lines.len());
-                let top = confirm_top(h, lines.len());
-                // ChatFormatting.RED.
-                centered(
-                    atlas,
-                    batch,
-                    &lang::get_or(
-                        "selectWorld.warning.lowDiskSpace.title",
-                        "Warning! Low disk space!",
-                    ),
-                    top,
-                    rgba(255, 85, 85, 255),
-                );
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
-                }
-            }
-            Mode::MissingBiomeRegions { missing, .. } => {
-                self.draw_missing_biome_regions(atlas, batch, (w, h), missing)
-            }
-            Mode::Backup { .. } => {
-                self.backup_shown.set(true);
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                centered(
-                    atlas,
-                    batch,
-                    &lang::get_or("selectWorld.waitingForBackup.title", "Creating Backup"),
-                    80.0,
-                    u32::MAX,
-                );
-                let dots = ["O o o", "o O o", "o o O", "o O o"]
-                    [(self.started.elapsed().as_millis() / 300 % 4) as usize];
-                centered(atlas, batch, dots, 120.0, rgba(128, 128, 128, 255));
-                let message = lang::get_or(
-                    "selectWorld.waitingForBackup.message",
-                    "Depending on the size of your world, this may take a while. Please do not close the game or shut off your device.",
-                );
-                for (i, line) in wrapped(atlas, &message, 360.0).iter().enumerate() {
-                    centered(
-                        atlas,
-                        batch,
-                        line,
-                        132.0 + i as f32 * 9.0,
-                        rgba(170, 170, 170, 255),
-                    );
-                }
-            }
-            Mode::Error { message, alert, .. } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let lines: Vec<String> = message
-                    .split('\n')
-                    .flat_map(|line| wrapped(atlas, line, w - 50.0))
-                    .collect();
-                self.message_lines.set(lines.len());
-                // AlertScreen: the title at 70, the text at 90.
-                let (top, text_top, key, fallback, color) = if let Some(alert) = alert {
-                    let (key, fallback, color) = match alert {
-                        Alert::Incompatible => (
-                            "selectWorld.incompatible.title",
-                            "Incompatible version",
-                            rgba(255, 0, 0, 255),
-                        ),
-                        Alert::Recreate => (
-                            "selectWorld.recreate.error.title",
-                            "An error occurred!",
-                            u32::MAX,
-                        ),
-                        Alert::Symlink => (
-                            "symlink_warning.title.world",
-                            "The world folder contains links",
-                            u32::MAX,
-                        ),
-                    };
-                    (70.0, 90.0, key, fallback, color)
-                } else {
-                    let top = confirm_top(h, lines.len());
-                    (
-                        top,
-                        top + 17.0,
-                        "selectWorld.access_failure",
-                        "Failed to access world",
-                        u32::MAX,
-                    )
-                };
-                centered(atlas, batch, &lang::get_or(key, fallback), top, color);
-                for (i, line) in lines.iter().enumerate() {
-                    centered(atlas, batch, line, text_top + i as f32 * 9.0, u32::MAX);
-                }
-            }
-            Mode::MultiplayerWarning { check } => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let message = lang::get_or(
-                    "multiplayerWarning.message",
-                    "Caution: Online play is offered by third-party servers that are not owned, operated, or supervised by Mojang Studios or Microsoft. During online play, you may be exposed to unmoderated chat messages or other types of user-generated content that may not be suitable for everyone.",
-                );
-                // The message sits in a text box `width - 100` wide with 4 px
-                // inside, left aligned (FittingMultiLineTextWidget).
-                let box_w = w - 100.0;
-                let lines = wrapped(atlas, &message, box_w - 8.0);
-                self.message_lines.set(lines.len());
-                let top = warning_top(h, lines.len());
-                let header = Text::translate("multiplayerWarning.header", &[]).bold();
-                batch.text_styled(
-                    atlas,
-                    &header,
-                    (w / 2.0).floor() - (atlas.font.width_text(&header) / 2.0).floor(),
-                    top,
-                    u32::MAX,
-                    true,
-                );
-                let box_x = ((w - box_w) / 2.0).floor();
-                let box_y = top + 29.0;
-                let box_h = lines.len() as f32 * 9.0 + 8.0;
-                // WarningScreen's FittingMultiLineTextWidget narrates the
-                // message; the title's StringWidget isn't active.
-                crate::widgets::narratable(|| {
-                    crate::widgets::Narratable::text(message.clone(), [box_x, box_y, box_w, box_h])
-                });
-                crate::ui::nine_slice(
-                    batch,
-                    atlas,
-                    "gui/sprites/widget/text_field",
-                    box_x,
-                    box_y,
-                    box_w,
-                    box_h,
-                    u32::MAX,
-                );
-                for (i, line) in lines.iter().enumerate() {
-                    batch.text(
-                        atlas,
-                        line,
-                        box_x + 4.0,
-                        box_y + 4.0 + i as f32 * 9.0,
-                        u32::MAX,
-                        true,
-                    );
-                }
-                // Checkbox: the box, its label right of it (as the dialogs draw theirs).
-                let label =
-                    lang::get_or("multiplayerWarning.check", "Do not show this screen again");
-                let width = BOX + 4.0 + HudBatch::text_width(atlas, &label).ceil();
-                let x = (w / 2.0).floor() - (width / 2.0).floor();
-                let y = top + 57.0 + lines.len() as f32 * 9.0;
-                self.warning_check.set([x, y, width, BOX]);
-                crate::widgets::target([x, y, width, BOX]);
-                let hover = (x..x + width).contains(&cursor.0) && (y..y + BOX).contains(&cursor.1);
-                crate::widgets::narratable(|| {
-                    crate::widgets::Narratable::checkbox(
-                        label.clone(),
-                        *check,
-                        [x, y, width, BOX],
-                        true,
-                    )
-                    .hovered(hover)
-                });
-                let sprite = match (*check, hover) {
-                    (true, true) => "gui/sprites/widget/checkbox_selected_highlighted",
-                    (true, false) => "gui/sprites/widget/checkbox_selected",
-                    (false, true) => "gui/sprites/widget/checkbox_highlighted",
-                    (false, false) => "gui/sprites/widget/checkbox",
-                };
-                batch.sprite_scaled(atlas, sprite, x, y, BOX, BOX, u32::MAX);
-                batch.text(
-                    atlas,
-                    &label,
-                    x + BOX + 4.0,
-                    y + 4.0,
-                    rgba(224, 224, 224, 255),
-                    true,
-                );
-            }
-            Mode::Onboarding(_) => fade_from = Some(self.draw_onboarding(atlas, batch, w, h)),
-            Mode::BanNotice(notice) => {
-                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                let now = chrono::Utc::now().timestamp_millis();
-                let layout = crate::confirm_screen::Choice::new(
-                    &atlas.font,
-                    (w, h),
-                    &notice.title(),
-                    &notice.message(now),
-                    3,
-                    100.0,
-                );
-                for (line, x, y) in &layout.lines {
-                    batch.text_styled(atlas, line, *x, *y, u32::MAX, true);
-                }
-                self.ban_buttons
-                    .set([layout.buttons[0], layout.buttons[1], layout.buttons[2]]);
-            }
-            Mode::Multiplayer(screen) => screen.draw(
-                atlas,
-                batch,
-                &mut self.caret.borrow_mut(),
-                self.started,
-                cursor,
-                hide_server_address,
-            ),
-            Mode::Realms(screen) => screen.draw(
-                batch,
-                atlas,
-                &mut self.caret.borrow_mut(),
-                self.started,
-                cursor,
-                w,
-                h,
-                self.focused_button.is_none(),
-            ),
-        }
-        // The hovered button's `Tooltip`, drawn once the widgets are.
-        let mut button_tooltip = None;
-        for b in self.buttons(w, h) {
-            crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
-            // Realms' icon buttons have no label to record.
-            if b.enabled && b.label.trim().is_empty() {
-                crate::widgets::target([b.x, b.y, b.w, 20.0]);
-            }
-            if let Some(action) = b.action.filter(|_| !self.preparing) {
-                crate::widgets::declare_action(action, [b.x, b.y, b.w, 20.0], b.enabled);
-            }
-            let inside =
-                cursor.0 >= b.x && cursor.0 < b.x + b.w && cursor.1 >= b.y && cursor.1 < b.y + 20.0;
-            crate::widgets::narratable(|| self.button_narration(&b).hovered(inside));
-            crate::widgets::widget_cursor(inside, b.enabled);
-            if inside && let Some(key) = self.button_tooltip(b.id) {
-                button_tooltip = Some((key, [b.x, b.y, b.w, 20.0]));
-            }
-            let is_focused = self.focused_button == Some(b.id);
-            let hover = b.enabled && (inside || is_focused);
-            let sprite = if !b.enabled {
-                "gui/sprites/widget/button_disabled"
-            } else if hover {
-                "gui/sprites/widget/button_highlighted"
-            } else {
-                "gui/sprites/widget/button"
-            };
-            // Nine-slice approximation: left and right halves of the 200-wide sprite.
-            if let Some(r) = atlas.sprites.get(sprite).copied() {
-                let half = b.w / 2.0;
-                let mut left = r;
-                left.u1 = r.u0 + (r.u1 - r.u0) * (half / r.w as f32);
-                batch.rect_uv(b.x, b.y, half, 20.0, left, u32::MAX);
-                let mut right = r;
-                right.u0 = r.u1 - (r.u1 - r.u0) * (half / r.w as f32);
-                batch.rect_uv(b.x + half, b.y, half, 20.0, right, u32::MAX);
-            }
-            let color = if b.enabled {
-                u32::MAX
-            } else {
-                rgba(160, 160, 160, 255)
-            };
-            if let Some((icon, size)) = b.icon {
-                // CenteredIcon divides the button and sprite sizes separately:
-                // a 15px icon in a 20px button starts at 10 - 7 = 3, not 2.
-                batch.sprite_scaled(
-                    atlas,
-                    &format!("gui/sprites/{icon}"),
-                    b.x + (b.w / 2.0).floor() - (size / 2.0).floor(),
-                    b.y + 10.0 - (size / 2.0).floor(),
-                    size,
-                    size,
-                    u32::MAX,
-                );
-                continue;
-            }
-            b.draw_label(batch, atlas, color);
-            if let Some((icon, size)) = b.trailing {
-                // TextAndIcon: `x + width - spriteWidth - 2`, centred in the height.
-                batch.sprite_scaled(
-                    atlas,
-                    &format!("gui/sprites/{icon}"),
-                    b.x + b.w - size - 2.0,
-                    b.y + 10.0 - (size / 2.0).floor(),
-                    size,
-                    size,
-                    u32::MAX,
-                );
-            }
-        }
-        // RealmsHeader's notification badges sit on their buttons, so they draw after.
-        if let Mode::Realms(screen) = &self.mode {
-            screen.draw_header_badges(atlas, batch, w);
-        }
-        if let Some(from) = fade_from {
-            self.draw_onboarding_logo(atlas, batch, w, from);
-        }
-        if let Mode::Create {
-            name,
-            creative,
-            options,
-            ..
-        } = &self.mode
-        {
-            self.create_tooltip(atlas, batch, cursor, name, *creative, options);
-        }
-        if let Mode::Select { worlds, selected } = &self.mode {
-            self.select_tooltip(atlas, batch, cursor, (w, h), worlds, *selected);
-        }
-        if let Mode::Multiplayer(screen) = &self.mode {
-            screen.draw_tooltip(atlas, batch, cursor);
-        }
-        if let Mode::Realms(screen) = &self.mode {
-            screen.draw_tooltip(atlas, batch, cursor, (w, h));
-        }
-        // WidgetTooltipHolder.refreshTooltipForNextRenderPass: beside the
-        // pointer and kept by its button (`MenuTooltipPositioner`), split at
-        // `Tooltip`'s 170. It comes after the onboarding fade: vanilla fades
-        // the widgets, not the tooltip.
-        if let Some((key, rect)) = button_tooltip {
-            let lines = atlas.font.split(&Text::translate(key, &[]), 170.0);
-            crate::ui::tooltip_menu(batch, atlas, &lines, cursor, rect);
-        }
-        if let Some(toast) = &self.toast {
-            toast.draw(atlas, batch, 0.0);
-        }
-    }
     /// The tooltip of a world's icon (drawn with the row, as vanilla does) or, for a
     /// world that needs its files upgraded first, of the Play, Edit and Re-Create
     /// buttons (`SelectWorldScreen.updateButtonStatus`).
@@ -3189,11 +2477,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             .into_iter()
             .find(|b| b.enabled && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + 20.0)
             .map(|b| b.id);
-        if hit.is_some() {
+        // Buttons retain focus; clicking a multiplayer text field drops it.
+        if hit.is_some() || matches!(&self.mode, Mode::Multiplayer(screen) if screen.has_fields()) {
             self.focused_button = hit;
-        } else if matches!(&self.mode, Mode::Multiplayer(screen) if screen.has_fields()) {
-            // A press on a text field takes the focus from the button.
-            self.focused_button = None;
         }
         if matches!(self.mode, Mode::CreateBuffet { .. }) {
             self.buffet_click(x, y, (w, h), hit);
@@ -3205,10 +2491,12 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             self.drop_button_focus_for_field(hit);
             return (Action::None, hit.is_some());
         }
+        let sound = hit.is_some()
+            || matches!(&self.mode, Mode::Realms(screen) if screen.reset_tile_at(x, y, (w, h)).is_some());
         let action = self.click_action(x, y, (w, h), hit);
         self.drop_button_focus_for_field(hit);
         // World list selection is silent; launching its selected entry sounds.
-        let sound = hit.is_some() || matches!(action, Action::Play { .. });
+        let sound = sound || matches!(action, Action::Play { .. });
         (action, sound)
     }
     /// A click that misses every button and leaves an edit box focused moves the focus
@@ -3260,12 +2548,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 }
             }
             (Mode::Main, Some(4)) => {
-                // TitleScreen.init: SafetyScreen first, unless it was turned off.
-                self.set_mode(if self.skip_multiplayer_warning {
-                    Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
-                } else {
-                    Mode::MultiplayerWarning { check: false }
-                });
+                self.open_server_list();
                 Action::None
             }
             (Mode::MultiplayerWarning { check }, Some(70)) => {
@@ -3365,6 +2648,12 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 let (world, stem_asked) = (world.clone(), stem.is_some());
                 self.after_prompt(world, stem_asked)
             }
+            // A native mod's request (`request_world`): Yes runs Play's checks, No goes back.
+            (Mode::WorldRequest { .. }, Some(104)) => self.answer_world_request(),
+            (Mode::WorldRequest { .. }, Some(105)) => {
+                self.escape();
+                Action::None
+            }
             // ConfirmScreen: Continue loads the world, Back (or Escape) leaves it closed.
             (Mode::LowDiskSpace { world }, Some(94)) => Action::Play {
                 folder: world.folder.clone(),
@@ -3377,6 +2666,10 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             (Mode::MissingBiomeRegions { world, .. }, Some(96)) => {
                 let world = world.clone();
                 self.open_with_vanilla_regions(world)
+            }
+            (Mode::MissingMods { world, .. }, Some(id @ 101..=103)) => {
+                let world = world.clone();
+                self.answer_missing_mods(world, id)
             }
             (Mode::Edit { world, name, .. }, Some(98)) => {
                 let (world, name) = (world.clone(), name.clone());
@@ -3422,7 +2715,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             }
             (Mode::BackupBeforeUpgrade { world, .. }, Some(42)) => {
                 let folder = world.folder.clone();
-                self.return_to_list(Some(&folder));
+                self.back_from_world(&folder);
                 Action::None
             }
             (Mode::Select { .. }, Some(11)) => {
@@ -3478,6 +2771,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             (Mode::Select { .. }, Some(12)) => {
                 self.set_mode(Mode::Main);
                 Action::None
+            }
+            (Mode::MissingMods { .. } | Mode::WorldRequest { .. }, None) => {
+                self.press_missing_mods((x, y), (w, h))
             }
             (Mode::Select { .. }, None) => {
                 self.search_focused =
@@ -3576,7 +2872,11 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             }
             (Mode::Recovered { world, .. }, Some(92)) => {
                 let world = world.clone();
-                self.play(world)
+                // A request's open keeps its return target through the recovery.
+                match self.recover_return.take() {
+                    Some(back) => self.play_from(world, back),
+                    None => self.play(world),
+                }
             }
             (Mode::Recover { .. } | Mode::Recovered { .. }, Some(91 | 93)) => {
                 self.escape();
@@ -3836,6 +3136,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
     /// Returns the triggered action and whether a UI button click sound should play.
     pub fn confirm_key_size(&mut self, size: (f32, f32)) -> (Action, bool) {
         self.remember_direct_address();
+        if let Some(answer) = self.confirm_missing_mods() {
+            return answer;
+        }
         if self.rules.get_mut().is_some() {
             return (Action::None, false);
         }
@@ -4513,6 +3816,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         match &self.mode {
             // OptimizeWorldScreen: `shouldCloseOnEsc` is false; the Backup wait takes no input.
             Mode::Backup { .. } | Mode::Optimize { .. } => {}
+            Mode::MissingMods { .. } => self.leave_closed_for_missing_mods(),
             // BackupConfirmScreen.keyPressed: Escape runs `onCancel`, the Edit World screen again.
             Mode::OptimizeConfirm { world, name, .. } | Mode::AdoptBiomeRegions { world, name } => {
                 self.edit_world(name.clone(), world.clone())
@@ -4525,7 +3829,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             | Mode::MissingBiomeRegions { world, .. }
             | Mode::BackupBeforeUpgrade { world, .. } => {
                 let folder = world.folder.clone();
-                self.return_to_list(Some(&folder));
+                self.back_from_world(&folder);
             }
             Mode::Error { return_to, .. } => self.set_mode(*return_to.clone()),
             Mode::CreateFlat { .. } => {
@@ -4556,6 +3860,69 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             *screen = crate::multiplayer::Screen::list(&self.saves);
         }
     }
+}
+/// Whether `saves/<folder>` is a save as the title's list sees it (a level.dat or level.dat_old), with no
+/// containment check: ordinary Play meets a link out of `saves/` at its own symlink alert.
+pub fn is_save_folder(saves: &Path, folder: &str) -> bool {
+    read_world(&saves.join(folder), folder.to_owned()).is_some()
+}
+/// The save `folder` names under `saves`, for a native mod's request: a world as the title's list sees
+/// it (`list_worlds`: a level.dat or level.dat_old in the folder), whose folder resolves inside `saves`,
+/// so a link pointing out of it does not count. Nothing is created: a folder that is not a save is None.
+pub fn world_request_entry(saves: &Path, folder: &str) -> Option<WorldEntry> {
+    let (Ok(root), Ok(dir)) = (
+        std::fs::canonicalize(saves),
+        std::fs::canonicalize(saves.join(folder)),
+    ) else {
+        return None;
+    };
+    if !dir.is_dir() || dir == root || !dir.starts_with(&root) {
+        return None;
+    }
+    read_world(&saves.join(folder), folder.to_owned())
+}
+/// The question of `Mode::WorldRequest`: the mod, then the save by its name and folder.
+fn world_request_text(mods: &str, world: &WorldEntry) -> String {
+    translate(
+        "horizon.world_request.message",
+        "%s asks to open the world \"%s\" (saves/%s).",
+        &[&mods, &world.name, &world.folder],
+    )
+}
+/// Where the question of `Mode::WorldRequest` lays out in a viewport `w` by `h` GUI pixels: its title, the
+/// message in the `top..bottom` area (which scrolls when the message is longer), and the row of Yes and No at
+/// `buttons_y`, each `button_w` wide, left edges `yes_x` and `no_x`. The row stays inside the viewport whatever
+/// the message holds, and in a viewport narrower than two full buttons the buttons narrow instead of leaving it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WorldRequestLayout {
+    pub(crate) title_y: f32,
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+    pub(crate) buttons_y: f32,
+    pub(crate) button_w: f32,
+    pub(crate) yes_x: f32,
+    pub(crate) no_x: f32,
+}
+pub(crate) fn world_request_layout((w, h): (f32, f32)) -> WorldRequestLayout {
+    let top = 36.0;
+    let buttons_y = h.ceil() - 52.0;
+    let centre = (w.ceil() / 2.0).floor();
+    // Two buttons 4 apart around the centre, 6 from the edges at the narrowest, 150 wide when there is room.
+    let button_w = (centre - 6.0).clamp(20.0, 150.0);
+    WorldRequestLayout {
+        title_y: 12.0,
+        top,
+        bottom: (buttons_y - 8.0).max(top + 9.0),
+        buttons_y,
+        button_w,
+        yes_x: centre - 2.0 - button_w,
+        no_x: centre + 2.0,
+    }
+}
+/// How far the question's message is drawn up, in pixels, for a scroll amount: exact, so that the last line
+/// of a message that does not fill whole lines still reaches the bottom of its area.
+pub(crate) fn world_request_offset(amount: f32) -> f32 {
+    amount.floor()
 }
 fn centered(atlas: &HudAtlas, batch: &mut HudBatch, text: &str, y: f32, color: u32) {
     batch.text(
@@ -4996,7 +4363,7 @@ mod classic_tests {
         let mut title = Title::new(PathBuf::new(), root, "");
         title.splash = Some("Visible splash!".into());
         let mut batch = HudBatch::scratch([1920, 1080]);
-        title.draw(&atlas, &mut batch, (0.0, 0.0), false);
+        title.draw(&atlas, &mut batch, (0.0, 0.0), false, &mut |_, _| {});
         let cx = (batch.width / 2.0).floor();
         assert_eq!(batch.vertices[0].pos, [cx - 128.0, 30.0]);
         assert_eq!(batch.vertices[2].pos, [cx + 128.0, 74.0]);
@@ -5033,7 +4400,7 @@ mod classic_tests {
         ] {
             title.splash = splash;
             let mut hidden = HudBatch::scratch([1920, 1080]);
-            title.draw(&atlas, &mut hidden, (0.0, 0.0), hide_splash);
+            title.draw(&atlas, &mut hidden, (0.0, 0.0), hide_splash, &mut |_, _| {});
             assert!(
                 !hidden
                     .vertices

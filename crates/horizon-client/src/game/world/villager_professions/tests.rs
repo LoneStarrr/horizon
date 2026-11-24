@@ -73,10 +73,7 @@ fn resource_root(scratch: &std::path::Path) -> std::path::PathBuf {
             jars: vec![],
         }],
         &root,
-        &horizon_mod_package::enabled::EnabledMods::new([(
-            "test".into(),
-            horizon_mod_package::Side::Both,
-        )]),
+        &horizon_mod_package::enabled::EnabledMods::new([("test".into(), mod_api::Side::Both)]),
     )
     .unwrap();
     root
@@ -107,7 +104,7 @@ fn fixture(mods: mod_api::Mods, run: impl FnOnce(&mut Game<'_>)) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_engineer_registration_and_assembler_job_acquisition() {
     let valid = Arc::new(AtomicBool::new(true));
     fixture(
@@ -124,7 +121,7 @@ fn villager_engineer_registration_and_assembler_job_acquisition() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_failed_reload_keeps_profession_poi_and_trade_snapshot() {
     let valid = Arc::new(AtomicBool::new(true));
     fixture(
@@ -186,7 +183,7 @@ fn refused(mods: mod_api::Mods, expected: &[&str]) {
     });
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_duplicate_owners_publish_zero_entries() {
     let valid = Arc::new(AtomicBool::new(true));
     refused(
@@ -211,7 +208,7 @@ fn villager_duplicate_owners_publish_zero_entries() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_reserved_profession_publishes_zero_entries() {
     refused(
         vec![ModEntry::new(
@@ -226,7 +223,7 @@ fn villager_reserved_profession_publishes_zero_entries() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_overlapping_poi_publishes_zero_entries() {
     let valid = Arc::new(AtomicBool::new(true));
     refused(
@@ -251,7 +248,7 @@ fn villager_overlapping_poi_publishes_zero_entries() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_no_mods_world_retains_farmer_composter_and_five_levels() {
     let scratch = tempfile::tempdir().unwrap();
     mod_platform::testing::with_mods(vec![].into(), || {
@@ -309,13 +306,14 @@ fn wasm_profession(value: ProfessionDefinition, owner: &str) -> mod_api::ModEntr
     declaration.put(&value);
     let declaration = declaration.into_bytes();
     let operation = horizon_mod_wasm::fixture_import_id("VillagerProfessions", "register").unwrap();
+    let subscribed = horizon_mod_wasm::fixture_export_id("Hooks", "subscribed").unwrap();
     let hook =
         horizon_mod_wasm::fixture_export_id("Hooks", "register_villager_professions").unwrap();
     let std = wat::parse_str(
         r#"(module (@custom "dylink.0" "\01\04\00\00\00\00") (import "env" "memory" (memory 1)))"#,
     )
     .unwrap();
-    let module = wat::parse_str(format!(r#"(module
+    let module = wat::parse_str(horizon_mod_wasm::fixture::by_name(&format!(r#"(module
         (@custom "dylink.0" "\01\04\00\00\00\00")
         (import "env" "memory" (memory 1))
         (import "env" "__indirect_function_table" (table 1 funcref))
@@ -326,7 +324,7 @@ fn wasm_profession(value: ProfessionDefinition, owner: &str) -> mod_api::ModEntr
         (func (export "horizon_layout") (result i64) i64.const {layout})
         (func (export "horizon_in") (param i32) (result i32) i32.const 512)
         (func (export "horizon_hook") (param i32) (result i64)
-            local.get 0 i32.eqz if (result i64)
+            local.get 0 i32.const {subscribed} i32.eq if (result i64)
                 i64.const {sub_reply}
             else local.get 0 i32.const {hook} i32.eq if (result i64)
                 i32.const {operation} i32.const 4096 i32.const {length} i32.const 0 i32.const 0 call $host
@@ -334,7 +332,7 @@ fn wasm_profession(value: ProfessionDefinition, owner: &str) -> mod_api::ModEntr
                 i64.const 0
             else i64.const 0 end end))"#,
             subscriptions=data(&subscriptions), declaration=data(&declaration), layout=*mod_api::wire::LAYOUT,
-            sub_reply=(2048u64<<32)|subscriptions.len() as u64, length=declaration.len())).unwrap();
+            sub_reply=(2048u64<<32)|subscriptions.len() as u64, length=declaration.len()), &[("VillagerProfessions", "register")])).unwrap();
     let manifest = horizon_mod_package::manifest::Manifest::parse(&format!("id = '{owner}'\nname = 'Wasm engineer'\nversion = '1.0.0'\napi = '0.2'\ncapabilities = ['registries']\n[wasm]\nsha512 = '{}'\ntoolchain = 'test'\nbuilt_with = 'test'\n", "a".repeat(128))).unwrap();
     let mut loaded = horizon_mod_wasm::load(
         &std,
@@ -358,7 +356,7 @@ impl Hooks for TradeFiles {
     }
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_wasm_engineer_declaration_resolves_with_assembler() {
     // Instantiate and invoke the real wasm guest on the production-sized stack.
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
@@ -377,6 +375,21 @@ fn assert_engineer_acquisition(game: &mut Game<'_>) {
     let table = game.stations().professions.clone();
     assert_eq!(table.entries().len(), 16);
     assert_eq!(table.resolve("test:engineer"), Some(15));
+    let host: &dyn mod_api::Host = game;
+    let engineer = host
+        .registry_entry("minecraft:villager_profession", "test:engineer")
+        .expect("the registered gameplay profession is a generic registry entry");
+    assert_eq!(engineer.id.to_string(), "test:engineer");
+    assert!(
+        host.registry_entries("minecraft:villager_profession")
+            .unwrap()
+            .contains(&Identifier::parse("test:engineer").unwrap())
+    );
+    assert!(
+        host.registry_entries("minecraft:villager_profession")
+            .unwrap()
+            .contains(&Identifier::parse("minecraft:farmer").unwrap())
+    );
     assert_eq!(table.acquiring("test:assembler"), Some(15));
     assert_eq!(table.trade_key("test:engineer", 1), Some("test:engineer"));
     assert_eq!(table.trade_key("test:engineer", 2), None);
@@ -502,7 +515,7 @@ fn saved_engineer(kind: &str) -> Tag {
     ])
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_game_load_resolves_saved_names_for_both_species_without_reroll() {
     fixture(
         vec![ModEntry::new(
@@ -558,7 +571,7 @@ fn villager_game_load_resolves_saved_names_for_both_species_without_reroll() {
     );
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_game_missing_mod_keeps_both_species_unresolved_and_offers_untouched() {
     fixture(vec![].into(), |game| {
         for kind in ["minecraft:villager", "minecraft:zombie_villager"] {
@@ -601,7 +614,7 @@ fn villager_game_missing_mod_keeps_both_species_unresolved_and_offers_untouched(
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_load_world_save_dir_preserves_custom_workstation() {
     fixture(
         vec![ModEntry::new(
@@ -654,7 +667,7 @@ fn villager_load_world_save_dir_preserves_custom_workstation() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_native_slots_ignore_declaring_mod_order() {
     struct NativeProfession(ProfessionDefinition);
     #[mod_api::__subscriptions]
@@ -705,7 +718,7 @@ fn villager_native_slots_ignore_declaring_mod_order() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn villager_wasm_slots_ignore_declaring_mod_order() {
     // Instantiate and invoke the real wasm guest on the production-sized stack.
     crate::game::native_entity_refs::tests::run_on_guest_stack(|| {
@@ -739,4 +752,57 @@ fn villager_wasm_slots_ignore_declaring_mod_order() {
             });
         }
     });
+}
+#[test]
+#[ignore = "daily"]
+fn villager_registered_profession_keeps_a_guest_trade_screen_valid() {
+    use horizon_client::lan::{Joined, PlayerSender, guest::Guest};
+    use horizon_protocol::packets::configuration::ClientInformation;
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    fixture(
+        vec![ModEntry::new(
+            "engineer",
+            Box::new(Engineer {
+                valid: Arc::new(AtomicBool::new(true)),
+                key: "test:engineer",
+            }),
+        )]
+        .into(),
+        |game| {
+            let id = game
+                .load_mob(saved_engineer("minecraft:villager"), None)
+                .unwrap();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let guest = Guest::new(
+                Joined {
+                    conn: 12,
+                    uuid: 12,
+                    name: "guest12".into(),
+                    properties: Vec::new(),
+                    info: ClientInformation::new(8),
+                    brand: String::new(),
+                    sender: PlayerSender::new(tx, Arc::new(AtomicUsize::new(0))),
+                    latency: Arc::new(AtomicI32::new(0)),
+                    address: "127.0.0.1:1".parse().unwrap(),
+                    expected: false,
+                },
+                12,
+                [1.5, 64.0, 0.5],
+                10,
+            );
+            // `AbstractVillager.stillValid`: alive and in reach; a registered
+            // profession resolves in the world's table, so the screen stays open
+            // and the guest's trades are applied (not opaque).
+            assert!(game.lan_merchant_valid(&guest, id));
+            assert!(!game.lan_merchant_opaque(id));
+            // An id no mod registers doesn't resolve: the screen closes.
+            let index = game.mobs.iter().position(|mob| mob.id == id).unwrap();
+            game.mobs[index].extra.profession =
+                horizon_client::mobs::villager::ProfessionState::Unresolved(
+                    "example:engineer".into(),
+                );
+            assert!(!game.lan_merchant_valid(&guest, id));
+            assert!(game.lan_merchant_opaque(id));
+        },
+    );
 }

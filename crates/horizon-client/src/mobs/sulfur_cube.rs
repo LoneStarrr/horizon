@@ -402,6 +402,7 @@ mod knockback_sync_tests {
     /// `TemptGoal` scales its range by the player's visibility: an invisible
     /// player five blocks away does not tempt a sulfur cube.
     #[test]
+    #[ignore = "daily"]
     fn an_invisible_player_tempts_a_sulfur_cube_only_within_two_blocks() {
         use crate::mobs::goals::Cx;
         use crate::mobs::world::{test_player, with_test_world};
@@ -687,6 +688,7 @@ mod burning_arrow_tests {
     /// the arrow's knock, then the fuse lit: the next tick plays
     /// `entity.tnt.primed`, then the archetype's hit sound.
     #[test]
+    #[ignore = "daily"]
     fn a_knock_and_a_lit_fuse_both_sound() {
         let mut test_level = crate::health::TestLevel::new(0);
         let level = &mut test_level.level();
@@ -715,6 +717,7 @@ mod burning_arrow_tests {
     /// crosses the baby boundary: a loaded adult of size 1 and a big baby
     /// keep their size, and only a baby growing up becomes size 2 (#14916).
     #[test]
+    #[ignore = "daily"]
     fn only_growing_up_makes_a_cube_size_2() {
         let mut events = Vec::new();
         let ran = crate::mobs::world::with_test_world(&[], |w, _| {
@@ -965,6 +968,7 @@ pub fn immune_to(source: &Damage) -> bool {
             | DamageKind::MaceSmash
             | DamageKind::Spear
             | DamageKind::MobAttack
+            | DamageKind::MobAttackNoAggro
             | DamageKind::Arrow
             | DamageKind::Thrown
             | DamageKind::Explosion
@@ -1403,9 +1407,9 @@ pub fn body(m: &Mob) -> (String, String) {
         )
     }
 }
-/// `SulfurCubeInnerLayer`: the inner cube when no block is held.
+/// `SulfurCubeInnerLayer.submit`: the inner cube when no block is held and the cube is visible.
 pub fn inner(m: &Mob) -> Option<(&'static str, &'static str)> {
-    if has_body(m) {
+    if has_body(m) || m.is_invisible() {
         return None;
     }
     Some(if m.is_baby() {
@@ -1531,7 +1535,9 @@ pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
     }
     // The saved Health, not the one the living load's Health Boost clamp cut
     // to the unsized maximum: vanilla sizes the cube before `setHealth`.
-    m.health = crate::save::float(tag.get("Health")).map_or(m.attrs.max_health, |h| h as f32);
+    m.health = crate::save::float(tag.get("Health"))
+        .map_or(m.attrs.max_health, |h| h as f32)
+        .min(super::finalize::loaded_max_health(m));
     m.extra.flag2 = int("wasOnGround").unwrap_or(0) != 0;
     m.extra.ints[3] = int("pickup_timer").unwrap_or(0);
     m.extra.scratch[3] = int("from_bucket").unwrap_or(0);
@@ -1558,6 +1564,7 @@ mod tnt_rule_tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn mob_tick_counts_the_fuse_but_keeps_noai_cooldowns_still() {
         let mut test_level = crate::health::TestLevel::new(0);
         let level = &mut test_level.level();
@@ -1618,6 +1625,7 @@ mod tnt_rule_tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_fuse_running_out_while_tnt_does_not_explode_makes_no_blast() {
         // tickFuse: the blast (and its source) only with tnt_explodes, the
         // discard either way.
@@ -1891,6 +1899,7 @@ mod mob_contact_tests {
     use std::sync::Arc;
 
     #[test]
+    #[ignore = "daily"]
     fn mob_tick_contacts_only_overlapping_pushable_mobs_with_a_hot_body() {
         let mut test_level = crate::health::TestLevel::new(0);
         let level = &mut test_level.level();
@@ -1900,7 +1909,7 @@ mod mob_contact_tests {
             if !alive {
                 m.health = 0.0;
             }
-            m.seen(None)
+            m.seen(None, &crate::items::Items::empty())
         };
         let others = [
             victim(2, Vec3::ZERO, true),
@@ -1945,5 +1954,49 @@ mod mob_contact_tests {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod inner_tests {
+    use super::*;
+
+    #[test]
+    fn inner_core_skips_when_invisible_or_carrying_block() {
+        let mut kind = crate::mobs::sensor_scan_tests::kind();
+        let data = std::sync::Arc::make_mut(&mut kind);
+        data.id = "minecraft:sulfur_cube".into();
+        data.species = crate::mobs::Species::SulfurCube;
+
+        for baby in [false, true] {
+            for body in [None, Some("minecraft:tnt")] {
+                for invisible in [false, true] {
+                    let mut m = Mob::new(1, kind.clone(), Vec3::ZERO, 0.0);
+                    if baby {
+                        m.extra.age = -24000;
+                    }
+                    m.extra.set_body(body.map(Into::into));
+                    m.invisible = invisible;
+
+                    let expected = if body.is_none() && !invisible {
+                        Some(if baby {
+                            (
+                                "sulfur_cube_small#inner",
+                                "entity/sulfur_cube/sulfur_cube_inner_small",
+                            )
+                        } else {
+                            ("sulfur_cube#inner", "entity/sulfur_cube/sulfur_cube_inner")
+                        })
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        inner(&m),
+                        expected,
+                        "baby={baby}, body={body:?}, invisible={invisible}"
+                    );
+                }
+            }
+        }
     }
 }

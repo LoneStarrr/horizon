@@ -48,6 +48,8 @@ impl Game<'_> {
     pub(super) fn draw_gamemode_switcher(&mut self, batch: &mut HudBatch) {
         let (w, h) = (batch.width as i32, batch.height as i32);
         let Some(switcher) = &mut self.gamemode_switcher else {
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             return;
         };
         // GameModeSwitcherScreen: `GameNarrator.NO_TITLE`; its slots are no
@@ -58,13 +60,15 @@ impl Game<'_> {
         switcher.hover(w, h, (self.cursor.0 as i32, self.cursor.1 as i32));
         let selected = switcher.selected;
         let atlas = &self.gui.atlas;
-        batch.sprite_region(
+        // `GameModeSwitcherScreen.extractBackground` blits the original texture.
+        batch.texture_blit(
             atlas,
             "gui/container/gamemode_switcher",
             [(w / 2 - 62) as f32, (h / 2 - 58) as f32, 125.0, 75.0],
-            128.0,
-            128.0,
+            [0.0; 2],
+            [128.0; 2],
         );
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let title = Text::translate(&format!("gameMode.{}", selected.name()), &[]);
         let help = Text::translate(
             "debug.gamemodes.select_next",
@@ -100,5 +104,6 @@ impl Game<'_> {
                 (y + 5) as f32,
             );
         }
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
     }
 }

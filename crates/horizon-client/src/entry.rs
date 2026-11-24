@@ -1,8 +1,8 @@
 //! Startup shared by the gameplay library and its executable.
-#[path = "horizon_look.rs"]
-mod horizon_look;
 use crate::{crash, game, logging};
 use horizon_mod_package::selection::{Argument, LaunchArguments};
+pub(crate) mod dedicated_arguments;
+pub(crate) mod runtime_environment;
 
 /// Validated startup state. No native hooks or workers may run before prepare returns.
 pub struct Startup {
@@ -22,6 +22,7 @@ impl Startup {
 /// and resource marker metadata only: no logging, account loading, mods or worker threads.
 /// Account IO, cwd changes and command registration remain in Options::read, after leases.
 pub fn prepare() -> Startup {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     horizon_mod_package::holder::enter();
     let result: crate::Result<_> = (|| {
         let mut command = std::process::Command::new(std::env::current_exe()?);
@@ -37,7 +38,10 @@ pub fn prepare() -> Startup {
     let Some(options) = options else {
         std::process::exit(0);
     };
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     let capture = horizon_mod_package::holder::acquire(&launch);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let capture = None;
     Startup {
         launch,
         options,
@@ -96,17 +100,21 @@ pub fn start<G>(
     code: CodeRuntime,
     startup: Startup,
 ) {
+    // The startup spans count from here, before the allocator, hooks and languages are set up.
+    let started = std::time::Instant::now();
     let _ = CODE_RUNTIME.set(code);
     let Startup {
         launch,
         options,
         _capture,
     } = startup;
+    runtime_environment::capture(&launch);
     horizon_threads::configure_allocator();
     horizon_chat_filter::install();
-    horizon_look::give();
     // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
     horizon_client::pack_formats::install();
+    // The controller glyphs' pictures: Horizon's own art, until a platform crate registers its own.
+    horizon_client::pad_glyph::install();
     // horizon-extras (docs/forking.md): without the feature, no Horizon Settings or Mods page.
     if !cfg!(feature = "horizon-extras") {
         horizon_client::options_ui::HORIZON_EXTRAS
@@ -118,10 +126,15 @@ pub fn start<G>(
     // Crates above the engine registered their hooks before this (horizon-official's `main`),
     // then the Horizon parts still in this crate; none registers after this point.
     game::player_hooks::register();
+    // `horizon-controller.txt` (platform, still in this crate's input until the controllers move
+    // out, layer plan M6), one player's side per seat.
+    if let Err(e) = horizon_hooks::settings::register(&horizon_client::gamepad::store::STORE) {
+        log::error!("Controllers: their settings came too late: {e}");
+    }
     horizon_hooks::engine::seal();
     // The text crates ship (`horizon_hooks::lang`), loaded with the game's own languages.
     horizon_client::lang::install_crate_files(horizon_hooks::lang::engine::all());
-    horizon_client::spans::startup::init(std::time::Instant::now());
+    horizon_client::spans::startup::init(started);
     logging::set_game_home(launch.context.home.clone());
     // The dedicated server logs in its own folder, as vanilla's does; the game in its home.
     let (home, side, thread) = if launch
@@ -146,11 +159,23 @@ pub fn start<G>(
     );
     // The log's first line names the build, so a bug report that carries the log says which one it was.
     log::info!("Horizon {}", crash::version());
+    // The machine's power state, on its own thread at 1 Hz and never in the frame loop: the
+    // window's tick says in the log what changed, and the graphics page says what the OS is
+    // reporting about the machine (its energy saver, or a CPU held below full speed;
+    // `horizon_system::power`, docs/graphics.md). A dedicated server has no window and no page,
+    // so it doesn't start the thread.
+    if side == "client" {
+        horizon_system::power::start();
+    }
+    // Mods' startup bars and lines (`RegistrationContext::progress`), before they register.
+    game::startup_progress::install(side == "server");
     // Mod loading emits refusals; both client and dedicated logs must exist first.
     let (_ids, _loaded_code) = load(&native, &launch);
     crash::install(home.clone(), side);
     if horizon_world::native_load_hooks::install(
         horizon_world::native_load_hooks::NativeLoadHooks {
+            item_ability_default: horizon_items::item_abilities::vanilla_can_perform,
+            loot_ability: crate::game::api_values::loot_values::dispatch_loot_ability,
             loot_table_load: |context, id, table| {
                 if !mod_api::__private::listened(mod_api::HookId::LootTableLoad) {
                     return;
@@ -185,6 +210,12 @@ pub fn start<G>(
     if horizon_world::native_worldgen_hooks::install(
         horizon_world::native_worldgen_hooks::NativeWorldgenHooks {
             alter_ground: crate::game::api_values::alter_ground,
+            on_tree_grow: crate::game::native_tree_grow::on_tree_grow,
+            rotate: crate::game::native_rotate::rotate,
+            can_survive: crate::game::native_survival::can_survive_v2,
+            may_place_on: crate::game::native_survival::may_place_on_v2,
+            can_sustain_plant: crate::game::native_survival::can_sustain_plant_v2,
+            feature: crate::game::native_worldgen_parts::feature,
         },
     )
     .is_err()
@@ -202,8 +233,11 @@ pub fn start<G>(
     raise_open_file_limit();
     if let Err(error) = game::run_with(options, native) {
         // A bad command line is the caller's mistake, not a crash: no report.
-        let usage = error.is::<game::UsageError>();
-        log::error!("Horizon: {error}");
+        let missing_mods = game::dedicated::is_missing_mods_refusal(error.as_ref());
+        let usage = error.is::<game::UsageError>() || missing_mods;
+        if !missing_mods {
+            log::error!("Horizon: {error}");
+        }
         logging::flush();
         // The report's path is the last line on stderr (crash::SAVED_LINE).
         if !usage {
@@ -224,12 +258,15 @@ pub fn start<G>(
     }
     horizon_hooks::engine::shutdown();
     logging::flush();
+    // `/restart`: the world is saved; the supervisor reads this code as "start the game again".
+    if game::exit_code::restart_requested() {
+        std::process::exit(game::exit_code::RESTART);
+    }
 }
 
 pub(crate) fn install_client_hooks() {
     game::api_values::install_stack_hooks();
     if !crate::native_client_hooks::install(crate::native_client_hooks::NativeClientHooks {
-        menu_slot_rules: game::api_values::menu_slot_rules,
         menu_still_valid: game::api_values::menu_still_valid,
         menu_still_valid_listens: |menu| {
             mod_api::__private::menu_listens(mod_api::HookId::MenuStillValid, menu)
@@ -245,6 +282,14 @@ pub(crate) fn install_client_hooks() {
             let context = reader.context();
             mod_api::dispatch_living_heal(&context, entity, amount, cancel);
         },
+        living_heal_cause: |context, entity, cause, amount| {
+            if !mod_api::__private::listened(mod_api::HookId::LivingHealCause) {
+                return;
+            }
+            let reader = horizon_client_render::api_context::LoopReader(context);
+            let context = reader.context();
+            mod_api::dispatch_living_heal_cause(&context, entity, cause, amount);
+        },
         living_breathe: |context, entity, kind, can_breathe, consume, refill| {
             if !mod_api::__private::listened(mod_api::HookId::LivingBreathe) {
                 return;
@@ -252,6 +297,12 @@ pub(crate) fn install_client_hooks() {
             let reader = horizon_client_render::api_context::LoopReader(context);
             let context = reader.context();
             mod_api::dispatch_living_breathe(&context, entity, kind, can_breathe, consume, refill);
+        },
+        player_login_profile: |player, name, properties| {
+            if !mod_api::__private::listened(mod_api::HookId::PlayerLoginProfile) {
+                return;
+            }
+            mod_api::dispatch_player_login_profile(player, name, properties);
         },
         farmland_trample: |context, entity, pos, state, distance, cancel| {
             if !mod_api::__private::listened(mod_api::HookId::FarmlandTrample) {
@@ -269,10 +320,16 @@ pub(crate) fn install_client_hooks() {
             }
             let reader = horizon_client_render::api_context::LoopReader(context);
             let context = reader.context();
-            let username = username.try_into_api().unwrap();
-            let mut converted = displayname.try_into_api().unwrap();
+            let (Ok(username), Ok(mut converted)) =
+                (username.try_into_api(), displayname.try_into_api())
+            else {
+                return;
+            };
             mod_api::dispatch_player_name_format(&context, &username, &mut converted);
-            *displayname = converted.try_into_engine(&()).unwrap();
+            // A listener result that cannot be an engine component keeps the name.
+            if let Ok(engine) = converted.try_into_engine(&()) {
+                *displayname = engine;
+            }
         },
         player_tab_list_name_format: |context, player, name, display_name| {
             use game::api_values::{TryIntoApi, TryIntoEngine};
@@ -281,9 +338,13 @@ pub(crate) fn install_client_hooks() {
             }
             let reader = horizon_client_render::api_context::LoopReader(context);
             let context = reader.context();
-            let mut converted = display_name.try_into_api().unwrap();
+            let Ok(mut converted) = display_name.try_into_api() else {
+                return;
+            };
             mod_api::dispatch_player_tab_list_name_format(&context, player, name, &mut converted);
-            *display_name = converted.try_into_engine(&()).unwrap();
+            if let Ok(engine) = converted.try_into_engine(&()) {
+                *display_name = engine;
+            }
         },
         living_drown: |context, entity, kind, is_drowning, damage_amount, bubble_count, cancel| {
             if !mod_api::__private::listened(mod_api::HookId::LivingDrown) {
@@ -341,6 +402,27 @@ pub(crate) fn install_client_hooks() {
             let context = reader.context();
             mod_api::dispatch_living_flying_speed(&context, entity, kind, speed);
         },
+        can_swim_in_fluid_listened: || {
+            mod_api::__private::listened(mod_api::HookId::CanSwimInFluid)
+        },
+        can_swim_in_fluid: |context, entity, kind, fluid, fire_resistance, can_swim| {
+            let reader = horizon_client_render::api_context::LoopReader(context);
+            mod_api::dispatch_can_swim_in_fluid(
+                &reader.context(),
+                entity,
+                kind,
+                fluid,
+                fire_resistance,
+                can_swim,
+            );
+        },
+        living_fluid_travel_listened: || {
+            mod_api::__private::listened(mod_api::HookId::LivingFluidTravel)
+        },
+        living_fluid_travel: |call| {
+            let reader = horizon_client_render::api_context::LoopReader(call.context);
+            mod_api::dispatch_living_fluid_travel(&reader.context(), call.values);
+        },
         block_jump_factor: |context, state, factor| {
             crate::game::block_jump_factor(context, state, factor);
         },
@@ -350,6 +432,8 @@ pub(crate) fn install_client_hooks() {
         is_ladder: |context, entity, pos, state, ladder| {
             crate::game::is_ladder(context, entity, pos, state, ladder);
         },
+        makes_open_trapdoor_above_climbable:
+            crate::game::native_trapdoor_ladder::makes_open_trapdoor_above_climbable,
         friction: |context, entity, kind, pos, state, friction| {
             crate::game::native_surface::friction(context, entity, kind, pos, state, friction);
         },
@@ -380,6 +464,10 @@ pub(crate) fn install_client_hooks() {
         sound_type: |context, pos, state, entity, cause, sound| {
             crate::game::native_block_sounds::sound_type(context, pos, state, entity, cause, sound);
         },
+        can_grindstone_repair: crate::game::native_item_menu_parts::can_grindstone_repair,
+        is_combine_repairable: crate::game::native_item_menu_parts::is_combine_repairable,
+        can_fit_inside_container_items:
+            crate::game::native_item_menu_parts::can_fit_inside_container_items,
     }) {
         log::warn!("Native client hooks already installed; keeping the first callbacks");
     }

@@ -27,6 +27,24 @@ fn default_cloud_particle() -> ParticleOptions {
     ParticleOptions::colored(ParticleType::EntityEffect, [1.0; 4])
 }
 
+/// `AreaEffectCloud.setRadius`: the server keeps a cloud's radius between 0
+/// and 32 (`MAX_RADIUS`). A client keeps a server's value in that range too,
+/// NaN as 0: the radius counts the particles of every tick.
+pub(super) fn cloud_radius(radius: f32) -> f32 {
+    if radius.is_nan() {
+        0.0
+    } else {
+        radius.clamp(0.0, 32.0)
+    }
+}
+
+/// `AreaEffectCloud.clientTick`'s particles of a tick once it stopped
+/// waiting: about one per square block of the disc, `ceil(PI * r * r)`.
+fn cloud_particle_count(radius: f32) -> i32 {
+    let radius = cloud_radius(radius);
+    (std::f32::consts::PI * radius * radius).ceil() as i32
+}
+
 /// `AreaEffectCloud.clientTick`: while waiting, now and then two particles
 /// near the middle; then about one per square block of the disc, drifting
 /// (an entity effect stays still).
@@ -43,10 +61,7 @@ pub(super) fn cloud_client_tick(
     let (count, spread) = if waiting {
         (2, 0.2)
     } else {
-        (
-            (std::f32::consts::PI * radius * radius).ceil() as i32,
-            radius,
-        )
+        (cloud_particle_count(radius), cloud_radius(radius))
     };
     for _ in 0..count {
         let r = particles.random();
@@ -125,11 +140,39 @@ fn remote_bullet_tick(p: &mut Projectile, w: &impl ProjectileWorld) {
 
 /// A server's client ticks a projectile itself: it flies on between the
 /// tracker's updates (10 to 20 ticks apart) with its own gravity and drag,
-/// and a block stops it there; only the server decides what it hits.
-pub(super) fn remote_projectile_tick(p: &mut Projectile, w: &impl ProjectileWorld) {
-    if !matches!(p.tick_remote(w).1, Hit::None) {
-        p.velocity = Vec3::ZERO;
+/// and a block stops it there; only the server decides what it hits. Returns
+/// the PORTAL sparks of an ender pearl that landed: `ThrownEnderpearl.onHit`
+/// runs on the client too and draws them there, while the server's
+/// `addParticle` sends nothing.
+pub(super) fn remote_projectile_tick(
+    p: &mut Projectile,
+    w: &impl ProjectileWorld,
+) -> Vec<([f64; 3], [f64; 3])> {
+    if matches!(p.tick_remote(w).1, Hit::None) {
+        return Vec::new();
     }
+    p.velocity = Vec3::ZERO;
+    if p.kind != ProjectileKind::EnderPearl {
+        return Vec::new();
+    }
+    let at = p.position;
+    ender_pearl_sparks(at, p.entity_random())
+}
+
+/// `ThrownEnderpearl.onHit`: 32 PORTAL particles at the impact, at
+/// (x, y + nextDouble() * 2, z) with a speed of (nextGaussian, 0,
+/// nextGaussian), drawn from the pearl's own random.
+pub(in crate::game) fn ender_pearl_sparks(
+    at: Vec3,
+    random: &mut impl RandomSource,
+) -> Vec<([f64; 3], [f64; 3])> {
+    (0..32)
+        .map(|_| {
+            let position = [at.x, at.y + random.next_double() * 2.0, at.z];
+            let speed = [random.next_gaussian(), 0.0, random.next_gaussian()];
+            (position, speed)
+        })
+        .collect()
 }
 
 /// `Entity.getRandomX(0.5)` / `getRandomY` / `getRandomZ(0.5)` for a shulker
@@ -168,15 +211,7 @@ pub(super) fn remote_projectile_power(
     power: f64,
 ) {
     if let Some(i) = projectiles.iter().position(|p| p.id == id as u32)
-        && matches!(
-            projectiles[i].kind,
-            ProjectileKind::SmallFireball
-                | ProjectileKind::LargeFireball { .. }
-                | ProjectileKind::DragonFireball
-                | ProjectileKind::WitherSkull { .. }
-                | ProjectileKind::WindCharge
-                | ProjectileKind::BreezeWindCharge
-        )
+        && projectiles[i].is_hurting()
     {
         projectiles.update(i, |p| p.acceleration = power);
     }
@@ -324,6 +359,45 @@ impl Game<'_> {
         packet: &horizon_protocol::packets::play::AddEntity,
         rotation: (f32, f32),
     ) -> bool {
+        let id = packet.id;
+        self.remove_remote_projectile(id as u32);
+        self.spawn_remote_projectile_inner(kind, packet, rotation)
+    }
+
+    /// Whether the client tracks `id` already: asked by `AddEntity` before it tracks the new one.
+    pub(super) fn tracks_remote_entity(&self, id: i32) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|r| r.tracked_entity(id).is_some())
+    }
+
+    /// `AddEntity`'s `spawn_remote_projectile`. Only an id the client already tracked (`replace`)
+    /// can still be in `falling` or `tnts`, so a new id skips those passes; the crystals and the
+    /// small lists are filtered every time, since the client adds to some of those itself.
+    pub(super) fn spawn_added_projectile(
+        &mut self,
+        p: &horizon_protocol::packets::play::AddEntity,
+        kind: &str,
+        rotation: (f32, f32),
+        replace: bool,
+    ) {
+        if replace {
+            self.spawn_remote_projectile(kind, p, rotation);
+        } else {
+            self.crystals.retain(|c| c.id != p.id as u32);
+            self.remove_remote_small_projectiles(p.id as u32);
+            self.spawn_remote_projectile_inner(kind, p, rotation);
+        }
+    }
+
+    /// `spawn_remote_projectile` without first removing an entity under the same id: for
+    /// `AddEntity` of an id the client does not track yet, which no list holds.
+    pub(super) fn spawn_remote_projectile_inner(
+        &mut self,
+        kind: &str,
+        packet: &horizon_protocol::packets::play::AddEntity,
+        rotation: (f32, f32),
+    ) -> bool {
         let id = packet.id as u32;
         let position = packet.position;
         let velocity = packet.velocity;
@@ -331,7 +405,6 @@ impl Game<'_> {
         let at = Vec3::new(position[0], position[1], position[2]);
         let velocity = Vec3::new(velocity[0], velocity[1], velocity[2]);
         let (yaw, pitch) = rotation;
-        self.remove_remote_projectile(id);
         match kind {
             "minecraft:evoker_fangs" => self.insert_fangs(id, position, yaw, 0, 0),
             "minecraft:tnt" => self.tnts.push(super::tnt::PrimedTnt {
@@ -351,6 +424,7 @@ impl Game<'_> {
                 owner: None,
                 guest: None,
                 power: 4.0,
+                used_portal: false,
                 block_state: None,
             }),
             // FallingBlockEntity.recreateFromPacket: the block state is the data.
@@ -418,16 +492,8 @@ impl Game<'_> {
                     .next_int_bound(100_000)
                     .unwrap_or(0);
                 let time = super::dragon::Crystal::start_time(at, drawn, self.clock.still());
-                self.crystals.push(super::dragon::Crystal {
-                    attachment_lifetime: Default::default(),
-                    join: Default::default(),
-                    id,
-                    position: at,
-                    show_bottom: true,
-                    time,
-                    beam: None,
-                    invulnerable: false,
-                });
+                self.crystals
+                    .push(super::dragon::Crystal::new(id, at, true, time));
             }
             _ => {
                 let Some(k) = projectile_kind(kind) else {
@@ -475,7 +541,7 @@ impl Game<'_> {
                     return;
                 };
                 match (index, value) {
-                    (8, Value::Float(r)) => c.radius = *r,
+                    (8, Value::Float(r)) => c.radius = cloud_radius(*r),
                     (9, Value::Bool(w)) => c.waiting = *w,
                     (10, _) => c.particle = particle.unwrap_or_else(default_cloud_particle),
                     _ => {}
@@ -756,13 +822,14 @@ impl Game<'_> {
         #[cfg(test)]
         nested_spawn_tests::after_lift(self, nested_spawn_tests::Point::Trident);
         let mut arrow_events = Vec::new();
+        let mut pearl_sparks = Vec::new();
         let rain = self.arrow_rain();
         let arrow_scene = self.arrow_scene(&rain);
         {
             let w = self.mob_world_base(&[]);
             let world = super::creatures::ProjWorld {
                 w: &w,
-                targets: Vec::new(),
+                targets: &[],
                 border: Some(self.border.bounds()),
             };
             projectiles.for_each_mut(|p| match p.kind {
@@ -777,7 +844,7 @@ impl Game<'_> {
                     }
                 }
                 ProjectileKind::ShulkerBullet { .. } => remote_bullet_tick(p, &world),
-                _ => remote_projectile_tick(p, &world),
+                _ => pearl_sparks.extend(remote_projectile_tick(p, &world)),
             });
             for t in &mut tridents {
                 t.remote_tick(&world, self.remote_eye(t.owner));
@@ -794,6 +861,10 @@ impl Game<'_> {
         );
         for (at, event) in arrow_events {
             self.arrow_event(at, event);
+        }
+        let portal = ParticleOptions::simple(ParticleType::Portal);
+        for (at, speed) in pearl_sparks {
+            self.particles.add(&portal, at, speed);
         }
         self.arrow_effect_particles();
         let trails: Vec<Vec3> = self
@@ -815,23 +886,20 @@ impl Game<'_> {
         #[cfg(test)]
         nested_spawn_tests::after_lift(self, nested_spawn_tests::Point::RemoteRocket);
         for r in &mut rockets {
-            r.remote_step(&mut SceneCollisions {
-                world: &self.world,
-                binding: self.collision,
-                subject: None,
-            });
+            r.remote_step(
+                &mut SceneCollisions {
+                    world: &self.world,
+                    binding: self.collision,
+                    subject: None,
+                },
+                &self.loop_context,
+            );
             if let Some(target) = r.attached_to {
                 if me == Some(target) {
                     continue;
                 }
                 if let Some(m) = self.mobs.iter().find(|m| m.id == target) {
-                    // Another player's motion is not known here: its step.
-                    r.velocity = Vec3::new(
-                        m.position.x - r.previous.x,
-                        m.position.y - r.previous.y,
-                        m.position.z - r.previous.z,
-                    );
-                    r.position = m.position;
+                    Self::follow_holder(r, m);
                 }
             }
             self.rocket_spark(r);
@@ -946,6 +1014,21 @@ mod tests {
     use horizon_client::mobs::Who;
     use horizon_core::geometry::Aabb;
 
+    /// `AreaEffectCloud.setRadius` keeps a radius between 0 and 32, so a
+    /// tick draws at most ceil(1024 * PI) = 3217 particles, whatever radius
+    /// a server sends.
+    #[test]
+    fn a_cloud_counts_its_particles_from_a_radius_of_at_most_32() {
+        // ceil(9 * PI) = ceil(28.27) = 29.
+        assert_eq!(cloud_particle_count(3.0), 29);
+        assert_eq!(cloud_particle_count(1.0e6), 3217);
+        assert_eq!(cloud_particle_count(f32::INFINITY), 3217);
+        assert_eq!(cloud_particle_count(f32::NAN), 0);
+        assert_eq!(cloud_particle_count(-3.0), 0);
+        assert_eq!(cloud_radius(f32::NAN), 0.0);
+        assert_eq!(cloud_radius(1.0e6), 32.0);
+    }
+
     /// A world with nothing in it: the client tick of a projectile only
     /// needs the blocks around it.
     struct Empty;
@@ -1035,7 +1118,7 @@ mod tests {
     /// ticks, so every tick has to carry the value of the one before it.
     #[test]
     fn a_thrown_item_flies_on_between_the_server_updates() {
-        // A thrown egg, an ender pearl and a wind charge (#1762): the server
+        // A thrown egg, an ender pearl and a wind charge (arismoko/horizon#1762): the server
         // sends their position every 10 ticks, and the client ticks them
         // itself in between, as vanilla's no-op interpolation handler does.
         for kind in [
@@ -1051,6 +1134,44 @@ mod tests {
             remote_projectile_tick(&mut p, &Empty);
             assert!(p.position.x > first, "the projectile stopped: {p:?}");
         }
+    }
+
+    /// A floor whose top is at y = 100, under the whole world.
+    struct Floor;
+    impl ProjectileWorld for Floor {
+        fn clip(&self, from: Vec3, to: Vec3) -> Option<(Vec3, [i32; 3], [i32; 3])> {
+            (from.y >= 100.0 && to.y < 100.0)
+                .then(|| (Vec3::new(to.x, 100.0, to.z), [0, 99, 0], [0, 1, 0]))
+        }
+        fn in_water(&self, _: Aabb) -> bool {
+            false
+        }
+        fn targets(&self) -> &[(Who, Aabb)] {
+            &[]
+        }
+    }
+
+    /// `ThrownEnderpearl.onHit` runs on a client too: a server's pearl that
+    /// lands there bursts into its 32 PORTAL sparks, which no packet carries.
+    /// A pearl in flight and another thrown item that lands draw none.
+    #[test]
+    fn a_remote_ender_pearl_bursts_where_it_lands() {
+        let mut pearl = thrown(ProjectileKind::EnderPearl);
+        pearl.velocity = Vec3::new(0.0, -1.0, 0.0);
+        pearl.position = Vec3::new(0.0, 100.5, 0.0);
+        assert!(remote_projectile_tick(&mut pearl.clone(), &Empty).is_empty());
+        let sparks = remote_projectile_tick(&mut pearl, &Floor);
+        assert_eq!(sparks.len(), 32);
+        assert!(
+            sparks
+                .iter()
+                .all(|(at, speed)| (100.0..102.0).contains(&at[1]) && speed[1] == 0.0),
+            "{sparks:?}"
+        );
+        let mut egg = thrown(ProjectileKind::Egg);
+        egg.velocity = Vec3::new(0.0, -1.0, 0.0);
+        egg.position = Vec3::new(0.0, 100.5, 0.0);
+        assert!(remote_projectile_tick(&mut egg, &Floor).is_empty());
     }
 
     #[test]
@@ -1081,7 +1202,9 @@ mod tests {
         remote_projectile_power(&mut list, 12, 0.5);
         assert_eq!(list[0].acceleration, 0.5);
         // AbstractHurtingProjectile.applyInertia: (1.5 + 0.5) * (double) 0.95f.
-        list.update(0, |p| remote_projectile_tick(p, &Empty));
+        list.update(0, |p| {
+            remote_projectile_tick(p, &Empty);
+        });
         assert_eq!(list[0].velocity.x, 1.899_999_976_158_142);
     }
 
@@ -1241,7 +1364,7 @@ mod nested_spawn_tests {
         position: fn(&Game<'_>) -> Vec3,
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn remote_lift_restores_each_nested_spawn_without_ticking_it_early() {
         crate::game::native_entity_refs::tests::with_client_game(|game| {
             game.world.chunks.insert(
@@ -1311,7 +1434,7 @@ mod nested_spawn_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn own_rocket_lift_keeps_a_new_attachment_until_the_next_pass() {
         crate::game::native_entity_refs::tests::with_client_game(|game| {
             let (client, _server) = horizon_protocol::connection::Pipe::pair();

@@ -21,6 +21,7 @@ use horizon_core::{
     geometry::{Vec3, trig},
     random::RandomSource,
 };
+use horizon_world::move_gate::MoveGate;
 
 /// `Turtle.registerGoals`, and the path maluses and navigation `Turtle` and
 /// `TurtlePathNavigation` give it.
@@ -166,7 +167,7 @@ pub fn travel(
         return false;
     }
     m.move_relative(0.1, input);
-    m.do_move(w, level, events);
+    m.do_move(w, level, events, &mut MoveGate::new());
     m.velocity = m.velocity.scale(0.9);
     if m.ai.target.is_none() && (!going_home(m) || !close_to_home(m, 20.0)) {
         m.velocity.y -= 0.005;
@@ -710,6 +711,7 @@ mod tests {
     /// random, the egg count from the turtle's, and the egg it sets is
     /// followed by `block_place` from the turtle at the new block.
     #[test]
+    #[ignore = "daily"]
     fn laying_an_egg_posts_block_place_with_the_level_s_pitch_and_its_own_eggs() {
         let ran = crate::mobs::world::with_test_world(&[], |w, _| {
             use horizon_core::random::LegacyRandom;
@@ -717,7 +719,7 @@ mod tests {
             m.position = Vec3::new(0.5, 0.0, 0.5);
             m.extra.flag = true;
             m.extra.counter = 201;
-            m.random = LegacyRandom::new(7);
+            m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(7));
             let mut lr = crate::health::TestLevel::new(11);
             let mut level = lr.random().clone();
             let pitch = 0.9_f32 + level.next_float() * 0.2_f32;
@@ -767,6 +769,6 @@ mod tests {
             assert_eq!(lr.random().state(), level.state());
             assert_eq!(m.random.state(), own.state());
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 }

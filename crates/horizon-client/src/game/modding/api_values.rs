@@ -1,7 +1,14 @@
 // game-module-visibility: pub(crate)
 //! The game-owned conversion boundary between API records and engine values.
 //! Rust's orphan rule prevents foreign From/TryFrom implementations here.
-use horizon_core::nbt::{Compound, JavaString, Tag};
+//! The traits and the conversions that need no `Game` live in `horizon_gameplay::api_values`; what stays
+//! here names `Game`, `GameLevel` or a client type.
+#[cfg(test)]
+use horizon_core::nbt::{JavaString, Tag};
+pub(crate) use horizon_gameplay::api_values::{
+    BlockEntitySnapshotError, StackReadError, TryIntoApi, TryIntoEngine,
+    TryIntoEnginePreservingCount, block_metadata_table, finish_block_entity_writeback, stack_value,
+};
 use horizon_items::items::{ItemStack as EngineStack, Items};
 use mod_api::item::item_stack::{ItemStack as ApiStack, StackWriteError};
 #[path = "api_values/aggregates.rs"]
@@ -86,8 +93,10 @@ pub(crate) fn behavior_block(
 pub(crate) use super::native_ground::alter_ground;
 pub(in crate::game) use super::native_worldgen::prepare as prepare_block_states;
 pub(in crate::game) use block_state::install as install_block_states;
+#[cfg(test)]
 #[path = "api_values/inside_write.rs"]
 mod inside_write;
+#[cfg(test)]
 #[path = "api_values/landing_write.rs"]
 mod landing_write;
 #[path = "api_values/recipe_inputs.rs"]
@@ -123,6 +132,14 @@ pub(in crate::game) fn resolve_enchantment_registry(
 pub(in crate::game) fn resolve_block_definitions(
     registry: &horizon_world::registry::BlockRegistry,
 ) -> Result<(), String> {
+    // Without installed parts the completed keys land in one process-wide table that keeps the
+    // first registry resolved; in a test process that is whichever test got there first, so a
+    // test that installed no parts gets its own empty installation, as tests do their mods.
+    #[cfg(test)]
+    if !mod_api::__private::parts_installation::parts_installed() {
+        mod_platform::__private::part_tests::install_parts_fixture(&[])
+            .map_err(|errors| errors.join("\n"))?;
+    }
     block_state::clear();
     if mod_api::__private::block_definitions().is_some() {
         return bind_worker_blocks(registry);
@@ -181,6 +198,32 @@ fn bind_worker_blocks(registry: &horizon_world::registry::BlockRegistry) -> Resu
 
 #[cfg(test)]
 #[test]
+fn a_test_without_parts_resolves_its_own_blocks_after_another_resolved_fewer() {
+    // Another test thread, with no parts installed, resolves a registry of air alone first.
+    std::thread::spawn(|| {
+        let air =
+            r#"{"defaults":{"minecraft:air":0},"states":[["air",true,false,"","minecraft:air"]]}"#;
+        let air = horizon_world::registry::BlockRegistry::from_facts_json(air.as_bytes()).unwrap();
+        resolve_block_definitions(&air).unwrap();
+    })
+    .join()
+    .unwrap();
+    // This one, with no parts installed either, still resolves its own block.
+    let own = r#"{"defaults":{"minecraft:air":0,"regression:own_block":1},"states":[
+        ["air",true,false,"","minecraft:air"],
+        ["b",false,false,"","regression:own_block"]
+    ]}"#;
+    let own = horizon_world::registry::BlockRegistry::from_facts_json(own.as_bytes()).unwrap();
+    resolve_block_definitions(&own).unwrap();
+    let state = own
+        .state(horizon_world::registry::BlockStateId(1))
+        .unwrap()
+        .try_into_api();
+    assert!(state.is_ok(), "{state:?}");
+}
+
+#[cfg(test)]
+#[test]
 fn block_definition_import_preserves_defaults_and_is_immutable_after_load() {
     let facts = r#"{"defaults":{"minecraft:air":0,"minecraft:stairs":2},"states":[
         ["air",true,false,"","minecraft:air"],
@@ -212,58 +255,9 @@ fn block_definition_import_preserves_defaults_and_is_immutable_after_load() {
     );
 }
 
-impl TryIntoApi for horizon_client::boss_overlay::ModBar {
-    type Api = mod_api::ClientBossBar;
-    type Error = mod_api::text::TextFormError;
-
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::ClientBossBar {
-            uuid: self.uuid,
-            name: self.name.try_into_api()?,
-            progress: self.progress,
-            color: self.color,
-            overlay: self.overlay,
-            darken_screen: self.darken_screen,
-            play_boss_music: self.play_boss_music,
-            create_world_fog: self.create_world_fog,
-        })
-    }
-}
-
-/// Registry access for generated stack write-back in full and narrowed hook hosts.
-pub(in crate::game) trait ItemBoundary {
-    fn boundary_items(&self) -> Option<&Items>;
-}
-impl ItemBoundary for super::Game<'_> {
-    fn boundary_items(&self) -> Option<&Items> {
-        Some(self.items())
-    }
-}
-impl ItemBoundary for super::GameLevel<'_> {
-    fn boundary_items(&self) -> Option<&Items> {
-        Some(self.items)
-    }
-}
-impl ItemBoundary for super::native_hooks::HitLevel<'_> {
-    fn boundary_items(&self) -> Option<&Items> {
-        self.0.tags()
-    }
-}
-
-impl TryIntoApi for horizon_world::chunk::BlockState {
-    type Api = mod_api::BlockState;
-    type Error = mod_api::BlockStateError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let block = mod_api::__private::block_key(&self.name)
-            .ok_or(mod_api::BlockStateError::UnknownBlock)?;
-        let properties: Vec<_> = self
-            .properties
-            .iter()
-            .map(|(name, value)| mod_api::StateConstraint::new(name.clone(), value.clone()))
-            .collect();
-        mod_api::BlockState::of(block_metadata_table()?, block, &properties)
-    }
-}
+#[path = "api_values/item_snapshot.rs"]
+mod item_snapshot;
+pub(in crate::game) use item_snapshot::ItemBoundary;
 
 #[cfg(test)]
 #[test]
@@ -317,10 +311,6 @@ pub(in crate::game) fn mod_tint_values(
     Ok(Some(crate::mesher::ModTintValues { states, metadata }))
 }
 
-fn block_metadata_table()
--> Result<&'static horizon_mod_runtime::block_definitions::Blocks, mod_api::BlockStateError> {
-    mod_api::__private::block_definitions().ok_or(mod_api::BlockStateError::Unavailable)
-}
 impl super::Game<'_> {
     pub(in crate::game) fn block_metadata_name(
         &self,
@@ -384,13 +374,6 @@ macro_rules! write_answers {
 }
 write_answers!(bool, u32, ());
 
-/// Convert an engine value into an owned API value after resolving registry identities.
-pub(crate) trait TryIntoApi {
-    type Api;
-    type Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error>;
-}
-
 /// Tests use the production snapshot conversion, never a second fixture codec.
 #[cfg(test)]
 pub(in crate::game) fn test_snapshot<T: TryIntoApi + ?Sized>(value: &T) -> T::Api
@@ -402,33 +385,14 @@ where
         .expect("fixture snapshot has resolved item keys and a nonempty count")
 }
 
-/// Validate a mod value against the game's registry before admitting it to engine state.
+#[cfg(test)]
 #[path = "api_values/content_declarations.rs"]
 mod content_declarations;
-pub(in crate::game) use content_declarations::push_reaction;
+pub(in crate::game) use horizon_gameplay::api_values::content_declarations::push_reaction;
 
-pub(crate) trait TryIntoEngine<Context: ?Sized = Items> {
-    type Engine;
-    type Error;
-    fn try_into_engine(&self, context: &Context) -> Result<Self::Engine, Self::Error>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StackReadError {
-    UnknownItem,
-    Empty,
-    InvalidComponents(mod_api::StackError),
-}
-
-impl StackReadError {
-    pub(in crate::game) fn into_write_error(self) -> StackWriteError {
-        match self {
-            Self::UnknownItem => StackWriteError::UnknownItem,
-            Self::Empty => StackWriteError::EmptyEngineStack,
-            Self::InvalidComponents(reason) => StackWriteError::InvalidComponents { reason },
-        }
-    }
-}
+#[cfg(test)]
+#[path = "api_values/stack_count.rs"]
+mod stack_count;
 
 /// Execute a native write and preserve its answer, including unit and original errors.
 pub(in crate::game) fn call_write<W: IntoWriteResult>(
@@ -451,665 +415,33 @@ where
         .map_err(|error| error.into_write_error().into())
 }
 
-macro_rules! scalar_values {
-    ($($ty:ty),* $(,)?) => { $(
-        impl TryIntoApi for $ty {
-            type Api = Self;
-            type Error = StackReadError;
-            fn try_into_api(&self) -> Result<Self, Self::Error> { Ok(*self) }
-        }
-        impl TryIntoEngine for $ty {
-            type Engine = Self;
-            type Error = StackWriteError;
-            fn try_into_engine(&self, _: &Items) -> Result<Self, Self::Error> { Ok(*self) }
-        }
-    )* };
-}
-scalar_values!(u32, i32, bool, ());
-
-impl TryIntoApi for String {
-    type Api = Self;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self, Self::Error> {
-        Ok(self.clone())
-    }
-}
-
-impl<T: TryIntoApi + ?Sized> TryIntoApi for &T {
-    type Api = T::Api;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        (*self).try_into_api()
-    }
-}
-impl<C: ?Sized, T: TryIntoEngine<C> + ?Sized> TryIntoEngine<C> for &T {
-    type Engine = T::Engine;
-    type Error = T::Error;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        (*self).try_into_engine(context)
-    }
-}
-
-impl<T: TryIntoApi> TryIntoApi for Option<T> {
-    type Api = Option<T::Api>;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        self.as_ref().map(TryIntoApi::try_into_api).transpose()
-    }
-}
-impl<C: ?Sized, T: TryIntoEngine<C>> TryIntoEngine<C> for Option<T> {
-    type Engine = Option<T::Engine>;
-    type Error = T::Error;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        self.as_ref()
-            .map(|value| value.try_into_engine(context))
-            .transpose()
-    }
-}
-impl<T: TryIntoApi, E: Clone> TryIntoApi for Result<T, E> {
-    type Api = Result<T::Api, E>;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        match self {
-            Ok(value) => value.try_into_api().map(Ok),
-            Err(error) => Ok(Err(error.clone())),
-        }
-    }
-}
-
-impl<T: TryIntoApi, const N: usize> TryIntoApi for [T; N] {
-    type Api = [T::Api; N];
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let mut output: [Option<T::Api>; N] = std::array::from_fn(|_| None);
-        for (target, source) in output.iter_mut().zip(self) {
-            *target = Some(source.try_into_api()?);
-        }
-        Ok(output.map(|value| value.expect("every array element converted")))
-    }
-}
-impl<C: ?Sized, T: TryIntoEngine<C>, const N: usize> TryIntoEngine<C> for [T; N] {
-    type Engine = [T::Engine; N];
-    type Error = T::Error;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        let mut output: [Option<T::Engine>; N] = std::array::from_fn(|_| None);
-        for (target, source) in output.iter_mut().zip(self) {
-            *target = Some(source.try_into_engine(context)?);
-        }
-        Ok(output.map(|value| value.expect("every array element converted")))
-    }
-}
-impl<T: TryIntoApi> TryIntoApi for [T] {
-    type Api = Vec<T::Api>;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        self.iter().map(TryIntoApi::try_into_api).collect()
-    }
-}
-impl<T: TryIntoApi> TryIntoApi for std::sync::Arc<[T]> {
-    type Api = std::sync::Arc<[T::Api]>;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(self.as_ref().try_into_api()?.into())
-    }
-}
-impl<T: TryIntoApi> TryIntoApi for Vec<T> {
-    type Api = Vec<T::Api>;
-    type Error = T::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        self.iter().map(TryIntoApi::try_into_api).collect()
-    }
-}
-impl<C: ?Sized, T: TryIntoEngine<C>> TryIntoEngine<C> for Vec<T> {
-    type Engine = Vec<T::Engine>;
-    type Error = T::Error;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        self.as_slice().try_into_engine(context)
-    }
-}
-impl<C: ?Sized, T: TryIntoEngine<C>> TryIntoEngine<C> for [T] {
-    type Engine = Vec<T::Engine>;
-    type Error = T::Error;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        self.iter()
-            .map(|value| value.try_into_engine(context))
-            .collect()
-    }
-}
-impl TryIntoApi for (horizon_client::text::Text, u32) {
-    type Api = (mod_api::Text, u32);
-    type Error = mod_api::text::TextFormError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok((self.0.try_into_api()?, self.1))
-    }
-}
-impl<C: ?Sized> TryIntoEngine<C> for (mod_api::Text, u32) {
-    type Engine = (horizon_client::text::Text, u32);
-    type Error = mod_api::text::TextFormError;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        Ok((self.0.try_into_engine(context)?, self.1))
-    }
-}
-
-impl<A: TryIntoApi, B: TryIntoApi<Error = A::Error>> TryIntoApi for (A, B) {
-    type Api = (A::Api, B::Api);
-    type Error = A::Error;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok((self.0.try_into_api()?, self.1.try_into_api()?))
-    }
-}
-impl<C: ?Sized> TryIntoEngine<C> for (mod_api::Text, mod_api::Text) {
-    type Engine = (horizon_client::text::Text, horizon_client::text::Text);
-    type Error = mod_api::text::TextFormError;
-    fn try_into_engine(&self, context: &C) -> Result<Self::Engine, Self::Error> {
-        Ok((
-            self.0.try_into_engine(context)?,
-            self.1.try_into_engine(context)?,
-        ))
-    }
-}
-
 impl TryIntoApi for super::spill::BlockItemDrop {
     type Api = mod_api::ItemDrop;
     type Error = StackReadError;
     fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::ItemDrop::new(
+        Ok(self.state.to_api(mod_api::ItemDrop::new(
             self.stack.try_into_api()?,
             self.position,
             self.velocity,
             self.pickup_delay,
-        ))
+        )))
     }
 }
-impl TryIntoEngine for mod_api::ItemDrop {
-    type Engine = super::spill::BlockItemDrop;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            random: None,
-            stack: self.stack.try_into_engine(items)?,
-            position: self.position,
-            velocity: self.velocity,
-            pickup_delay: self.pickup_delay,
+
+/// Edited drops back as engine drops, as `Vec<ItemDrop>::try_into_engine` would. The engine type is
+/// the game's own, so this cannot be a `TryIntoEngine` impl on `ItemDrop`: the trait and the type
+/// both live in other crates.
+pub(in crate::game) fn item_drops_into_engine(
+    drops: &[mod_api::ItemDrop],
+    items: &Items,
+) -> Result<Vec<super::spill::BlockItemDrop>, StackWriteError> {
+    drops
+        .iter()
+        .map(|drop| {
+            let stack = drop.stack.try_into_engine(items)?;
+            Ok(super::spill::BlockItemDrop::from_api(drop, stack))
         })
-    }
-}
-
-impl TryIntoEngine for mod_api::ItemDisplayContext {
-    type Engine = horizon_assets::item_model::DisplayContext;
-    type Error = ();
-    fn try_into_engine(&self, _: &Items) -> Result<Self::Engine, Self::Error> {
-        use horizon_assets::item_model::DisplayContext as Engine;
-        use mod_api::ItemDisplayContext as Api;
-        Ok(match self {
-            Api::None => Engine::None,
-            Api::ThirdPersonLeftHand => Engine::ThirdPersonLeftHand,
-            Api::ThirdPersonRightHand => Engine::ThirdPersonRightHand,
-            Api::FirstPersonLeftHand => Engine::FirstPersonLeftHand,
-            Api::FirstPersonRightHand => Engine::FirstPersonRightHand,
-            Api::Head => Engine::Head,
-            Api::Gui => Engine::Gui,
-            Api::Ground => Engine::Ground,
-            Api::Fixed => Engine::Fixed,
-            Api::OnShelf => Engine::OnShelf,
-            _ => return Err(()),
-        })
-    }
-}
-
-impl TryIntoApi for horizon_client::merchant::ItemCost {
-    type Api = mod_api::ItemCost;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::ItemCost::new(self.stack.try_into_api()?))
-    }
-}
-impl TryIntoEngine for mod_api::ItemCost {
-    type Engine = horizon_client::merchant::ItemCost;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            stack: self.stack.try_into_engine(items)?,
-        })
-    }
-}
-impl TryIntoApi for horizon_client::merchant::MerchantOffer {
-    type Api = mod_api::MerchantOffer;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let mut offer = mod_api::MerchantOffer::new(
-            self.base_cost_a.try_into_api()?,
-            self.cost_b.try_into_api()?,
-            self.result.try_into_api()?,
-            self.max_uses,
-            self.xp,
-            self.price_multiplier,
-        );
-        offer.uses = self.uses;
-        offer.reward_exp = self.reward_exp;
-        offer.special_price_diff = self.special_price_diff;
-        offer.demand = self.demand;
-        Ok(offer)
-    }
-}
-impl TryIntoEngine for mod_api::MerchantOffer {
-    type Engine = horizon_client::merchant::MerchantOffer;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            base_cost_a: self.base_cost_a.try_into_engine(items)?,
-            cost_b: self.cost_b.try_into_engine(items)?,
-            result: self.result.try_into_engine(items)?,
-            uses: self.uses,
-            max_uses: self.max_uses,
-            reward_exp: self.reward_exp,
-            special_price_diff: self.special_price_diff,
-            demand: self.demand,
-            price_multiplier: self.price_multiplier,
-            xp: self.xp,
-        })
-    }
-}
-
-impl TryIntoApi for EngineStack {
-    type Api = ApiStack;
-    type Error = StackReadError;
-
-    fn try_into_api(&self) -> Result<ApiStack, Self::Error> {
-        let key = mod_api::__private::item_key(&self.item).ok_or(StackReadError::UnknownItem)?;
-        let mut result = ApiStack::new(key, self.count).ok_or(StackReadError::Empty)?;
-        if self.carries_component(None, "minecraft:damage") {
-            result.set_damage(self.damage);
-        }
-        if let Some(Tag::Compound(patch)) = horizon_items::item_data::encode_extra_components(self)
-        {
-            result
-                .set_components(patch)
-                .map_err(StackReadError::InvalidComponents)?;
-        }
-        Ok(result)
-    }
-}
-
-impl TryIntoApi for horizon_assets::item_model::StackView {
-    type Api = ApiStack;
-    type Error = StackReadError;
-
-    fn try_into_api(&self) -> Result<ApiStack, StackReadError> {
-        let count = u32::try_from(self.count)
-            .ok()
-            .filter(|&count| count > 0)
-            .ok_or(StackReadError::Empty)?;
-        let components = Tag::compound(self.patch.iter().map(|(name, value)| match value {
-            Some(value) => (
-                horizon_core::nbt::JavaString::from(name.as_str()),
-                horizon_client_core::scoreboard::json_to_tag(value),
-            ),
-            None => (
-                horizon_core::nbt::JavaString::from(format!("!{name}").as_str()),
-                Tag::Compound(Compound::new()),
-            ),
-        }));
-        let key = mod_api::__private::item_key(&self.item).ok_or(StackReadError::UnknownItem)?;
-        let mut stack = ApiStack::new(key, count).ok_or(StackReadError::Empty)?;
-        let Tag::Compound(patch) = components else {
-            unreachable!("model patch is constructed as a compound")
-        };
-        stack
-            .set_components(patch)
-            .map_err(StackReadError::InvalidComponents)?;
-        Ok(stack)
-    }
-}
-
-impl TryIntoEngine for mod_api::ItemResource {
-    type Engine = EngineStack;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        self.as_stack().try_into_engine(items)
-    }
-}
-
-/// Encode an API value for a read-only predicate or drawing, without imposing resident maxima.
-/// Unknown keys and unrepresentable/invalid effect payloads still refuse conversion.
-/// The write conversion below adds authoritative registry-dependent validation.
-pub(in crate::game) fn stack_value(value: &ApiStack) -> Result<EngineStack, StackWriteError> {
-    let id = mod_api::__private::item_key_id(value.item()).ok_or(StackWriteError::UnknownItem)?;
-    encode_stack(value, id.into())
-}
-
-fn encode_stack(
-    value: &ApiStack,
-    item: std::sync::Arc<str>,
-) -> Result<EngineStack, StackWriteError> {
-    let mut patch = value.components().map(|patch| patch.as_nbt().clone());
-    // Let the existing component codec preserve explicit zero versus prototype inheritance.
-    if value.damage_component() == Some(0) {
-        patch
-            .get_or_insert_with(Default::default)
-            .insert(JavaString::from("minecraft:damage"), Tag::Int(0));
-    }
-    let patch = patch.map(Tag::Compound);
-    let (_, extra) = horizon_items::item_data::decode_components(patch.as_ref());
-    let stack = EngineStack {
-        item,
-        count: value.count(),
-        damage: value.damage(),
-        extra,
-    };
-    content_declarations::validate_decoded_effects(patch.as_ref(), &stack)?;
-    Ok(stack)
-}
-
-impl TryIntoEngine for ApiStack {
-    type Engine = EngineStack;
-    type Error = StackWriteError;
-
-    fn try_into_engine(&self, items: &Items) -> Result<EngineStack, Self::Error> {
-        let id =
-            mod_api::__private::item_key_id(self.item()).ok_or(StackWriteError::UnknownItem)?;
-        let (id, definition) = items
-            .items
-            .get_key_value(id)
-            .ok_or(StackWriteError::UnknownItem)?;
-        let stack = encode_stack(self, id.clone())?;
-        let effective = |name: &str, default: u32| -> Result<u32, StackWriteError> {
-            match stack.data().and_then(|data| data.other(name)) {
-                Some(Tag::Int(value)) => {
-                    u32::try_from(*value).map_err(|_| StackWriteError::InvalidMaximum)
-                }
-                Some(_) => Err(StackWriteError::InvalidMaximum),
-                None => Ok(default),
-            }
-        };
-        let maximum = if stack.carries_component(Some(definition), "minecraft:max_stack_size") {
-            effective("minecraft:max_stack_size", definition.max_stack)?
-        } else {
-            1
-        };
-        if !(1..=99).contains(&maximum) {
-            return Err(StackWriteError::InvalidMaximum);
-        }
-        if !horizon_world::item_template::durability_allows_stack_size(
-            stack.carries_component(Some(definition), "minecraft:max_damage"),
-            i64::from(maximum),
-        ) {
-            return Err(StackWriteError::StackableDamageable);
-        }
-        if stack.count > maximum {
-            return Err(StackWriteError::CountExceeded { maximum });
-        }
-        let maximum = if stack.carries_component(Some(definition), "minecraft:max_damage") {
-            effective("minecraft:max_damage", definition.max_damage)?
-        } else {
-            0
-        };
-        let damage = self.damage_component().map_or_else(
-            || {
-                u32::try_from(stack.effective_damage(Some(definition))).map_err(|_| {
-                    StackWriteError::InvalidComponents {
-                        reason: mod_api::StackError::InvalidDamage,
-                    }
-                })
-            },
-            Ok,
-        )?;
-        if damage > maximum {
-            return Err(StackWriteError::DamageExceeded { maximum });
-        }
-        if i32::try_from(damage).is_err() {
-            return Err(StackWriteError::InvalidComponents {
-                reason: mod_api::StackError::InvalidDamage,
-            });
-        }
-        Ok(stack)
-    }
-}
-
-impl TryIntoApi for crate::crafting::RecipeRule {
-    type Api = mod_api::RecipeRule;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(match self {
-            Self::Stonecutting { input, result } => mod_api::RecipeRule::Stonecutting {
-                input: input.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::SmithingTransform {
-                template,
-                base,
-                addition,
-                result,
-            } => mod_api::RecipeRule::SmithingTransform {
-                template: template.try_into_api()?,
-                base: base.try_into_api()?,
-                addition: addition.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::SmithingTrim {
-                template,
-                base,
-                addition,
-                pattern,
-            } => mod_api::RecipeRule::SmithingTrim {
-                template: template.try_into_api()?,
-                base: base.try_into_api()?,
-                addition: addition.try_into_api()?,
-                pattern: pattern.try_into_api()?,
-            },
-            Self::BannerDuplicate { banner, result } => mod_api::RecipeRule::BannerDuplicate {
-                banner: banner.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::ShieldDecoration {
-                banner,
-                target,
-                result,
-            } => mod_api::RecipeRule::ShieldDecoration {
-                banner: banner.try_into_api()?,
-                target: target.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::Transmute {
-                input,
-                material,
-                min,
-                max,
-                add_count,
-                result,
-            } => mod_api::RecipeRule::Transmute {
-                input: input.try_into_api()?,
-                material: material.try_into_api()?,
-                min: *min,
-                max: *max,
-                add_count: *add_count,
-                result: result.try_into_api()?,
-            },
-            Self::Dye {
-                target,
-                dye,
-                result,
-            } => mod_api::RecipeRule::Dye {
-                target: target.try_into_api()?,
-                dye: dye.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::Imbue {
-                source,
-                material,
-                result,
-            } => mod_api::RecipeRule::Imbue {
-                source: source.try_into_api()?,
-                material: material.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::BookCloning {
-                source,
-                material,
-                min,
-                max,
-                result,
-            } => mod_api::RecipeRule::BookCloning {
-                source: source.try_into_api()?,
-                material: material.try_into_api()?,
-                min: *min,
-                max: *max,
-                result: result.try_into_api()?,
-            },
-            Self::FireworkRocket {
-                shell,
-                fuel,
-                star,
-                result,
-            } => mod_api::RecipeRule::FireworkRocket {
-                shell: shell.try_into_api()?,
-                fuel: fuel.try_into_api()?,
-                star: star.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::FireworkStar {
-                dye,
-                fuel,
-                trail,
-                twinkle,
-                shapes,
-                result,
-            } => mod_api::RecipeRule::FireworkStar {
-                dye: dye.try_into_api()?,
-                fuel: fuel.try_into_api()?,
-                trail: trail.try_into_api()?,
-                twinkle: twinkle.try_into_api()?,
-                shapes: shapes.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::FireworkStarFade {
-                dye,
-                target,
-                result,
-            } => mod_api::RecipeRule::FireworkStarFade {
-                dye: dye.try_into_api()?,
-                target: target.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::MapExtending {
-                map,
-                material,
-                result,
-            } => mod_api::RecipeRule::MapExtending {
-                map: map.try_into_api()?,
-                material: material.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::DecoratedPot {
-                back,
-                left,
-                right,
-                front,
-                result,
-            } => mod_api::RecipeRule::DecoratedPot {
-                back: back.try_into_api()?,
-                left: left.try_into_api()?,
-                right: right.try_into_api()?,
-                front: front.try_into_api()?,
-                result: result.try_into_api()?,
-            },
-            Self::RepairItem => mod_api::RecipeRule::RepairItem,
-        })
-    }
-}
-
-impl TryIntoApi for crate::crafting::Ingredient {
-    type Api = mod_api::Ingredient;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::Ingredient {
-            items: self.items.clone(),
-            order: self.order.clone(),
-            custom: self.custom.clone(),
-            children: self
-                .children
-                .as_ref()
-                .map(|(shape, kids)| Ok((shape.clone(), kids.try_into_api()?)))
-                .transpose()?,
-        })
-    }
-}
-impl TryIntoEngine for mod_api::Ingredient {
-    type Engine = crate::crafting::Ingredient;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, _items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::crafting::Ingredient {
-            items: self.items.clone(),
-            order: self.order.clone(),
-            custom: self.custom.clone(),
-            children: self
-                .children
-                .as_ref()
-                .map(|(shape, kids)| {
-                    Ok::<_, StackWriteError>((
-                        shape.clone(),
-                        kids.iter()
-                            .map(|k| k.try_into_engine(_items))
-                            .collect::<Result<_, _>>()?,
-                    ))
-                })
-                .transpose()?,
-        })
-    }
-}
-impl TryIntoApi for crate::crafting::RecipeTemplate {
-    type Api = mod_api::RecipeTemplate;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::RecipeTemplate::new(
-            self.item.clone(),
-            self.count,
-            self.components.clone(),
-        ))
-    }
-}
-impl TryIntoApi for crate::crafting::RecipeTrimPattern {
-    type Api = mod_api::RecipeTrimPattern;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(match self {
-            Self::Reference(id) => mod_api::RecipeTrimPattern::Reference(id.clone()),
-            Self::Inline {
-                asset_id,
-                description,
-                decal,
-            } => mod_api::RecipeTrimPattern::Inline {
-                asset_id: asset_id.clone(),
-                description: description.clone(),
-                decal: *decal,
-            },
-        })
-    }
-}
-impl TryIntoApi for crate::crafting::FireworkShapeIngredient {
-    type Api = mod_api::FireworkShapeIngredient;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::FireworkShapeIngredient::new(
-            self.shape.try_into_api().unwrap(),
-            self.ingredient.try_into_api()?,
-        ))
-    }
-}
-impl TryIntoApi for crate::crafting::RecipeSnapshot {
-    type Api = mod_api::Recipe;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let mut result =
-            mod_api::Recipe::new(self.id.clone(), self.kind.clone(), self.json.clone());
-        result.group = self.group.clone();
-        result.ingredients = self.ingredients.try_into_api()?;
-        result.results = self.results.try_into_api()?;
-        result.cooking_time = self.cooking_time;
-        result.experience = self.experience;
-        result.rule = self.rule.try_into_api()?;
-        Ok(result)
-    }
+        .collect()
 }
 
 /// Install the engine-facing callbacks; snapshots never enter engine storage.
@@ -1191,26 +523,6 @@ impl mod_api::item::menu::SlotView for ApiSlot<'_> {
         }
     }
 }
-/// Adapt a synchronous slot event; engine slot rules still own every write.
-pub(crate) fn menu_slot_rules(
-    context: &horizon_world::native_load_context::LoopContext,
-    menu: &str,
-    slot: usize,
-    stack: &EngineStack,
-    may_place: &mut bool,
-    max_stack: &mut u32,
-) {
-    if !mod_api::__private::has_part_hook(mod_api::HookId::MenuSlotRules) {
-        return;
-    }
-    let Ok(stack) = stack.try_into_api() else {
-        return;
-    };
-    let reader = horizon_client_render::api_context::LoopReader(context);
-    let context = reader.context();
-    mod_api::dispatch_menu_slot_rules(&context, menu, slot, &stack, may_place, max_stack);
-}
-
 /// Adapt a player's block menu `stillValid` check; the game asks only for a menu
 /// whose type has a part answering it (`menu_still_valid_listens`, when it opened).
 pub(crate) fn menu_still_valid(
@@ -1291,147 +603,6 @@ pub(crate) fn stacked_on_other(
     }
 }
 
-impl TryIntoApi for crate::stations::AnvilResult {
-    type Api = mod_api::item::stations::AnvilResult;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::item::stations::AnvilResult {
-            result: self.result.try_into_api()?,
-            cost: self.cost,
-            repair_item_count_cost: self.repair_item_count_cost,
-            only_renaming: self.only_renaming,
-        })
-    }
-}
-impl TryIntoEngine for mod_api::item::stations::AnvilResult {
-    type Engine = crate::stations::AnvilResult;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::stations::AnvilResult {
-            result: self.result.try_into_engine(items)?,
-            cost: self.cost,
-            repair_item_count_cost: self.repair_item_count_cost,
-            only_renaming: self.only_renaming,
-        })
-    }
-}
-impl TryIntoApi for crate::menu::AnvilCraft {
-    type Api = mod_api::item::menu::AnvilCraft;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::item::menu::AnvilCraft {
-            left: self.left.try_into_api()?,
-            right: self.right.try_into_api()?,
-            output: self.output.try_into_api()?,
-        })
-    }
-}
-impl TryIntoEngine for mod_api::item::menu::AnvilCraft {
-    type Engine = crate::menu::AnvilCraft;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::menu::AnvilCraft {
-            left: self.left.try_into_engine(items)?,
-            right: self.right.try_into_engine(items)?,
-            output: self.output.try_into_engine(items)?,
-        })
-    }
-}
-impl TryIntoApi for crate::menu::GrindstonePlace {
-    type Api = mod_api::item::menu::GrindstonePlace;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::item::menu::GrindstonePlace {
-            top: self.top.try_into_api()?,
-            bottom: self.bottom.try_into_api()?,
-            vanilla_output: self.vanilla_output.try_into_api()?,
-            output: self.output.try_into_api()?,
-            xp: self.xp,
-        })
-    }
-}
-impl TryIntoEngine for mod_api::item::menu::GrindstonePlace {
-    type Engine = crate::menu::GrindstonePlace;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::menu::GrindstonePlace {
-            top: self.top.try_into_engine(items)?,
-            bottom: self.bottom.try_into_engine(items)?,
-            vanilla_output: self.vanilla_output.try_into_engine(items)?,
-            output: self.output.try_into_engine(items)?,
-            xp: self.xp,
-        })
-    }
-}
-impl TryIntoApi for crate::menu::GrindstoneTake {
-    type Api = mod_api::item::menu::GrindstoneTake;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::item::menu::GrindstoneTake {
-            top: self.top.try_into_api()?,
-            bottom: self.bottom.try_into_api()?,
-            xp: self.xp,
-            new_top: self.new_top.try_into_api()?,
-            new_bottom: self.new_bottom.try_into_api()?,
-        })
-    }
-}
-impl TryIntoEngine for mod_api::item::menu::GrindstoneTake {
-    type Engine = crate::menu::GrindstoneTake;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::menu::GrindstoneTake {
-            top: self.top.try_into_engine(items)?,
-            bottom: self.bottom.try_into_engine(items)?,
-            xp: self.xp,
-            new_top: self.new_top.try_into_engine(items)?,
-            new_bottom: self.new_bottom.try_into_engine(items)?,
-        })
-    }
-}
-
-impl TryIntoApi for crate::menu::AnvilUpdate {
-    type Api = mod_api::item::menu::AnvilUpdate;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let vanilla = mod_api::item::stations::AnvilResult {
-            result: self.vanilla.output.try_into_api()?,
-            cost: self.vanilla.xp_cost,
-            repair_item_count_cost: self.vanilla.material_cost.max(0) as u32,
-            only_renaming: false,
-        };
-        let mut result = mod_api::item::menu::AnvilUpdate::new(
-            self.left.try_into_api()?,
-            self.right.try_into_api()?,
-            self.name.clone(),
-            &vanilla,
-        );
-        result.output = self.output.try_into_api()?;
-        result.xp_cost = self.xp_cost;
-        result.material_cost = self.material_cost;
-        Ok(result)
-    }
-}
-
-impl TryIntoEngine for mod_api::item::menu::AnvilUpdate {
-    type Engine = crate::menu::AnvilUpdate;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::menu::AnvilUpdate {
-            left: self.left.try_into_engine(items)?,
-            right: self.right.try_into_engine(items)?,
-            name: self.name.clone(),
-            vanilla: crate::menu::AnvilVanilla {
-                output: self.vanilla.output.try_into_engine(items)?,
-                xp_cost: self.vanilla.xp_cost,
-                material_cost: self.vanilla.material_cost,
-            },
-            output: self.output.try_into_engine(items)?,
-            xp_cost: self.xp_cost,
-            material_cost: self.material_cost,
-        })
-    }
-}
 impl super::Game<'_> {
     pub(in crate::game) fn api_anvil_update(
         &mut self,
@@ -1776,7 +947,7 @@ mod enchantment_boundary_tests {
 }
 
 #[cfg(test)]
-fn prepare_stack_boundary_tests() {
+pub(in crate::game) fn prepare_stack_boundary_tests() {
     install_stack_hooks();
     install_parts(&[]).unwrap();
     mod_api::__private::resolve_items([
@@ -1840,85 +1011,7 @@ mod brewed_boundary_tests {
     }
 }
 
-impl TryIntoApi for crate::containers::ModBlockEntityFields {
-    type Api = mod_api::item::containers::ModBlockEntityFields;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::item::containers::ModBlockEntityFields {
-            nbt: self.nbt.clone(),
-            items: self.items.try_into_api()?,
-            data: self.data.clone(),
-        })
-    }
-}
-impl TryIntoEngine for mod_api::item::containers::ModBlockEntityFields {
-    type Engine = crate::containers::ModBlockEntityFields;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, items: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(crate::containers::ModBlockEntityFields {
-            nbt: self.nbt.clone(),
-            items: self.items.try_into_engine(items)?,
-            data: self.data.clone(),
-        })
-    }
-}
-impl TryIntoApi for crate::containers::ModBlockEntity {
-    type Api = mod_api::ModBlockEntity;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(mod_api::ModBlockEntity::from_snapshot(
-            self.id().to_owned(),
-            (**self).try_into_api()?,
-            mod_api::item::containers::ModRevision::from_snapshot(
-                self.revision().identity(),
-                self.revision().changes(),
-            ),
-        ))
-    }
-}
-
-include!("api_values/block_entity_writeback.rs");
-
 impl super::Game<'_> {
-    pub(in crate::game) fn api_block_entity_tick(
-        &mut self,
-        pos: [i32; 3],
-        entity: &mut crate::containers::ModBlockEntity,
-    ) {
-        // #2051: the one decision whether a block entity ticks is its
-        // type's own ticker (`native_block_entity_ticks`,
-        // `EntityBlock.getTicker`), answered when the world opens — the
-        // level's ticking list carries it here, whichever path registered
-        // the type (a Registrar part or a bare declaration whose tick
-        // arrives another way). No second gate: a parts-only check here
-        // kept declared types' ticks — and the injections on
-        // `native_block_entity_tick` — unreachable.
-        let Ok(mut api) = entity.try_into_api() else {
-            return;
-        };
-        let revision = api.revision();
-        self.native_block_entity_tick(pos, &mut api);
-        if let Some(scope) = &mut self.block_entity_tick_items
-            && scope.items.is_some()
-        {
-            scope.snapshot = Some(Box::new((api, revision)));
-            return;
-        }
-        let _ = finish_block_entity_writeback(
-            entity,
-            &api,
-            revision,
-            self.items(),
-            "block_entity_tick",
-            if self.block_entity_tick_key.as_ref().is_none_or(|key| {
-                !key.unbalanced && key.failure_generation == self.wasm_dispatch_failures.get()
-            }) {
-                Ok(())
-            } else {
-                Err(BlockEntitySnapshotError::InvalidRevision)
-            },
-        );
-    }
     pub(in crate::game) fn api_block_entity_update_tag(
         pos: [i32; 3],
         entity: &crate::containers::ModBlockEntity,
@@ -2094,6 +1187,7 @@ mod stacked_slot_tests;
 #[cfg(test)]
 mod block_entity_snapshot_tests {
     use super::*;
+    use horizon_gameplay::api_values::block_entity_writeback::apply_block_entity_snapshot;
     #[test]
     fn rejected_writebacks_invalidate_tick() {
         assert_rejected_writeback("block_entity_tick");
@@ -2662,110 +1756,6 @@ mod item_model_snapshot_tests {
     }
 }
 
-impl TryIntoApi for horizon_mod_package::Side {
-    type Api = mod_api::Side;
-    type Error = std::convert::Infallible;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(match self {
-            Self::Client => mod_api::Side::Client,
-            Self::Both => mod_api::Side::Both,
-        })
-    }
-}
-
-fn package_snapshot(
-    manifest: &horizon_mod_package::Manifest,
-    kind: mod_api::PackageKind,
-) -> mod_api::PackageInfo {
-    mod_api::PackageInfo::new(
-        manifest.id.clone(),
-        manifest.version.clone(),
-        kind,
-        manifest.side.try_into_api().unwrap(),
-        std::iter::once(&manifest.id)
-            .chain(&manifest.namespaces)
-            .cloned()
-            .collect(),
-        manifest.dependencies.keys().cloned().collect(),
-    )
-}
-impl TryIntoApi for horizon_mod_package::Manifest {
-    type Api = mod_api::PackageInfo;
-    type Error = std::convert::Infallible;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(package_snapshot(
-            self,
-            if self.wasm.is_some() {
-                mod_api::PackageKind::Code
-            } else {
-                mod_api::PackageKind::Content
-            },
-        ))
-    }
-}
-impl TryIntoApi for horizon_mod_package::packages::AdjacentManifest {
-    type Api = mod_api::PackageInfo;
-    type Error = std::convert::Infallible;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(package_snapshot(&self.manifest, mod_api::PackageKind::Code))
-    }
-}
-
-pub(in crate::game) fn install_packages(
-    native: &[horizon_mod_package::packages::AdjacentManifest],
-    content: &[horizon_mod_package::selection::SelectedPackage],
-) -> Result<(), horizon_engine_slots::PlatformRefusal> {
-    let native: Vec<_> = native.iter().map(|p| p.try_into_api().unwrap()).collect();
-    let content: Vec<_> = content
-        .iter()
-        .map(|p| p.package.manifest.try_into_api().unwrap())
-        .collect();
-    (horizon_engine_slots::platform()?.install_packages)(&native, &content);
-    Ok(())
-}
-
-#[cfg(test)]
-mod package_snapshot_tests {
-    use super::*;
-    #[test]
-    fn package_metadata_keeps_declared_side_and_namespace_order() {
-        for (side, expected) in [
-            ("client", mod_api::Side::Client),
-            ("both", mod_api::Side::Both),
-        ] {
-            let manifest = horizon_mod_package::Manifest::parse(&format!(
-                "id='test'\nname='Test'\nversion='1'\napi='0.2'\nside='{side}'\ncapabilities=['registries']\n"
-            )).unwrap();
-            let snapshot = manifest.try_into_api().unwrap();
-            assert_eq!(snapshot.side(), expected);
-            assert_eq!(snapshot.namespaces().collect::<Vec<_>>(), ["test"]);
-            assert_eq!(snapshot.kind(), mod_api::PackageKind::Content);
-        }
-    }
-}
-
-impl TryIntoApi for horizon_client_core::suggestion::Suggestion {
-    type Api = mod_api::Suggestion;
-    type Error = std::convert::Infallible;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let mut value = mod_api::Suggestion::new(self.range, self.text.clone());
-        value.tooltip.clone_from(&self.tooltip);
-        value.int_value = self.int_value;
-        Ok(value)
-    }
-}
-impl TryIntoEngine for mod_api::Suggestion {
-    type Engine = horizon_client_core::suggestion::Suggestion;
-    type Error = StackWriteError;
-    fn try_into_engine(&self, _: &Items) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            range: self.range,
-            text: self.text.clone(),
-            tooltip: self.tooltip.clone(),
-            int_value: self.int_value,
-        })
-    }
-}
 #[cfg(test)]
 mod completion_snapshot_tests {
     use super::*;
@@ -2791,37 +1781,12 @@ mod completion_snapshot_tests {
     }
 }
 
-// Registration declarations do not need a live item registry.
-impl TryIntoEngine<()> for mod_api::BlockEntityTypeDecl {
-    type Engine = horizon_mod_package::content::BlockEntityType;
-    type Error = std::convert::Infallible;
-    fn try_into_engine(&self, _: &()) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            id: self.id.clone(),
-            blocks: self.blocks.clone(),
-        })
-    }
-}
 pub(in crate::game) fn block_entity_declarations()
 -> Vec<horizon_mod_package::content::BlockEntityType> {
     mod_api::__private::block_entity_types()
         .iter()
         .map(|decl| decl.try_into_engine(&()).unwrap())
         .collect()
-}
-
-impl TryIntoEngine<()> for mod_api::GameRuleDecl {
-    type Engine = horizon_client_core::gamerules::Rule;
-    type Error = std::convert::Infallible;
-    fn try_into_engine(&self, _: &()) -> Result<Self::Engine, Self::Error> {
-        Ok(Self::Engine {
-            name: self.name.clone(),
-            category: self.category.clone(),
-            default: horizon_client_core::gamerules::Value::Bool(self.default),
-            min: 0,
-            max: 0,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -2861,134 +1826,6 @@ mod declaration_snapshot_tests {
     }
 }
 
-macro_rules! gui_draw_value {
-    ($draw:expr, $from:ident, $to:ident, $convert:ident($($args:expr),*)) => {
-        match $draw {
-            $from::Sprite {
-                sprite,
-                x,
-                y,
-                w,
-                h,
-                region,
-                color,
-                blend,
-            } => $to::Sprite {
-                sprite: sprite.clone(),
-                x: *x,
-                y: *y,
-                w: *w,
-                h: *h,
-                region: *region,
-                color: *color,
-                blend: *blend,
-            },
-            $from::AtlasSprite {
-                sprite,
-                x,
-                y,
-                w,
-                h,
-                color,
-            } => $to::AtlasSprite {
-                sprite: sprite.clone(),
-                x: *x,
-                y: *y,
-                w: *w,
-                h: *h,
-                color: *color,
-            },
-            $from::Blit {
-                texture,
-                blend,
-                x,
-                y,
-                w,
-                h,
-                uv,
-                src,
-                tex,
-                color,
-            } => $to::Blit {
-                texture: texture.clone(),
-                blend: *blend,
-                x: *x,
-                y: *y,
-                w: *w,
-                h: *h,
-                uv: *uv,
-                src: *src,
-                tex: *tex,
-                color: *color,
-            },
-            $from::Fill {
-                x0,
-                y0,
-                x1,
-                y1,
-                color,
-            } => $to::Fill {
-                x0: *x0,
-                y0: *y0,
-                x1: *x1,
-                y1: *y1,
-                color: *color,
-            },
-            $from::Text {
-                text,
-                x,
-                y,
-                color,
-                shadow,
-            } => $to::Text {
-                text: text.$convert($($args),*)?,
-                x: *x,
-                y: *y,
-                color: *color,
-                shadow: *shadow,
-            },
-            $from::Item {
-                slot,
-                x,
-                y,
-                seed,
-                scale,
-                pivot,
-            } => $to::Item {
-                slot: *slot,
-                x: *x,
-                y: *y,
-                seed: *seed,
-                scale: *scale,
-                pivot: *pivot,
-            },
-            $from::Push(ops) => $to::Push(ops.clone()),
-            $from::Pop => $to::Pop,
-        }
-    };
-}
-
-impl TryIntoApi for horizon_client::hud_layout::GuiDraw {
-    type Api = mod_api::client::hud_layout::GuiDraw;
-    type Error = mod_api::text::TextFormError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        use horizon_client::hud_layout::GuiDraw as Engine;
-        use mod_api::client::hud_layout::GuiDraw as Api;
-        Ok(gui_draw_value!(self, Engine, Api, try_into_api()))
-    }
-}
-impl<C: ?Sized> TryIntoEngine<C> for mod_api::client::hud_layout::GuiDraw {
-    type Engine = horizon_client::hud_layout::GuiDraw;
-    type Error = mod_api::text::TextFormError;
-    fn try_into_engine(&self, _: &C) -> Result<Self::Engine, Self::Error> {
-        use horizon_client::hud_layout::GuiDraw as Engine;
-        use mod_api::client::hud_layout::GuiDraw as Api;
-        Ok(gui_draw_value!(self, Api, Engine, try_into_engine(&())))
-    }
-}
-
-#[path = "api_values/text_boundary.rs"]
-mod text_boundary;
 #[cfg(test)]
 mod gui_draw_boundary_tests {
     use super::{TryIntoApi, TryIntoEngine};
@@ -3041,6 +1878,14 @@ mod gui_draw_boundary_tests {
                 y1: 34,
                 color: 35,
             },
+            D::FillGradient {
+                x0: 36,
+                y0: -37,
+                x1: 38,
+                y1: 39,
+                top: 0x8000_0040,
+                bottom: 0xFF00_0041,
+            },
             D::Text {
                 text: text.clone(),
                 x: 41,
@@ -3063,7 +1908,7 @@ mod gui_draw_boundary_tests {
         let actual: Result<Vec<D>, mod_api::text::TextFormError> = api.try_into_engine(&());
         let actual = actual.unwrap();
         assert_eq!(actual, commands);
-        let D::Text { text: actual, .. } = &actual[4] else {
+        let D::Text { text: actual, .. } = &actual[5] else {
             panic!("text command")
         };
         assert_eq!(actual.component(), text.component());
@@ -3096,27 +1941,6 @@ mod gui_draw_boundary_tests {
         let actual = actual.unwrap().unwrap();
         assert_eq!(actual[0][1].0.plain(), "a");
         assert_eq!(actual[0][1].1.plain(), "b");
-    }
-}
-
-impl TryIntoApi for horizon_world::level::PlacementContext {
-    type Api = mod_api::PlacementContext;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        let item = if self.item.is_empty() {
-            None
-        } else {
-            Some(mod_api::__private::item_key(&self.item).ok_or(StackReadError::UnknownItem)?)
-        };
-        let mut snapshot = mod_api::PlacementContext::new(self.pos, self.face, item);
-        snapshot.hit_pos = self.hit_pos;
-        snapshot.hit = [self.hit.x, self.hit.y, self.hit.z];
-        snapshot.inside = self.inside;
-        snapshot.yaw = self.yaw;
-        snapshot.pitch = self.pitch;
-        snapshot.sneaking = self.sneaking;
-        snapshot.replace_clicked = self.replace_clicked;
-        Ok(snapshot)
     }
 }
 
@@ -3161,17 +1985,6 @@ mod placement_snapshot_tests {
         assert_eq!(engine.try_into_api(), Ok(empty));
         engine.item = "missing:item".into();
         assert_eq!(engine.try_into_api(), Err(StackReadError::UnknownItem));
-    }
-}
-
-impl TryIntoApi for horizon_client_core::gamerules::Value {
-    type Api = mod_api::GameRuleValue;
-    type Error = StackReadError;
-    fn try_into_api(&self) -> Result<Self::Api, Self::Error> {
-        Ok(match *self {
-            Self::Bool(value) => mod_api::GameRuleValue::Bool(value),
-            Self::Int(value) => mod_api::GameRuleValue::Int(value),
-        })
     }
 }
 
@@ -3263,23 +2076,24 @@ pub(in crate::game) fn game_rule_registry() -> horizon_client_core::gamerules::R
         .iter()
         .map(|rule| rule.try_into_engine(&()).unwrap())
         .collect();
-    horizon_client_core::gamerules::RuleRegistry::with_bool_rules(
+    horizon_client_core::gamerules::RuleRegistry::with_mod_rules(
         mod_api::__private::game_rule_categories(),
         &rules,
     )
     .expect("validated at registration")
 }
 
-#[path = "api_values/damage.rs"]
-pub(in crate::game) mod damage;
-#[path = "api_values/item_properties.rs"]
-mod item_properties;
+#[cfg(test)]
+pub(in crate::game) mod damage {
+    pub(in crate::game) use horizon_gameplay::api_values::damage::CONVERSIONS;
+}
 #[path = "api_values/loot_values.rs"]
-mod loot_values;
+pub(crate) mod loot_values;
+#[cfg(test)]
 #[path = "api_values/particle_values.rs"]
 mod particle_values;
+pub(in crate::game) use horizon_gameplay::api_values::package_snapshot::install_packages;
 pub(crate) use loot_values::{dispatch_loot_condition, dispatch_loot_function};
-#[path = "api_values/phase_values.rs"]
-mod phase_values;
+#[cfg(test)]
 #[path = "api_values/small_values.rs"]
 mod small_values;

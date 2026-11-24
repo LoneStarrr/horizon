@@ -1,5 +1,5 @@
 //! A mob the game has made but not yet added to a level, lent to one hook call
-//! (`finalize_spawn`'s `mob`, docs/modding/src/how-to/spawning.md): the lend,
+//! (`finalize_spawn`'s `mob`, docs/modding/src/how-to/world/spawning.md): the lend,
 //! the handle's reads (`UnspawnedMobRef`), the scoped editor handed out with it
 //! (`UnspawnedMobEdits`), and the spawn group data at the API boundary
 //! (`SpawnGroup`).
@@ -249,6 +249,19 @@ impl Game<'_> {
         mob: UnspawnedMobRef,
     ) -> Result<Vec<String>, UnspawnedMobError> {
         self.with_lent_mob(mob, |m| Ok(m.extra.spawn_tags.clone()))
+    }
+
+    /// Whether the mob is a baby (`LivingEntity.isBaby`). The dragon, lent without a mob, is
+    /// never one; another lend without its mob can't tell.
+    pub(super) fn unspawned_mob_baby(
+        &self,
+        mob: UnspawnedMobRef,
+    ) -> Result<bool, UnspawnedMobError> {
+        self.with_lent(mob, |l| match &l.mob {
+            Some(m) => Ok(m.is_baby()),
+            None if l.kind == "minecraft:ender_dragon" => Ok(false),
+            None => Err(UnspawnedMobError::Unsupported),
+        })
     }
 
     /// The mob's custom name, if it has one.
@@ -629,7 +642,7 @@ mod tests {
     /// What a listener edits through the editor is on the mob that joins the
     /// level, and the handle reads the edits back inside the call.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn edits_through_the_editor_are_on_the_mob_that_joins() {
         type Seen = (
             Result<Identifier, UnspawnedMobError>,
@@ -696,7 +709,7 @@ mod tests {
     /// A handle kept past its hook reads `Expired`, and the next call's
     /// editor refuses it the same way: it reaches only its own lend.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn a_handle_kept_past_its_hook_is_expired() {
         let kept: Arc<Mutex<Vec<UnspawnedMobRef>>> = Arc::default();
         let refused = Arc::new(Mutex::new(Vec::new()));
@@ -729,10 +742,45 @@ mod tests {
         assert_ne!(kept[0], kept[1], "each call lends anew");
     }
 
+    /// `baby` is `LivingEntity.isBaby` on the lent mob: a negative age on a type that can be
+    /// one, so a frog with one is still an adult. The dragon, lent without a mob, never is a
+    /// baby, another lend without its mob is `Unsupported`, and a handle kept past its lend is
+    /// expired.
+    #[test]
+    #[ignore = "daily"]
+    fn an_unspawned_mobs_baby_reads_its_age_and_type() {
+        with_game(|game| {
+            let baby = |game: &Game<'_>, kind: &str, mob: Option<&mut Mob>| {
+                game.lend_unspawned(kind, AT, mob, |handle, _| handle.baby(game))
+            };
+            let lent = |game: &mut Game<'_>, kind: &str| {
+                let id = game
+                    .spawn_mob(kind, AT, false, SpawnSite::Finalizing(Reason::Natural))
+                    .unwrap();
+                game.mobs.iter().find(|m| m.id == id).unwrap().clone()
+            };
+            let mut pig = lent(game, "minecraft:pig");
+            assert_eq!(baby(game, "minecraft:pig", Some(&mut pig)), Ok(false));
+            pig.extra.age = -24000;
+            assert_eq!(baby(game, "minecraft:pig", Some(&mut pig)), Ok(true));
+            let mut frog = lent(game, "minecraft:frog");
+            frog.extra.age = -24000;
+            assert_eq!(baby(game, "minecraft:frog", Some(&mut frog)), Ok(false));
+            assert_eq!(baby(game, "minecraft:ender_dragon", None), Ok(false));
+            assert_eq!(
+                baby(game, "minecraft:pig", None),
+                Err(UnspawnedMobError::Unsupported),
+                "a lend without its mob"
+            );
+            let kept = game.lend_unspawned("minecraft:pig", AT, Some(&mut pig), |handle, _| handle);
+            assert_eq!(kept.baby(game), Err(UnspawnedMobError::Expired));
+        });
+    }
+
     /// `Flow::Cancel` skips finalization and keeps the listener's edits on
     /// the mob that still joins; `spawn_cancelled` adds no mob at all.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn both_cancels_keep_their_contract_with_edits() {
         let max_health = id("minecraft:max_health");
         listening(
@@ -779,7 +827,7 @@ mod tests {
     /// leaves there is what finalization reads: an ageable group whose later
     /// members are all babies makes this pig one.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn the_group_a_listener_leaves_is_what_finalization_reads() {
         with_game(|game| {
             let alone = spawn_pig(game).unwrap();
@@ -840,7 +888,7 @@ mod tests {
     /// and the mob in the caller's slot is the one that was lent, mod goal
     /// and all, not a copy (whose mod goal would have no goal) or a default.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_panicking_listener_still_ends_the_lend() {
         let installed = || vec![mod_api::ModEntry::new("kept-goal", Box::new(KeptGoalMod))];
         mod_platform::testing::with_mods(installed().into(), || {

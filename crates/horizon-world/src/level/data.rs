@@ -1,6 +1,6 @@
 //! Behaviour tables built once from the pinned client resources.
 use super::{
-    Behaviours, GameplayStateSource,
+    Behaviours, GameplayStateSource, HotTags,
     classes::{Class, ClassSet, Interface},
     states::{BlockId, PropKey, StateTable},
 };
@@ -420,9 +420,6 @@ tags! {
     sand = "sand",
     ice = "ice",
     snow = "snow",
-    infiniburn_overworld = "infiniburn_overworld",
-    infiniburn_nether = "infiniburn_nether",
-    infiniburn_end = "infiniburn_end",
     soul_fire_base_blocks = "soul_fire_base_blocks",
     washed_away_by_fluids = "washed_away_by_fluids",
     blocks_fluid_flow = "blocks_fluid_flow",
@@ -765,6 +762,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         all_tags.insert(name.clone(), Arc::new(set));
     }
     let tags = Tags::resolve(&all_tags);
+    let hot_tags = HotTags::resolve(&all_tags);
     let tag = |name: &str| -> Option<Arc<BlockSet>> {
         all_tags
             .get(name.strip_prefix('#').unwrap_or(name))
@@ -1128,6 +1126,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         named,
         tags,
         all_tags,
+        hot_tags,
         facts,
         shapes,
         shape_info,
@@ -1140,6 +1139,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         dynamic,
         occlusion_cache: Default::default(),
         growth: Default::default(),
+        block_maps: Default::default(),
     })
 }
 

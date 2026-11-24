@@ -10,7 +10,7 @@ pub(super) struct FrameAttempt<K = FrameKey>(Option<K>);
 type FrameKey = (
     Option<horizon_client::gfx::FrameConfiguration>,
     PathBuf,
-    Option<Option<horizon_shader_api::Api>>,
+    Option<bool>,
 );
 
 impl<K: PartialEq> FrameAttempt<K> {
@@ -36,7 +36,7 @@ impl Game<'_> {
             gui,
             self.renderer.as_ref(),
             None,
-            self.settings.horizon.api,
+            self.settings.horizon.effective_api(),
             self.settings.horizon.translucent_batching,
             self.settings.vsync,
             &self.settings.horizon,
@@ -51,32 +51,52 @@ impl Game<'_> {
             ),
         )
     }
-    /// Under `HORIZON_HDR_FRAME=float` the frame follows what draws the picture
-    /// (docs/design/hdr-linear-light.md, "When it changes"): when HDR, Smooth Gradients or the
-    /// pick (unless refused) call for another frame than the renderer's, it is made again before
-    /// this frame draws. Without the switch a frame stays until the next start, as before.
+    /// The frame follows what draws the picture (docs/design/hdr-linear-light.md, "When it
+    /// changes"): when HDR or the pick (unless refused) call for another frame than the
+    /// renderer's, it is made again before this frame draws.
     pub(super) fn follow_frame(&mut self) {
-        if !native_shaders::linear_frame_switch()
-            || self.options.paced_by_split
-            || self.options.split_guest
+        let split = self.options.paced_by_split || self.options.split_guest;
+        // Split-screen's renderer isn't made again here, so the Anti-aliasing button offers
+        // 4x MSAA there only where the renderer already has its pipelines.
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_msaa_rebuildable(!split);
+        }
+        if split {
+            return;
+        }
+        // 4x MSAA's pipelines come with a renderer made while it is on: switched on in one made
+        // without them, the renderer is made again once.
+        if self
+            .renderer
+            .as_mut()
+            .is_some_and(Renderer::take_msaa_rebuild)
         {
+            if let Err(e) = self.rebuild_renderer() {
+                log::warn!("Horizon: the renderer for 4x MSAA could not be made: {e}");
+            }
             return;
         }
         let picked = shader_packs::picked_pack(&self.settings);
-        let path = self.native_shaders.resolve_path(
-            &Self::shader_packs_dir(),
-            picked,
-            shader_packs::dev_pack().is_some(),
-        );
-        let available = path.exists()
-            && path.file_name().is_none_or(|f| {
-                !shader_packs::active_pack(&f.to_string_lossy(), &self.settings.mods).is_empty()
-            });
-        let outcome = if available {
-            native_shaders::outcome(&path)
-        } else {
-            Some(None)
-        };
+        if picked.is_empty() {
+            self.native_shaders.forget_selection();
+        }
+        let (path, outcome) = shader_packs::pick_key(picked, || {
+            let path = self.native_shaders.resolve_path(
+                &Self::shader_packs_dir(),
+                picked,
+                shader_packs::dev_pack().is_some(),
+            );
+            let available = path.exists()
+                && path.file_name().is_none_or(|f| {
+                    !shader_packs::active_pack(&f.to_string_lossy(), &self.settings.mods).is_empty()
+                });
+            let outcome = if available {
+                native_shaders::outcome(&path)
+            } else {
+                Some(false)
+            };
+            (path, outcome)
+        });
         // The renderer's offer can change while the game runs (Vulkan's formats follow desktop
         // HDR and the window's output), and the frame with it.
         let request = shader_packs::picked_pack_shape(&self.settings).frame();
@@ -100,7 +120,8 @@ impl Game<'_> {
     }
 
     /// The renderer made again on the same device from the resources loaded, keeping the
-    /// pipelines that come out the same (`adopt_renderer`, as after a lost device).
+    /// pipelines that come out the same and the world the old one holds (`Renderer::take_world`):
+    /// only what draws in the frame is made again, and no section is meshed again.
     fn rebuild_renderer(&mut self) -> Result<()> {
         let Some(window) = self.window.clone() else {
             return Ok(());
@@ -118,12 +139,14 @@ impl Game<'_> {
                 return Err(error);
             }
         };
+        let mut world_kept = false;
         if let Some(old) = &mut self.renderer {
             renderer.resize(old.config.width, old.config.height);
             renderer.screenshot = old.screenshot.take();
             renderer.screenshot_result = old.screenshot_result.take();
+            world_kept = renderer.take_world(old);
         }
-        self.adopt_renderer(renderer);
+        self.adopt(renderer, world_kept);
         log::info!(
             "Horizon: the renderer was made again for the frame the settings call for in {} ms",
             started.elapsed().as_millis()
@@ -132,6 +155,7 @@ impl Game<'_> {
     }
 
     pub(super) fn apply_settings(&mut self) {
+        self.bind_mod_mappings();
         // LocalPlayer.refreshChatAbilities: the chat shows what the Chat option allows.
         let abilities = self.chat_abilities();
         self.ui.chat.set_abilities(&self.gui.atlas.font, abilities);
@@ -147,18 +171,21 @@ impl Game<'_> {
                 s.biome_blend,
                 s.smooth_lighting,
                 s.cutout_leaves,
+                s.better_grass_mode(),
                 s.horizon.opaque_ice,
                 leaf_culling,
             ) != (
                 st.biome_blend,
                 st.smooth_lighting,
                 st.cutout_leaves,
+                st.better_grass_mode,
                 st.opaque_ice,
                 st.leaf_culling,
             );
         self.streaming.biome_blend = self.settings.biome_blend;
         self.streaming.smooth_lighting = self.settings.smooth_lighting;
         self.streaming.cutout_leaves = self.settings.cutout_leaves;
+        self.streaming.better_grass_mode = self.settings.better_grass_mode();
         self.streaming.opaque_ice = self.settings.horizon.opaque_ice;
         self.streaming.leaf_culling = leaf_culling;
         if reload {
@@ -202,15 +229,10 @@ impl Game<'_> {
         self.remote.as_ref()?.far_terrain
     }
 
-    /// LOD Distance as far terrain uses it (`graphics::lod_distance_capped`).
+    /// LOD Distance as far terrain uses it.
     pub(super) fn lod_distance(&self) -> u32 {
         let (distance, _) = self.far_terrain_choice();
-        match &self.renderer {
-            Some(renderer) => {
-                horizon_client::graphics::lod_distance_capped(distance, &renderer.info)
-            }
-            None => distance.min(horizon_client::lod::MAX_CHUNKS),
-        }
+        distance.min(horizon_client::lod::MAX_CHUNKS)
     }
 
     /// Only enabled LOD worlds extend the renderer's range, never simulation.
@@ -220,6 +242,19 @@ impl Game<'_> {
         } else {
             self.streaming.radius
         }
+    }
+
+    /// `Options.getEffectiveRenderDistance`: the render distance option, capped
+    /// by the server's view distance once a login has reported one
+    /// (`serverRenderDistance > 0`). What the border wall and the entity view
+    /// scale follow; the streaming radius keeps its own one-chunk margin.
+    pub(super) fn effective_render_distance(&self) -> i32 {
+        effective_render_distance(
+            self.settings.render_distance,
+            self.remote
+                .as_ref()
+                .map_or(0, |remote| remote.view_distance),
+        )
     }
 
     /// The renderer for the window, with the current block sprites, GUI
@@ -243,16 +278,27 @@ impl Game<'_> {
     /// A renderer made again from the resources loaded takes over: what named the old one's
     /// atlas slots is forgotten, the world is meshed again, and the shader pack and the
     /// settings are applied again.
-    pub(super) fn adopt_renderer(&mut self, mut renderer: Renderer) {
-        // A new renderer starts with the vanilla column and without the world border's wall.
-        renderer.clear_sections(self.world.layout());
+    pub(super) fn adopt_renderer(&mut self, renderer: Renderer) {
+        self.adopt(renderer, false);
+    }
+
+    /// `adopt_renderer`; with `world_kept`, a renderer that took the old one's sections and far
+    /// tiles (`Renderer::take_world`): they and the meshes on their way stay.
+    fn adopt(&mut self, mut renderer: Renderer, world_kept: bool) {
+        if !world_kept {
+            // A new renderer starts with the vanilla column.
+            renderer.clear_sections(self.world.layout());
+        }
+        // And has no wall for the world border.
         self.border_renderer.invalidate();
         self.renderer = Some(renderer);
         self.forget_atlas_slots();
-        self.clear_lod();
-        self.pending_uploads.clear();
-        let context = self.worker_context();
-        self.streaming.reload_resources(&mut self.world, context);
+        if !world_kept {
+            self.clear_lod();
+            self.pending_uploads.clear();
+            let context = self.worker_context();
+            self.streaming.reload_resources(&mut self.world, context);
+        }
         self.native_shaders = native_shaders::NativeShaders::picking(&std::mem::take(
             &mut self.native_shaders.picked,
         ));
@@ -263,7 +309,7 @@ impl Game<'_> {
     /// discarded, then every loaded section is rebuilt.
     pub(super) fn all_sections_changed(&mut self) {
         self.clear_lod();
-        self.pending_uploads.clear();
+        self.streaming.free(self.pending_uploads.take_all());
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.clear_sections(self.world.layout());
         }
@@ -271,10 +317,29 @@ impl Game<'_> {
     }
 }
 
+/// `Options.getEffectiveRenderDistance`: a reported server view distance caps
+/// the option; until one arrives, the option stands.
+fn effective_render_distance(option: i32, server: i32) -> i32 {
+    if server > 0 {
+        option.min(server)
+    } else {
+        option
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::FrameAttempt;
-    use horizon_shader_api::Api;
+
+    /// The server's view distance caps the option, and only a reported one
+    /// does (`Options.getEffectiveRenderDistance`).
+    #[test]
+    fn the_effective_render_distance_is_vanillas() {
+        assert_eq!(super::effective_render_distance(32, 8), 8);
+        assert_eq!(super::effective_render_distance(8, 32), 8);
+        assert_eq!(super::effective_render_distance(16, 0), 16);
+        assert_eq!(super::effective_render_distance(16, -1), 16);
+    }
 
     #[test]
     fn failed_frame_attempt_waits_for_a_policy_or_setting_change() {
@@ -286,10 +351,10 @@ mod tests {
             ("8-bit", "p", None),
             // HDR output offered later, with HDR On: the frame is looked at again.
             ("float", "p", None),
-            ("float", "p", Some(Some(Api::V0_2))),
-            ("float", "p", Some(Some(Api::V0_2))),
-            ("float", "p", Some(None)),
-            ("float", "p", Some(None)),
+            ("float", "p", Some(true)),
+            ("float", "p", Some(true)),
+            ("float", "p", Some(false)),
+            ("float", "p", Some(false)),
             ("float", "q", None),
             ("8-bit", "q", None),
         ] {

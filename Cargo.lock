@@ -486,7 +486,7 @@ dependencies = [
  "io-lifetimes",
  "ipnet",
  "maybe-owned",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "rustix-linux-procfs",
  "windows-sys 0.59.0",
  "winx",
@@ -501,31 +501,34 @@ dependencies = [
  "cap-primitives",
  "io-extras",
  "io-lifetimes",
- "rustix 1.1.5",
+ "rustix 1.1.6",
 ]
 
 [[package]]
 name = "cargo-horizon-mod"
 version = "0.1.0"
 dependencies = [
- "cap-std",
+ "base64 0.22.1",
  "dunce",
- "horizon-mod-api-gen",
+ "horizon-addresses",
  "horizon-mod-package",
- "horizon-mod-point-emit",
- "horizon-mod-wasm",
+ "horizon-mod-source",
+ "horizon-mod-surface",
+ "horizon-mod-vocab",
  "horizon-port-pack",
+ "horizon-release-sign",
  "libc",
+ "ring",
  "rustc-demangle",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml",
  "toml_edit",
- "ureq",
  "wasm-encoder 0.261.0",
  "wasmparser 0.261.0",
- "wasmtime",
+ "wat",
  "zip",
 ]
 
@@ -1405,7 +1408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "windows-sys 0.59.0",
 ]
 
@@ -1415,7 +1418,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
 dependencies = [
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -1499,7 +1502,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
 dependencies = [
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "windows-link",
 ]
 
@@ -1810,9 +1813,10 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "crc32fast",
- "dunce",
  "flate2",
  "fs4",
  "gilrs",
@@ -1822,6 +1826,7 @@ dependencies = [
  "horizon-bench",
  "horizon-chat-filter",
  "horizon-client-core",
+ "horizon-client-gameplay",
  "horizon-client-input",
  "horizon-client-lib",
  "horizon-client-render",
@@ -1832,10 +1837,11 @@ dependencies = [
  "horizon-engine-slots",
  "horizon-friends",
  "horizon-game-discovery",
+ "horizon-gameplay",
  "horizon-guest-stack",
- "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
+ "horizon-java-properties",
  "horizon-mod-api",
  "horizon-mod-api-gen",
  "horizon-mod-api-macros",
@@ -1853,26 +1859,22 @@ dependencies = [
  "horizon-shaders",
  "horizon-system",
  "horizon-telemetry",
- "horizon-theme",
  "horizon-threads",
  "horizon-world",
  "log",
- "miniz_oxide 0.8.9",
  "naga",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
- "open",
  "png",
  "pollster",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "tempfile",
  "toml",
- "unicode-bidi",
  "ureq",
  "wat",
  "wgpu",
@@ -1892,13 +1894,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-client-gameplay"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "horizon-client-lib",
+ "horizon-core",
+ "horizon-world",
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "horizon-client-input"
 version = "0.1.0"
 dependencies = [
  "arboard",
  "horizon-client-core",
+ "horizon-engine-slots",
+ "horizon-hooks",
  "horizon-mod-api-macros",
  "horizon-theme",
+ "log",
  "png",
  "winit",
 ]
@@ -1909,8 +1926,11 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "crc32fast",
+ "dunce",
  "flate2",
  "fs4",
  "getrandom 0.3.4",
@@ -1924,11 +1944,13 @@ dependencies = [
  "horizon-client-render",
  "horizon-command",
  "horizon-core",
- "horizon-dualsense",
+ "horizon-engine-slots",
+ "horizon-game-discovery",
  "horizon-guest-stack",
  "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
+ "horizon-java-properties",
  "horizon-mcp",
  "horizon-mod-api",
  "horizon-mod-api-macros",
@@ -1959,15 +1981,19 @@ dependencies = [
  "png",
  "pollster",
  "rayon",
- "rustix 1.1.5",
+ "rustix 1.1.6",
+ "same-file",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
+ "shlex",
+ "smallvec",
  "tempfile",
  "unicode-bidi",
  "ureq",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
  "xxhash-rust",
  "zip",
@@ -1990,6 +2016,7 @@ dependencies = [
  "horizon-client-input",
  "horizon-command",
  "horizon-core",
+ "horizon-engine-slots",
  "horizon-guest-stack",
  "horizon-hdr",
  "horizon-hooks",
@@ -2018,7 +2045,7 @@ dependencies = [
  "naga",
  "png",
  "pollster",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha1",
@@ -2040,6 +2067,7 @@ version = "0.1.0"
 dependencies = [
  "horizon-client-core",
  "horizon-core",
+ "horizon-items",
  "horizon-protocol",
  "horizon-world",
 ]
@@ -2051,6 +2079,7 @@ dependencies = [
  "libm",
  "serde",
  "serde_json",
+ "unicode_names2",
 ]
 
 [[package]]
@@ -2082,6 +2111,7 @@ dependencies = [
  "cpal",
  "hidapi",
  "log",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2118,6 +2148,7 @@ dependencies = [
  "horizon-mod-host",
  "horizon-mod-package",
  "horizon-protocol",
+ "horizon-theme",
  "serde_json",
  "tempfile",
  "winresource",
@@ -2127,7 +2158,32 @@ dependencies = [
 name = "horizon-game-discovery"
 version = "0.1.0"
 dependencies = [
+ "horizon-mod-source",
+ "proc-macro2",
+ "quote",
+ "serde_json",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "horizon-gameplay"
+version = "0.1.0"
+dependencies = [
+ "horizon-assets",
+ "horizon-client-core",
+ "horizon-client-lib",
+ "horizon-command",
+ "horizon-core",
+ "horizon-engine-slots",
+ "horizon-items",
+ "horizon-mod-package",
+ "horizon-mod-runtime",
+ "horizon-mod-vocab",
+ "horizon-protocol",
+ "horizon-threads",
+ "horizon-world",
+ "log",
+ "serde_json",
 ]
 
 [[package]]
@@ -2162,6 +2218,17 @@ name = "horizon-hooks"
 version = "0.1.0"
 
 [[package]]
+name = "horizon-hot-paths-game"
+version = "0.1.0"
+dependencies = [
+ "horizon-client",
+ "horizon-guest-stack",
+ "horizon-mod-api",
+ "horizon-mod-host",
+ "horizon-mod-package",
+]
+
+[[package]]
 name = "horizon-internals"
 version = "0.1.0"
 
@@ -2172,11 +2239,16 @@ dependencies = [
  "horizon-client-core",
  "horizon-core",
  "horizon-mod-package",
+ "horizon-mod-vocab",
  "horizon-world",
  "log",
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "horizon-java-properties"
+version = "0.1.0"
 
 [[package]]
 name = "horizon-mcp"
@@ -2207,7 +2279,8 @@ version = "0.1.0"
 dependencies = [
  "heck",
  "horizon-game-discovery",
- "horizon-mod-point-shape",
+ "horizon-mod-source",
+ "horizon-mod-surface",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -2229,6 +2302,7 @@ dependencies = [
  "horizon-mod-api-gen",
  "horizon-mod-api-macros",
  "horizon-mod-runtime",
+ "log",
  "serde_json",
 ]
 
@@ -2236,7 +2310,6 @@ dependencies = [
 name = "horizon-mod-api-macros"
 version = "0.1.0"
 dependencies = [
- "horizon-mod-point-shape",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -2284,8 +2357,11 @@ dependencies = [
  "horizon-mod-points",
  "horizon-mod-render",
  "horizon-mod-wasm",
+ "libloading",
  "log",
+ "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2294,12 +2370,11 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
- "flate2",
  "getrandom 0.4.3",
  "horizon-core",
  "horizon-mod-api",
  "horizon-mod-api-macros",
- "horizon-mod-point-shape",
+ "horizon-mod-surface",
  "horizon-mod-vocab",
  "horizon-shader-api",
  "libc",
@@ -2307,7 +2382,7 @@ dependencies = [
  "minisign-verify",
  "os_pipe",
  "png",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "semver",
  "serde",
  "serde_json",
@@ -2320,41 +2395,13 @@ dependencies = [
  "wasmparser 0.261.0",
  "wat",
  "windows-sys 0.61.2",
+ "xz4rust",
  "zip",
-]
-
-[[package]]
-name = "horizon-mod-point-emit"
-version = "0.1.0"
-dependencies = [
- "horizon-mod-package",
- "serde",
-]
-
-[[package]]
-name = "horizon-mod-point-shape"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.119",
 ]
 
 [[package]]
 name = "horizon-mod-points"
 version = "0.1.0"
-dependencies = [
- "horizon-engine-slots",
- "horizon-mod-api",
- "horizon-mod-api-gen",
- "horizon-mod-api-macros",
- "horizon-mod-point-shape",
- "quote",
- "serde_json",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "horizon-mod-render"
@@ -2363,6 +2410,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "horizon-client-render",
+ "horizon-engine-slots",
  "horizon-mod-api",
  "horizon-mod-api-gen",
  "horizon-mod-api-macros",
@@ -2374,6 +2422,30 @@ name = "horizon-mod-runtime"
 version = "0.1.0"
 dependencies = [
  "horizon-core",
+]
+
+[[package]]
+name = "horizon-mod-source"
+version = "0.1.0"
+dependencies = [
+ "horizon-mod-surface",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "horizon-mod-surface"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2400,24 +2472,38 @@ dependencies = [
  "horizon-client-core",
  "horizon-core",
  "horizon-guest-stack",
+ "horizon-java-properties",
  "horizon-mod-api",
  "horizon-mod-api-gen",
  "horizon-mod-api-macros",
  "horizon-mod-package",
- "horizon-mod-point-emit",
- "horizon-mod-points",
  "horizon-mod-runtime",
  "horizon-threads",
  "horizon-world",
  "libc",
  "log",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde_json",
  "sha2",
  "tempfile",
  "wasmparser 0.261.0",
  "wasmtime",
  "wat",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "horizon-mod-wasm-wire-loopback"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+ "horizon-game-discovery",
+ "horizon-mod-api",
+ "horizon-mod-api-gen",
+ "horizon-mod-runtime",
+ "horizon-world",
+ "log",
+ "serde_json",
 ]
 
 [[package]]
@@ -2425,7 +2511,14 @@ name = "horizon-modding-examples"
 version = "0.0.0"
 dependencies = [
  "horizon-mod-api",
- "horizon-mod-points",
+]
+
+[[package]]
+name = "horizon-name-tag"
+version = "0.1.0"
+dependencies = [
+ "horizon-hooks",
+ "horizon-platform",
 ]
 
 [[package]]
@@ -2444,13 +2537,16 @@ dependencies = [
 name = "horizon-official"
 version = "0.1.0"
 dependencies = [
+ "horizon-addresses",
  "horizon-discord",
  "horizon-friends",
  "horizon-game",
  "horizon-heartbeat",
+ "horizon-name-tag",
  "horizon-official-servers",
  "horizon-perf-share",
  "horizon-platform",
+ "horizon-theme",
  "log",
  "winresource",
 ]
@@ -2524,8 +2620,9 @@ dependencies = [
  "horizon-core",
  "horizon-guest-stack",
  "horizon-hooks",
+ "horizon-java-properties",
  "horizon-mod-api-gen",
- "horizon-mod-point-shape",
+ "horizon-mod-package",
  "horizon-perf-format",
  "horizon-prepare",
  "horizon-protocol",
@@ -2561,6 +2658,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-port-pack-cli"
+version = "0.1.0"
+dependencies = [
+ "horizon-addresses",
+ "horizon-port-pack",
+]
+
+[[package]]
 name = "horizon-prepare"
 version = "0.1.0"
 dependencies = [
@@ -2583,6 +2688,8 @@ dependencies = [
  "horizon-mod-runtime",
  "horizon-threads",
  "horizon-world",
+ "idna",
+ "idna_adapter",
  "ipconfig",
  "log",
  "serde_json",
@@ -2644,6 +2751,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "horizon-core",
+ "horizon-java-properties",
  "horizon-protocol",
  "horizon-world",
  "log",
@@ -2740,11 +2848,12 @@ dependencies = [
  "horizon-assets",
  "horizon-core",
  "horizon-threads",
+ "indexmap",
  "libm",
  "log",
  "lz4_flex",
  "postcard",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha2",
@@ -3368,7 +3477,7 @@ version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57804b2c9b69967f1536a56f86297e367a33b19e98852ed624b84551cdbc0d90"
 dependencies = [
- "rustix 1.1.5",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -4147,7 +4256,7 @@ dependencies = [
  "hmac",
  "pkcs12",
  "pkcs5",
- "rand",
+ "rand 0.10.3",
  "rc2",
  "sha1",
  "sha2",
@@ -4222,6 +4331,44 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared",
+ "rand 0.8.8",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]
@@ -4315,7 +4462,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -4385,6 +4532,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb458bb7f6e250e6eb79d5026badc10a3ebb8f9a15d1fff0f13d17c71f4d6dee"
 dependencies = [
  "unicode-xid",
+]
+
+[[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
 ]
 
 [[package]]
@@ -4584,7 +4740,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash 2.1.3",
@@ -4634,6 +4790,17 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
+dependencies = [
+ "libc",
+ "rand_chacha",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
@@ -4641,6 +4808,16 @@ dependencies = [
  "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -4905,9 +5082,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -4923,7 +5100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix 1.1.5",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -5169,6 +5346,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "slab"
@@ -5460,7 +5643,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "windows-sys 0.59.0",
 ]
 
@@ -5693,7 +5876,7 @@ checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
 dependencies = [
  "bytes",
  "log",
- "rand",
+ "rand 0.10.3",
  "thiserror 2.0.21",
 ]
 
@@ -5750,6 +5933,26 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unicode_names2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d189085656ca1203291e965444e7f6a2723fbdd1dd9f34f8482e79bafd8338a0"
+dependencies = [
+ "phf",
+ "unicode_names2_generator",
+]
+
+[[package]]
+name = "unicode_names2_generator"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1262662dc96937c71115228ce2e1d30f41db71a7a45d3459e98783ef94052214"
+dependencies = [
+ "phf_codegen",
+ "rand 0.8.8",
+]
 
 [[package]]
 name = "universal-hash"
@@ -5986,7 +6189,7 @@ dependencies = [
  "postcard",
  "pulley-interpreter",
  "rayon",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde",
  "serde_derive",
  "smallvec",
@@ -6085,7 +6288,7 @@ checksum = "6326d47c759c0478489a034f1282a6f516ce97594f9af785539697d03add17ec"
 dependencies = [
  "cc",
  "libc",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "wasmtime-environ",
  "wasmtime-internal-versioned-export-macros",
  "windows-sys 0.61.2",
@@ -6165,7 +6368,7 @@ checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
 dependencies = [
  "cc",
  "downcast-rs",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "scoped-tls",
  "smallvec",
  "wayland-sys",
@@ -6178,7 +6381,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
 dependencies = [
  "bitflags 2.13.2",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "wayland-backend",
  "wayland-scanner",
 ]
@@ -6200,7 +6403,7 @@ version = "0.31.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
 dependencies = [
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "wayland-client",
  "xcursor",
 ]
@@ -6950,7 +7153,7 @@ dependencies = [
  "libc",
  "log",
  "os_pipe",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "thiserror 2.0.21",
  "tree_magic_mini",
  "wayland-backend",
@@ -6987,7 +7190,7 @@ dependencies = [
  "libc",
  "libloading",
  "once_cell",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "x11rb-protocol",
 ]
 
@@ -7072,6 +7275,12 @@ name = "xxhash-rust"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
+name = "xz4rust"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "606930b71bad6379f366994e4e6252a3462fa28bfc3695c33b07bef8f967d6d6"
 
 [[package]]
 name = "yaml-rust2"

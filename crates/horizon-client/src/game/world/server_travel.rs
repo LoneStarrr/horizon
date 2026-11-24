@@ -8,7 +8,7 @@
 //! exit once the destination has loaded around them.
 
 use super::end::GatewayJob;
-use super::nether_portal::{PLAYER_DELAY, Plan};
+use super::nether_portal::{Exit, ExitSearch, PLAYER_DELAY, Plan};
 use super::persist::OffLevel;
 use super::respawn_anchor::RespawnConfig;
 use super::respawn_position::Respawn;
@@ -70,6 +70,10 @@ pub(super) struct Trip {
     /// A respawn at this point outside the Overworld, resolved through its
     /// block on arrival.
     respawn: Option<RespawnConfig>,
+    /// Whether that point's block is used up (`findRespawnAndUseSpawnBlock`'s
+    /// `consumeSpawnBlock`): a death does, the credits and an End portal
+    /// leave it as it is.
+    consume: bool,
     /// A respawn at the world spawn, moved onto a free column within the
     /// respawn radius once the chunks around it have loaded.
     world_spawn: bool,
@@ -80,6 +84,9 @@ pub(super) struct Trip {
     finder: Option<PlayerSpawnFinder>,
     /// Sent by a command: the player is already where it goes.
     placed: bool,
+    /// A command teleport to chunks not loaded yet: the client's moves are ignored until the
+    /// destination is ready, whether placed by a level change or waiting for another position packet.
+    hold: bool,
     /// The level the player left for another one: the mods are told they
     /// changed dimension when the trip ends (`tell_mods_changed_dimension`).
     pub(super) left: Option<Dim>,
@@ -155,6 +162,7 @@ macro_rules! server_ctx {
             next_entity: &mut $s.next_entity,
             spawn,
             spawn_angle: $s.level.world_spawn_angle,
+            spawn_dimension: $s.level.spawn_dimension(),
             sea_level: $s.end.locator().map_or(63, |terrain| terrain.sea_level()),
             difficulty: i32::from($s.ui.difficulty),
             difficulty_locked: $s.level.difficulty_locked,
@@ -230,6 +238,12 @@ impl Trip {
     pub(super) fn is(&self, conn: u32) -> bool {
         self.conn == conn
     }
+
+    /// Respawn searches, like command arrivals, must finish before the client can leave
+    /// their loading area. `hold` alone names a command's already-placed body.
+    fn holds_movement(&self) -> bool {
+        self.hold || self.respawn.is_some() || self.world_spawn
+    }
 }
 
 impl Game<'_> {
@@ -239,6 +253,97 @@ impl Game<'_> {
             .filter(|t| t.dim == self.dim)
             .filter_map(|t| t.gateway.and_then(GatewayJob::source_chunk))
             .collect()
+    }
+
+    /// The gateway jobs of the trips still waiting to arrive.
+    pub(super) fn gateway_trip_jobs(&self) -> impl Iterator<Item = GatewayJob> + '_ {
+        self.server_trips.iter().filter_map(|t| t.gateway)
+    }
+
+    /// A server player's `tp` inside their level, where the chunks round `target` have not loaded: vanilla loads
+    /// them before the player arrives, so the player is held as a trip holds them (their body is left alone, their
+    /// client's moves ignored) until the chunks are lit, then placed there again (#15727).
+    pub(super) fn hold_for_chunks(&mut self, conn: u32, target: Vec3) {
+        // The arrival the player was waiting for elsewhere is abandoned.
+        self.server_trips.retain(|t| !t.is(conn));
+        let (cx, cz) = (
+            (target.x.floor() as i32) >> 4,
+            (target.z.floor() as i32) >> 4,
+        );
+        if (-2..=2).all(|dz| (-2..=2).all(|dx| self.streaming.is_lit(cx + dx, cz + dz))) {
+            return;
+        }
+        self.server_trips.push(Trip {
+            conn,
+            dim: self.dim,
+            source: self.dim,
+            target,
+            end: false,
+            plan: None,
+            vehicle: None,
+            gateway: None,
+            respawn: None,
+            consume: false,
+            world_spawn: false,
+            finder: None,
+            placed: false,
+            hold: true,
+            missing: None,
+            left: None,
+        });
+    }
+    /// A command hold follows the player where a mod sent them (`native_player_teleport` may
+    /// cancel or redirect it). A respawn keeps its own destination and stand-up search.
+    fn follow_command_arrivals(&mut self) {
+        let Some(host) = self.lan.as_ref() else {
+            return;
+        };
+        let level = self.dim.id();
+        let moved: Vec<(u32, Vec3)> = self
+            .server_trips
+            .iter()
+            .filter(|t| t.hold && t.dim == self.dim)
+            .filter_map(|t| {
+                let g = host.hub.guests.iter().find(|g| g.conn == t.conn)?;
+                let at = Vec3::new(g.position[0], g.position[1], g.position[2]);
+                (g.dimension == level && at != t.target).then_some((t.conn, at))
+            })
+            .collect();
+        for (conn, at) in moved {
+            self.hold_for_chunks(conn, at);
+        }
+    }
+
+    /// Release movement after completed or replaced arrivals. A spawn search can requeue
+    /// itself while a candidate chunk loads: that still owns the hold until it finishes.
+    fn release_held_arrivals(&mut self) {
+        let Some(host) = self.lan.as_mut() else {
+            return;
+        };
+        for i in 0..host.hub.guests.len() {
+            let g = &host.hub.guests[i];
+            if !g.tp_held {
+                continue;
+            }
+            let conn = g.conn;
+            if self
+                .server_trips
+                .iter()
+                .any(|t| t.is(conn) && t.holds_movement())
+            {
+                continue;
+            }
+            let landing = self
+                .server_trips
+                .iter()
+                .any(|t| t.is(conn) && (t.end || t.plan.is_some()));
+            host.hub.guests.update(i, |g| {
+                g.tp_held = false;
+                if !landing {
+                    g.landing = false;
+                }
+            });
+        }
     }
     /// Whether `conn` is between two levels: the server leaves its body
     /// alone until it arrives.
@@ -371,9 +476,18 @@ impl Game<'_> {
                 let from_end = self.dim == Dim::End;
                 // Entity.canTeleport: out of the End only after the credits.
                 if !from_end || seen_credits {
-                    let target = if from_end { Dim::Overworld } else { Dim::End };
+                    // EndPortalBlock.getPortalDestination: into the End from
+                    // anywhere else, out of it to the player's own point, in
+                    // the level the config names
+                    // (`findRespawnPositionAndUseSpawnBlock`, not used up).
+                    let (target, respawn) = if from_end {
+                        self.end_departure(conn)
+                    } else {
+                        (Dim::End, None)
+                    };
                     if self.server_player_travel_allowed(conn, target, TravelCause::EndPortal) {
                         self.start_server_trip(conn, target, None, false);
+                        self.trip_respawn(conn, respawn);
                     }
                 }
             }
@@ -386,6 +500,25 @@ impl Game<'_> {
         true
     }
 
+    /// The level a player leaving the End goes to, and the respawn point it
+    /// resolves there: the point's own level
+    /// (`ServerPlayer.RespawnConfig.getDimensionOrDefault`), else the
+    /// Overworld's.
+    fn end_departure(&mut self, conn: u32) -> (Dim, Option<RespawnConfig>) {
+        let config = self.as_guest(conn, |g| g.respawn_config).flatten();
+        (config.map_or(Dim::Overworld, |c| c.dim), config)
+    }
+
+    /// The respawn point of the trip a player has just started: its block is
+    /// resolved once the level it names has loaded (`arrive_server_trips`).
+    fn trip_respawn(&mut self, conn: u32, respawn: Option<RespawnConfig>) {
+        if let Some(config) = respawn
+            && let Some(trip) = self.server_trips.iter_mut().find(|t| t.is(conn))
+        {
+            trip.respawn = Some(config);
+        }
+    }
+
     /// Whether an exit portal already stands in the plan's dimension
     /// (`PortalForcer.findClosestPortalPosition`), searched without building.
     fn spectator_exit_exists(&mut self, plan: &Plan) -> bool {
@@ -393,7 +526,7 @@ impl Game<'_> {
         if self.enter_level(plan.dim).is_err() {
             return false;
         }
-        let exists = self.find_exit_portal(plan).is_some();
+        let exists = !matches!(self.search_exit_portal(plan), ExitSearch::NoPortal);
         if let Err(e) = self.enter_level(source) {
             log::error!("could not reopen {}: {e}", source.id());
         }
@@ -518,7 +651,7 @@ impl Game<'_> {
             g.vehicle.is_some(),
         );
         // Entity.checkInsideBlocks: the Nether portal blocks the box is in.
-        // `LivingEntity.canUsePortal` (#943): not a passenger — its vehicle
+        // `LivingEntity.canUsePortal` (arismoko/horizon#943): not a passenger — its vehicle
         // goes through and carries it (`carry_riders_through_portals`) — and
         // not asleep.
         if g.motion
@@ -539,10 +672,17 @@ impl Game<'_> {
                 .get(&conn)
                 .is_some_and(|play| play.respawn_requested)
             {
-                if !self.server_player_travel_allowed(conn, Dim::Overworld, TravelCause::EndPortal)
-                {
+                // PlayerList.respawn(keepAllPlayerData = true) and
+                // EndPortalBlock.getPortalDestination for a player out of the
+                // End: its own point, in the level the config names
+                // (`findRespawnPositionAndUseSpawnBlock`), not used up.
+                let (target, respawn) = self.end_departure(conn);
+                if !self.server_player_travel_allowed(conn, target, TravelCause::EndPortal) {
                     return;
                 }
+                // The first exit from the End keeps only `PlayerPersisted` of a mod's saved
+                // compound, as a death respawn does; later exits keep all of it.
+                self.keep_only_player_persisted(conn);
                 let Some(host) = self.lan.as_mut() else {
                     return;
                 };
@@ -560,7 +700,8 @@ impl Game<'_> {
                         });
                     }
                 }
-                self.start_server_trip(conn, Dim::Overworld, None, true);
+                self.start_server_trip(conn, target, None, true);
+                self.trip_respawn(conn, respawn);
                 self.portals.player.cooldown = 10;
             }
             return;
@@ -588,15 +729,20 @@ impl Game<'_> {
                 return;
             }
             if self.portals.player.cooldown == 0 {
-                let target = if self.dim == Dim::End {
-                    Dim::Overworld
+                // EndPortalBlock.getPortalDestination: into the End from
+                // anywhere else, out of it to the player's own point, in the
+                // level the config names (`findRespawnPositionAndUseSpawnBlock`,
+                // not used up).
+                let (target, respawn) = if self.dim == Dim::End {
+                    self.end_departure(conn)
                 } else {
-                    Dim::End
+                    (Dim::End, None)
                 };
                 if !self.server_player_travel_allowed(conn, target, TravelCause::EndPortal) {
                     return;
                 }
                 self.start_server_trip(conn, target, None, false);
+                self.trip_respawn(conn, respawn);
             }
             // Entity.setAsInsidePortal while cooling down restarts the cooldown.
             self.portals.player.cooldown = 10;
@@ -662,7 +808,7 @@ impl Game<'_> {
     /// a portal (a vehicle's transition time is 0): the riders travel with
     /// it and ride it again on arrival (`Entity.teleportCrossDimension`), so
     /// a rider never waits for its own portal delay.
-    fn carry_riders_through_portals(&mut self) {
+    pub(in crate::game) fn carry_riders_through_portals(&mut self) {
         for (vehicle, entry) in self.take_carrying(self.dim) {
             let Some(plan) = self.vehicle_plan(vehicle, entry) else {
                 continue;
@@ -816,9 +962,19 @@ impl Game<'_> {
         }
         self.bind_player_attachments(conn, false);
         self.as_guest(conn, |g| {
-            g.trigger_dimension(source, target, [from.x, from.y, from.z]);
-            if source != target && !credits_respawn {
-                g.stop_active_item_use();
+            if credits_respawn {
+                // ServerGamePacketListenerImpl.handleClientCommand:
+                // CHANGED_DIMENSION with END → OVERWORLD, whatever level the
+                // point is in (`PlayerList.respawn` is no teleport, so the
+                // entered Nether position stays as it was). The End credits
+                // make a new player, so nothing stops its item use here.
+                g.trigger_changed_dimension(Dim::End, Dim::Overworld);
+            } else {
+                g.trigger_dimension(source, target, [from.x, from.y, from.z]);
+                // ServerPlayer.teleport: stopUsingItem after the dimension change triggers.
+                if source != target {
+                    g.stop_active_item_use();
+                }
             }
         });
         self.server_trips.push(Trip {
@@ -831,10 +987,12 @@ impl Game<'_> {
             vehicle,
             gateway: None,
             respawn: None,
+            consume: false,
             world_spawn: false,
             missing: None,
             finder: None,
             placed: false,
+            hold: false,
             left: Some(source),
         });
         if let Err(e) = self.enter_level(source) {
@@ -856,27 +1014,34 @@ impl Game<'_> {
             vehicle: None,
             gateway: None,
             respawn: Some(config),
+            consume: true,
             world_spawn: false,
             missing: None,
             finder: None,
             placed: false,
+            hold: false,
             left: None,
         });
     }
 
     /// `findRespawnAndUseSpawnBlock` for the player in place, at its point
     /// in the level in place: where it stands up, facing the anchor (with
-    /// the deplete sound) or the bed; else the point is forgotten, and the
-    /// caller tells the player (`Hub::missing_respawn_block`).
+    /// the deplete sound, `PlayerList.respawn`'s, when the block is used up)
+    /// or the bed; else the point is forgotten, and the caller tells the
+    /// player (`Hub::missing_respawn_block`).
     pub(super) fn resolve_server_respawn(
         &mut self,
         config: RespawnConfig,
+        consume: bool,
     ) -> Option<(Vec3, f32, f32)> {
         let [x, y, z] = config.pos;
         let anchor = self.is_anchor(self.world.block(x, y, z));
-        match self.find_respawn_and_use(config, true) {
+        match self.find_respawn_and_use(config, consume) {
             Ok(Some((at, yaw, pitch))) => {
-                if !config.forced && anchor {
+                if consume && anchor {
+                    // PlayerList.respawn: the deplete sound has no `forced`
+                    // test, so a point `/spawnpoint` kept plays it too; a
+                    // return from the End credits keeps all data and skips it.
                     let [x, y, z] = config.pos.map(f64::from);
                     self.audio.play(
                         "minecraft:block.respawn_anchor.deplete",
@@ -921,10 +1086,12 @@ impl Game<'_> {
             vehicle: None,
             gateway: None,
             respawn: None,
+            consume: false,
             world_spawn: true,
             missing,
             finder: None,
             placed: false,
+            hold: false,
             left: None,
         });
     }
@@ -978,10 +1145,12 @@ impl Game<'_> {
             vehicle: None,
             gateway: Some(job),
             respawn: None,
+            consume: false,
             world_spawn: false,
             missing: None,
             finder: None,
             placed: false,
+            hold: false,
             left: None,
         });
     }
@@ -990,6 +1159,7 @@ impl Game<'_> {
     /// around their target: the exit (the Nether portal found or built, the
     /// End platform, the Overworld's spawn column) and the teleport there.
     fn arrive_server_trips(&mut self) {
+        self.follow_command_arrivals();
         let mut k = 0;
         while k < self.server_trips.len() {
             let trip = &self.server_trips[k];
@@ -1005,6 +1175,12 @@ impl Game<'_> {
                 (trip.target.x.floor() as i32) >> 4,
                 (trip.target.z.floor() as i32) >> 4,
             );
+            if trip.holds_movement() {
+                self.lan.as_mut().unwrap().hub.guests.update(i, |g| {
+                    g.landing = true;
+                    g.tp_held = true;
+                });
+            }
             if trip.dim != self.dim
                 || !(-2..=2).all(|dz| (-2..=2).all(|dx| self.streaming.is_lit(cx + dx, cz + dz)))
                 || trip
@@ -1028,7 +1204,8 @@ impl Game<'_> {
             };
             let yaw = host.hub.guests[i].yaw;
             let (position, yaw) = if let Some(config) = trip.respawn {
-                let found = self.as_guest(trip.conn, |g| g.resolve_server_respawn(config));
+                let (conn, consume) = (trip.conn, trip.consume);
+                let found = self.as_guest(conn, |g| g.resolve_server_respawn(config, consume));
                 match found {
                     Some(Some((at, yaw, pitch))) => {
                         if let Some(host) = self.lan.as_mut() {
@@ -1099,7 +1276,13 @@ impl Game<'_> {
                 }
             } else if let Some(job) = trip.gateway {
                 match self.resolve_gateway(job, trip.target) {
-                    Ok(at) => (at, yaw),
+                    Ok(Some(at)) => (at, yaw),
+                    // The exit search waits for a candidate chunk to load.
+                    Ok(None) => {
+                        self.server_trips.insert(k, trip);
+                        k += 1;
+                        continue;
+                    }
                     Err(e) => {
                         log::error!("End gateway exit: {e}");
                         (trip.target, yaw)
@@ -1129,14 +1312,18 @@ impl Game<'_> {
                     }
                 }
             } else {
-                let exit = trip
-                    .plan
-                    .as_ref()
-                    .and_then(|plan| self.nether_exit_portal(plan));
-                match (trip.plan, exit) {
-                    (Some(plan), Some(exit)) => {
+                let plan = trip.plan;
+                match plan.map(|plan| (plan, self.resolve_exit_portal(&plan))) {
+                    Some((plan, Exit::Found(exit))) => {
                         let (at, rotation) = self.arrival(&plan, exit);
                         (at, yaw + rotation)
+                    }
+                    Some((_, Exit::Waiting)) => {
+                        // The exit portal's chunk is still loading: its ticket
+                        // is placed; land once it is there.
+                        self.server_trips.insert(k, trip);
+                        k += 1;
+                        continue;
                     }
                     _ => (trip.target, yaw),
                 }
@@ -1177,7 +1364,9 @@ impl Game<'_> {
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
-            host.play.entry(trip.conn).or_default().portal.cooldown = 10;
+            if !trip.hold {
+                host.play.entry(trip.conn).or_default().portal.cooldown = 10;
+            }
             host.hub.guests.update(i, |g| {
                 g.yaw = yaw;
                 if let Some(pitch) = pitch {
@@ -1185,7 +1374,9 @@ impl Game<'_> {
                 }
                 // A new body at the exit: no fall distance or motion carried over,
                 // but the player's attributes (ServerPlayer.teleport keeps the entity).
-                g.new_body(true);
+                if !trip.hold {
+                    g.new_body(true);
+                }
             });
             let at = [position.x, position.y, position.z];
             if portal {
@@ -1195,13 +1386,14 @@ impl Game<'_> {
             }
             self.tell_mods_changed_dimension(trip.conn, trip.left, trip.dim);
         }
+        self.release_held_arrivals();
     }
 
     /// The vehicle the player rode arrives with it, at the point the player
     /// arrives: it keeps its entity id, so the ride is never broken
     /// (`Entity.teleportCrossDimension` recreates the vehicle in the other
     /// dimension, and its passengers ride it again).
-    fn arrive_vehicle(&mut self, source: Dim, id: u32, at: Vec3, yaw: f32) {
+    pub(in crate::game) fn arrive_vehicle(&mut self, source: Dim, id: u32, at: Vec3, yaw: f32) {
         let Some(id) = self.parked_vehicle_root(source, id) else {
             return;
         };
@@ -1370,10 +1562,14 @@ impl Game<'_> {
                 vehicle: None,
                 gateway: None,
                 respawn: None,
+                consume: false,
                 world_spawn: false,
                 missing: None,
                 finder: None,
                 placed: true,
+                // The body does not tick until arrival. Letting it leave the destination before
+                // its chunks load can strand this trip and freeze its damage cooldown indefinitely.
+                hold: true,
                 left: Some(source),
             });
             if let Err(e) = self.enter_level(source) {
@@ -1415,6 +1611,7 @@ impl Game<'_> {
             next_entity: &mut self.next_entity,
             spawn,
             spawn_angle: self.level.world_spawn_angle,
+            spawn_dimension: self.level.spawn_dimension(),
             difficulty: i32::from(self.ui.difficulty),
             difficulty_locked: self.level.difficulty_locked,
             clock_rate,
@@ -1435,7 +1632,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn guest_portal_entry_uses_body_sleep_and_vehicle() {
         super::super::native_guest_turn_tests::with_guests(|game| {
             let mut chunk = horizon_client::chunk::Chunk::empty(0, 0);
@@ -1488,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn arriving_vehicle_is_announced_once_after_destination_entities() {
         use mod_api::{self, EntityJoinLevelEvent, Flow, Hooks};
         use std::sync::Mutex;
@@ -1559,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn natural_carrier_moves_full_objects_and_readmits_the_tree_in_order() {
         use mod_api::{AttachmentType, EntityConstructingEvent, Holder, Hooks, HostSide};
         use std::sync::Mutex;
@@ -1686,7 +1883,7 @@ mod tests {
     /// vehicle, so a pig that shares its boat's or minecart's UUID takes it in
     /// the destination and the vehicle is retained off-level below it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn natural_carrier_retains_a_vehicle_root_refused_by_its_passenger() {
         for (kind, uuid) in [("minecraft:oak_boat", 705), ("minecraft:minecart", 706)] {
             super::super::native_entity_refs::tests::with_game(|game| {
@@ -1732,7 +1929,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn natural_portal_schedules_a_player_on_a_retained_indirect_vehicle() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.options.dedicated = Some(Vec::new());
@@ -1898,7 +2095,7 @@ mod transfer_lifetime_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn transfer_arrival_rebinds_only_bound_owners_with_the_same_id() {
         for kind in ["minecraft:minecart", "minecraft:oak_boat", "minecraft:pig"] {
             for bound in [true, false] {
@@ -2028,7 +2225,11 @@ mod transfer_lifetime_tests {
 #[cfg(test)]
 mod credits_respawn_tests {
     use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
-    use horizon_client::lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig};
+    use horizon_client::lan::{
+        Joined, NetConfig, PlayerSender,
+        guest::{Guest, SPECTATOR},
+        hub::HubConfig,
+    };
     use horizon_protocol::packets::configuration::ClientInformation;
     use std::sync::{Arc, atomic::AtomicI32, mpsc};
 
@@ -2037,7 +2238,7 @@ mod credits_respawn_tests {
     /// respawned player is not loaded (its actions wait, `isInvulnerableTo`
     /// spares it) until the client says so or 60 ticks pass.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_credits_respawn_waits_for_the_client_to_load() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let settings = Settings::default();
@@ -2103,6 +2304,116 @@ mod credits_respawn_tests {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
+            },
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut guest = Guest::new(
+            Joined {
+                conn: 2,
+                uuid: 330,
+                name: "CreditsGuest".into(),
+                properties: Vec::new(),
+                info: ClientInformation::new(2),
+                brand: "test".into(),
+                sender: PlayerSender::new(tx, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 100.0, 0.5],
+            2,
+        );
+        guest.dimension = "minecraft:overworld".into();
+        guest.saved = Some(horizon_core::nbt::Tag::compound([(
+            "NeoForgeData",
+            horizon_core::nbt::Tag::compound([
+                ("outside", horizon_core::nbt::Tag::Int(1)),
+                (
+                    "PlayerPersisted",
+                    horizon_core::nbt::Tag::compound([("inside", horizon_core::nbt::Tag::Int(2))]),
+                ),
+            ]),
+        )]));
+        guest.placed = true;
+        guest.loaded = true;
+        guest.loading = false;
+        guest.load_timeout = 0;
+        let mut host = game.lan.take().unwrap();
+        host.hub.guests.push(guest);
+        let play = host.play.entry(2).or_default();
+        play.won_game = true;
+        play.respawn_requested = true;
+        assert!(host.hub.guests[0].client_loaded());
+
+        game.lan = Some(host);
+        game.handle_server_portal(2);
+        let host = game.lan.take().unwrap();
+        assert!(!host.play[&2].won_game, "the credits are over");
+        let guest = &host.hub.guests[0];
+        assert_eq!(guest.load_timeout, 60);
+        assert!(guest.loading);
+        assert!(!guest.client_loaded());
+        assert_eq!(
+            guest.saved.as_ref().and_then(|tag| tag.get("NeoForgeData")),
+            Some(&horizon_core::nbt::Tag::compound([(
+                "PlayerPersisted",
+                horizon_core::nbt::Tag::compound([("inside", horizon_core::nbt::Tag::Int(2))]),
+            )])),
+            "the real first-End-exit path drops only data outside PlayerPersisted"
+        );
+        drop(host);
+        drop(game);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// The player's own point in the tests here: a respawn anchor in the Nether.
+    const ANCHOR: [i32; 3] = [10, 100, 10];
+
+    /// A server on a scratch world with one guest, placed in the Overworld,
+    /// whose own point is a respawn anchor in the Nether.
+    fn server_with_a_nether_anchor<'a>(
+        resources: &'a mut Option<Arc<crate::game::Resources>>,
+    ) -> (Game<'a>, std::path::PathBuf) {
+        let mut game = crate::game::game_tests::tests::server_game(resources);
+        let scratch = std::env::temp_dir().join(format!(
+            "horizon-credits-anchor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        game.world_root = scratch.clone();
+        // The world spawn a player without a point of its own comes back to.
+        game.level.world_spawn = Some([0, 100, 0]);
+        game.lan_host(
+            super::super::lan::LanSettings {
+                port: 0,
+                guest_commands: true,
+                force_game_mode: false,
+            },
+            NetConfig {
+                announce: false,
+                ..NetConfig::loopback(0, "credits-anchor-test".into(), 2)
+            },
+            HubConfig {
+                default_game_mode: 0,
+                guest_commands: true,
+                force_game_mode: false,
+                hardcore: false,
+                view_distance: 2,
+                simulation_distance: 2,
+                dimension: "minecraft:overworld".into(),
+                allow_flight: false,
+                seed: 0,
+                max_players: 2,
+                integrated: false,
+                levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();
@@ -2129,23 +2440,116 @@ mod credits_respawn_tests {
         guest.loaded = true;
         guest.loading = false;
         guest.load_timeout = 0;
-        let mut host = game.lan.take().unwrap();
-        host.hub.guests.push(guest);
-        let play = host.play.entry(2).or_default();
+        guest.respawn_elsewhere = Some(("minecraft:the_nether".into(), ANCHOR, 0.0, 0.0, false));
+        game.lan.as_mut().unwrap().hub.guests.push(guest);
+        (game, scratch)
+    }
+
+    /// A player whose own point is a charged Nether anchor and who has seen the
+    /// credits comes back at that anchor, in the Nether, and the anchor keeps
+    /// its charge: `PlayerList.respawn(keepAllPlayerData = true)` resolves the
+    /// point in the config's own level and does not use the block up
+    /// (`ServerPlayer.findRespawnPositionAndUseSpawnBlock(false, ..)`).
+    #[test]
+    #[ignore = "daily"]
+    fn the_credits_respawn_returns_to_a_nether_anchor_and_keeps_its_charge() {
+        use horizon_client::chunk::Chunk;
+        let mut resources = None;
+        let (mut game, scratch) = server_with_a_nether_anchor(&mut resources);
+        let play = game.lan.as_mut().unwrap().play.entry(2).or_default();
         play.won_game = true;
         play.respawn_requested = true;
-        assert!(host.hub.guests[0].client_loaded());
 
-        game.lan = Some(host);
         game.handle_server_portal(2);
-        let host = game.lan.take().unwrap();
-        assert!(!host.play[&2].won_game, "the credits are over");
-        let guest = &host.hub.guests[0];
-        assert_eq!(guest.load_timeout, 60);
-        assert!(guest.loading);
-        assert!(!guest.client_loaded());
-        drop(host);
+        assert_eq!(
+            game.lan.as_ref().unwrap().hub.guests[0].dimension,
+            "minecraft:the_nether",
+            "the credits respawn goes to the config's level, not the Overworld's"
+        );
+
+        // The Nether loads around the anchor, which holds one charge.
+        game.enter_level(super::Dim::Nether).unwrap();
+        for x in -2..=2 {
+            for z in -2..=2 {
+                game.streaming
+                    .insert_remote(&mut game.world, Chunk::empty(x, z));
+            }
+        }
+        let charged = {
+            let registry = game.pack.assets.registry;
+            let id = registry.default_state("minecraft:respawn_anchor").unwrap();
+            let mut value = registry.state(id).unwrap().clone();
+            value.properties.insert("charges".into(), "1".into());
+            registry.resolve(&value).unwrap()
+        };
+        game.world
+            .set(ANCHOR[0], ANCHOR[1], ANCHOR[2], charged)
+            .unwrap();
+        game.tick_server_travel();
+
+        // RespawnAnchorBlock.findStandUpPosition: the block's top is the only
+        // spot with a floor under it here (`DismountHelper.findSafeDismountLocation`).
+        let guest = &game.lan.as_ref().unwrap().hub.guests[0];
+        assert_eq!(
+            guest.position,
+            [10.5, 101.0, 10.5],
+            "the player stands on its anchor"
+        );
+        // PlayerList.respawn copies the point when its block resolved.
+        assert_eq!(
+            guest.respawn_elsewhere.as_ref().map(|r| r.1),
+            Some(ANCHOR),
+            "the point stays the player's own"
+        );
+        assert_eq!(
+            game.world.block(ANCHOR[0], ANCHOR[1], ANCHOR[2]),
+            charged,
+            "the anchor keeps its charge"
+        );
+        assert!(!game.on_server_trip(2), "the trip has arrived");
+        drop(game);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// A spectator that right-clicks the exit portal in the End leaves for the
+    /// level of its own point, not the Overworld: a spectator is a
+    /// `ServerPlayer`, so `EndPortalBlock.getPortalDestination` resolves its
+    /// point too (`findRespawnPositionAndUseSpawnBlock(false, ..)`).
+    #[test]
+    #[ignore = "daily"]
+    fn a_spectator_leaves_the_end_for_its_nether_point() {
+        use horizon_client::chunk::Chunk;
+        let mut resources = None;
+        let (mut game, scratch) = server_with_a_nether_anchor(&mut resources);
+        game.lan.as_mut().unwrap().hub.guests.update(0, |g| {
+            g.game_mode = SPECTATOR;
+            g.seen_credits = true;
+            g.dimension = "minecraft:the_end".into();
+        });
+        game.enter_level(super::Dim::End).unwrap();
+        game.streaming
+            .insert_remote(&mut game.world, Chunk::empty(0, 0));
+        let portal = [0, 100, 0];
+        assert!(
+            game.set_state_named(portal, "minecraft:end_portal", &[])
+                .unwrap()
+        );
+        assert!(game.spectator_use_portal(2, 0, portal));
+        assert_eq!(
+            game.lan.as_ref().unwrap().hub.guests[0].dimension,
+            "minecraft:the_nether",
+            "a spectator's exit from the End goes to its point's level"
+        );
+        assert!(game.on_server_trip(2), "the player is on its way there");
         drop(game);
         std::fs::remove_dir_all(scratch).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "server_travel/hold_tests.rs"]
+mod hold_tests;
+
+#[cfg(test)]
+#[path = "server_travel/changed_dimension_tests.rs"]
+mod changed_dimension_tests;

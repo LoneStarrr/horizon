@@ -30,8 +30,7 @@ fn stamp(time: SystemTime) -> String {
     let secs = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let (y, m, d) =
-        horizon_platform::server_files::java_properties::civil_from_days(secs.div_euclid(86_400));
+    let (y, m, d) = horizon_platform::java_properties::civil_from_days(secs.div_euclid(86_400));
     let s = secs.rem_euclid(86_400);
     format!(
         "{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}",
@@ -41,9 +40,20 @@ fn stamp(time: SystemTime) -> String {
     )
 }
 
-/// A backup's file name: the time, and a name the owner gave (letters, digits, `-` and `_` only).
+/// A backup's file name: the time, and a name the owner gave (letters, digits, `-` and `_` only). Not
+/// `auto`: that is the automatic backups' name, and `prune` deletes the ones that carry it.
 pub fn file_name(time: SystemTime, name: Option<&str>) -> Result<String, String> {
     let name = name.unwrap_or("manual");
+    if name == AUTO {
+        return Err(format!(
+            "{AUTO:?} is the name of the automatic backups, which are deleted beyond `keep`: use another name"
+        ));
+    }
+    stamped(time, name)
+}
+
+/// `<time>-<name>.zip` for a name made of letters, digits, `-` and `_`.
+fn stamped(time: SystemTime, name: &str) -> Result<String, String> {
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -57,7 +67,10 @@ pub fn file_name(time: SystemTime, name: Option<&str>) -> Result<String, String>
     Ok(format!("{}-{name}.zip", stamp(time)))
 }
 
-/// Adds a folder to the zip, under `prefix`, skipping the game's session lock.
+/// Adds a folder to the zip, under `prefix`, skipping the game's session lock. Only regular files and
+/// folders are taken, and links are not followed: vanilla worlds hold no symlinks (vanilla refuses a world
+/// with one unless allow-listed), while a link in an extracted archive could pull a file from outside the
+/// server folder into the zip, and a FIFO or device would make the copy never finish.
 fn add_dir(zip: &mut ZipWriter<BufWriter<File>>, dir: &Path, prefix: &str) -> Result<(), String> {
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -71,8 +84,16 @@ fn add_dir(zip: &mut ZipWriter<BufWriter<File>>, dir: &Path, prefix: &str) -> Re
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         let inner = format!("{prefix}/{name}");
-        if path.is_dir() {
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_dir() {
             add_dir(zip, &path, &inner)?;
+        } else if !kind.is_file() {
+            eprintln!(
+                "horizon-server: backup skips {}: not a regular file or folder",
+                path.display()
+            );
         } else if name != "session.lock" {
             zip.start_file(inner.as_str(), options)
                 .map_err(|e| e.to_string())?;
@@ -84,24 +105,50 @@ fn add_dir(zip: &mut ZipWriter<BufWriter<File>>, dir: &Path, prefix: &str) -> Re
 }
 
 /// Zips the world and the settings into `backups/<file_name>`. The zip is written under a temporary name
-/// and renamed when complete, so a backup that looks finished is one.
+/// and renamed when complete, so a backup that looks finished is one. Existing finished or partial
+/// backups with this name are left intact. The output directory must resolve outside the world.
 pub fn create(dir: &Path, config: &Config, file_name: &str) -> Result<PathBuf, String> {
     let backups = dir.join(DIR);
     std::fs::create_dir_all(&backups).map_err(|e| format!("{}: {e}", backups.display()))?;
+    let world = dir.join(&config.world.name);
+    if world.is_dir() {
+        let source = world
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", world.display()))?;
+        let destination = backups
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", backups.display()))?;
+        if destination.starts_with(&source) {
+            return Err(format!(
+                "{} must be outside the world {}",
+                backups.display(),
+                world.display()
+            ));
+        }
+    }
     let path = backups.join(file_name);
     let part = backups.join(format!("{file_name}.part"));
+    // Owner only: a backup holds server.toml and server.properties, with the API token, the
+    // RCON password and the management secret. Reserve a new partial before entering its cleanup path.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(&part)
+        .map_err(|e| format!("{}: {e}", part.display()))?;
     let result = (|| {
-        // Owner only: a backup holds server.toml and server.properties, with the API token, the
-        // RCON password and the management secret.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options
-            .open(&part)
-            .map_err(|e| format!("{}: {e}", part.display()))?;
+        // Holding the partial's name also excludes another creator while checking the finished ZIP.
+        if path
+            .try_exists()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+        {
+            return Err(format!(
+                "{} exists already; try another name or try again in a second",
+                path.display()
+            ));
+        }
         let mut zip = ZipWriter::new(BufWriter::new(file));
-        let world = dir.join(&config.world.name);
         if world.is_dir() {
             add_dir(&mut zip, &world, &config.world.name)?;
         }
@@ -171,11 +218,14 @@ pub fn prune(dir: &Path, keep: usize) -> Vec<String> {
 }
 
 pub fn auto_name(time: SystemTime) -> String {
-    file_name(time, Some(AUTO)).expect("the automatic name is valid")
+    stamped(time, AUTO).expect("the automatic name is valid")
 }
 
 /// The backup a name points at: a file in `backups/`, by its full name or the start of it.
 pub fn find(dir: &Path, name: &str) -> Result<String, String> {
+    if name.trim().is_empty() {
+        return Err("a backup name is required".into());
+    }
     let all = list(dir);
     if let Some(b) = all
         .iter()
@@ -196,8 +246,9 @@ pub fn find(dir: &Path, name: &str) -> Result<String, String> {
     }
     // The name given to `backup NAME` (or `auto`, `manual`): the newest backup with it.
     let label = format!("-{name}.zip");
+    // The whole label after the time stamp: `test` is not the end of `<stamp>-my-test.zip`.
     all.iter()
-        .find(|b| b.name.ends_with(&label))
+        .find(|b| b.name.len() == STAMP_LEN + label.len() && b.name.ends_with(&label))
         .map(|b| b.name.clone())
         .ok_or_else(|| {
             format!("no backup {name:?} in {DIR}/ (`horizon-server backups` lists them)")
@@ -384,6 +435,160 @@ mod tests {
         assert_eq!(auto_name(t), "2026-10-14_17-46-40-auto.zip");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_skips_links_and_special_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-backup-links-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let world = dir.join("world");
+        std::fs::create_dir(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"level").unwrap();
+        std::os::unix::fs::symlink(&outside, world.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&dir, world.join("link-dir")).unwrap();
+        let fifo = CString::new(world.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let path = create(&dir, &Config::default(), "x.zip").unwrap();
+        let zip = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut names: Vec<_> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["world/level.dat"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_backup_collision_preserves_finished_and_partial_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-backup-collision-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config = Config::default();
+        let world = dir.join("world");
+        std::fs::create_dir(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"before").unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let name = file_name(t, Some("collision")).unwrap();
+        let path = create(&dir, &config, &name).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        std::fs::write(world.join("level.dat"), b"after").unwrap();
+        assert!(create(&dir, &config, &name).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!dir.join(DIR).join(format!("{name}.part")).exists());
+        let mut zip = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut restored = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name("world/level.dat").unwrap(), &mut restored)
+            .unwrap();
+        assert_eq!(restored, b"before");
+        drop(zip);
+
+        let pending = file_name(t, Some("pending")).unwrap();
+        let part = dir.join(DIR).join(format!("{pending}.part"));
+        std::fs::write(&part, b"another backup in progress").unwrap();
+        assert!(create(&dir, &config, &pending).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(), b"another backup in progress");
+        assert!(!dir.join(DIR).join(&pending).exists());
+        assert_eq!(std::fs::read(world.join("level.dat")).unwrap(), b"after");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_output_cannot_alias_the_world() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-server-backup-alias-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let config = Config::default();
+        let name = "2026-11-13_00-00-00-layout.zip";
+        let mut accepted_overlaps = Vec::new();
+        for (label, world_target, backup_target, succeeds) in [
+            ("world-is-backups", Some("backups"), None, false),
+            ("backups-in-world", None, Some("world/archives"), false),
+            ("same-target", Some("store"), Some("store"), false),
+            ("world-disjoint", Some("world-data"), None, true),
+            ("backups-disjoint", None, Some("archive-data"), true),
+            (
+                "both-disjoint",
+                Some("store/world"),
+                Some("store/world-archives"),
+                true,
+            ),
+        ] {
+            let dir = root.join(label);
+            std::fs::create_dir(&dir).unwrap();
+            let world = dir.join("world");
+            if let Some(target) = world_target {
+                std::fs::create_dir_all(dir.join(target)).unwrap();
+                std::os::unix::fs::symlink(target, &world).unwrap();
+            } else {
+                std::fs::create_dir(&world).unwrap();
+            }
+            let backups = dir.join(DIR);
+            if let Some(target) = backup_target {
+                std::fs::create_dir_all(dir.join(target)).unwrap();
+                std::os::unix::fs::symlink(target, &backups).unwrap();
+            }
+            std::fs::create_dir(world.join("region")).unwrap();
+            std::fs::write(world.join("level.dat"), b"synthetic world").unwrap();
+            std::fs::write(world.join("region/r.0.0.mca"), b"synthetic region").unwrap();
+            std::fs::write(dir.join("server.toml"), b"synthetic settings").unwrap();
+
+            match create(&dir, &config, name) {
+                Ok(path) if succeeds => {
+                    let mut zip = ZipArchive::new(File::open(path).unwrap()).unwrap();
+                    let mut entries: Vec<_> = zip
+                        .file_names()
+                        .map(|name| name.unwrap().into_owned())
+                        .collect();
+                    entries.sort();
+                    assert_eq!(
+                        entries,
+                        ["server.toml", "world/level.dat", "world/region/r.0.0.mca"],
+                        "{label}"
+                    );
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut zip.by_name("world/level.dat").unwrap(),
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    assert_eq!(bytes, b"synthetic world", "{label}");
+                }
+                Ok(_) => accepted_overlaps.push(label),
+                Err(error) => {
+                    assert!(!succeeds, "{label}: {error}");
+                    assert!(!backups.join(name).exists(), "{label}");
+                }
+            }
+            assert!(!backups.join(format!("{name}.part")).exists(), "{label}");
+            assert_eq!(
+                std::fs::read(world.join("level.dat")).unwrap(),
+                b"synthetic world",
+                "{label}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            accepted_overlaps.is_empty(),
+            "backup accepted overlapping paths: {accepted_overlaps:?}"
+        );
+    }
+
     #[test]
     fn back_up_and_restore() {
         let dir =
@@ -515,6 +720,63 @@ mod tests {
         let path = create(&dir, &Config::default(), "b.zip").unwrap();
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+
+    /// `restore NAME` takes "the name given to `backup` (the newest with it)": the whole label after the
+    /// time stamp, not any name that happens to end the same way.
+    #[test]
+    fn a_label_matches_only_the_whole_label() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-backup-label-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let test = "2026-11-01_00-00-00-test.zip";
+        let my_test = "2026-11-02_00-00-00-my-test.zip";
+        let update = "2026-11-03_00-00-00-before-update.zip";
+        let nightly = "2026-11-04_00-00-00-nightly-auto.zip";
+        for name in [test, my_test, update, nightly] {
+            std::fs::write(dir.join(DIR).join(name), b"x").unwrap();
+        }
+        // The label `test` is the older file, not the newer one whose label ends with it.
+        assert_eq!(find(&dir, "test").unwrap(), test);
+        assert_eq!(find(&dir, "my-test").unwrap(), my_test);
+        assert_eq!(find(&dir, "before-update").unwrap(), update);
+        assert_eq!(find(&dir, "nightly-auto").unwrap(), nightly);
+        // A label that only ends another one names no backup.
+        assert!(find(&dir, "update").is_err());
+        assert!(find(&dir, "auto").is_err());
+        // The other ways in are as before: the file name, and a unique start of it.
+        assert_eq!(find(&dir, my_test).unwrap(), my_test);
+        assert_eq!(find(&dir, "2026-11-03").unwrap(), update);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `auto` is the automatic backups' name: a backup made by hand under it would have exactly an
+    /// automatic one's file name, and `prune` would delete it with them.
+    #[test]
+    fn a_hand_backup_cannot_take_the_automatic_name() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert!(file_name(t, Some("auto")).is_err());
+        // The automatic name is still made, and a label that only contains `auto` is still a hand one.
+        assert_eq!(auto_name(t), "2023-11-14_22-13-20-auto.zip");
+        assert_eq!(
+            file_name(t, Some("nightly-auto")).unwrap(),
+            "2023-11-14_22-13-20-nightly-auto.zip"
+        );
+        // So `prune` can only meet automatic backups under that name.
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-hand-auto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let later = t + std::time::Duration::from_secs(60);
+        let mut names = vec![auto_name(later)];
+        names.extend(file_name(t, Some("auto")));
+        for name in &names {
+            std::fs::write(dir.join(DIR).join(name), b"zip").unwrap();
+        }
+        assert_eq!(prune(&dir, 0), vec![auto_name(later)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

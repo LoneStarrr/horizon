@@ -6,7 +6,7 @@
 //! the experience orbs.
 use super::{Mob, Species, equine, gear, raider, render::DYE_NAMES};
 use crate::random_sequences::RandomSequences;
-use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_core::random::{LegacyRandom, LevelRandom, RandomSource};
 use horizon_world::{
     loot::{EnchantedLevel, EntityLootParams, LootDamage, LootData, LootEntity, LootStack},
     registry::BlockStateId,
@@ -21,8 +21,8 @@ pub use horizon_world::loot::EQUIPMENT_SLOTS as SLOTS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Drop {
     Item(LootStack),
-    /// The whole stack a mob kept in an equipment slot (damage, name,
-    /// components), dropped as it is.
+    /// A whole stack a mob kept (in an equipment slot, its inventory or a
+    /// horse's chest), with its damage, name and components, dropped as it is.
     Stack(crate::items::ItemStack),
     /// `Enderman.dropCustomDeathLoot`: the carried block's own drops, rolled
     /// with `enderman::carried_block_tool` (`enderman::carried_block_roll`).
@@ -30,6 +30,9 @@ pub enum Drop {
     /// The experience the mob is worth (`getExperienceReward`), before
     /// `ExperienceOrb.award` splits it into orbs.
     Experience(i32),
+    /// A custom death drop with an explicit initial item-entity age.
+    /// Bypasses stack-only table modifiers; joins the captured living drops.
+    Aged(LootStack, i32),
 }
 
 /// How the mob died.
@@ -295,6 +298,17 @@ fn stored_slot_stack(m: &Mob, slot: &str) -> Option<crate::items::ItemStack> {
         _ => super::finalize::stored_stack(m, slot_index(slot)?),
     }
 }
+/// `EnchantmentHelper.has(stack, EnchantmentEffectComponents.PREVENT_EQUIPMENT_DROP)`
+/// on a whole stack: whether its enchantments keep it from dropping.
+fn stack_prevents_drop(loot: &LootData, stack: &crate::items::ItemStack) -> bool {
+    let mut probe = loot_stack(&stack.item, stack.count as i32);
+    probe.enchantments = stack
+        .enchantments()
+        .iter()
+        .map(|(e, l)| (e.to_string(), *l as i32))
+        .collect();
+    loot.prevents_equipment_drop(&probe)
+}
 /// The drop of what the mob has in `slot`, given its `stack` after the drop
 /// rolls: the whole stack the mob kept (with the rolled damage), else the loot stack.
 fn slot_drop(m: &Mob, slot: &str, stack: LootStack) -> Drop {
@@ -492,7 +506,7 @@ pub fn die(
     m: &mut Mob,
     d: &Death,
     sequences: &mut RandomSequences,
-    level_random: &mut LegacyRandom,
+    level_random: &mut LevelRandom,
 ) -> (Vec<Drop>, bool) {
     let rolled = roll_death(
         m,
@@ -537,6 +551,8 @@ pub fn roll_death(m: &mut Mob, d: &Death, rolls: &mut dyn DeathRolls) -> Rolled 
         out.push(slot_drop(m, "mainhand", stack));
         clear_slot(m, "mainhand");
     }
+    // `LivingEntity.dropAllDeathLoot`'s `shouldDropLoot`: the loot table and
+    // `dropCustomDeathLoot` only; `dropEquipment` below always runs.
     // Allay: what it carries (`ints[1]` of the held item) is its inventory.
     let allay_load = (s == Species::Allay)
         .then(|| {
@@ -550,7 +566,7 @@ pub fn roll_death(m: &mut Mob, d: &Death, rolls: &mut dyn DeathRolls) -> Rolled 
             player: d.player.clone().filter(|_| killed_by_player),
             luck: if killed_by_player { d.luck } else { 0.0 },
         };
-        let items = roll(d, &table, &params, rolls, m.extra.death_loot_seed);
+        let items = roll(d, &table, &params, rolls, m.extra.death_table_seed);
         out.extend(items.into_iter().filter(|i| !i.is_empty()).map(Drop::Item));
         table_rolled = true;
     }
@@ -619,9 +635,11 @@ pub fn finish_death(
         {
             out.push(Drop::CarriedBlock(state));
         }
-        // WitherBoss.dropCustomDeathLoot.
+        // WitherBoss.dropCustomDeathLoot: the star is spawned, then
+        // `setExtendedLifetime` gives it `age = -6000`, so it outlives the
+        // 6000-tick age discard by another 6000 ticks.
         if s == Species::Wither {
-            out.push(Drop::Item(loot_stack("minecraft:nether_star", 1)));
+            out.push(Drop::Aged(loot_stack("minecraft:nether_star", 1), -6000));
         }
     }
     // Allay.dropEquipment: its inventory, then the main-hand item unless it
@@ -650,21 +668,21 @@ pub fn finish_death(
             clear_slot(m, "mainhand");
         }
     }
-    // Piglin.dropCustomDeathLoot: everything in its inventory.
-    if s == Species::Piglin {
+    // Piglin.dropCustomDeathLoot, inside `shouldDropLoot` (`table_rolled`):
+    // everything in its inventory, as the whole stacks it kept
+    // (`removeAllItems`, with no vanishing curse check).
+    if s == Species::Piglin && table_rolled {
         for stack in m.extra.inventory.drain(..) {
-            let mut item = loot_stack(&stack.item, stack.count as i32);
-            item.damage = stack.damage as i32;
-            out.push(Drop::Item(item));
+            if stack.count > 0 {
+                out.push(Drop::Stack(stack));
+            }
         }
     }
     // dropEquipment: AbstractHorse's inventory, then a chested horse's chest.
     if equine::is_equine(s) {
         for stack in m.extra.items.iter().flatten() {
-            if stack.count > 0 {
-                let mut item = loot_stack(&stack.item, stack.count as i32);
-                item.damage = stack.damage as i32;
-                out.push(Drop::Item(item));
+            if stack.count > 0 && !stack_prevents_drop(d.loot, stack) {
+                out.push(Drop::Stack(stack.clone()));
             }
         }
         if m.extra.chested {
@@ -839,6 +857,7 @@ pub fn base_experience(m: &mut Mob) -> i32 {
 #[cfg(test)]
 mod death_loot_table_tests {
     use super::*;
+    use crate::mobs::world::level_random;
     use horizon_world::loot::{LootData, PackOverlay};
 
     /// Mob.getLootTable and LootTable.getRandomItems: a mob's own
@@ -874,9 +893,9 @@ mod death_loot_table_tests {
             if own {
                 m.extra.death_loot_table = Some("pack:boss".into());
             }
-            m.extra.death_loot_seed = seed;
+            m.extra.death_table_seed = seed;
             let mut sequences = RandomSequences::default();
-            let (out, _) = die(&mut m, &death, &mut sequences, &mut LegacyRandom::new(7));
+            let (out, _) = die(&mut m, &death, &mut sequences, &mut level_random(7));
             out.into_iter()
                 .filter_map(|d| match d {
                     Drop::Item(s) => Some(s.item),
@@ -888,6 +907,69 @@ mod death_loot_table_tests {
         assert_eq!(items(42, true), ["minecraft:diamond"]);
         // Without one, the type's table (a cow's beef and leather).
         assert!(items(0, false).iter().all(|i| i != "minecraft:diamond"));
+    }
+
+    /// `LootTable.createStackSplitter` on a death, through `die`, with
+    /// `table`'s ender pearls.
+    fn death_pearls(name: &str, modifier: &str) -> Vec<i32> {
+        let root = std::env::temp_dir().join(format!("drops-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("data/minecraft/loot_table");
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = format!(
+            r#"{{"type":"minecraft:entity","pools":[{{"rolls":1,"entries":[{{"type":"minecraft:item",
+                "name":"minecraft:ender_pearl","modifier":{modifier}}}]}}]}}"#
+        );
+        std::fs::write(dir.join("test.json"), table).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let loot = LootData::load(&root, &PackOverlay::NONE, &defaults).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let death = Death {
+            loot: &loot,
+            damage: None,
+            player: None,
+            player_killed: false,
+            luck: 0.0,
+            vehicle: None,
+            mob_drops: true,
+            world_seed: 0,
+        };
+        let kind = crate::mobs::sensor_scan_tests::kind();
+        let mut m = Mob::new(1, kind, horizon_core::geometry::Vec3::ZERO, 0.0);
+        m.extra.death_loot_table = Some("minecraft:test".into());
+        let mut sequences = RandomSequences::default();
+        let (out, _) = die(&mut m, &death, &mut sequences, &mut level_random(7));
+        out.into_iter()
+            .filter_map(|d| match d {
+                Drop::Item(s) if s.item == "minecraft:ender_pearl" => Some(s.count),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A death drop splits at its own `max_stack_size` patch: 12 ender pearls
+    /// made to stack to 5 drop as 5, 5 and 2.
+    #[test]
+    fn a_death_drop_splits_at_its_own_max_stack_size() {
+        let pearls = death_pearls(
+            "max-stack",
+            r#"[{"type":"minecraft:set_count","count":12},
+                {"type":"minecraft:set_components","components":{"minecraft:max_stack_size":5}}]"#,
+        );
+        assert_eq!(pearls, [5, 5, 2]);
+    }
+
+    /// The standard removal patch (`"!minecraft:max_stack_size": {}`) leaves a
+    /// stack size of 1: three pearls drop one by one.
+    #[test]
+    fn a_death_drop_without_a_max_stack_size_drops_one_by_one() {
+        let pearls = death_pearls(
+            "no-max-stack",
+            r#"[{"type":"minecraft:set_count","count":3},
+                {"type":"minecraft:set_components","components":{"!minecraft:max_stack_size":{}}}]"#,
+        );
+        assert_eq!(pearls, [1, 1, 1]);
     }
 
     /// A listener of `enchanted_entity_loot` draws from the level's random in
@@ -1052,6 +1134,7 @@ mod death_loot_table_tests {
 mod slot_tests {
     use super::*;
     use crate::mobs::sensor_scan_tests::kind;
+    use crate::mobs::world::level_random;
     use horizon_core::geometry::Vec3;
     use horizon_world::loot::PackOverlay;
     use std::sync::Arc;
@@ -1148,7 +1231,7 @@ mod slot_tests {
             &mut m,
             &death(true),
             &mut RandomSequences::default(),
-            &mut LegacyRandom::new(7),
+            &mut level_random(7),
         );
         assert!(orbs(&out) > 0, "memory timer awards experience: {out:?}");
 
@@ -1157,7 +1240,7 @@ mod slot_tests {
             &mut m,
             &death(false),
             &mut RandomSequences::default(),
-            &mut LegacyRandom::new(7),
+            &mut level_random(7),
         );
         assert_eq!(orbs(&out), 0, "no timer, no experience: {out:?}");
 
@@ -1166,7 +1249,7 @@ mod slot_tests {
             &mut m,
             &death(true),
             &mut RandomSequences::default(),
-            &mut LegacyRandom::new(7),
+            &mut level_random(7),
         );
         assert!(helmet(&out), "memory timer drops equipment: {out:?}");
 
@@ -1175,7 +1258,7 @@ mod slot_tests {
             &mut m,
             &death(false),
             &mut RandomSequences::default(),
-            &mut LegacyRandom::new(7),
+            &mut level_random(7),
         );
         assert!(!helmet(&out), "no timer, no equipment: {out:?}");
     }
@@ -1194,3 +1277,7 @@ mod slot_tests {
         assert_eq!(m.extra.slot_stack(horizon_items::equipment::HEAD), None);
     }
 }
+
+#[cfg(test)]
+#[path = "drops_tests.rs"]
+mod drops_tests;

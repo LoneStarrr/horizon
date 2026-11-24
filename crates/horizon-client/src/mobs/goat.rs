@@ -6,7 +6,7 @@
 //! on a log, stone or ore. Both are one goal here. The long jump activity is
 //! the frog's goal (frog.rs) with the goat's numbers.
 use super::{
-    Damage, Mob, MobEvent, MobWorld, Who,
+    Damage, DamageKind, Mob, MobEvent, MobWorld, Who,
     goals::{Cx, Goal, LOOK, MOVE, goal_clone},
 };
 use horizon_core::{geometry::Vec3, random::RandomSource};
@@ -432,7 +432,11 @@ fn ram_tick(m: &mut Mob, cx: &mut Cx) {
             Who::Mob(id) => cx.events.push(MobEvent::AttackMob {
                 target: id,
                 amount,
-                source: Damage::mob(m.id, from),
+                // The same `noAggroMobAttack`: a ram angers no mob.
+                source: Damage {
+                    kind: DamageKind::MobAttackNoAggro,
+                    ..Damage::mob(m.id, from)
+                },
             }),
         }
         let level = |effect: &str| {
@@ -613,7 +617,7 @@ pub fn write_nbt(m: &Mob, map: &mut horizon_core::nbt::Compound) {
 /// fields and the ticks left of the long jump cooldown.
 pub fn read_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
     m.extra.screaming = crate::entity_nbt::flag(tag, "IsScreamingGoat");
-    let horn = |key| crate::save::number(tag.get(key)).is_some_and(|v| v == 0);
+    let horn = |key| !crate::entity_nbt::flag_or(tag, key, true);
     m.extra.lost_horns = [horn("HasLeftHorn"), horn("HasRightHorn")];
     let cooldown = tag
         .get("Brain")
@@ -732,11 +736,12 @@ mod ram_tests {
     /// absent, and `GoatAi.updateActivity` picks RAM before IDLE: a goat being
     /// fed or bred only follows.
     #[test]
+    #[ignore = "daily"]
     fn a_fed_or_bred_goat_starts_no_ram() {
         let kind = fake_goat();
         let mut partner = Mob::new(9, kind.clone(), Vec3::new(2.5, 64.0, 0.5), 0.0);
         partner.extra.in_love = 600;
-        let others = [partner.seen(None)];
+        let others = [partner.seen(None, &crate::items::Items::empty())];
         let ran = with_test_world(&others, |w, _| {
             let mut damage = crate::health::TestLevel::new(0);
             let mut events = Vec::new();
@@ -769,12 +774,13 @@ mod ram_tests {
             stone.player = Some(p);
             assert!(due(&mut goat, &stone));
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 
     /// `RamTarget.tick` posts the hit (`noAggroMobAttack`) and then its push,
     /// which names the damage the victim's `applyItemBlocking` runs again on.
     #[test]
+    #[ignore = "daily"]
     fn a_ram_posts_the_hits_damage_with_its_push() {
         let kind = fake_goat();
         let ran = with_test_world(&[], |w, _| {
@@ -820,6 +826,10 @@ mod ram_tests {
             // victim's second `applyItemBlocking`.
             assert_eq!(push, (7.5, 0.0, 1.0, Some(2.0)));
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 }
+
+#[cfg(test)]
+#[path = "goat_ram_tests.rs"]
+mod goat_ram_tests;

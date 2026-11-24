@@ -135,7 +135,7 @@ impl Game<'_> {
 mod tests {
     use super::Game;
     use crate::game::native_entity_refs::tests::with_game;
-    use horizon_client::{command::vanilla, motion::PlayerMotion};
+    use horizon_client::{command::vanilla, effects::EffectInstance, motion::PlayerMotion};
     use horizon_core::geometry::Vec3;
 
     /// Runs a line of the dev tree (`/raid` is registered only there).
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn raid_check_finds_a_raid_counting_down_and_the_horn_is_local_only() {
         with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
@@ -194,6 +194,131 @@ mod tests {
                     2.0
                 )]
             );
+        });
+    }
+
+    /// `RaidCommand.start` goes through `Raids.createOrExtendRaid`, which
+    /// absorbs the player's Raid Omen (`Raid.absorbRaidOmen`: the
+    /// `raid_trigger` statistic) before it sets the level from the command.
+    /// The omen stays: nothing in vanilla removes it there.
+    #[test]
+    #[ignore = "daily"]
+    fn raid_start_absorbs_the_players_raid_omen() {
+        with_game(|game| {
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            game.ui.registries.permission = 4;
+            game.chat_capture = Some(Vec::new());
+            let stat = |g: &Game<'_>| g.stats.get("custom", "minecraft:raid_trigger");
+
+            // No Raid Omen: absorbRaidOmen finds no effect and awards nothing.
+            assert_eq!(run_dev(game, "raid start 2"), 1);
+            assert_eq!(stat(game), 0);
+            run_dev(game, "raid stop");
+
+            game.add_player_effect(EffectInstance::new("raid_omen", 600, 1));
+            assert_eq!(run_dev(game, "raid start 3"), 1);
+            // The omen's amplifier + 1 is absorbed, then the command's level wins
+            // (`Raid.setRaidOmenLevel`).
+            let (_, raid) = game.raiding.raids.nearby([0, 64, 0]).expect("raid here");
+            assert_eq!(raid.omen_level, 3);
+            assert_eq!(stat(game), 1);
+            assert!(game.potions.effects.get("raid_omen").is_some());
+        });
+    }
+
+    /// #15334: a killed captain drops `Raid.getOminousBannerInstance`, not a
+    /// plain white banner. Expected values are vanilla's
+    /// `Raid.getBannerComponentPatch` (26.3).
+    #[test]
+    #[ignore = "daily"]
+    fn a_killed_captain_drops_the_ominous_banner_it_wears() {
+        use horizon_core::nbt::Tag;
+        let ominous_patch = || {
+            let layer = |pattern: &str, color: &str| {
+                Tag::compound([
+                    ("pattern", Tag::String(pattern.into())),
+                    ("color", Tag::String(color.into())),
+                ])
+            };
+            [
+                (
+                    "minecraft:banner_patterns",
+                    Tag::List(vec![
+                        layer("minecraft:rhombus", "cyan"),
+                        layer("minecraft:stripe_bottom", "light_gray"),
+                        layer("minecraft:stripe_center", "gray"),
+                        layer("minecraft:border", "light_gray"),
+                        layer("minecraft:stripe_middle", "black"),
+                        layer("minecraft:half_horizontal", "light_gray"),
+                        layer("minecraft:circle", "light_gray"),
+                        layer("minecraft:border", "black"),
+                    ]),
+                ),
+                (
+                    "minecraft:tooltip_display",
+                    Tag::compound([(
+                        "hidden_components",
+                        Tag::List(vec![Tag::String("minecraft:banner_patterns".into())]),
+                    )]),
+                ),
+                (
+                    "minecraft:item_name",
+                    Tag::compound([(
+                        "translate",
+                        Tag::String("block.minecraft.ominous_banner".into()),
+                    )]),
+                ),
+                ("minecraft:rarity", Tag::String("uncommon".into())),
+            ]
+        };
+        let check = |wrong: &mut Vec<String>, what: &str, stack: &horizon_client::items::ItemStack| {
+            if &*stack.item != "minecraft:white_banner" || stack.count != 1 {
+                wrong.push(format!("{what}: {} x{}", stack.item, stack.count));
+            }
+            let components = horizon_client::item_data::encode_components(stack);
+            for (key, want) in ominous_patch() {
+                let got = components.as_ref().and_then(|c| c.get(key));
+                if got != Some(&want) {
+                    wrong.push(format!("{what}: {key} is {got:?}"));
+                }
+            }
+            // What draws the stack (its icon, the item entity) and what
+            // washing, the loom and shields read: the layers themselves.
+            let layers = horizon_client::banner::layers(stack).len();
+            if layers != 8 {
+                wrong.push(format!("{what}: {layers} layers in memory"));
+            }
+        };
+
+        with_game(|game| {
+            let mut wrong = Vec::new();
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            game.ui.registries.permission = 4;
+            run_dev(game, "raid spawnleader");
+            let captain = game
+                .mobs
+                .iter()
+                .find(|m| &*m.kind.id == "minecraft:pillager")
+                .expect("the captain");
+            // PatrollingMonster.finalizeSpawn: setItemSlot(HEAD, the banner), as
+            // getItemBySlot reads it and as SetEquipment sends it.
+            let head = horizon_items::equipment::HEAD;
+            let worn = captain.extra.slot_stack(head).cloned().expect("a head stack");
+            check(&mut wrong, "worn", &worn);
+            let read = horizon_client::mobs::finalize::item_stack(captain, head).expect("a head stack");
+            check(&mut wrong, "read", &read);
+            let before = game.dropped.len();
+            assert!(game.run_command("kill @e[type=minecraft:pillager]"));
+            let banners: Vec<_> = game
+                .dropped
+                .iter()
+                .skip(before)
+                .filter(|e| &*e.stack.item == "minecraft:white_banner")
+                .map(|e| e.stack.clone())
+                .collect();
+            assert_eq!(banners.len(), 1, "the head drop (chance 2.0)");
+            check(&mut wrong, "dropped", &banners[0]);
+            assert!(wrong.is_empty(), "{wrong:#?}");
         });
     }
 }

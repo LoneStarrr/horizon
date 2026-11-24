@@ -1,7 +1,7 @@
 # Read-only equipment predicates inside menu loops
 
-Design proposal for #2669, inspected at main `c6ba817607` and contributor head
-`f516b9dd62`. No implementation is authorized by this note.
+Implemented boundary for arismoko/horizon#2669 and arismoko/horizon#3549. The historical conversion analysis below
+explains why the engine stack and API stack remain distinct owned types.
 
 ## Can we just borrow the existing stack?
 
@@ -70,7 +70,7 @@ applied under one immutable borrow, through a Host adapter that offers observati
 (no commands, storage writes, scheduling or random draws), so nothing can change in
 between and a revision token would compare a value with itself. The recheck stays required
 wherever deciding and applying are separated in time or state: (1) the prepared wasm
-crossing (#3549), where a payload prepared once is reused across candidates: a stack
+crossing (arismoko/horizon#3549), where a payload prepared once is reused across candidates: a stack
 mutation invalidates it and a stale preparation refuses; (2) any path that keeps an answer
 beyond the call (a cache, a predicted answer applied later). A stale or missing entity
 handle refuses on every path.
@@ -81,8 +81,27 @@ handles, slot and scalar answer per candidate. No engine pointers cross; release
 handles at decision end. This requires a reusable prepared Wire call path, not the
 ordinary owned-stack encode/decode on every slot. Unsupported capabilities refuse at
 registration/load with a named reason on both targets; no silent wasm skip.
-The prepared wasm path is deferred and tracked by #3549: until it lands the predicate is native-only
-for the budget below, and a wasm mod is given a copy of the stack on each call.
+The generator layer of arismoko/horizon#3549 implements prepared ownership per participating guest instance,
+borrowed token-based asks, generation/release checks and load/registration refusal for missing
+prepared exports. Slot and entity-kind names are prepared outside traversal and asks carry IDs.
+Gameplay hoists preparation across candidates for one dispense, menu input scope and
+one mob's pickup attempt. `EquipDecision` exclusively owns the source slot during
+mutation; every mutable field access bumps its revision before lending, and
+replacement/removal bumps its identity generation. Overflow retires the scope.
+A changed-and-restored source remains stale. Menu reuse uses scope and scalar stamps,
+not stack equality. Apply checks the source, menu and entity admission preconditions;
+a recycled numeric entity id does not reuse an earlier admission. No-listener paths
+retain their data answer without conversion or a new entity lookup.
+
+The prepared target rows retain entity type (`EntityTypeKey`), position, health,
+maximum health, alive/living status and the eight physical equipment slots. Native
+lends these through an observation Host; wasm sends the rows once with the stack,
+and serves these reads from guest storage. Equipment components remain shared API
+owners rather than being converted or encoded again per read. `entity_kind` uses the
+same allocation-free key API for every caller, with explicit `key.id(host)` name
+resolution outside this budget. Other allocating Host reads remain ordinary calls;
+this is not a promise that every Host operation is allocation-free. Registry/tag/settings
+observations use scalar lookups; owned names and enumerations are outside the budget.
 
 The required engine/bridge budget **per candidate** is 0 heap allocations, 0 stack or
 component payload clones/copies, and only bounded scalar/handle copies, including
@@ -91,5 +110,9 @@ stack mutations invalidate preparation. A counting allocator/no-allocation scope
 around warmed traversal must cover both menus, multiple slots, component-rich stacks,
 unrelated subscribed items, entity reads, and native/wasm dispatch. Check refusal
 leaves the source and all other slots unchanged, stale revisions refuse, and data-only
-stack overrides work. Mod-authored allocations are outside the bridge budget. These
-are acceptance tests to implement, not tests run for this docs-only proposal.
+stack overrides work. Mod-authored allocations are outside the bridge budget. Generator
+loopback tests now cover retained stack identity, payload-size-independent scalar asks,
+native/guest answers and token refusals; runtime tests cover memory-copy counts and
+missing-export load refusal. Decision tests cover source mutation barriers, entity admission checks, gameplay apply
+preconditions and the no-listener path. Native warmed traversal checks allocations;
+wasm copy probes separate preparation bytes from payload-independent scalar asks.

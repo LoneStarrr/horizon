@@ -52,7 +52,7 @@ mod landing_crossing_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn landing_crossing_refuses_invalid_writes_and_sibling_damage() {
         let part = LandingPart::default();
         let mods: mod_api::Mods = vec![ModEntry::new(
@@ -77,7 +77,7 @@ mod landing_crossing_tests {
                     let mut damage = 7.0;
                     let mut writes = original.clone();
                     let mut level = horizon_client::health::TestLevel::new(0);
-                    HitLevel(level.level()).native_fall_on(super::super::fire::FallOnCall {
+                    HitLevel::new(level.level()).native_fall_on(super::super::fire::FallOnCall {
                         dimension: "minecraft:overworld",
                         entity: 1,
                         kind: "minecraft:player",

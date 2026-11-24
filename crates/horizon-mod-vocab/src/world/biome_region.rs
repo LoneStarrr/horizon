@@ -1,7 +1,6 @@
 //! A mod's biome region in the Overworld or the Nether: its own climate points, chosen for an
 //! area by weight beside vanilla's layout, as data a mod registers with
 //! [`Registrar::declare_biome_region`](crate::BiomeRegionsRegistrar::declare_biome_region).
-//! The design and what is built so far: `docs/modding/src/concepts/mod-biome-regions.md`.
 use crate::world::dimension::BiomePoint;
 
 /// The dimensions a region can join: the two whose biomes come from a multi-noise preset.
@@ -61,7 +60,8 @@ impl BiomeRegion {
 #[non_exhaustive]
 #[derive(horizon_mod_api_macros::Wire)]
 pub enum BiomeRegionError {
-    /// The region's id is malformed or in a namespace the declaring mod does not own.
+    /// The region's id is malformed or outside the declaring mod's own namespace: the mod's id,
+    /// not another namespace its manifest lists.
     InvalidId,
     /// A region with the id was already declared.
     Duplicate,

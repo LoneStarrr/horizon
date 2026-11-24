@@ -1,6 +1,6 @@
 //! Jigsaw blocks on the server: `handleSetJigsawBlock` and
-//! `handleJigsawGenerate` (`JigsawBlockEntity.generate`), and the joint a
-//! placed jigsaw starts with.
+//! `handleJigsawGenerate` (`JigsawBlockEntity.generate`), and the joint
+//! `JigsawBlockEntity.loadAdditional` gives data that carries none.
 use super::Game;
 use horizon_client::{
     containers::BlockEntity,
@@ -32,17 +32,6 @@ impl Game<'_> {
         Some(jigsaw_block::front_of_orientation(orientation).to_owned())
     }
 
-    /// `new JigsawBlockEntity(pos, state)`: the joint a block starts with
-    /// follows its facing (`StructureTemplate.getDefaultJointType`).
-    pub(super) fn jigsaw_block_placed(&mut self, pos: Pos) {
-        let Some(front) = self.jigsaw_front(pos) else {
-            return;
-        };
-        if let Some(b) = self.jigsaw_block_mut(pos) {
-            b.joint = JointType::default_for_front(&front);
-        }
-    }
-
     /// `save::decode_block_entity` for data loaded into the block at `pos`
     /// (`/setblock`, `/data`): a jigsaw without `joint` takes the default its
     /// facing gives (`JigsawBlockEntity.loadAdditional`), which the decode
@@ -52,6 +41,8 @@ impl Game<'_> {
             tag,
             &self.data_block_name([pos.0, pos.1, pos.2]),
         )?;
+        // A command's or a mod's NBT is a saved block entity this world takes in.
+        entity.clean_stacks(&self.items().component_defaults);
         if let BlockEntity::JigsawBlock(b) = &mut entity
             && tag.get("joint").is_none()
             && let Some(front) = self.jigsaw_front(pos)

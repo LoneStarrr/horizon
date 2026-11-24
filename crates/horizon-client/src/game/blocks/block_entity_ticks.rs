@@ -14,6 +14,7 @@ use horizon_client::{
     furnace::FurnaceCooking,
 };
 use horizon_core::position::BlockPos;
+use horizon_gameplay::block_entity_ticks::{block_ticking_at, ticker_name};
 use horizon_world::registry::BlockStateId;
 
 /// What `block_entities.tick` is visiting: the kinds its dispatch ticks, read once per entry.
@@ -285,28 +286,6 @@ impl Drop for Enclosing<'_, '_> {
     }
 }
 
-/// The block entity type a sample is attributed to while its ticker runs.
-fn ticker_name(entity: &BlockEntity) -> &'static str {
-    match entity {
-        BlockEntity::Chest(_) => "hopper",
-        BlockEntity::Crafter(_) => "crafter",
-        BlockEntity::Jukebox(_) => "jukebox",
-        BlockEntity::Beacon(_) => "beacon",
-        BlockEntity::CreakingHeart(_) => "creaking_heart",
-        BlockEntity::Spawner(_) => "mob_spawner",
-        BlockEntity::TrialSpawner(_) => "trial_spawner",
-        BlockEntity::Vault(_) => "vault",
-        BlockEntity::Beehive(_) => "beehive",
-        BlockEntity::Furnace(_) => "furnace",
-        BlockEntity::Brewing(_) => "brewing_stand",
-        BlockEntity::DaylightDetector => "daylight_detector",
-        BlockEntity::Campfire(_) => "campfire",
-        BlockEntity::Mod(_) => "mod_block_entity",
-        BlockEntity::PotentSulfur(_) => "potent_sulfur",
-        _ => "block_entity",
-    }
-}
-
 impl Game<'_> {
     /// The published loop `block_entities.tick` (`published_loops.rs`): with no
     /// `[[native.loop]]` mod its slot is `()`, and a mod build installs its own copy of this
@@ -367,10 +346,37 @@ impl Game<'_> {
         this.trial_spawner_tick_positions.clear();
         this.item_columns = Some(Default::default());
         this.pass_mobs = Some(Default::default());
-        let tickers = this.world.block_entity_tickers();
+        let awake = this.world.awake_block_entity_tickers();
+        let wake_epoch = this.world.block_entities.wake_epoch();
+        // Once something wakes mid-pass, the rest of the pass walks the full ticker list from
+        // where it got to, skipping sleepers below: one switch, not a rebuild per wake.
+        let mut all: Option<std::sync::Arc<Vec<(Pos, u32)>>> = None;
         let mut last_chunk = (i32::MIN, i32::MIN);
         let mut last_chunk_ticking = false;
-        for ticker in tickers.iter().copied() {
+        let mut idx = 0usize;
+        let mut last_order: Option<u64> = None;
+        loop {
+            let ticker = if let Some(all) = &all {
+                let Some(&ticker) = all.get(idx) else {
+                    break;
+                };
+                idx += 1;
+                ticker
+            } else {
+                if let Some(prev) = last_order
+                    && this.world.block_entities.wake_epoch() != wake_epoch
+                {
+                    all = Some(this.world.block_entities.ticker_slots());
+                    idx = this.world.block_entities.ticker_index_after(prev);
+                    continue;
+                }
+                let Some(&(pos, ticker_slot, order)) = awake.get(idx) else {
+                    break;
+                };
+                idx += 1;
+                last_order = Some(order);
+                (pos, ticker_slot)
+            };
             let pos = ticker.0;
             let chunk = (pos.0 >> 4, pos.2 >> 4);
             let chunk_ticking = if chunk == last_chunk {
@@ -425,7 +431,16 @@ impl Game<'_> {
             horizon_threads::work::set_entity(horizon_threads::work::entity_id(
                 this.world.block_entities.get(&pos).map_or("", ticker_name),
             ));
+            let suppressed = !matches!(kind, TickedKind::Mod)
+                && this.native_authoritative()
+                && crate::game::code_block_owners::suppressed(
+                    this.pack.assets.registry,
+                    this.world.block(pos.0, pos.1, pos.2),
+                );
             match kind {
+                // A mod block's template ticker (a furnace burning its fuel and input) is the
+                // template's own: it waits while the block's mod is off. The slots still run.
+                _ if suppressed => {}
                 TickedKind::Hopper => this.tick_hopper(pos),
                 TickedKind::Crafter => this.tick_crafter(pos),
                 TickedKind::Jukebox => this.tick_jukebox(pos),
@@ -513,12 +528,14 @@ impl Game<'_> {
             {
                 continue;
             }
-            let tick = self
-                .be_anims
-                .shulkers
-                .get_mut(&pos)
-                .map(|shulker| shulker.tick(pos, facing));
-            let Some(tick) = tick else { continue };
+            let Some(shulker) = self.be_anims.shulkers.get_mut(&pos) else {
+                continue;
+            };
+            let tick = shulker.tick(pos, facing);
+            if tick.neighbor_updates != 0 {
+                // The neighbour updates need the collision shape for this tick.
+                self.world.shulkers.insert(pos, shulker.clone());
+            }
             // `ShulkerBoxBlockEntity.doNeighborUpdates` at the start and the
             // end of an opening or closing lid: the box's collision shape
             // moved, so the neighbours' shapes and their redstone updates run.
@@ -600,14 +617,12 @@ impl Game<'_> {
     /// (`ServerLevel.areEntitiesLoaded`).
     pub(super) fn block_ticking_area(&self) -> impl Fn(i32, i32) -> bool + use<> {
         let levels = self.tickets.levels();
-        let has_pending = !self.world.entities_pending.is_empty();
-        let pending = has_pending.then(|| self.world.entities_pending.clone());
-        move |x, z| {
-            levels.block_ticking_at(x, z)
-                && pending
-                    .as_ref()
-                    .is_none_or(|p| !p.contains(&(x >> 4, z >> 4)))
-        }
+        let pending = self.world.entities_pending.clone();
+        move |x, z| block_ticking_at(&levels, &pending, x, z)
+    }
+    /// Single-position read without copying the pending-entity set.
+    pub(super) fn block_ticking_at(&self, x: i32, z: i32) -> bool {
+        block_ticking_at(&self.tickets.levels(), &self.world.entities_pending, x, z)
     }
     /// `DaylightDetectorBlock.tickEntity` of the detector at `pos`.
     fn tick_daylight_detector(&mut self, pos: Pos) {
@@ -800,7 +815,7 @@ mod jukebox_stop_tests {
     /// vibration only when the block itself was broken, so pulling the disc out
     /// was silent to a sculk sensor beside it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_jukebox_that_stops_tells_the_listeners() {
         let Some(lines) = with_jukebox(|game, disc| {
             assert!(
@@ -906,7 +921,7 @@ mod add_blocks_tests {
     use std::sync::{Arc, OnceLock};
 
     #[test]
-    #[ignore = "needs prepared resources; isolates process-wide registries"]
+    #[ignore = "daily"]
     fn vanilla_template_membership_creates_ticks_and_saves() {
         const FLAG: &str = "HORIZON_ADD_BLOCKS_CASE";
         const BLOCK: &str = "add_blocks_test:vault";
@@ -1074,11 +1089,12 @@ mod add_blocks_tests {
                     panic!("must create vanilla vault")
                 };
                 assert_eq!(vault.state_updating_resumes_at, 120);
-                let tag = horizon_client::save::encode_block_entity((1, 64, 1), entity, BLOCK);
+                let tag =
+                    horizon_client::save::block_entity_encode::encode((1, 64, 1), entity, BLOCK);
                 let (_, restored) =
                     horizon_client::save::decode_block_entity_for_block(&tag, BLOCK).unwrap();
                 assert_eq!(
-                    horizon_client::save::encode_block_entity((1, 64, 1), &restored, BLOCK),
+                    horizon_client::save::block_entity_encode::encode((1, 64, 1), &restored, BLOCK),
                     tag
                 );
                 let BlockEntity::Vault(restored) = restored else {
@@ -1129,7 +1145,7 @@ mod furnace_changed_tests {
     /// that completes while the furnace stays LIT changes the output and the
     /// input without changing the block state, so nothing else marks it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_finished_smelt_marks_the_chunk() {
         let mut game_resources = None;
         let mut game = server_game(&mut game_resources);
@@ -1177,7 +1193,7 @@ mod furnace_changed_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_refuel_while_lit_marks_the_chunk() {
         // litTimeRemaining goes 1 -> 0 and the furnace takes new fuel in the
         // same tick: it stays LIT, and consuming the fuel sets changed.
@@ -1260,7 +1276,7 @@ mod slot_guard_tests {
 
     /// Each call of a slot, before and after an entry, runs inside its mod's guard.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_slot_is_entered_as_its_mod_before_and_after_an_entry() {
         let mut game_resources = None;
         let mut game = server_game(&mut game_resources);
@@ -1368,7 +1384,7 @@ mod slot_mutation_tests {
     /// A slot that removes the entity it is asked about and answers Continue: it does not tick,
     /// and no `after` is called for it; the next one ticks.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_removed_current_entity_does_not_tick() {
         with_blocks(
             &[(A, "minecraft:hopper"), (B, "minecraft:hopper")],
@@ -1386,7 +1402,7 @@ mod slot_mutation_tests {
     /// A slot that puts another kind of block entity in the visited one's place: the old kind's
     /// tick is not run on it, and no `after` is called for it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_replaced_current_entity_of_another_kind_does_not_tick() {
         with_blocks(
             &[(A, "minecraft:hopper"), (B, "minecraft:hopper")],
@@ -1411,7 +1427,7 @@ mod slot_mutation_tests {
     /// One a slot adds is not visited in this pass (the pass's list was taken when it started)
     /// and is from the next.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_added_entity_ticks_from_the_next_pass() {
         with_blocks(
             &[(A, "minecraft:hopper"), (B, "minecraft:hopper")],
@@ -1432,7 +1448,7 @@ mod slot_mutation_tests {
     /// then the enclosing pass goes on with its own scratch. Its later hopper takes an item, and
     /// its spawner list holds the spawner once, as its own pass ticked it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_nested_pass_leaves_the_enclosing_pass_its_scratch() {
         with_blocks(
             &[
@@ -1466,7 +1482,7 @@ mod slot_mutation_tests {
     /// A slot that catches a nested pass's panic and goes on: the enclosing pass still has its own
     /// scratch, so the spawner it ticked is listed once and its later hopper takes an item.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_caught_nested_panic_leaves_the_enclosing_pass_its_scratch() {
         struct Boom;
         impl BlockEntityTickSlot for Boom {
@@ -1673,7 +1689,7 @@ mod own_block_entity_tests {
     /// (B made its type valid there): each mod's slot is asked about all of them and counts only
     /// its own entities, whatever block they stand on. An id with no type counts nothing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; runs in an isolated scratch process"]
+    #[ignore = "daily"]
     fn each_slot_counts_only_its_own_mods_block_entities() {
         // The content root freezes the process's block entity types.
         if run_fresh_cases(
@@ -1719,7 +1735,7 @@ mod own_block_entity_tests {
     /// valid on, beside each mod's own block and a detector with its vanilla block entity: mod B's
     /// slot counts it, mod A's doesn't, and it ticks as B's. Neither counts the vanilla detector.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; runs in an isolated scratch process"]
+    #[ignore = "daily"]
     fn a_mods_block_entity_on_a_vanilla_block_is_only_its_own_mods() {
         // The content root freezes the process's block entity types.
         if run_fresh_cases(
@@ -1837,7 +1853,7 @@ mod own_block_entity_tests {
     /// A's type, though B's entity stands there), the replaced entity does not tick, as A's or at
     /// all, and no slot's `after` sees it. The next pass visits it as B's.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; runs in an isolated scratch process"]
+    #[ignore = "daily"]
     fn an_entity_replaced_by_another_mods_type_does_not_tick_as_the_old_one() {
         // The content root freezes the process's block entity types.
         if run_fresh_cases(
@@ -1882,6 +1898,69 @@ mod own_block_entity_tests {
             assert_eq!(swap.after, [a, c]);
             assert_eq!(ticks_of(game, a), [2]);
             assert_eq!(ticks_of(game, c), [1, 1]);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn waking_a_later_sleeping_ticker_runs_it_in_the_same_pass() {
+        if run_fresh_cases(
+            "game::block_entity_ticks::own_block_entity_tests::waking_a_later_sleeping_ticker_runs_it_in_the_same_pass",
+            "HORIZON_OWN_BLOCK_ENTITIES_CHILD",
+            &["run"],
+        ) {
+            return;
+        }
+        struct WakeLater {
+            a: Pos,
+            wake: Vec<Pos>,
+            woke: bool,
+            seen: Vec<Pos>,
+        }
+        impl BlockEntityTickSlot for WakeLater {
+            fn before(&mut self, tick: &mut BlockEntityTick<'_, '_>) -> LoopFlow {
+                self.seen.push(tick.pos);
+                if tick.pos == self.a && !self.woke {
+                    self.woke = true;
+                    for &pos in &self.wake {
+                        let _ = tick.game.world.block_entities.get_mut(&pos);
+                    }
+                }
+                LoopFlow::Continue
+            }
+        }
+        let mods: Mods = vec![ModEntry::new("own_a", Box::new(Machines::new(A, None)))].into();
+        let (early, a, b, c) = ((1, 64, 1), (3, 64, 1), (5, 64, 1), (7, 64, 1));
+        with_machines(mods, &[(early, A), (a, A), (b, A), (c, A)], |game| {
+            // First pass initializes states and promotes slots in placement order (early < a < b < c).
+            game.tick_block_entities().unwrap();
+            game.world.block_entities.sleep(early);
+            game.world.block_entities.sleep(b);
+            game.world.block_entities.sleep(c);
+
+            // Visiting a wakes both early (slot < a) and b (slot > a); b runs in this same pass in
+            // slot order, early waits until the next pass, and c stays skipped.
+            let mut slot = WakeLater {
+                a,
+                wake: vec![early, b],
+                woke: false,
+                seen: Vec::new(),
+            };
+            game.tick_block_entities_with(&mut slot).unwrap();
+            assert_eq!(slot.seen, [a, b]);
+            assert_eq!(ticks_of(game, early), [1]);
+            assert_eq!(ticks_of(game, a), [1, 1]);
+            assert_eq!(ticks_of(game, b), [1, 1]);
+            assert_eq!(ticks_of(game, c), [1]);
+            assert!(game.world.block_entities.is_asleep(&c));
+
+            slot.seen.clear();
+            game.tick_block_entities_with(&mut slot).unwrap();
+            assert_eq!(slot.seen, [early, a, b]);
+            assert_eq!(ticks_of(game, early), [1, 1]);
+            assert_eq!(ticks_of(game, a), [1, 1, 1]);
+            assert_eq!(ticks_of(game, b), [1, 1, 1]);
+            assert_eq!(ticks_of(game, c), [1]);
         });
     }
 }

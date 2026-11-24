@@ -137,7 +137,7 @@ if most of the work moves to parallel phases.
 
 ### 3.1 One server, in this repo
 
-Single player runs on the server thread (`game/world/integrated.rs`, since #1514), so the integrated server, LAN
+Single player runs on the server thread (`game/world/integrated.rs`, since arismoko/horizon#1514), so the integrated server, LAN
 hosts and `--dedicated` share every line of server code: the tick, the levels, the hub, the entity tracker,
 saving. A separate server repo would fork that code or pin it across repos, and either way two copies would
 drift. Gameplay is about 420 000 lines (`game/` 133 k, `mobs/` 62 k, `lan/` 15 k, the flat lib 90 k, and
@@ -150,7 +150,7 @@ drift. Gameplay is about 420 000 lines (`game/` 133 k, `mobs/` 62 k, `lan/` 15 k
 | Saving and light off the tick thread (5.5) | `game/world/saving.rs`, `save.rs`, `horizon-world` | everyone |
 | Fast path (8) | `horizon-protocol` (the `horizon:hello` payloads), `lan/conn.rs` (server), `net.rs` and `game/remote*.rs` (client) | every Horizon client against every Horizon server |
 | Operations (9.2) | `crates/horizon-server` (supervisor, panel, control API, MCP), `crates/horizon-server-files` | dedicated |
-| Plugin API (W9) | `crates/horizon-mod-package` and the server hooks from #3706 and #3878 | integrated server, LAN, dedicated |
+| Plugin API (W9) | `crates/horizon-mod-package` and the server hooks from arismoko/horizon#3706 and arismoko/horizon#3878 | integrated server, LAN, dedicated |
 | Bench (W0) | `tools/server_bench.py`, `crates/horizon-bots`, `benchmarks/` | — |
 
 What changes for single player: it gets the exact parallel phases (4.1, 4.2 `tick = "vanilla"`), the cheaper
@@ -366,6 +366,11 @@ Each step below is one or more PRs. Each one is measured with the bench on three
    shrink back after the last one leaves. Their stacks are sized to what they use.
 6. **Give memory back.** After the last player leaves, unloaded chunks and caches are freed, and the allocator
    returns pages to the OS. The bench checks that RSS drops back under the target 60 s after the last leave.
+   - Done: 5 s and 30 s after the last player leaves, the chunk send caches are dropped and every pool thread
+     (terrain workers, chunk encoders, network threads, save compressors) hands its heap's free pages back. After
+     ten bots explored for two minutes, an empty server holds 506 MB instead of 659 MB; a fresh one holds 356-369 MB.
+   - Left: the structure starts the generator keeps (they also hold starts read from saved chunks, about 25 MB)
+     and pages the allocator can't return while a few small allocations still use them (about 75 MB).
 7. **Start < 0.1 s.** With steps 1 to 4, nothing heavy runs before the listener opens: read `server.properties`
    and the lists, map `server.pack`, read `level.dat`, bind. A startup span log times each step, and the bench
    fails a PR that makes any of them slower.

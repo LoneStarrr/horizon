@@ -2,7 +2,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires explicit isolated prepared resources"]
+#[ignore = "daily"]
 fn murder_uses_only_the_victims_sensor_memory() {
     crate::game::kill_die_vibration_tests::game(|game| {
         game.mobs.clear();
@@ -23,7 +23,11 @@ fn murder_uses_only_the_victims_sensor_memory() {
             0,
             "a nearby villager absent from the last scan is not a witness"
         );
-        let snapshot: Vec<_> = game.mobs.iter().map(|m| m.seen(None)).collect();
+        let snapshot: Vec<_> = game
+            .mobs
+            .iter()
+            .map(|m| m.seen(None, game.items()))
+            .collect();
         let world = game.mob_world_base(&snapshot);
         let mut level = horizon_client::health::TestLevel::new(0);
         let mut events = Vec::new();

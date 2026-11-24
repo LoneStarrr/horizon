@@ -36,7 +36,7 @@ impl Hooks for Probe {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and an isolated mod registry"]
+#[ignore = "daily"]
 fn a_changed_inventory_is_heard_once_with_its_41_slots() {
     crate::game::in_own_process(
         "game::advancements::inventory_changed_tests::a_changed_inventory_is_heard_once_with_its_41_slots",
@@ -130,4 +130,17 @@ fn the_slots_follow_inventory_numbering() {
     );
     // A short inventory is padded, never shifted into the armour.
     assert_eq!(super::inventory_slots(&[], &armor, &None).len(), 41);
+}
+
+#[test]
+fn empty_inventory_hashes_to_zero_and_starts_unseen() {
+    use std::hash::{Hash, Hasher};
+    let mut h = horizon_core::fast_hash::FxHasher::default();
+    for _ in 0..41 {
+        Option::<(&str, u32)>::None.hash(&mut h);
+    }
+    assert_eq!(h.finish(), 0);
+    let state = super::AdvState::default();
+    assert_eq!(state.last_inventory, None);
+    assert_ne!(state.last_inventory, Some(0));
 }

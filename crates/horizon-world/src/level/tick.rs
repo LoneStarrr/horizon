@@ -11,7 +11,7 @@ use horizon_core::{
     geometry::Direction,
     position::{BlockPos, ChunkPos},
     random::RandomSource,
-    ticks::TickTypeId,
+    ticks::{ScheduledTick, TickTypeId},
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,6 +23,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
 
     /// `BlockState.tick` (scheduled block tick).
     pub fn tick_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        if self.level.template_suppressed(state) {
+            return;
+        }
         let b = self.b;
         let p = b.props;
         let block = b.block(state);
@@ -271,13 +274,54 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// `ServerLevel.tickBlock` once the block at `pos` is the tick's: the
     /// level may handle the tick first, else `BlockState.tick`.
     fn tick_due_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        // The hooks read the mod's switch themselves: asked before them as well as after, a
+        // switch in between can't hand the block to its template with no hook answering.
+        let before = self.level.template_suppressed(state);
         let (mut current, mut handled) = (state, false);
         self.level
             .before_tick_block(self.ticks, pos, &mut current, &mut handled);
         // A block the level changed ticks as it is now, if it is still the
         // tick's block.
-        if !handled && (current == state || self.block_of(current) == self.block_of(state)) {
+        if !handled
+            && (current == state || self.block_of(current) == self.block_of(state))
+            && !self.suppressed_after_hooks(before, state, current)
+        {
             self.tick_block(current, pos);
+        }
+    }
+
+    /// Whether `current`, the block a dispatch that began on `state` reaches its template with,
+    /// must not run it ([`LevelAccess::template_suppressed`]). `before` is the answer for `state`
+    /// from before the hooks; it counts only while the target is still that block, as a hook may
+    /// have put another in its place.
+    fn suppressed_after_hooks(
+        &self,
+        before: bool,
+        state: BlockStateId,
+        current: BlockStateId,
+    ) -> bool {
+        (before && self.block_of(current) == self.block_of(state))
+            || self.level.template_suppressed(current)
+    }
+
+    /// A due block tick from the queue.
+    fn run_due_block_tick(&mut self, tick: ScheduledTick) {
+        let state = self.state(tick.pos);
+        let block = self.b.block(state);
+        horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+        horizon_threads::work::set_block(block.0);
+        if u32::from(block.0) == tick.kind.0 {
+            self.tick_due_block(state, tick.pos);
+        }
+    }
+
+    /// A due fluid tick from the queue.
+    fn run_due_fluid_tick(&mut self, tick: ScheduledTick) {
+        let state = self.state(tick.pos);
+        horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+        horizon_threads::work::set_block(self.b.block(state).0);
+        if TickTypeId(self.b.fluid(state).kind().tick_id()) == tick.kind {
+            self.fluid_tick(tick.pos);
         }
     }
 
@@ -285,24 +329,34 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     pub fn random_tick_at(&mut self, pos: BlockPos) {
         let state = self.state(pos);
         horizon_threads::work::set_block(self.b.block(state).0);
+        // Asked before the hooks as well as after, as in `tick_due_block`.
+        let before = self.level.template_suppressed(state);
         if self.b.is_randomly_ticking(state) {
             let (mut current, mut handled) = (state, false);
             self.level
                 .before_random_tick(self.ticks, pos, &mut current, &mut handled);
             // A block the level changed ticks as it is now, if it still ticks
             // randomly.
-            if !handled && (current == state || self.b.is_randomly_ticking(current)) {
+            if !handled
+                && (current == state || self.b.is_randomly_ticking(current))
+                && !self.suppressed_after_hooks(before, state, current)
+            {
                 self.random_tick_block(current, pos);
             }
         }
         // Only lava's fluid state ticks randomly. A lava block is ticked twice
         // (LiquidBlock.randomTick, then FluidState.randomTick), as in vanilla.
-        if super::fluids::fluid_randomly_ticks(self.b.fluid(state).kind()) {
+        if super::fluids::fluid_randomly_ticks(self.b.fluid(state).kind())
+            && !self.suppressed_after_hooks(before, state, self.state(pos))
+        {
             self.lava_random_tick(pos);
         }
     }
 
     pub fn random_tick_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        if self.level.template_suppressed(state) {
+            return;
+        }
         let b = self.b;
         let p = b.props;
         let block = b.block(state);
@@ -535,7 +589,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     pub(crate) fn is_free(&self, state: BlockStateId) -> bool {
         let b = self.b;
         b.is_air(state)
-            || b.tag("minecraft:fire")
+            || b.hot_tags
+                .fire
+                .as_deref()
                 .is_some_and(|tag| b.in_set(state, tag))
             || b.liquid(state)
             || b.is_replaceable(state)
@@ -649,11 +705,16 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.remove_block(pos, false);
         }
         let below_state = self.below_state(pos);
-        let infiniburn = match self.level.dimension_type().infiniburn.as_str() {
-            "#minecraft:infiniburn_nether" => &b.tags.infiniburn_nether,
-            "#minecraft:infiniburn_end" => &b.tags.infiniburn_end,
-            _ => &b.tags.infiniburn_overworld,
-        };
+        static EMPTY: std::sync::LazyLock<super::data::BlockSet> =
+            std::sync::LazyLock::new(super::data::BlockSet::default);
+        let infiniburn = self
+            .level
+            .infiniburn()
+            .or_else(|| {
+                let name = &self.level.dimension_type().infiniburn;
+                b.tag(name.strip_prefix('#').unwrap_or(name))
+            })
+            .unwrap_or(&EMPTY);
         let mut infini = None;
         self.level
             .before_is_fire_source(below_state, below(pos), &mut infini);
@@ -857,13 +918,20 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let b = self.b;
         let mut speed = 1.0f32;
         let under = below(pos);
+        let asks = self.level.asks_is_fertile();
         for xx in -1..=1 {
             for zz in -1..=1 {
                 let mut block_speed = 0.0f32;
-                let state = self.state(under.offset(xx, 0, zz));
+                let at = under.offset(xx, 0, zz);
+                let state = self.state(at);
                 if b.in_set(state, &b.tags.grows_crops) {
                     block_speed = 1.0;
-                    if b.table.int(state, b.props.moisture) > 0 {
+                    // IBlockExtension.isFertile: vanilla's moisture, as a part leaves it.
+                    let mut fertile = b.table.int(state, b.props.moisture) > 0;
+                    if asks {
+                        self.level.before_is_fertile(state, at, &mut fertile);
+                    }
+                    if fertile {
                         block_speed = 3.0;
                     }
                 }
@@ -1041,16 +1109,28 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         self.level.crop_grow_post(pos, state);
     }
+    /// `FarmlandBlock.randomTick`, with session-only watered areas before `isNearWater`.
     fn farmland_random_tick(&mut self, state: BlockStateId, pos: BlockPos) {
         let b = self.b;
         let moisture = b.table.int(state, b.props.moisture);
-        let mut near_water = false;
-        'search: for x in -4..=4 {
-            for y in 0..=1 {
-                for z in -4..=4 {
-                    if b.is_water_fluid(self.fluid_at(pos.offset(x, y, z)).kind()) {
-                        near_water = true;
-                        break 'search;
+        let mut near_water = self.level.has_water_ticket(pos);
+        // IBlockExtension.canBeHydrated: the farmland's parts, looked up once.
+        let asks = !near_water && self.level.asks_can_be_hydrated(state);
+        if !near_water {
+            'search: for x in -4..=4 {
+                for y in 0..=1 {
+                    for z in -4..=4 {
+                        let at = pos.offset(x, y, z);
+                        let fluid = self.fluid_at(at);
+                        let mut hydrates = None;
+                        if asks && fluid.kind() != FluidKind::Empty {
+                            self.level
+                                .before_can_be_hydrated(state, pos, fluid, at, &mut hydrates);
+                        }
+                        if hydrates.unwrap_or_else(|| b.is_water_fluid(fluid.kind())) {
+                            near_water = true;
+                            break 'search;
+                        }
                     }
                 }
             }
@@ -1548,7 +1628,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         if info.freezes_below {
             let from = self.state(below_pos);
             let to = b.default_of(b.named.ice);
-            if self.level.allow_block_form(below_pos, from, to) {
+            // A water template's freezing is its own, as below a cauldron's filling.
+            if !self.level.template_suppressed(from)
+                && self.level.allow_block_form(below_pos, from, to)
+            {
                 self.set_block_and_update(below_pos, to);
             }
         }
@@ -1582,6 +1665,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         if info.kind != PrecipitationKind::None {
             let below_state = self.state(below_pos);
+            if self.level.template_suppressed(below_state) {
+                return;
+            }
             let data = b.data(below_state);
             let chance = match info.kind {
                 PrecipitationKind::Rain => 0.05,
@@ -1671,10 +1757,17 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.set_block_and_update(pos, next);
         }
     }
-    /// `WeatheringCopper.getNext` by registry naming.
+    /// `WeatheringCopper.getNext`: the world's `neoforge:oxidizables` value
+    /// (`DataMapHooks.getNextOxidizedStage`), else by registry naming.
     pub(crate) fn copper_next(&self, state: BlockStateId) -> Option<BlockStateId> {
         let b = self.b;
         let name = &*b.table.info(b.block(state)).name;
+        if let Some(next) = b.read_block_maps(|maps| {
+            maps.next_oxidation(name)
+                .and_then(|n| b.table.block_by_name(n))
+        }) {
+            return Some(b.table.with_properties_of(next, state));
+        }
         let path = name.strip_prefix("minecraft:")?;
         let next = if path == "copper_block" {
             "exposed_copper".to_owned()
@@ -1707,14 +1800,25 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             })
         }
     }
+    /// One oxidation step back, or all of them: the world's
+    /// `neoforge:oxidizables` inverse (`DataMapHooks.getPreviousOxidizedStage`)
+    /// first, else by registry naming.
     fn copper_stepped(&self, state: BlockStateId, all_the_way: bool) -> Option<BlockStateId> {
         let b = self.b;
-        let name = &*b.table.info(b.block(state)).name;
-        let mut path = Self::copper_previous_name(name.strip_prefix("minecraft:")?)?;
-        while all_the_way && let Some(earlier) = Self::copper_previous_name(&path) {
-            path = earlier;
-        }
-        let block = b.table.block_by_name(&format!("minecraft:{path}"))?;
+        let previous = |name: &str| -> Option<String> {
+            b.read_block_maps(|maps| maps.previous_oxidation(name).map(str::to_owned))
+                .or_else(|| {
+                    let path = Self::copper_previous_name(name.strip_prefix("minecraft:")?)?;
+                    Some(format!("minecraft:{path}"))
+                })
+        };
+        let start: &str = &b.table.info(b.block(state)).name;
+        let name = if all_the_way {
+            first_stage(start, previous)?
+        } else {
+            previous(start)?
+        };
+        let block = b.table.block_by_name(&name)?;
         Some(b.table.with_properties_of(block, state))
     }
     /// `LightningBolt.clearCopperOnLightningStrike`: the struck copper goes
@@ -1766,6 +1870,22 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
 }
 
+/// The first oxidation stage before `start`: `previous` stepped back until it gives nothing
+/// (`LightningBolt.clearCopperOnLightningStrike`'s walk to the unoxidized block), none when
+/// `start` has no earlier stage. A pack's chain that comes back to a block it already passed
+/// stops there, so mod data can't hang the walk; vanilla's chain has four stages.
+fn first_stage(start: &str, previous: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let mut name = previous(start)?;
+    let mut passed = vec![start.to_owned()];
+    while let Some(earlier) = previous(&name) {
+        if passed.contains(&earlier) || earlier == name {
+            break;
+        }
+        passed.push(std::mem::replace(&mut name, earlier));
+    }
+    Some(name)
+}
+
 /// `Biome.Precipitation` at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrecipitationKind {
@@ -1788,10 +1908,11 @@ pub struct Precipitation {
 
 impl Behaviours {
     /// Run due scheduled ticks for the level's current game time, in vanilla
-    /// order: block ticks then fluid ticks (65536 each at most).
+    /// order: block ticks then fluid ticks (65536 each at most). The caller
+    /// runs them inside the level tick's `handlingTick`
+    /// ([`Ticks::begin_handling_tick`]).
     pub fn tick_scheduled<L: LevelAccess + ?Sized>(&self, level: &mut L, ticks: &mut Ticks) {
         let time = level.game_time();
-        ticks.handling_tick = true;
         {
             let level_ref: &L = level;
             if ticks
@@ -1801,18 +1922,11 @@ impl Behaviours {
                 })
                 .is_err()
             {
-                ticks.handling_tick = false;
                 return;
             }
         }
         while let Ok(Some(tick)) = ticks.blocks.next_tick() {
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            if u32::from(self.block(state).0) == tick.kind.0 {
-                sim.tick_due_block(state, tick.pos);
-            }
+            self.sim(level, ticks).run_due_block_tick(tick);
         }
         let _ = ticks.blocks.finish_tick();
         {
@@ -1824,28 +1938,21 @@ impl Behaviours {
                 })
                 .is_err()
             {
-                ticks.handling_tick = false;
                 return;
             }
         }
         while let Ok(Some(tick)) = ticks.fluids.next_tick() {
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            let fluid = self.fluid(state).kind();
-            if TickTypeId(fluid.tick_id()) == tick.kind {
-                sim.fluid_tick(tick.pos);
-            }
+            self.sim(level, ticks).run_due_fluid_tick(tick);
         }
         let _ = ticks.fluids.finish_tick();
-        ticks.handling_tick = false;
     }
     /// `tick_scheduled` one tick at a time, for a caller that must act on
     /// each tick's side effects before the next runs (as vanilla runs them
     /// inline): `scheduled_begin`, then `scheduled_step` until it returns
     /// false, then `scheduled_finish`; block ticks first, then fluid ticks.
     /// Returns whether ticks are due (false: nothing to step or finish).
+    /// Inside the level tick's `handlingTick`
+    /// ([`Ticks::begin_handling_tick`]), like `tick_scheduled`.
     pub fn scheduled_begin<L: LevelAccess + ?Sized>(
         &self,
         level: &mut L,
@@ -1853,22 +1960,17 @@ impl Behaviours {
         fluids: bool,
     ) -> bool {
         let time = level.game_time();
-        ticks.handling_tick = true;
         let level_ref: &L = level;
         let queue = if fluids {
             &mut ticks.fluids
         } else {
             &mut ticks.blocks
         };
-        let ok = queue
+        queue
             .begin_tick(time, 65536, |chunk: ChunkPos| {
                 level_ref.is_ticking_chunk(chunk)
             })
-            .is_ok();
-        if !ok {
-            ticks.handling_tick = false;
-        }
-        ok
+            .is_ok()
     }
     /// Run the next due tick; false when none is left.
     pub fn scheduled_step<L: LevelAccess + ?Sized>(
@@ -1881,25 +1983,12 @@ impl Behaviours {
             let Ok(Some(tick)) = ticks.fluids.next_tick() else {
                 return false;
             };
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            let fluid = self.fluid(state).kind();
-            if TickTypeId(fluid.tick_id()) == tick.kind {
-                sim.fluid_tick(tick.pos);
-            }
+            self.sim(level, ticks).run_due_fluid_tick(tick);
         } else {
             let Ok(Some(tick)) = ticks.blocks.next_tick() else {
                 return false;
             };
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            if u32::from(self.block(state).0) == tick.kind.0 {
-                sim.tick_due_block(state, tick.pos);
-            }
+            self.sim(level, ticks).run_due_block_tick(tick);
         }
         true
     }
@@ -1910,7 +1999,6 @@ impl Behaviours {
         } else {
             ticks.blocks.finish_tick()
         };
-        ticks.handling_tick = false;
     }
     /// Random-tick one chunk (`ServerLevel.tickChunk` block part). Visits the
     /// sections from the bottom up and draws `randomTickSpeed` positions in
@@ -1927,7 +2015,7 @@ impl Behaviours {
         mut next_ticking: impl FnMut(&mut L, i32) -> Option<i32>,
     ) {
         self.tick_chunk_random_masked(level, ticks, chunk, |level, from| {
-            next_ticking(level, from).map(|min_y| (min_y, None))
+            next_ticking(level, from).map(|min_y| (min_y, RandomTickMaskUpdate::Replace(None)))
         });
     }
     /// [`Self::tick_chunk_random`], where `next_ticking` may also give the
@@ -1940,12 +2028,19 @@ impl Behaviours {
         level: &mut L,
         ticks: &mut Ticks,
         chunk: ChunkPos,
-        mut next_ticking: impl FnMut(&mut L, i32) -> Option<(i32, Option<Rc<RandomTickMask>>)>,
+        mut next_ticking: impl FnMut(&mut L, i32) -> Option<(i32, RandomTickMaskUpdate)>,
     ) {
         let speed = level.game_rules().random_tick_speed;
         if speed <= 0 {
             return;
         }
+        // `ServerChunkCache.tick` random-ticks inside the level tick's
+        // `handlingTick` (ServerLevel.java:360 sets it, :406 runs
+        // `chunkSource.tick`, :412 clears it): the caller holds it for the
+        // whole tick ([`Ticks::begin_handling_tick`]), so a piston reached by
+        // a random tick's neighbour change reports event 2 for a pushed block
+        // still in flight, as `PistonBaseBlock.checkIfExtend`
+        // (PistonBaseBlock.java:108) asks.
         let (min_x, min_z) = (chunk.x * 16, chunk.z * 16);
         horizon_threads::work::set_chunk(chunk.x, chunk.z);
         for _ in 0..speed {
@@ -1957,18 +2052,31 @@ impl Behaviours {
             }
         }
         let mut from = level.min_y();
-        while let Some((min_y, mut mask)) =
-            next_ticking(level, from).filter(|&(y, _)| y < level.max_y())
-        {
+        let mut mask = None;
+        while let Some((min_y, update)) = next_ticking(level, from) {
+            if min_y >= level.max_y() {
+                break;
+            }
+            if let RandomTickMaskUpdate::Replace(next) = update {
+                mask = next;
+            }
             for _ in 0..speed {
                 let pos = ticks.block_random_pos(min_x, min_y, min_z, 15);
                 if mask.as_ref().is_none_or(|m| m.may_tick(pos)) {
                     self.sim(level, ticks).random_tick_at(pos);
                     // The same section as it is now; one that stopped
                     // ticking still gets the rest of its draws, unfiltered.
-                    mask = next_ticking(level, min_y)
-                        .filter(|&(y, _)| y == min_y)
-                        .and_then(|(_, m)| m);
+                    if let Some((y, update)) = next_ticking(level, min_y) {
+                        if y == min_y {
+                            if let RandomTickMaskUpdate::Replace(next) = update {
+                                mask = next;
+                            }
+                        } else {
+                            mask = None;
+                        }
+                    } else {
+                        mask = None;
+                    }
                 }
             }
             from = min_y + 16;
@@ -2034,6 +2142,15 @@ impl Behaviours {
     }
 }
 
+/// How [`Behaviours::tick_chunk_random_masked`] should update the current
+/// section mask. `Keep` reuses the mask already held by the tick loop, so a
+/// callback can answer repeated asks without cloning its `Rc`.
+#[derive(Debug)]
+pub enum RandomTickMaskUpdate {
+    Keep,
+    Replace(Option<Rc<RandomTickMask>>),
+}
+
 /// Which of a section's 4,096 blocks a random tick can do anything for
 /// ([`Behaviours::random_tick_candidate`]), one bit each in the section's
 /// index order (`y << 8 | z << 4 | x`). Vanilla reads the block at every drawn
@@ -2068,3 +2185,40 @@ impl RandomTickMask {
 #[cfg(test)]
 #[path = "fire_tick_tests.rs"]
 mod fire_tick_tests;
+
+#[cfg(test)]
+#[path = "block_maps_tests.rs"]
+mod block_maps_tests;
+
+#[cfg(test)]
+mod first_stage_tests {
+    use super::first_stage;
+
+    fn chain<'a>(steps: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            steps
+                .iter()
+                .find(|(from, _)| *from == name)
+                .map(|(_, to)| (*to).to_owned())
+        }
+    }
+
+    #[test]
+    fn the_lightning_walk_reaches_the_first_stage_and_stops_where_a_chain_loops() {
+        let vanilla = [
+            ("oxidized", "weathered"),
+            ("weathered", "exposed"),
+            ("exposed", "copper"),
+        ];
+        assert_eq!(
+            first_stage("oxidized", chain(&vanilla)).as_deref(),
+            Some("copper")
+        );
+        assert_eq!(first_stage("copper", chain(&vanilla)), None);
+        // b -> c -> d -> b: the walk from a stops at d, the last block before it repeats.
+        let looped = [("a", "b"), ("b", "c"), ("c", "d"), ("d", "b")];
+        assert_eq!(first_stage("a", chain(&looped)).as_deref(), Some("d"));
+        // A block that is its own previous stage stays as it is.
+        assert_eq!(first_stage("x", chain(&[("x", "x")])).as_deref(), Some("x"));
+    }
+}

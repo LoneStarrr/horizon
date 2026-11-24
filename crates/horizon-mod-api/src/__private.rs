@@ -15,6 +15,12 @@ pub fn install_parts(
 #[path = "profiler.rs"]
 pub mod profiler;
 
+/// Installs the built-in profiler provider before native mods start.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_profile_spans(provider: fn(&'static str) -> Option<Box<dyn std::any::Any>>) {
+    crate::profiling::install(provider);
+}
+
 /// Install platform instrumentation before any mod registration or dispatch.
 /// A first guard entry seals the socket; late initialization is refused without
 /// replacing a backend or disturbing an in-flight call.
@@ -36,3 +42,9 @@ pub use crate::load_state::{install_packages, install_registration_data};
 #[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub use crate::load_state::{with_test_packages, with_test_registration_data};
+
+pub use crate::equip_reads::{
+    EquipReadGuard, EquipReadSet, cached_equip_alive, cached_equip_equipment,
+    cached_equip_hand_item, cached_equip_health, cached_equip_kind, cached_equip_living,
+    cached_equip_max_health, cached_equip_position, enter_equip_reads,
+};

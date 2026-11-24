@@ -8,10 +8,9 @@
 
 The game ships only the Nightly since 2026-10-28 (Ludovic): when `decide --kind game` says so, release.yml starts
 `nightly build` on the commit it decided (tools/ci/nightly.py), and "the last release" is the published Nightly.
-
 A kind releases when a pull request merged into main since its last published release changed one of its
-player-facing paths (GAME_PATHS, LAUNCHER_PATHS), once BATCH of them are waiting and the newest merged at least
-DEBOUNCE ago (a burst of merges becomes one release), or once the oldest has waited MAX_WAIT (a lone fix still ships),
+player-facing paths (GAME_PATHS, LAUNCHER_RELEASE_PATHS), once BATCH of them are waiting and the newest merged at least
+DEBOUNCE ago (a burst of merges becomes one release), or once the oldest has waited MAX_WAIT (LAUNCHER_MAX_WAIT for the launcher: a lone fix still ships),
 or at once when one of those pull requests is labelled release-now. Pull requests labelled skip-release (work players don't see) don't count
 towards a release and aren't listed in the notes. RELEASES_PAUSED=1 (a repository variable) stops automatic releases,
 and an open issue labelled release-blocker stops game releases, even forced ones, until it is closed.
@@ -50,6 +49,10 @@ MAINTAINER = "ludovic111"
 BATCH = 5
 DEBOUNCE = dt.timedelta(minutes=5)
 MAX_WAIT = dt.timedelta(hours=6)
+# The launcher waits an hour at most: a fix to installs or updates is what players are waiting for, and a launcher
+# release updates itself without touching worlds (2026-11-17: the Voltz install fix sat merged, "3 of 5 pull
+# requests: waiting for more, or 234 more minutes", while players couldn't install the mod).
+LAUNCHER_MAX_WAIT = dt.timedelta(hours=1)
 # Kept as typed in release titles, where the clauses after the first are lowercased.
 PROPER = {"Horizon", "Horizon's", "Minecraft", "Mojang", "Microsoft", "Java", "Xbox", "PlayStation", "Steam", "Windows",
           "Linux", "LAN", "Kira", "Discord", "Wayland", "Hyprland", "F3", "GUI", "UI"}
@@ -65,8 +68,58 @@ OLD_LAUNCHER_PREFIX = "launcher-v"
 
 # What players run. Documentation (*.md), tests, benchmarks and harness probes (examples/) never count.
 GAME_PATHS = ["crates/", "xtask/", "packaging/", "Cargo.toml", "Cargo.lock", "research-lock.json"]
-# Every crate the launcher builds in (cargo metadata --manifest-path launcher/Cargo.toml: the path packages).
+# Every crate the launcher builds in: the path packages its manifest reaches, through dependencies of any kind of the
+# launcher and normal and build dependencies of each crate after it (tests/test_release_train.py fails when they differ).
+# It decides only whether the launcher's checks and build run (tools/ci/rust_changes.py, tools/pr_ready.py, launcher.yml);
+# LAUNCHER_RELEASE_PATHS below decides releases.
 LAUNCHER_PATHS = [
+    "launcher/",
+    "crates/horizon-addresses/",
+    "crates/horizon-anticheat/",
+    "crates/horizon-assets/",
+    "crates/horizon-bench/",
+    "crates/horizon-chat-filter/",
+    "crates/horizon-core/",
+    "crates/horizon-cosmetics/",
+    "crates/horizon-friends/",
+    "crates/horizon-game-discovery/",
+    "crates/horizon-guest-stack/",
+    "crates/horizon-hooks/",
+    "crates/horizon-java-properties/",
+    "crates/horizon-mcp/",
+    "crates/horizon-mod-api-gen/",
+    "crates/horizon-mod-api-macros/",
+    "crates/horizon-mod-package/",
+    "crates/horizon-mod-runtime/",
+    "crates/horizon-mod-source/",
+    "crates/horizon-mod-surface/",
+    "crates/horizon-mod-vocab/",
+    "crates/horizon-perf-format/",
+    "crates/horizon-platform/",
+    "crates/horizon-port-pack/",
+    "crates/horizon-prepare/",
+    "crates/horizon-protocol/",
+    "crates/horizon-release-sign/",
+    "crates/horizon-server-files/",
+    "crates/horizon-server-launch/",
+    "crates/horizon-shader-api/",
+    "crates/horizon-system/",
+    "crates/horizon-telemetry/",
+    "crates/horizon-theme/",
+    "crates/horizon-threads/",
+    "crates/horizon-world/",
+    # Its icon, its menu entries and its AppImage are compiled or packaged into a release
+    # (launcher/build.rs, src/desktop.rs, packaging/linux/appimage.sh).
+    "packaging/icons/",
+    "packaging/linux/",
+    # launcher.yml's macOS build packages Horizon.app and the .dmg with packaging/macos/package.sh.
+    "packaging/macos/",
+]
+# What counts toward a launcher release (player_facing). Deliberately narrower than LAUNCHER_PATHS: the checks must see
+# every crate the launcher compiles, but a release for each change to the other 26 (horizon-world, horizon-core...)
+# would mean about 60% more launcher releases, more auto-updates for players and more release jobs on the Mac that
+# parity and Nightlies need; at about 47 releases a week such changes ship within hours anyway. Don't widen it to match.
+LAUNCHER_RELEASE_PATHS = [
     "launcher/",
     "crates/horizon-bench/",
     "crates/horizon-friends/",
@@ -82,6 +135,8 @@ LAUNCHER_PATHS = [
     # (launcher/build.rs, src/desktop.rs, packaging/linux/appimage.sh).
     "packaging/icons/",
     "packaging/linux/",
+    # launcher.yml's macOS build packages Horizon.app and the .dmg with packaging/macos/package.sh.
+    "packaging/macos/",
 ]
 LAUNCHER_IGNORED = ["launcher/links.json", "launcher/docs/", "launcher/tests/"]
 
@@ -104,10 +159,13 @@ DISCLAIMER = "Not an official Minecraft product. Not approved by or associated w
 BLOCKER = "release-blocker"
 
 
-def run(*command, check=True):
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+def run(*command, check=True, text=True):
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=text)
     if check and result.returncode:
-        raise SystemExit(f"{' '.join(command)}: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        if isinstance(stderr, bytes):
+            stderr = os.fsdecode(stderr)
+        raise SystemExit(f"{' '.join(command)}: {stderr}")
     return result.stdout
 
 
@@ -128,7 +186,7 @@ def player_facing(path, kind, exporter_paths=frozenset()):
     if path.endswith(".md") or re.match(r"(crates|launcher)/([\w-]+/)?(examples|tests|benches)/", path):
         return False
     if kind == "launcher":
-        return any(path.startswith(p) for p in LAUNCHER_PATHS) and not any(path.startswith(p) for p in LAUNCHER_IGNORED)
+        return any(path.startswith(p) for p in LAUNCHER_RELEASE_PATHS) and not any(path.startswith(p) for p in LAUNCHER_IGNORED)
     return any(path == p or path.startswith(p) for p in GAME_PATHS) or path in exporter_paths
 
 
@@ -231,8 +289,14 @@ def merged_pull_requests(base, head):
 
 
 def changed_paths(commit):
-    """The files a pull request changed: its merge commit against main before it (first parent)."""
-    return run("git", "diff", "--name-only", f"{commit}^1", commit).split()
+    """The files a pull request changed: its merge commit against main before it (first parent).
+
+    -z asks Git for NUL-delimited, verbatim paths: core.quotePath and whitespace in a name
+    cannot hide a player-facing change. Each raw path is decoded with os.fsdecode, the same
+    filesystem-safe decoding Python uses for on-disk names, so any byte round-trips.
+    """
+    raw = run("git", "diff", "--name-only", "-z", f"{commit}^1", commit, text=False)
+    return [os.fsdecode(path) for path in raw.split(b"\0") if path]
 
 
 def merged_pull_request_metadata():
@@ -320,6 +384,8 @@ def decision(kind, prs, now, paused=False, force=False, new_line=None, blockers=
     counted = [pr for pr in prs if pr["paths"] and "skip-release" not in pr["labels"]]
     urgent = [pr for pr in counted if "release-now" in pr["labels"]]
     merged = [pr["merged_at"] for pr in counted if pr.get("merged_at")]
+    max_wait = LAUNCHER_MAX_WAIT if kind == "launcher" else MAX_WAIT
+    hours = max_wait.seconds // 3600
     if blockers:
         return False, "held by " + ", ".join(f"release-blocker #{number}" for number in blockers)
     if force:
@@ -332,10 +398,11 @@ def decision(kind, prs, now, paused=False, force=False, new_line=None, blockers=
         return False, "no merged pull request changed what players run"
     if urgent:
         return True, "release-now: " + ", ".join(f"#{pr['number']}" for pr in urgent)
-    if merged and now - min(merged) >= MAX_WAIT:
-        return True, f"{len(counted)} pull requests changed what players run; the oldest has waited {MAX_WAIT.seconds // 3600} hours"
+    if merged and now - min(merged) >= max_wait:
+        return True, (f"{len(counted)} pull requests changed what players run; the oldest has waited {hours} "
+                      f"hour{'s' if hours != 1 else ''}")
     if len(counted) < BATCH:
-        wait = MAX_WAIT - (now - min(merged)) if merged else MAX_WAIT
+        wait = max_wait - (now - min(merged)) if merged else max_wait
         return False, (f"{len(counted)} of {BATCH} pull requests: waiting for more, or {wait.seconds // 60 + 1} more "
                        "minutes for the oldest")
     if merged and now - max(merged) < DEBOUNCE:
@@ -344,9 +411,20 @@ def decision(kind, prs, now, paused=False, force=False, new_line=None, blockers=
     return True, f"{len(counted)} pull requests changed what players run"
 
 
+# A title's `kind(area): ` prefix (CONTRIBUTING.md "Pull requests") labels the pull request; release names and notes
+# read the words after it.
+KIND_PREFIX = re.compile(r"^\s*(?:parity|bug|fix|perf|feature|feat|extra|tooling|docs)(?:\([^)]*\))?\s*:\s*", re.I)
+
+
+def plain(title):
+    """A title without its `kind(area): ` prefix, capitalised: "parity(mobs): ghasts fly" -> "Ghasts fly"."""
+    rest = KIND_PREFIX.sub("", title.strip(), count=1)
+    return rest if rest == title.strip() else rest[:1].upper() + rest[1:]
+
+
 def clause(title):
     """The start of a pull request title, for a release's name: "Nether portals: vanilla timing" -> "Nether portals"."""
-    title = re.sub(r"^(?:fix|fixes|fixed)\s+(?:the\s+)?", "", title.strip(), flags=re.I)
+    title = re.sub(r"^(?:fix|fixes|fixed)\s+(?:the\s+)?", "", plain(title), flags=re.I)
     return re.split(r"[:;(]| — | - ", title, maxsplit=1)[0].strip().rstrip(".")
 
 
@@ -376,7 +454,7 @@ def summary(new, fixed, limit=72):
 
 def bullet(pr):
     """A pull request as a line of notes: its title (written for people), its number and the issues it closes."""
-    title = re.sub(r"\s*\((?:fixes|closes) #\d+\)|,? stacked on #\d+", "", pr["title"]).strip().rstrip(".")
+    title = re.sub(r"\s*\((?:fixes|closes) #\d+\)|,? stacked on #\d+", "", plain(pr["title"])).strip().rstrip(".")
     issues = "".join(f", fixes #{issue}" for issue in pr["issues"])
     return f"- {title} (#{pr['number']}{issues})"
 
@@ -416,7 +494,7 @@ def line_intro(kind, version, previous):
             f"`horizon-server update --version {version}`.")
 
 
-def notes(kind, version, prs, issues, previous=None, repository="horizon-rust/horizon"):
+def notes(kind, version, prs, issues, previous=None):
     """(title, body) of a release. previous: the release before it, for a line's first release."""
     shown = [pr for pr in prs if pr["paths"] and "skip-release" not in pr["labels"]]
     new = [pr for pr in shown if "feature" in pr["labels"]]
@@ -425,12 +503,8 @@ def notes(kind, version, prs, issues, previous=None, repository="horizon-rust/ho
         title = f"Horizon {version.removeprefix(GAME_PREFIX)}" + (f": {summary(new, fixed)}" if shown else "")
     else:
         title = f"Horizon launcher {version.removeprefix(OLD_LAUNCHER_PREFIX).removeprefix(LAUNCHER_PREFIX)}"
-    fork_launcher = kind == "launcher" and repository == "arismoko/horizon"
-    intro = None if fork_launcher else line_intro(kind, version, previous)
+    intro = line_intro(kind, version, previous)
     parts = [PLAYERS] if kind == "game" else []
-    if fork_launcher:
-        title = f"Horizon Fork Launcher (arismoko) {version}"
-        parts.append((ROOT / "packaging/fork-launcher-release-notes.md").read_text().replace("{tag}", version).strip())
     if intro:
         parts.append(intro)
     if not shown:
@@ -444,7 +518,7 @@ def notes(kind, version, prs, issues, previous=None, repository="horizon-rust/ho
     contributors = sorted({pr["author"] for pr in shown if pr["author"] and pr["author"] != MAINTAINER})
     if contributors:
         parts.append("### Contributors\nThanks to " + ", ".join(f"@{name}" for name in contributors) + ".")
-    if kind == "launcher" and not fork_launcher:
+    if kind == "launcher":
         parts.append(LAUNCHER_FOOTER)
     if kind == "game":
         parts.append(PLAYERS_FOOTER)
@@ -464,12 +538,31 @@ def published_nightly():
     return json.loads(out) if out.strip() else None
 
 
-def nightly_building():
-    """The run of `nightly build` under way or waiting, if any: the train starts no second one."""
-    runs = gh_json("run", "list", "--repo", REPO, "--workflow", NIGHTLY_WORKFLOW, "--limit", "10",
-                   "--json", "databaseId,status")
-    return next((entry["databaseId"] for entry in runs if entry["status"] in ("queued", "in_progress", "waiting",
-                                                                              "pending", "requested")), None)
+# How far back `nightly_building` looks, and the most runs it lists. GitHub allows a run to be rerun for 30 days and
+# the rerun keeps the run's creation date (a real cut's `sdk-publish` rerun after parity-main passes), so any run
+# created in the last 35 days may be active again. GitHub returns at most 1000 runs for a filtered listing; a full
+# one counts as building.
+NIGHTLY_ACTIVE = ("queued", "in_progress", "waiting", "pending", "requested")
+NIGHTLY_LOOKBACK_DAYS = 35
+NIGHTLY_LISTING = 1000
+
+
+def nightly_building(now):
+    """The run of `nightly build` under way or waiting, if any: the train starts no second one. One listing of every
+    run created in the lookback, so a run moving between states is seen in exactly one of them, and newer finished
+    runs (dry runs no longer wait in line) can't hide an active one. A full listing may be cut off: it counts as
+    building. A dry run counts too: its own concurrency group, but its macOS jobs share the Mac's one nightly
+    runner."""
+    since = (now - dt.timedelta(days=NIGHTLY_LOOKBACK_DAYS)).date().isoformat()
+    runs = gh_json("run", "list", "--repo", REPO, "--workflow", NIGHTLY_WORKFLOW, "--created", f">={since}",
+                   "--limit", str(NIGHTLY_LISTING), "--json", "databaseId,status")
+    if not isinstance(runs, list):
+        # gh prints `[]` for no runs; blank or anything else is a listing that failed, never "nothing is building".
+        raise SystemExit(f"gh run list {NIGHTLY_WORKFLOW}: no run listing ({runs!r})")
+    active = next((entry["databaseId"] for entry in runs if entry["status"] in NIGHTLY_ACTIVE), None)
+    if active is None and len(runs) >= NIGHTLY_LISTING:
+        return f"unknown: {len(runs)} runs since {since} fill the listing, so one may be hidden"
+    return active
 
 
 def nightly_builds_today(today):
@@ -527,44 +620,11 @@ def passed_on(workflow, sha):
     return bool(done) and done[0]["conclusion"] == "success"
 
 
-def gate_jobs_passed(run_id, required):
-    """Require every named gate on the latest attempt, regardless of non-gate failures."""
-    pages = gh_json("api", "--paginate", "--slurp",
-                    f"repos/{REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100")
-    jobs = [job for page in pages for job in page["jobs"] if job["name"] in required]
-    return (required == {job["name"] for job in jobs}
-            and all(job["status"] == "completed" and job["conclusion"] == "success" for job in jobs))
-
-
-def green_main_head(parity=False, eligible=None):
+def green_main_head(parity=False):
     """The newest commit on main whose checks passed: what an automatic release builds. With parity (game
     releases), the newest commit parity-main passed on whose checks passed too: parity-main runs on batches of
     merges, so the commits a run skipped are covered by the next one, and a superseded run counts for nothing. A
     later batch that failed holds only the merges after that commit, which the green one doesn't contain."""
-    if REPO == "arismoko/horizon":
-        # Runs are ordered by creation, not completion: a late old run must not
-        # displace a newer push. Paginate beyond bursts of cancelled main runs.
-        pages = gh_json("api", "--paginate", "--slurp",
-                        f"repos/{REPO}/actions/workflows/dyna-ci.yml/runs?branch=main&event=push&per_page=100")
-        seen = set()
-        for page in pages:
-            for entry in page["workflow_runs"]:
-                sha = entry["head_sha"]
-                if entry["head_branch"] != "main" or entry["event"] != "push" or sha in seen:
-                    continue
-                seen.add(sha)
-                if eligible is not None and not eligible(sha):
-                    continue
-                if not gate_jobs_passed(entry["id"], {"lint", "verify", "verify-static", "launcher", "pool-watch"}):
-                    continue
-                fixtures = gh_json("api", "--paginate", "--slurp",
-                                   f"repos/{REPO}/actions/workflows/wasm-mods.yml/runs"
-                                   f"?branch=main&event=push&head_sha={sha}&per_page=100")
-                runs = [run for page in fixtures for run in page["workflow_runs"]
-                        if run["head_sha"] == sha and run["head_branch"] == "main" and run["event"] == "push"]
-                if runs and gate_jobs_passed(runs[0]["id"], {"fixture"}):
-                    return sha
-        return None
     if parity:
         # Only the successful runs: while merges land, one run at a time finishes (the pending one is replaced at
         # every push), and a later failed or timed-out batch must not starve the Nightly of the commit an earlier
@@ -635,7 +695,7 @@ def main():
     if args.command == "notes":
         version = args.tag or "unreleased"
         previous = last["tag_name"] if last and last["tag_name"] != version else None
-        title, body = notes(args.kind, version, prs, known_issues(), previous=previous, repository=REPO)
+        title, body = notes(args.kind, version, prs, known_issues(), previous=previous)
         if args.out:
             args.out.mkdir(parents=True, exist_ok=True)
             (args.out / "title.txt").write_text(title + "\n")
@@ -654,7 +714,7 @@ def main():
         release, reason = False, f"waiting for checks and parity-main to pass on {head[:9]}"
     urgent = False
     if args.kind == "game":
-        release, reason, urgent = nightly_decision(release, reason, prs, nightly_building(),
+        release, reason, urgent = nightly_decision(release, reason, prs, nightly_building(now),
                                                    len(nightly_builds_today(now.date().isoformat())), args.force)
     minor = any("feature" in pr["labels"] for pr in prs if pr["paths"])
     tag = "nightly" if args.kind == "game" else next_launcher_tag(tags, minor, line)

@@ -13,6 +13,7 @@ use crate::{
     projectiles::{Hit, Projectile, ProjectileKind},
     world::World,
 };
+use horizon_core::nbt::Tag;
 use horizon_core::{
     geometry::{Aabb, Direction, Vec3, sweep_intersected_blocks},
     position::BlockPos,
@@ -178,6 +179,9 @@ pub struct ArrowState {
     pub pickup_item: crate::items::ItemStack,
     /// `AbstractArrow.firedFromWeapon`: the crossbow or bow it was shot from.
     pub fired_from_weapon: Option<crate::items::ItemStack>,
+    /// `AbstractArrow.soundEvent` is `item.crossbow.hit` (`CrossbowItem.createProjectile`)
+    /// until the first block hit sets it back to `entity.arrow.hit`.
+    pub crossbow_hit_sound: bool,
     pub no_physics: bool,
     /// `Arrow.ID_EFFECT_COLOR` as a client has it from its server (-1: none).
     pub effect_color: i32,
@@ -186,6 +190,10 @@ pub struct ArrowState {
     /// `piercingIgnoreEntityIds`: the entities a piercing arrow has gone
     /// through (cleared when it sticks in a block).
     pub pierced: Vec<Who>,
+    /// `piercedAndKilledEntities`: what a piercing arrow has killed so far, as
+    /// `KILLED_BY_ARROW` sees it. Made on its first piercing hit, emptied (not
+    /// dropped) when it sticks in a block.
+    pub pierced_and_killed: Option<Vec<crate::advancements::EntityView>>,
     /// `Entity.remainingFireTicks`.
     pub fire_ticks: i32,
     /// The server's shared fire flag, independent of the client-local fire timer.
@@ -237,7 +245,36 @@ impl Default for ArrowState {
         Self::new()
     }
 }
+const ARROW_HIT: &str = "minecraft:entity.arrow.hit";
+const CROSSBOW_HIT: &str = "minecraft:item.crossbow.hit";
+
 impl ArrowState {
+    /// `AbstractArrow.addAdditionalSaveData`'s `SoundEvent`: the crossbow's
+    /// until the first block hit, else the loaded one (a trident's own) or
+    /// `entity.arrow.hit`.
+    pub fn saved_sound_event(&self, loaded: Option<&Tag>) -> Tag {
+        let loaded = match loaded {
+            Some(Tag::String(s)) => s.to_string_lossy(),
+            _ => ARROW_HIT.into(),
+        };
+        let sound = match (self.crossbow_hit_sound, loaded.as_ref()) {
+            (true, _) => CROSSBOW_HIT,
+            (false, CROSSBOW_HIT) => ARROW_HIT,
+            (false, other) => other,
+        };
+        Tag::String(sound.into())
+    }
+    /// `AbstractArrow.readAdditionalSaveData`'s `weapon` and `SoundEvent`.
+    pub fn load_weapon_and_sound(
+        &mut self,
+        tag: &Tag,
+        item: impl FnOnce(&Tag) -> Option<crate::items::ItemStack>,
+    ) {
+        self.fired_from_weapon = tag.get("weapon").and_then(item);
+        let saved = tag.get("SoundEvent");
+        self.crossbow_hit_sound =
+            matches!(saved, Some(Tag::String(s)) if s.to_string_lossy() == CROSSBOW_HIT);
+    }
     pub fn new() -> Self {
         Self {
             in_ground: false,
@@ -251,10 +288,12 @@ impl ArrowState {
             spectral_duration: 200,
             pickup_item: crate::items::ItemStack::new("minecraft:arrow", 1),
             fired_from_weapon: None,
+            crossbow_hit_sound: false,
             no_physics: false,
             effect_color: -1,
             pierce: 0,
             pierced: Vec::new(),
+            pierced_and_killed: None,
             fire_ticks: 0,
             synced_fire: false,
             fall_distance: 0.0,
@@ -278,6 +317,20 @@ impl ArrowState {
     pub fn potion_color(&self) -> Option<u32> {
         (!crate::brewing::contents_empty(&self.pickup_item))
             .then(|| crate::brewing::contents_color(&self.pickup_item))
+    }
+    /// Its entity type is `SpectralArrow`: the type it loaded with, or the
+    /// item it was fired as (a bow's spectral ammo).
+    pub fn is_spectral_type(&self) -> bool {
+        self.spectral || &*self.pickup_item.item == "minecraft:spectral_arrow"
+    }
+    /// `SpectralArrow.readAdditionalSaveData`: the glow `Duration` of the
+    /// compound being loaded, 200 when it has none. `getIntOr` is
+    /// `NumericTag.intValue`, so a float or double one floors.
+    pub fn read_spectral_duration(&mut self, tag: &Tag) {
+        self.spectral_duration = tag
+            .get("Duration")
+            .and_then(crate::nbt_path::int_value)
+            .unwrap_or(200);
     }
     /// The `AbstractArrow` constructor's `pickupItemStack`: the drawn ammo
     /// (one item). Ammo drawn without being used up (`INTANGIBLE_PROJECTILE`)
@@ -362,6 +415,18 @@ impl ArrowScene<'_, '_> {
     }
     fn is_air(&self, state: BlockStateId) -> bool {
         self.facts.is_air(state)
+    }
+    /// The check that opens `AbstractArrow.tick`: `at` lies inside one of the
+    /// collision boxes of the block it is in.
+    pub fn inside_collision(&self, at: Vec3) -> bool {
+        let p = BlockPos::containing(at);
+        let state = self.block(p);
+        let origin = Vec3::new(f64::from(p.x), f64::from(p.y), f64::from(p.z));
+        !self.is_air(state)
+            && self
+                .collision_boxes(state, p)
+                .iter()
+                .any(|b| b.move_by(origin).contains(at))
     }
     /// `BlockState.getCollisionShape(level, pos)` (an empty collision context).
     fn collision_boxes(&self, state: BlockStateId, p: BlockPos) -> Vec<Aabb> {
@@ -722,19 +787,13 @@ impl Ticker<'_, '_, '_, '_> {
         let block_pos = self.block_position();
         let state = self.scene.block(block_pos);
         if !self.scene.is_air(state) && physics {
-            let origin = Vec3::new(
-                f64::from(block_pos.x),
-                f64::from(block_pos.y),
-                f64::from(block_pos.z),
-            );
-            let at = self.position();
-            let inside = self
-                .scene
-                .collision_boxes(state, block_pos)
-                .iter()
-                .any(|b| b.move_by(origin).contains(at));
+            let inside = self.scene.inside_collision(self.position());
             if inside && !self.st.canceled_impact_inside {
                 self.p.velocity = Vec3::ZERO;
+                // `setInGround(true)`: `onSyncedDataUpdated` starts the shake.
+                if !self.st.in_ground && !self.st.first_tick && self.st.shake <= 0 {
+                    self.st.shake = 7;
+                }
                 self.st.in_ground = true;
             }
             self.st.canceled_impact_inside &= inside;
@@ -970,6 +1029,7 @@ impl Ticker<'_, '_, '_, '_> {
             // AbstractArrow.onHitEntity: past pierce level + 1 entities the
             // arrow is discarded before it hurts the next one.
             if (self.st.pierce as i8) > 0 {
+                self.st.pierced_and_killed.get_or_insert_with(Vec::new);
                 if self.st.pierced.len() > usize::from(self.st.pierce) {
                     self.st.removed = true;
                     return Hit::None;
@@ -1022,11 +1082,7 @@ impl Ticker<'_, '_, '_, '_> {
     fn hit_sound(&mut self) {
         let pitch = 1.2 / (self.p.entity_random().next_float() * 0.2 + 0.9);
         // CrossbowItem.createProjectile: its arrows hit with the crossbow's sound.
-        let crossbow = self
-            .st
-            .fired_from_weapon
-            .as_ref()
-            .is_some_and(|s| &*s.item == "minecraft:crossbow");
+        let crossbow = self.st.crossbow_hit_sound;
         let sound = if self.trident() {
             ArrowSound::TridentHitGround
         } else if crossbow {
@@ -1095,9 +1151,14 @@ impl Ticker<'_, '_, '_, '_> {
         self.hit_sound();
         self.st.in_ground = true;
         self.st.shake = 7;
+        // setSoundEvent(SoundEvents.ARROW_HIT): later hits and the save.
+        self.st.crossbow_hit_sound = false;
         self.p.set_critical(false);
         self.st.pierce = 0;
         self.st.pierced.clear();
+        if let Some(killed) = &mut self.st.pierced_and_killed {
+            killed.clear();
+        }
     }
     /// `Projectile.mayInteract`: a mob's arrows need `mob_griefing`, or a
     /// mod's yes for the owner (NeoForge's `canEntityGrief(level, owner)`).

@@ -102,7 +102,25 @@ pub mod exit_code {
     pub const USAGE: i32 = 2;
     /// A panic; a crash report was saved.
     pub const PANIC: i32 = 101;
+    /// A dedicated server's `/restart`: saved and stopped, to be started again by `horizon-server`
+    /// (crates/horizon-server/src/engine.rs holds the same number).
+    pub const RESTART: i32 = 75;
+
+    static RESTART_REQUESTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// `/restart` stopped a dedicated server: entry.rs exits with `exit_code::RESTART` once it is saved.
+    pub fn restart_requested() -> bool {
+        RESTART_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_restart_requested() {
+        RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
+
+/// Set by `horizon-server` in the game's environment: something outlives the game and starts it again.
+pub const SUPERVISED_ENV: &str = "HORIZON_SUPERVISED";
 
 const EXIT_CODES: &[(i32, &str)] = &[
     (
@@ -120,6 +138,10 @@ const EXIT_CODES: &[(i32, &str)] = &[
     (
         exit_code::PANIC,
         "The game panicked. A crash report was saved.",
+    ),
+    (
+        exit_code::RESTART,
+        "A dedicated server saved and stopped on `/restart`: horizon-server starts it again.",
     ),
 ];
 
@@ -143,7 +165,7 @@ fn content() -> serde_json::Value {
         // 0.1 was the WebAssembly code line: no build runs it any more.
         "mod": { "api": [manifest::API] },
         "native_mod": { "exact_build": true, "rebuild": true },
-        // The lines it draws: a newer one is read and checked, not drawn yet.
+        // The line it draws: a pack for another is refused.
         "shader": { "schema": horizon_shader_api::SCHEMA, "api": [horizon_shader_api::API] },
         "resourcepack": { "format": horizon_core::version::RESOURCE_PACK_FORMAT },
         "datapack": { "format": horizon_core::version::DATA_PACK_FORMAT },
@@ -223,7 +245,7 @@ pub fn markdown() -> String {
          what works on it: content \
          mods of the manifest `api` lines in `mod.api`; native mods built for this exact game build \
          (`native_mod.exact_build`), which need the game rebuilt (`rebuild`); shader packs of \
-         `shader.schema` and the lines in `shader.api` (a newer line is read, not drawn); resource \
+         `shader.schema` and the lines in `shader.api` (a pack for another is refused); resource \
          and data packs of `format` (`[major, minor]`; others still load, marked too old or too \
          new as vanilla marks them); modpacks of `modpack.format`; the mod index of \
          `index.schema`.\n"
@@ -272,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn developer_offline_never_consumes_inherited_sessions() {
         if let Some(file) = std::env::var_os("OFFLINE_SESSION_TEST_FILE") {
             assert!(parse(&["--developer-single-player"]).is_err());
@@ -283,6 +306,7 @@ mod tests {
         std::fs::write(&file, b"unconsumed session sentinel").unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "game::launch_api::tests::developer_offline_never_consumes_inherited_sessions",
                 "--nocapture",

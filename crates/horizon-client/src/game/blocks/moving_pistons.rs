@@ -13,6 +13,7 @@ impl Game<'_> {
         alpha: f64,
         out: &mut Vec<Vertex>,
     ) {
+        let start = out.len();
         let partial = alpha as f32;
         let live = self
             .world
@@ -57,6 +58,8 @@ impl Game<'_> {
                 self.moving_block_vertices(base, at, corner - camera, out);
             }
         }
+        // `minecraft:moving_piston` is a block entity.
+        self.lit_block_entity(start..out.len());
         self.mark_motion(out.len(), 0);
     }
     /// The section holding the block at `p` (`SectionPos.blockToSection`).
@@ -78,7 +81,7 @@ impl Game<'_> {
     }
     /// Whether a mesh of the section waits for its upload.
     pub(super) fn section_upload_pending(&self, section: (i32, i32, i32)) -> bool {
-        self.pending_uploads.iter().any(|(key, _)| *key == section)
+        self.pending_uploads.contains(&section)
     }
     /// The moved block and, for a retracting piston, its extended base.
     fn moving_piston_blocks(

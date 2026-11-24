@@ -1,5 +1,6 @@
 //! The parts of a humanoid model as vanilla posed them this frame (`HumanoidModel.setupAnim`),
-//! read-only, for a mod drawing on a player or humanoid mob in `mob_layer`. The poses are the
+//! read-only, for a mod drawing on a player or humanoid mob in `render_living_post`,
+//! `render_player_post` or a layer (`register_entity_layers`). The poses are the
 //! [`PartPose`](crate::PartPose)s a baked layer's parts take, so a mod copies them onto its own
 //! tree (`ClientHost::bake_layer`) and draws it where vanilla drew the body.
 
@@ -75,7 +76,7 @@ pub const MAX_HIDDEN_PARTS: usize = 8;
 /// The longest part name [`HiddenParts`] takes, in bytes.
 pub const MAX_PART_NAME: usize = 24;
 
-/// The parts a mod hid from a vanilla model this frame (`player_submit`, `mob_submit`), by their
+/// The parts a mod hid from a vanilla model this frame (`render_player_pre`, `render_living_pre`), by their
 /// names in the model (`head`, `nose`, `right_front_leg`): at most [`MAX_HIDDEN_PARTS`] names of
 /// at most [`MAX_PART_NAME`] bytes, nothing allocated. A hidden part takes its children with it
 /// (the hat goes with the head). An unknown name refuses the draw with the mob type and name.
@@ -197,9 +198,61 @@ impl TryFrom<HiddenPartsWire> for HiddenParts {
     }
 }
 
+/// A layer of the opted-in local first-person world body. These switches do not
+/// affect the separate first-person hand pass or third-person rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub enum FirstPersonBodyLayer {
+    /// Helmet armor, including its trim, overlays and glint.
+    Helmet,
+    /// Non-armor head items, including skulls and pumpkins.
+    HeadItem,
+    /// The vanilla extra ears.
+    Ears,
+    /// Cosmetics attached to the world body (not the vanilla cape).
+    Cosmetics,
+    /// Both held items on the world body, including a spyglass held to the eye.
+    HeldItems,
+    /// Stuck arrows and bee stingers.
+    StuckItems,
+    /// Elytra wings, including glint and emissive overlays.
+    Elytra,
+    /// All layers registered through `register_entity_layers`.
+    CustomLayers,
+}
+
+/// The frame-local answer to `render_first_person_body`. The game draws the
+/// ordinary animated player model, including its crouching and vehicle poses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, horizon_mod_api_macros::Wire)]
+#[non_exhaustive]
+pub struct FirstPersonBody {
+    /// Opt into rendering. False by default, even when a mod listens.
+    pub show: bool,
+    /// Translation from the vanilla model origin in blocks, along world axes:
+    /// +X east, +Y up, +Z south. If any component is non-finite, the game uses
+    /// zero translation. Applied to the world model and all its layers.
+    pub offset: [f32; 3],
+    /// Model parts to leave out. The ensuing pre hooks may hide more parts.
+    /// Hiding a body part does not hide its separate equipment or cosmetic layers.
+    pub hidden: HiddenParts,
+    layers: u32,
+}
+
+impl FirstPersonBody {
+    /// Leave a layer out without affecting any other layer.
+    pub fn hide_layer(&mut self, layer: FirstPersonBodyLayer) {
+        self.layers |= 1 << (layer as u32);
+    }
+
+    /// Whether `layer` is hidden.
+    pub fn layer_hidden(&self, layer: FirstPersonBodyLayer) -> bool {
+        self.layers & (1 << (layer as u32)) != 0
+    }
+}
+
 /// One humanoid part as posed this frame: its pose relative to its parent, and whether it draws
 /// (`ModelPart.visible` as the body drew it: after Skin Customization and the parts
-/// `player_submit` hid).
+/// `render_player_pre` hid).
 #[derive(Clone, Copy, Debug, PartialEq, horizon_mod_api_macros::Wire)]
 #[non_exhaustive]
 pub struct PosedPart {

@@ -165,7 +165,9 @@ shows the address the relay sees for you: behind a proxy that hides client addre
 platforms' TCP proxies), set `RELAY_PER_ADDRESS_LIMITS=0`. Run **one** instance per address: codes live
 in its memory.
 
-Settings, all optional:
+Settings, all optional (an empty variable counts as unset; one that is set and does not parse, such as
+`RELAY_PER_ADDRESS_LIMITS=false` (a flag is a number, `0` for off), stops the relay at start with a
+message that names it):
 
 | Variable | Default | |
 | --- | --- | --- |
@@ -174,6 +176,7 @@ Settings, all optional:
 | `RELAY_MAX_HOSTS` | 1000 | short codes at once |
 | `RELAY_MAX_HOSTS_PER_ADDRESS` | 4 | short codes one client address holds at once (IPv6 by /64; a /48 holds 4 times as many); with `RELAY_PER_ADDRESS_LIMITS` |
 | `RELAY_MAX_OPEN_PER_ADDRESS` | 64 | connections of any kind one client address holds open at once (IPv6 by /64; a /48 holds 4 times as many); past it a connection is closed at once; with `RELAY_PER_ADDRESS_LIMITS` |
+| `RELAY_MAX_BRIDGES_PER_ADDRESS` | 32 | relayed streams one client address is an end of at once, as guest or as host (IPv6 by /64; a /48 holds 4 times as many); past it a guest is told the relay is full; with `RELAY_PER_ADDRESS_LIMITS` |
 | `RELAY_MAX_BRIDGES` | 200 | relayed streams at once |
 | `RELAY_MAX_PENDING_PER_HOST` | 8 | guests joining one host at the same time |
 | `RELAY_MAX_CONNECTIONS` | 4096 | connections open at once, of every kind (more are closed unanswered) |

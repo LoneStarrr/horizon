@@ -13,8 +13,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The patch crate's name: the copies' ids and the executable's `--extern` use it.
-pub(super) const CRATE: &str = "horizon_patch";
+/// The patch crates' name (a lower game crate's is `<name>_<crate>`): the copies' ids and the library entry's
+/// `--extern` use it. It is not `horizon_patch`, the name of the library built from them: a library and a crate
+/// it links with one crate name are indistinguishable to rustc (E0519), and a registry workspace refuses two
+/// packages of one name.
+pub(super) const CRATE: &str = "horizon_patched";
 
 /// The compiled patch crates, `(crate name, rlib)`, and the installation result expressions the
 /// generated `main` installs.
@@ -51,6 +54,22 @@ fn target_refusal(
             ("why", &refused.why),
         ],
     )
+}
+
+/// Removes what a previous run staged at `path`: `horizon-mixins apply` refuses an `--out` that
+/// already exists, and a stale directory must not pass for this run's output. A symlink is removed
+/// as the link itself, never followed into the directory it names.
+fn clear_output_dir(path: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if meta.is_dir() {
+        fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
+    }
 }
 
 /// The support modules and bridges `bundles` add to the patch crate.
@@ -150,6 +169,22 @@ pub(super) fn build(
     let mut compiled = Vec::new();
     for name in &prepared.names {
         let rlib = out.join(format!("lib{name}.rlib"));
+        let mut hash = sha2::Sha256::new();
+        use sha2::Digest;
+        hash.update(sdk.commit());
+        for bundle in &prepared.bundles {
+            hash.update(
+                super::source_digest(bundle)
+                    .ok_or(crate::i18n::tr("Could not hash patch inputs"))?,
+            );
+            hash.update(fs::read(&rlibs[bundle.manifest.id.as_str()]).map_err(|e| e.to_string())?);
+        }
+        let fingerprint = format!("{:x}", hash.finalize());
+        let saved = rlib.with_extension("fingerprint");
+        if rlib.is_file() && fs::read_to_string(&saved).ok().as_deref() == Some(&fingerprint) {
+            compiled.push((name.clone(), rlib));
+            continue;
+        }
         let mut cmd = rustc("2024");
         cmd.args([
             "--crate-type",
@@ -182,6 +217,7 @@ pub(super) fn build(
         arg.push(&argfile);
         cmd.arg(arg);
         super::run(cmd, "Compiling the patched functions", |_| {})?;
+        fs::write(saved, fingerprint).map_err(|e| e.to_string())?;
         compiled.push((name.clone(), rlib));
     }
     prepared.log()?;
@@ -231,15 +267,27 @@ impl Prepared<'_> {
 /// replaces or redirects a filled loop's entry (anything but `HEAD` and `RETURN`, which compose
 /// around the loop), are refused by name.
 fn loop_slots(game: &Path, bundles: &[&Bundle]) -> Result<Vec<api_gen::patch::LoopSlots>, String> {
-    use horizon_mod_package::manifest::mixin::Kind;
-    let rows: Vec<(&Bundle, &horizon_mod_package::manifest::loops::Loop)> = bundles
+    use horizon_platform::mod_package::manifest::mixin::Kind;
+    let rows: Vec<(
+        &Bundle,
+        &horizon_platform::mod_package::manifest::loops::Loop,
+    )> = bundles
         .iter()
         .flat_map(|bundle| bundle.native().r#loop.iter().map(move |row| (*bundle, row)))
         .collect();
     let path = game.join(api_gen::loops::FILE);
     // A game built before published loops has no list, and so no loop a row can name.
-    let published: Vec<api_gen::loops::PublishedLoop> = match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+    #[derive(serde::Deserialize)]
+    struct Loops {
+        loops: Vec<api_gen::loops::PublishedLoop>,
+    }
+    let published = match fs::read_to_string(&path) {
+        Ok(text) => {
+            horizon_platform::mod_package::build_data::read::<Loops>(api_gen::loops::FILE, &text)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .1
+                .loops
+        }
         Err(_) => Vec::new(),
     };
     let mut refusals = Vec::new();
@@ -327,6 +375,30 @@ fn loop_slots(game: &Path, bundles: &[&Bundle]) -> Result<Vec<api_gen::patch::Lo
     }
 }
 
+/// The game build's function index (`functions.json`), from its SDK at `game`: where each function
+/// a row may target is in the source, and whether it can be copied. With no index for this build
+/// nothing is copied: the source is never walked instead.
+fn function_index(game: &Path, commit: &str) -> Result<api_gen::functions::FunctionIndex, String> {
+    use api_gen::functions::FILE;
+    let path = game.join(FILE);
+    let text = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "E_MIXIN_INDEX: {}: {e}: the game build's SDK has no function index, so no function can be copied; fetch the SDK again",
+            path.display()
+        )
+    })?;
+    let (build, index): (_, api_gen::functions::FunctionIndex) =
+        horizon_platform::mod_package::build_data::read(FILE, &text)
+            .map_err(|e| format!("E_MIXIN_INDEX: {e}"))?;
+    if build.commit != commit {
+        return Err(format!(
+            "E_MIXIN_INDEX: {FILE} describes game build {}, not {commit}; fetch the SDK again",
+            build.commit
+        ));
+    }
+    index.checked().map_err(|e| format!("E_MIXIN_INDEX: {e}"))
+}
+
 /// Copies, generates and transforms the patch crates for `projects` into `out`, without
 /// compiling them; `None` when no mod has a mixin, module, bridge or loop.
 pub(super) fn prepare<'a>(
@@ -375,8 +447,9 @@ pub(super) fn prepare<'a>(
     } else {
         Some(super::mixins_patch::tool(rust, &|_| {})?)
     };
-    let source = super::source(sdk.commit())?;
+    let source = super::source_until(sdk.commit(), &super::check_cancelled)?;
     let started = std::time::Instant::now();
+    let index = function_index(game, sdk.commit())?;
     // A filled loop's entry, or one whose loop function has rows, is copied like a mixin's target,
     // with the loop's body.
     let targets: Vec<String> = rows
@@ -389,7 +462,7 @@ pub(super) fn prepare<'a>(
     // The generator refuses targets the staged game cannot replace.
     let mut extras = extras(&bundles)?;
     extras.loops = loops;
-    let generated = api_gen::patch::generate(&source, CRATE, &targets, &extras);
+    let generated = api_gen::patch::generate(&source, CRATE, &targets, &extras, &index);
     let refusals: Vec<String> = match &generated {
         Ok(_) => Vec::new(),
         Err(refused) => refused
@@ -408,7 +481,7 @@ pub(super) fn prepare<'a>(
         .collect();
     // The workspace horizon-mixins plans against: one patch crate per game crate with copies.
     let workspace = out.join("patch-workspace");
-    let _ = fs::remove_dir_all(&workspace);
+    clear_output_dir(&workspace)?;
     let write = |path: PathBuf, text: &str| {
         fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
     };
@@ -451,7 +524,7 @@ pub(super) fn prepare<'a>(
     }
     // Each mod's rows, retargeted at the copies, as the tool's bundles.
     let mods = out.join("patch-mods");
-    let _ = fs::remove_dir_all(&mods);
+    clear_output_dir(&mods)?;
     for bundle in bundles
         .iter()
         .filter(|bundle| !bundle.native().mixin.is_empty())
@@ -487,9 +560,12 @@ pub(super) fn prepare<'a>(
         )?;
     }
     let copied = started.elapsed();
+    // A repeated build in one folder finds the last run's output: clear it unconditionally, so apply
+    // never stages into an existing `--out` and no stale copy survives a run with no tool.
+    let patched = out.join("patch-applied");
+    clear_output_dir(&patched)?;
     // With no rows (only modules or bridges), the crate compiles as generated.
     let patched = if let Some(tool) = &tool {
-        let patched = out.join("patch-applied");
         super::run(
             super::apply(rust, tool, &workspace, &mods, &patched),
             "Applying the mixins to their functions",
@@ -544,16 +620,91 @@ pub(super) fn prepare<'a>(
 #[cfg(test)]
 mod refusal_tests {
     #[test]
+    fn a_stale_patch_applied_directory_is_cleared_before_apply() {
+        let out = tempfile::tempdir().unwrap();
+        let patched = out.path().join("patch-applied");
+        std::fs::create_dir_all(patched.join("nested")).unwrap();
+        std::fs::write(patched.join("stale.rs"), "fn stale() {}").unwrap();
+        std::fs::write(patched.join("nested").join("also-stale.rs"), "").unwrap();
+        super::clear_output_dir(&patched).unwrap();
+        assert!(
+            !patched.exists(),
+            "a stale patch-applied directory must not survive: apply refuses an existing --out"
+        );
+        // A fresh or already-cleared path is not an error, so every run can clear unconditionally.
+        super::clear_output_dir(&patched).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_patch_applied_symlink_is_removed_not_followed() {
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.rs"), "keep").unwrap();
+        let patched = out.path().join("patch-applied");
+        std::os::unix::fs::symlink(&target, &patched).unwrap();
+        super::clear_output_dir(&patched).unwrap();
+        assert!(patched.symlink_metadata().is_err());
+        assert!(target.join("keep.rs").is_file(), "the link's target stays");
+    }
+
+    #[test]
+    fn a_missing_or_foreign_function_index_is_refused_by_name() {
+        let game = tempfile::tempdir().unwrap();
+        let commit = "c".repeat(40);
+        let error = super::function_index(game.path(), &commit).unwrap_err();
+        assert!(
+            error.starts_with("E_MIXIN_INDEX: ") && error.contains("no function index"),
+            "{error}"
+        );
+        let write = |commit: &str| {
+            std::fs::write(
+                game.path().join("functions.json"),
+                format!(
+                    r#"{{"schema":1,"build":{{"commit":"{commit}"}},"crates":{{}},"functions":{{}},"refused":{{}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write(&"d".repeat(40));
+        let error = super::function_index(game.path(), &commit).unwrap_err();
+        assert!(
+            error.starts_with("E_MIXIN_INDEX: functions.json describes game build dddd"),
+            "{error}"
+        );
+        write(&commit);
+        assert_eq!(
+            super::function_index(game.path(), &commit).unwrap(),
+            Default::default()
+        );
+        // A tampered index whose module the copy would write as Rust is refused, not a panic.
+        std::fs::write(
+            game.path().join("functions.json"),
+            format!(
+                r#"{{"schema":1,"build":{{"commit":"{commit}"}},"crates":{{"horizon_client":{{"library":"horizon_client","modules":{{"horizon_client::game":[]}}}}}},"functions":{{"horizon_client::game::f":{{"module":"horizon_client::not a path!","file":"crates/horizon-client/src/game.rs","span":[0,1],"signature_hash":"","sha256":""}}}},"refused":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        let error = super::function_index(game.path(), &commit).unwrap_err();
+        assert!(
+            error.starts_with("E_MIXIN_INDEX: functions.json: function `horizon_client::game::f` is in `horizon_client::not a path!`"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn generated_install_passes_owners_and_result_to_startup_gate() {
         assert_eq!(
             super::install_expression("game::tick", &["first", "second"], "patch::install()"),
             r#"("game::tick", &["first", "second"], patch::install())"#
         );
-        let template = include_str!("../../../crates/horizon-client/src/native_main.rs.template");
-        assert!(
-            template.find("entry::installed").unwrap()
-                < template.find("mod_api::ModEntry> =").unwrap()
-        );
+        // The patch library's entry module hands its installs to the loader, which passes them
+        // to the startup gate before any mod's entries are registered.
+        let template =
+            include_str!("../../../crates/horizon-client/src/native_mod_entry.rs.template");
+        let installs = template.find("fn installs()").unwrap();
+        assert!(template[installs..].find("/* MOD_REDIRECTS */").is_some());
     }
 
     #[test]

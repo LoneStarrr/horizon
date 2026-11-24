@@ -1,6 +1,10 @@
 //! Collision queries against the same resident chunks used by the renderer.
 //! The development scene has no entities, block entities or world border.
 //! Entity-dependent rules use the defaults for players and the supported mobs.
+// The defining module of the collide entries: they delegate to each other and
+// the border tests exercise them directly; the `clippy.toml` ban (arismoko/horizon#2414)
+// targets their callers elsewhere, not this file.
+#![allow(clippy::disallowed_methods)]
 use crate::{Result, world::World};
 use horizon_core::{
     geometry::{Aabb, Vec3, VoxelShape, border::BorderGeometry},
@@ -234,7 +238,7 @@ impl<'w> SceneCollisions<'w, '_> {
         self.resolve_with_context(bounds, movement, max_step, on_ground, self.context(bounds))
     }
     /// [`Self::resolve`], also stopped by the world border's walls when one is
-    /// given with the moving entity's x and z: `Entity.collectColliders` adds
+    /// given with the moving entity's x and z: `Entity.collectAllColliders` adds
     /// `WorldBorder.getCollisionShape` for any entity inside and close to it.
     pub fn resolve_in_border(
         self,

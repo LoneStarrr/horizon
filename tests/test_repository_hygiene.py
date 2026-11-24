@@ -74,7 +74,7 @@ class RepositoryHygieneTests(unittest.TestCase):
 
     def test_all_workflow_files_are_parsed(self):
         self.write(".github/workflows/ok.yml", "on: push\njobs: {}\n")
-        for path in [".github/workflows/dyna-ci.yml", ".github/workflows/other.yaml"]:
+        for path in [".github/workflows/ci.yml", ".github/workflows/other.yaml"]:
             with self.subTest(path=path):
                 self.write(path, "name: [unfinished\n")
                 result = self.run_check()
@@ -83,21 +83,23 @@ class RepositoryHygieneTests(unittest.TestCase):
                 self.assertIn("invalid workflow YAML", result.stderr)
                 self.write(path, "on: push\njobs: {}\n")
         self.write(".github/workflows/scalar.yml", "not-a-workflow\n")
-        self.assertNotEqual(self.run_check().returncode, 0)
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".github/workflows/scalar.yml:1: workflow must be a YAML mapping", result.stderr)
 
     def test_pre_push_checks_each_committed_tip_not_clean_worktree(self):
         self.git("commit", "-qm", "clean")
         clean = self.git("rev-parse", "HEAD")
-        self.write(".github/workflows/dyna-ci.yml", "name: [unfinished\n")
+        self.write(".github/workflows/ci.yml", "name: [unfinished\n")
         self.git("commit", "-qm", "broken workflow")
         broken = self.git("rev-parse", "HEAD")
-        self.write(".github/workflows/dyna-ci.yml", "on: push\njobs: {}\n")
+        self.write(".github/workflows/ci.yml", "on: push\njobs: {}\n")
         self.assertEqual(self.run_check().returncode, 0)
         refs = f"refs/heads/clean {clean} refs/heads/clean {'0' * 40}\n"
         refs += f"refs/heads/broken {broken} refs/heads/broken {'0' * 40}\n"
         result = self.run_check(pre_push=refs)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("dyna-ci.yml:", result.stderr)
+        self.assertIn("ci.yml:", result.stderr)
         self.assertIn("invalid workflow YAML", result.stderr)
         self.assertEqual(self.run_check(pre_push="").returncode, 0)
         self.assertEqual(self.run_check(pre_push=f"refs/heads/x {'0' * 40} refs/heads/x {clean}\n").returncode, 0)

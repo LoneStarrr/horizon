@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn recipes_of_type_answers_vanilla_types_from_the_live_table() {
         with_game(|game| {
             let smelting = game.recipes_of_type("minecraft:smelting");
@@ -558,7 +558,7 @@ mod tests {
             assert_eq!(iron.ingredients.len(), 1);
             assert!(iron.ingredients[0].items.contains("minecraft:raw_iron"));
             assert_eq!(iron.results[0].item.as_ref(), "minecraft:iron_ingot");
-            let shaped = game.recipes_of_type("minecraft:crafting_shaped");
+            let shaped = game.recipes_of_type("minecraft:crafting");
             let bucket = shaped
                 .iter()
                 .find(|recipe| recipe.id == "minecraft:bucket")
@@ -575,8 +575,35 @@ mod tests {
         });
     }
 
+    /// Every type that has recipes is listed once, by type and never by serializer, and so is a
+    /// mod's registered type with no recipe yet.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn recipe_types_list_each_type_with_recipes_or_a_serializer() {
+        mod_platform::testing::with_recipe_types(&["typesprobe:grinding"], || {
+            with_game(|game| {
+                let types = game.recipe_types();
+                for kind in [
+                    "minecraft:blasting",
+                    "minecraft:campfire_cooking",
+                    "minecraft:crafting",
+                    "minecraft:smelting",
+                    "minecraft:smithing",
+                    "minecraft:smoking",
+                    "minecraft:stonecutting",
+                    "typesprobe:grinding",
+                ] {
+                    assert!(types.iter().any(|t| t == kind), "{kind}: {types:?}");
+                }
+                assert!(!types.iter().any(|t| t == "minecraft:crafting_shaped"));
+                assert!(types.is_sorted());
+                assert!(types.windows(2).all(|pair| pair[0] != pair[1]));
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn tag_and_fluid_reads_follow_vanilla_and_load_nothing() {
         with_game(|game| {
             let dir =
@@ -847,14 +874,15 @@ mod tests {
             });
             {
                 use mod_api::LevelHost;
-                let hit =
-                    super::super::native_hooks::HitLevel(horizon_client::health::DamageLevel::of(
+                let hit = super::super::native_hooks::HitLevel::new(
+                    horizon_client::health::DamageLevel::of(
                         &mut game.world,
                         game.pack.assets.registry,
                         Some(world_items!(game)),
                         Some(&game.pack.block_registries),
                         &game.damage_hooks,
-                    ));
+                    ),
+                );
                 assert_eq!(
                     hit.block_state_id("minecraft:oak_slab[waterlogged=true]"),
                     parsed
@@ -885,14 +913,15 @@ mod tests {
             }
             {
                 use mod_api::LevelHost;
-                let hit =
-                    super::super::native_hooks::HitLevel(horizon_client::health::DamageLevel::of(
+                let hit = super::super::native_hooks::HitLevel::new(
+                    horizon_client::health::DamageLevel::of(
                         &mut game.world,
                         game.pack.assets.registry,
                         None,
                         None,
                         &game.damage_hooks,
-                    ));
+                    ),
+                );
                 assert_eq!(hit.block_state_id("minecraft:stone"), None);
                 assert_eq!(
                     hit.block_state_default(mod_platform::__private::part_tests::block_key(
@@ -929,7 +958,7 @@ mod tests {
     /// Sources and their flowing forms are one fluid, the empty fluid has no bucket and no
     /// pickup sound, and a name no fluid has answers nothing, through a mod's `Host`.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fluid_sameness_buckets_and_bucket_sounds_follow_vanilla() {
         with_game(|game| {
             let host: &dyn mod_api::Host = game;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 /// `FollowMobGoal.canUse` skips an invisible mob (`!isInvisible()`), which
 /// is the flag or the invisibility effect.
 #[test]
+#[ignore = "daily"]
 fn a_follow_mob_goal_ignores_an_invisible_mob() {
     use crate::mobs::sensor_scan_tests::kind;
     let mut outcomes = Vec::new();
@@ -20,7 +21,7 @@ fn a_follow_mob_goal_ignores_an_invisible_mob() {
             let mut m = Mob::new(1, Arc::new(follower_kind), Vec3::new(0.5, 64.0, 0.5), 0.0);
             let mut target = Mob::new(2, Arc::new(target_kind), Vec3::new(1.5, 64.0, 0.5), 0.0);
             target.invisible = invisible;
-            let seen = [target.seen(None)];
+            let seen = [target.seen(None, &crate::items::Items::empty())];
             let world = crate::mobs::MobWorld {
                 others: &seen,
                 ..w.clone()

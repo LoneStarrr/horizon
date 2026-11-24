@@ -4,7 +4,7 @@
 //! GitHub's public API to an exact **release asset** (a `.hmod`, kept by its SHA-256) or an exact
 //! **commit** (the archive of that commit, whose mod folder is packed into a `.hmod`), never to a
 //! branch that moves. The result passes the checks the registry's `.hmod`s pass
-//! (`horizon_mod_package::index::native::Bundle::read`) before anything is installed, and the origin is
+//! (`horizon_platform::mod_package::index::native::Bundle::read`) before anything is installed, and the origin is
 //! kept beside the file (`horizon-native-mods/<id>.origin.json`) for "check for updates".
 //!
 //! Nothing here runs the mod's code, and nothing here trusts it: the registry has not reviewed it.
@@ -218,7 +218,7 @@ fn commit_of(api: Api, link: &Link, reference: &str) -> Result<String, String> {
     })?;
     found["sha"]
         .as_str()
-        .filter(|s| horizon_mod_package::manifest::revision(s))
+        .filter(|s| horizon_platform::mod_package::manifest::revision(s))
         .map(str::to_owned)
         .ok_or_else(|| format!("GitHub did not name the commit of {reference}."))
 }
@@ -232,12 +232,23 @@ fn default_head(api: Api, link: &Link) -> Result<String, String> {
     commit_of(api, link, branch)
 }
 
+/// Whether `url` is a release file of `link`'s own repository. GitHub answers a link whatever its
+/// letter case and spells the owner and the repository its own way (#18167); the rest is exact.
+fn own_release_file(url: &str, link: &Link) -> bool {
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '/');
+    let (Some(owner), Some(repo), Some(file)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    owner.eq_ignore_ascii_case(&link.owner)
+        && repo.eq_ignore_ascii_case(&link.repo)
+        && file.starts_with("releases/download/")
+}
+
 /// The release's mod package, validated after download.
 fn assets(release: &serde_json::Value, link: &Link) -> Option<Asset> {
-    let prefix = format!(
-        "https://github.com/{}/{}/releases/download/",
-        link.owner, link.repo
-    );
     let list = release["assets"]
         .as_array()
         .map(Vec::as_slice)
@@ -248,7 +259,7 @@ fn assets(release: &serde_json::Value, link: &Link) -> Option<Asset> {
             let url = a["browser_download_url"].as_str()?.to_owned();
             let name = a["name"].as_str()?.to_owned();
             // Only this repository's own release files.
-            url.starts_with(&prefix).then(|| Asset {
+            own_release_file(&url, link).then(|| Asset {
                 name,
                 url,
                 sha256: a["digest"]
@@ -384,11 +395,13 @@ fn checked(bytes: &[u8], dir: &Path) -> Result<Packed, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join(format!("{}.hmod", &sum[..16]));
     fs::write(&file, bytes).map_err(|e| format!("{}: {e}", file.display()))?;
-    let facts =
-        horizon_mod_package::index::inspect(&horizon_mod_package::index::Kind::NativeMod, &file)
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&file);
-            })?;
+    let facts = horizon_platform::mod_package::index::inspect(
+        &horizon_platform::mod_package::index::Kind::NativeMod,
+        &file,
+    )
+    .inspect_err(|_| {
+        let _ = fs::remove_file(&file);
+    })?;
     Ok(Packed {
         id: facts.id.expect("native bundle has an id"),
         version: facts.version.expect("native bundle has a version"),
@@ -433,7 +446,7 @@ pub fn find_mods(root: &Path) -> Result<Vec<Bundle>, String> {
 
 /// Deterministically package a validated flat mod project.
 pub fn pack(bundle: &Bundle) -> Result<Vec<u8>, String> {
-    horizon_mod_package::Package::pack_directory(&bundle.dir)
+    horizon_platform::mod_package::Package::pack_directory(&bundle.dir)
 }
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
@@ -581,6 +594,20 @@ pub fn install(home: &Path, found: &Resolved, packed: &Packed) -> Result<Origin,
 
 /// Removes mod `id` installed from GitHub; false when it wasn't.
 pub fn remove(home: &Path, id: &str) -> Result<bool, String> {
+    remove_with(home, id, true)
+}
+
+/// Removes the untracked native file `row`: through [`remove`] when it came from GitHub, else as
+/// a file. A retired `[[inject]]` file whose id another mod shares keeps `mod.<id>`, which is
+/// that other mod's setting too.
+pub fn remove_installed(home: &Path, row: &crate::native_status::Installed) -> Result<(), String> {
+    if row.origin.is_none() {
+        return fs::remove_file(home.join(&row.file)).map_err(|e| e.to_string());
+    }
+    remove_with(home, &row.id, !row.shares_id()).map(|_| ())
+}
+
+fn remove_with(home: &Path, id: &str, turn_off: bool) -> Result<bool, String> {
     let _lock = crate::browser::lock_home(home).map_err(|e| e.to_string())?;
     if origin(home, id).is_none() {
         return Ok(false);
@@ -595,7 +622,9 @@ pub fn remove(home: &Path, id: &str) -> Result<bool, String> {
             }
         }
     }
-    java::set_enabled(home, id, false)?;
+    if turn_off {
+        java::set_enabled(home, id, false)?;
+    }
     Ok(true)
 }
 

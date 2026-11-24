@@ -1,7 +1,7 @@
 # Registered raw custom payload transport
 
-This is the raw transport below the typed payload work in #813, implementing
-#2882. The codec prerequisite is #2951. Names and contracts are based on
+This is the raw transport below the typed payload work in arismoko/horizon#813, implementing
+arismoko/horizon#2882. The codec prerequisite is arismoko/horizon#2951. Names and contracts are based on
 NeoForge 26.3's public payload API and the room's written clean-room specification;
 no NeoForge implementation source was read by this implementation's author.
 
@@ -11,7 +11,8 @@ Replace the legacy envelope transport, its broadcast hooks, old send methods, br
 30,000-byte envelope bound and 32-message counters outright. Application packets
 use their declared namespaced custom-payload channel and exact opaque body bytes.
 There is no Horizon application envelope and no second path for typed payloads.
-Existing attachment synchronization is outside this raw transport migration.
+Attachment synchronization rides this transport as an engine declaration (arismoko/horizon#813 step 4a;
+see the typed-payload design note).
 
 Registration runs in dependency order during mod loading. `PayloadRegistrar`
 provides play, configuration and common registrations, each ToClient, ToServer or
@@ -36,8 +37,8 @@ incompatible matching declaration is ignored. A vanilla
 peer is admitted when all local requirements are optional; sending an absent
 optional payload returns UnsupportedPeer without a packet. There is no per-tick mod
 work for empty registries. Configuration still exchanges a constant-size protocol
-mark (and an empty Offer) for Horizon-branded peers, even with empty or all-optional
-registries. On `horizon:payloads`, Query is bytes `[0, 1]`; Offer begins `[1, 1]`
+mark (and an Offer, which carries the engine's optional declarations even with no mods) for
+Horizon-branded peers, even with empty or all-optional mod registries. On `horizon:payloads`, Query is bytes `[0, 1]`; Offer begins `[1, 1]`
 then the manifest record count. The second byte is raw transport revision 1,
 independent of application versions. A wrong revision or an absent marked response
 from a Horizon-branded peer refuses admission with a named raw-protocol cause.
@@ -87,9 +88,31 @@ cannot execute inline across the connection and are received on a subsequent tur
 Single-player and split-screen use their real connect_local sessions, not direct
 callback shortcuts.
 
-## Acceptance and the amendment to #813
+`IPayloadHandler::handle` returns `Result<(), PayloadHandleError>`, with explicit
+`Failed(String)` for application and execution failures. Native panics and disabled
+owners remain failures. `PayloadWork::run` retains its `Result<(), String>` contract.
+Guest-group contention instead returns `Busy { payload, holder }` before the handler
+starts, returning the same owned body and a resolved `PayloadBusy` snapshot (shared
+owner/export/thread names and elapsed held milliseconds).
 
-Replace #813's proposed 32-per-tick cap and its “33 sends” acceptance row: vanilla
+The connection transport must requeue busy input at its head, preserving both
+payload and ordinary gameplay ordering, the original ingress lease and accounting,
+and the original payload deadline. Existing queue byte budgets bound retained
+memory. The deadline is 60 seconds, exceeding the largest guest execution budget;
+retries never renew it. Deadline expiry reports the held mod/export/thread/duration.
+Disconnect and protocol/epoch replacement cancel pending retries. Nested cross-group
+calls refuse immediately rather than waiting. This is the caller's contract, not
+queueing performed by the handler itself; it adds no detached retry worker.
+
+Busy retries retain the existing 16 MiB physical ingress reservations across work
+and main-thread moves. One connection-owned receiving turn spans MAIN root
+publication or rollback. Pooled server receivers retry on their existing tick;
+dedicated client and configuration receivers use timed condition-variable wakes,
+so progress requires neither another network frame nor a detached worker.
+
+## Acceptance and the amendment to arismoko/horizon#813
+
+Replace arismoko/horizon#813's proposed 32-per-tick cap and its “33 sends” acceptance row: vanilla
 has no such cap. The replacement checks byte-bounded pressure, explicit local
 Backpressure, bounded flood memory and progress for more than 32 legal messages.
 Its registered-body limit wording must distinguish discard limits from the actual
@@ -102,3 +125,13 @@ refusal, generic-send bypass and named decode failures. Native and wasm must bot
 exercise the real transport. Measure allocations for a 1 MiB wasm transfer; do not
 claim zero-copy across Wire. The author supplies prepared-data self-check evidence;
 review is static. The lane lead separately orders independent network test commands.
+
+The `wasm-mods` fixture job runs
+`game::payload_transport::wasm_config_tests::compiled_guest_runs_on_configuration_connection_thread`
+by exact name and requires one passing test. It loads this run's compiled fixture,
+negotiates payloads over TCP with the actual LAN connection, and holds known packs
+and the serving Game thread while requiring two transformed, guest-counted replies.
+This keeps dispatch in CONFIGURATION on `horizon-lan-conn`, before the Play I/O pool:
+the existing guest-entry `check_current()` rejects a default-stack connection thread
+instead of producing the expected replies. Its isolated child uses fresh game and
+launcher homes and a scratch game directory/current working directory.

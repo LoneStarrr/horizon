@@ -1,5 +1,40 @@
 use super::*;
 
+#[derive(Debug, PartialEq)]
+struct NoCodec;
+
+macro_rules! ident_ty {
+    ($t:ty) => {
+        $t
+    };
+}
+
+#[derive(horizon_mod_api_macros::PayloadCodec)]
+struct MacroField<T> {
+    value: ident_ty!(T),
+}
+
+#[derive(Debug, PartialEq)]
+struct Opaque<T>(u8, std::marker::PhantomData<T>);
+
+impl<T> PayloadCodec for Opaque<T> {
+    fn schema(_: &mut Vec<std::any::TypeId>) -> u64 {
+        crate::content::payload_schema::payload_schema_leaf("test:Opaque")
+    }
+    fn encode(&self, out: &mut PayloadWriter) {
+        self.0.encode(out);
+    }
+
+    fn decode(input: &mut PayloadReader<'_>) -> Result<Self, PayloadDecodeError> {
+        u8::decode(input).map(|value| Self(value, std::marker::PhantomData))
+    }
+}
+
+#[derive(Debug, PartialEq, horizon_mod_api_macros::PayloadCodec)]
+struct OpaqueEnvelope<T> {
+    value: Opaque<T>,
+}
+
 /// The acceptance matrix's payload: `counter=7`.
 #[derive(Debug, PartialEq)]
 struct Counter {
@@ -8,6 +43,9 @@ struct Counter {
 }
 
 impl PayloadCodec for Counter {
+    fn schema(_: &mut Vec<std::any::TypeId>) -> u64 {
+        crate::content::payload_schema::payload_schema_leaf("test:Counter")
+    }
     fn encode(&self, out: &mut PayloadWriter) {
         out.var_int(self.counter);
         self.labels.encode(out);
@@ -25,6 +63,9 @@ impl PayloadCodec for Counter {
 struct Chain(Option<Box<Chain>>);
 
 impl PayloadCodec for Chain {
+    fn schema(_: &mut Vec<std::any::TypeId>) -> u64 {
+        crate::content::payload_schema::payload_schema_leaf("test:Chain")
+    }
     fn encode(&self, out: &mut PayloadWriter) {
         self.0.encode(out);
     }
@@ -53,6 +94,9 @@ thread_local! {
 }
 
 impl PayloadCodec for Counted {
+    fn schema(_: &mut Vec<std::any::TypeId>) -> u64 {
+        crate::content::payload_schema::payload_schema_leaf("test:Counted")
+    }
     fn encode(&self, _: &mut PayloadWriter) {}
     fn decode(_: &mut PayloadReader<'_>) -> Result<Self, PayloadDecodeError> {
         DECODED.set(DECODED.get() + 1);
@@ -257,6 +301,9 @@ fn an_encode_past_a_bound_writes_nothing() {
 #[derive(Debug, PartialEq)]
 struct Recursive(Box<Recursive>);
 impl PayloadCodec for Recursive {
+    fn schema(_: &mut Vec<std::any::TypeId>) -> u64 {
+        crate::content::payload_schema::payload_schema_leaf("test:Recursive")
+    }
     fn encode(&self, out: &mut PayloadWriter) {
         self.0.encode(out);
     }
@@ -321,6 +368,132 @@ struct Cell {
     out: VarInt,
     input: Option<String>,
     flags: u8,
+}
+
+#[test]
+fn a_derived_codec_does_not_bound_generic_parameters_its_fields_do_not_need() {
+    let envelope = OpaqueEnvelope {
+        value: Opaque(42, std::marker::PhantomData::<NoCodec>),
+    };
+    assert_eq!(encode_payload(&envelope, 1), Ok(vec![42]));
+    assert_eq!(
+        decode_payload::<OpaqueEnvelope<NoCodec>>(&[42]),
+        Ok(OpaqueEnvelope {
+            value: Opaque(42, std::marker::PhantomData),
+        })
+    );
+}
+
+#[test]
+fn a_derived_codec_bounds_a_type_parameter_hidden_in_a_type_macro() {
+    let value = MacroField { value: 42_u8 };
+    let bytes = [42];
+    assert_eq!(encode_payload(&value, 1), Ok(bytes.to_vec()));
+    assert_eq!(decode_payload::<MacroField<u8>>(&bytes).unwrap().value, 42);
+}
+
+#[derive(Debug, PartialEq, horizon_mod_api_macros::PayloadCodec)]
+struct GenericTree<T> {
+    value: T,
+    children: Vec<GenericTree<T>>,
+}
+
+#[test]
+fn a_derived_generic_recursive_tree_uses_the_generic_bound() {
+    let tree = GenericTree {
+        value: 1_u8,
+        children: vec![GenericTree {
+            value: 2_u8,
+            children: vec![],
+        }],
+    };
+    let bytes = [1, 1, 2, 0];
+    assert_eq!(encode_payload(&tree, 4), Ok(bytes.to_vec()));
+    assert_eq!(
+        decode_payload::<GenericTree<u8>>(&bytes),
+        Ok(GenericTree {
+            value: 1,
+            children: vec![GenericTree {
+                value: 2,
+                children: vec![],
+            }],
+        })
+    );
+}
+
+mod bound_overrides {
+    use super::{NoCodec, Opaque, decode_payload, encode_payload};
+    use crate::content::payload_codec as contract;
+
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::PayloadCodec)]
+    #[payload(crate = contract, bound = "T: contract::PayloadCodec")]
+    struct A<T> {
+        value: T,
+        b: Vec<B<T>>,
+    }
+
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::PayloadCodec)]
+    #[payload(crate = contract, bound = "T: contract::PayloadCodec")]
+    struct B<T> {
+        a: Option<Box<A<T>>>,
+    }
+
+    #[derive(Debug, PartialEq, horizon_mod_api_macros::PayloadCodec)]
+    #[payload(crate = contract, bound = "")]
+    struct OpaqueTree<T> {
+        value: Opaque<T>,
+        children: Vec<OpaqueTree<T>>,
+    }
+
+    #[test]
+    fn mutual_recursion_uses_explicit_bounds_and_independent_bytes() {
+        let value = A {
+            value: 1_u8,
+            b: vec![B {
+                a: Some(Box::new(A {
+                    value: 2_u8,
+                    b: vec![],
+                })),
+            }],
+        };
+        let bytes = [1, 1, 1, 2, 0];
+        assert_eq!(encode_payload(&value, 5), Ok(bytes.to_vec()));
+        assert_eq!(
+            decode_payload::<A<u8>>(&bytes),
+            Ok(A {
+                value: 1,
+                b: vec![B {
+                    a: Some(Box::new(A {
+                        value: 2,
+                        b: vec![],
+                    })),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn empty_bound_override_supports_recursive_opaque_values() {
+        let value = OpaqueTree {
+            value: Opaque(7, std::marker::PhantomData::<NoCodec>),
+            children: vec![OpaqueTree {
+                value: Opaque(8, std::marker::PhantomData),
+                children: vec![],
+            }],
+        };
+        let bytes = [7, 1, 8, 0];
+        assert_eq!(encode_payload(&value, 4), Ok(bytes.to_vec()));
+        assert_eq!(
+            decode_payload::<OpaqueTree<NoCodec>>(&bytes),
+            Ok(OpaqueTree {
+                value: Opaque(7, std::marker::PhantomData),
+                children: vec![OpaqueTree {
+                    value: Opaque(8, std::marker::PhantomData),
+                    children: vec![],
+                }],
+            })
+        );
+    }
 }
 
 /// A derived enum: a VarInt tag counting variants from 0, then the variant's

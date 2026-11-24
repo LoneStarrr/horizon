@@ -30,6 +30,7 @@ fn meta_hub() -> horizon_client::lan::hub::Hub {
     let sync = std::sync::Arc::new(data::SyncData::empty());
     let config = NetConfig {
         announce: false,
+        listen: false,
         ..NetConfig::loopback(0, "CatPoseMetaTest".into(), 2)
     };
     let lan = Lan::start_with(sync.clone(), config).unwrap();
@@ -52,6 +53,7 @@ fn meta_hub() -> horizon_client::lan::hub::Hub {
         max_players: 20,
         integrated: false,
         levels: Default::default(),
+        level_seeds: Default::default(),
     };
     hub::Hub::new(
         lan,

@@ -1,7 +1,7 @@
 //! Carrier transfers in the server's game: the fences that hold the
 //! world's cells and the carrier still while an operation is between
 //! prepared and committed, and the assembly that runs at a tick
-//! boundary (issue #2413, slice 2 part C).
+//! boundary (issue arismoko/horizon#2413, slice 2 part C).
 //!
 //! A transfer is one synchronous call on the server's thread at a tick
 //! boundary: no tick runs between `prepared` and `committed`, so routes
@@ -20,7 +20,7 @@
 
 use crate::carrier_store::{MAX_CARRIERS, Store};
 use crate::game::Game;
-use crate::save::encode_block_entity;
+use crate::save::block_entity_encode;
 use horizon_core::position::BlockPos;
 use horizon_world::carrier::codec;
 use horizon_world::carrier::contact::RigidTransform;
@@ -164,7 +164,7 @@ impl Game<'_> {
     ///
     /// Order: preflight; the operation encoded in memory; the affected
     /// chunks forced to disk with the writer's acknowledged barrier
-    /// (before the #2488 obligation, under which saves refuse); a
+    /// (before the arismoko/horizon#2488 obligation, under which saves refuse); a
     /// revalidation that every cell still holds exactly its preflight
     /// state and entity — a mismatch refuses with the world and the
     /// store untouched; then, under the obligation, the operation file
@@ -277,7 +277,7 @@ impl Game<'_> {
                 .block_entities
                 .get(&(key[0], key[1], key[2]))
                 .map(|entity| {
-                    encode_block_entity((key[0], key[1], key[2]), entity, &descriptor.name)
+                    block_entity_encode::encode((key[0], key[1], key[2]), entity, &descriptor.name)
                 });
             operation_cells.push(OperationCell {
                 world: key,
@@ -393,7 +393,7 @@ impl Game<'_> {
         let encoded = encode_operation(&operation).map_err(|_| TransferError::Envelope)?;
 
         // The affected chunks reach the disk, acknowledged, before the
-        // obligation: under #2488 saves refuse, so this must precede the
+        // obligation: under arismoko/horizon#2488 saves refuse, so this must precede the
         // lease. Replay will find its pre-image here.
         store
             .check_admission(OpKind::Assemble, uuid, generation)
@@ -408,7 +408,7 @@ impl Game<'_> {
         self.revalidate_cells(&operation_cells, registry)?;
 
         // From here the path runs forward to `committed`. The lift is
-        // under #2488's obligation, fenced until the barrier confirms.
+        // under arismoko/horizon#2488's obligation, fenced until the barrier confirms.
         let _lease = PassLease::enter();
         // The immutable carrier is published and verified by reading it
         // back BEFORE any intent exists: once `prepared` runs, the
@@ -850,7 +850,7 @@ impl Game<'_> {
                         .state(state)
                         .map(|descriptor| descriptor.name.as_str())
                         .unwrap_or("");
-                    let encoded = encode_block_entity((pos[0], pos[1], pos[2]), live, name);
+                    let encoded = block_entity_encode::encode((pos[0], pos[1], pos[2]), live, name);
                     if !entities_content_equal(&encoded, image) {
                         return Err(TransferError::Revalidation(pos));
                     }
@@ -1043,7 +1043,7 @@ mod tests {
     /// cell becomes air, the operation commits, and the block has
     /// exactly one owner — the carrier file, decoded back.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn assembling_moves_a_chest_to_one_owner_and_commits() {
         let root =
             std::env::temp_dir().join(format!("horizon-carrier-transfer-{}", std::process::id()));
@@ -1106,7 +1106,7 @@ mod tests {
     /// While a fence holds a cell, each refusal route refuses exactly at
     /// its one chokepoint, and the moment the fence clears they pass.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fenced_cells_refuse_every_route_at_its_chokepoint() {
         with_game(|game| {
             game.world
@@ -1148,7 +1148,7 @@ mod tests {
 
     /// (item 7) An empty selection refuses before any indexing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_empty_assembly_refuses() {
         with_game(|game| match game.carrier_assemble(51, &[]) {
             Err(TransferError::EmptySelection) => {}
@@ -1159,7 +1159,7 @@ mod tests {
     /// (item 7) A destination arithmetic that overflows refuses instead
     /// of wrapping the world.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_overflowing_destination_refuses() {
         let root = transfer_root("overflow");
         with_game(|game| {
@@ -1198,7 +1198,7 @@ mod tests {
     /// (item 7) An unsupported block entity in the selection refuses in
     /// preflight — the world keeps the block and its entity.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_ticking_block_entity_refuses_before_the_lift() {
         let root = transfer_root("passive");
         with_game(|game| {
@@ -1252,7 +1252,7 @@ mod tests {
     /// capacity: ten sequential transfers fit an eight-carrier index,
     /// but all ten deletion witnesses survive this world session.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn repeated_transfers_beyond_the_index_capacity_stay_bounded() {
         let root = transfer_root("capacity");
         with_game(|game| {
@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn capacity_refusal_leaves_world_untouched() {
         let root = transfer_root("admission");
         with_game(|game| {
@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn saved_tag_refuses_assembly_and_disassembly_without_mutation() {
         let root = transfer_root("saved-tag");
         with_game(|game| {
@@ -1368,8 +1368,11 @@ mod tests {
                     extra: None,
                 }),
             ]);
-            let tag =
-                horizon_client::save::encode_block_entity((4, 64, 4), &entity, "minecraft:chest");
+            let tag = horizon_client::save::block_entity_encode::encode(
+                (4, 64, 4),
+                &entity,
+                "minecraft:chest",
+            );
             spill::put_saved_entity(&mut game.world, [4, 64, 4], tag.clone());
             assert!(matches!(
                 game.carrier_assemble(7, &[BlockPos::new(4, 64, 4)]),
@@ -1415,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn assembly_revalidation_refuses_saved_tag_without_mutation() {
         let root = transfer_root("assembly-revalidation-saved-tag");
         with_game(|game| {
@@ -1440,8 +1443,11 @@ mod tests {
                     extra: None,
                 }),
             ]);
-            let tag =
-                horizon_client::save::encode_block_entity((4, 64, 4), &entity, "minecraft:chest");
+            let tag = horizon_client::save::block_entity_encode::encode(
+                (4, 64, 4),
+                &entity,
+                "minecraft:chest",
+            );
             spill::put_saved_entity(&mut game.world, [4, 64, 4], tag.clone());
             let images = [crate::carrier_store::OperationCell {
                 world: [4, 64, 4],
@@ -1495,7 +1501,7 @@ mod tests {
     /// resolves it cleanly — the carrier file is gone, the journal
     /// holds no operation, and the world reopens.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_crash_after_a_finished_disassembly_recovers_clean() {
         let root = transfer_root("post-disassembly");
         with_game(|game| {
@@ -1543,7 +1549,7 @@ mod tests {
     /// gaps stay gaps and the input order is irrelevant — the same
     /// selection shuffled produces the byte-identical carrier.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn sparse_selection_geometry_survives_and_order_is_irrelevant() {
         let root = transfer_root("geometry");
         let sparse = [
@@ -1613,7 +1619,7 @@ mod tests {
     /// keeps facing — resolved from the saved properties at placement,
     /// never from the block's default state.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn non_default_states_survive_the_round_trip() {
         let root = transfer_root("states");
         with_game(|game| {
@@ -1689,7 +1695,7 @@ mod tests {
     /// file, and the source cell empty. If the live code ever publishes
     /// the carrier after prepared again, this test fails.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_live_assembly_publishes_the_cargo_before_prepared() {
         let root = transfer_root("live-cargo");
         with_game(|game| {
@@ -1779,7 +1785,7 @@ mod tests {
     /// transfer refuses, and recovery at a reopen finishes the
     /// operation with the chest's items in exactly one place.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_flush_failure_after_prepared_recovers_on_reopen() {
         let root =
             std::env::temp_dir().join(format!("horizon-carrier-flush-{}", std::process::id()));
@@ -1854,7 +1860,7 @@ mod tests {
     /// the exit, and the next open's recovery still finishes the
     /// operation with exactly one owner.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_failed_commit_stops_the_session_until_recovery() {
         let root = transfer_root("fail-closed");
         with_game(|game| {
@@ -1921,7 +1927,7 @@ mod tests {
     /// gates alike — and the refusal leaves the world untouched: no
     /// store is created, nothing is written.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_client_mirror_transfer_refuses_without_touching_the_world() {
         let root = std::env::temp_dir().join(format!(
             "horizon-carrier-client-refusal-{}",
@@ -1949,7 +1955,7 @@ mod tests {
     /// Assemble then disassemble: at every step the chest has exactly
     /// one owner — the world, the carrier's images or the carrier file.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn assemble_then_disassemble_keeps_one_owner_at_every_step() {
         let root = transfer_root("cycle");
         with_game(|game| {
@@ -1989,7 +1995,7 @@ mod tests {
     /// A destination that already holds a block entity refuses, with
     /// the carrier intact.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_destination_with_a_block_entity_refuses() {
         let root = transfer_root("dest");
         with_game(|game| {
@@ -2026,7 +2032,7 @@ mod tests {
     /// A rotation that is not a cube symmetry refuses; a cube rotation
     /// without an adapter refuses too; the carrier survives both.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn rotations_refuse_without_symmetry_or_an_adapter() {
         let root = transfer_root("rot");
         with_game(|game| {
@@ -2066,7 +2072,7 @@ mod tests {
     /// Revalidation itself: images built from the world, the world then
     /// changed underneath — the mismatch refuses and nothing moved.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn revalidation_refuses_a_changed_cell_without_touching_the_world() {
         with_game(|game| {
             game.world
@@ -2112,7 +2118,7 @@ mod tests {
     /// operation replays in the Nether, the Overworld is untouched and
     /// the player stays where the world opened.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_nether_transfer_recovers_while_the_world_opens_in_the_overworld() {
         let root = transfer_root("nether");
         // Opening a second level on demand reads the data-fix tables of
@@ -2197,7 +2203,7 @@ mod tests {
     /// A journal naming a dimension the world cannot hold refuses the
     /// load with that name, and no level is touched.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_unknown_dimension_refuses_the_load_without_touching_levels() {
         let root = transfer_root("nope");
         with_game(|game| {
@@ -2249,7 +2255,7 @@ mod tests {
     /// newest batch") drops the older snapshot. No record number of
     /// our own is needed; this test pins the guarantee.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_older_snapshot_completing_late_cannot_overwrite_the_post_state() {
         let root = transfer_root("writer");
         with_game(|game| {
@@ -2298,14 +2304,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Every save route refuses while the #2488 obligation holds —
+    /// Every save route refuses while the arismoko/horizon#2488 obligation holds —
     /// autosave, save-all, requested parked saves and the shutdown
     /// save all enter through `admit_entity_save` — and admits again
     /// the moment the transfer commits. The transfer runs inside one
     /// synchronous call, so the steps cannot interleave with a save;
     /// this pins the gate each route passes.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn every_save_route_refuses_under_the_obligation_and_admits_after_commit() {
         let root = transfer_root("saves");
         with_game(|game| {
@@ -2329,7 +2335,7 @@ mod tests {
                 game.levels.request_save(game.dim);
                 game.run_requested_saves();
                 // The requested save was refused while lifted and stays
-                // queued for the next tick, as #2488 defines.
+                // queued for the next tick, as arismoko/horizon#2488 defines.
                 assert!(game.levels.save_pending(game.dim));
             }
             // Committed: the routes admit again (the full save writes
@@ -2345,7 +2351,7 @@ mod tests {
     /// operation, copy the world folder, load the copy — the carriers
     /// and chunks come out identical.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_supported_backup_restores_identical_carriers_and_chunks() {
         let root = transfer_root("backup");
         with_game(|game| {
@@ -2468,7 +2474,7 @@ mod tests {
         .unwrap();
     }
 
-    /// The #2488 obligation is what autosave and `save-all` refuse on:
+    /// The arismoko/horizon#2488 obligation is what autosave and `save-all` refuse on:
     /// holding it refuses, releasing it admits again.
     #[test]
     fn the_save_obligation_gates_saves() {
@@ -2483,7 +2489,7 @@ mod tests {
 
     /// A world without transfers creates nothing and fences nothing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_world_without_transfers_writes_no_store_files() {
         let root =
             std::env::temp_dir().join(format!("horizon-carrier-quiet-{}", std::process::id()));

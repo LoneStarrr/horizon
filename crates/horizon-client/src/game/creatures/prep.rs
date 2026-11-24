@@ -27,8 +27,9 @@ impl Game<'_> {
         for (m, climbing) in self.mobs.iter_mut().zip(climbing) {
             m.on_climbable = climbing;
         }
+        let items = self.items();
         snapshot.extend(par_map(&self.mobs, MIN_MOBS, |part, out| {
-            out.extend(part.iter().map(|m| super::seen(m, player)));
+            out.extend(part.iter().map(|m| super::seen(m, player, items)));
         }));
     }
 }
@@ -72,26 +73,37 @@ impl<'p> MobsNearest<'p> {
 /// `base` without its hooks into the game, which can't leave the server thread, as a recipe a
 /// helper thread builds its own world from: native mod effects (the phases on helpers don't run
 /// them) and the UUID lookup.
-pub(super) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + Sync + use<'w> {
+pub(crate) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + Sync + use<'w> {
     // Every field but the two hooks, named, so that a field added to `MobWorld` is decided here.
     let MobWorld {
+        mob_maps,
+        section_writer: _,
+        professions,
+        loop_context,
         world,
         registry,
         facts,
         fluid_tables,
+        attributes,
         movement,
         collision,
         suffocation,
         data,
         player,
+        player_identity,
+        player_selection: _,
         controlling_player_movement,
         nearest_player,
         others,
+        live_mobs: _,
         dragon,
         leash_boats,
         others_grid,
         others_index,
+        passenger_objects,
         others_villagers,
+        village: _,
+        species_slots: _,
         others_solid,
         daylight,
         monsters_burn,
@@ -115,28 +127,44 @@ pub(super) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + S
         items,
         lid_openers,
         mod_effects: _,
+        mob_hooks: _,
+        goal_host: _,
+        asks_animal_tame: _,
+        asks_living_destroy_block: _,
+        asks_baby_spawn: _,
         who_lookup: _,
         foreign: _,
         border,
     } = base.clone();
     move || MobWorld {
+        mob_maps,
+        section_writer: None,
+        professions,
+        loop_context,
         world,
         registry,
         facts,
         fluid_tables,
+        attributes,
         movement,
         collision,
         suffocation,
         data,
         player: player.clone(),
+        player_identity,
+        player_selection: None,
         controlling_player_movement,
         nearest_player,
         others,
+        live_mobs: None,
         dragon,
         leash_boats,
         others_grid,
         others_index,
+        passenger_objects,
         others_villagers,
+        village: None,
+        species_slots: None,
         others_solid,
         daylight,
         monsters_burn,
@@ -160,6 +188,11 @@ pub(super) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + S
         items,
         lid_openers,
         mod_effects: None,
+        mob_hooks: None,
+        goal_host: None,
+        asks_animal_tame: false,
+        asks_living_destroy_block: false,
+        asks_baby_spawn: false,
         who_lookup: None,
         foreign: None,
         border,
@@ -173,7 +206,7 @@ mod tests {
     use horizon_core::geometry::Aabb;
 
     #[test]
-    #[ignore = "needs prepared resources and scratch homes/cwd"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn preparation_refreshes_climbing_and_nearest_after_a_move() {
         let mut game = super::super::super::native_machines::tests::server_game();
         game.build_registries();
@@ -188,15 +221,13 @@ mod tests {
         }
         assert_eq!(game.mobs.len(), 2);
         let examples = game.mobs.clone();
-        game.mobs = (0..MIN_MOBS + 37)
-            .map(|i| {
-                let mut mob = examples[i % 2].clone();
-                mob.id = 10_000 + i as u32;
-                mob.on_climbable = i % 2 != 0; // deliberately stale in both cases
-                mob
-            })
-            .collect::<Vec<_>>()
-            .into();
+        game.mobs.clear();
+        for i in 0..MIN_MOBS + 37 {
+            let mut mob = examples[i % 2].clone();
+            mob.id = 10_000 + i as u32;
+            mob.on_climbable = i % 2 != 0; // deliberately stale in both cases
+            game.mobs.push(mob);
+        }
         let mut snapshot = Vec::new();
         game.prepare_mobs(None, &mut snapshot);
         assert_eq!(snapshot.len(), game.mobs.len());

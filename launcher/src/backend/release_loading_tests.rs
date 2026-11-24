@@ -164,7 +164,9 @@ fn empty_or_prebuilt_only_fork_has_no_game_or_launcher_update() {
                 Vec::new,
                 |list| {
                     launcher_releases_in_with(list, |url| {
-                        assert!(url.starts_with("https://api.github.com/repos/arismoko/horizon/"));
+                        assert!(
+                            url.starts_with("https://api.github.com/repos/horizon-rust/horizon/")
+                        );
                         Ok(missing.clone())
                     })
                 },
@@ -185,31 +187,19 @@ fn each_platform_download_is_bound_to_the_fork_not_the_provider_url() {
             "linux",
             "x86_64",
             "horizon-linux-x86_64.tar.gz",
-            if cfg!(horizon_fork_launcher) {
-                "horizon-fork-launcher-linux-x86_64.tar.gz"
-            } else {
-                "horizon-launcher-linux-x86_64.tar.gz"
-            },
+            "horizon-launcher-linux-x86_64.tar.gz",
         ),
         (
             "windows",
             "x86_64",
             "horizon-windows-x64.zip",
-            if cfg!(horizon_fork_launcher) {
-                "horizon-fork-launcher-windows-x64.zip"
-            } else {
-                "horizon-launcher-windows-x64.zip"
-            },
+            "horizon-launcher-windows-x64.zip",
         ),
         (
             "macos",
             "aarch64",
             "horizon-macos-arm64.zip",
-            if cfg!(horizon_fork_launcher) {
-                "horizon-fork-launcher-macos-arm64.zip"
-            } else {
-                "horizon-launcher-macos-arm64.zip"
-            },
+            "horizon-launcher-macos-arm64.zip",
         ),
     ];
     let assets: Vec<_> = platforms.iter().flat_map(|(_, _, game, launcher)| [game, launcher])
@@ -237,7 +227,7 @@ fn each_platform_download_is_bound_to_the_fork_not_the_provider_url() {
                 parsed[0].asset,
                 Some((
                     format!(
-                        "https://github.com/arismoko/horizon/releases/download/{tag}/{expected}"
+                        "https://github.com/horizon-rust/horizon/releases/download/{tag}/{expected}"
                     ),
                     9
                 ))
@@ -267,7 +257,7 @@ fn decoy_asset_names_never_replace_the_exact_platform_asset() {
                 got[0].asset,
                 Some((
                     format!(
-                        "https://github.com/arismoko/horizon/releases/download/{encoded}/{asset}"
+                        "https://github.com/horizon-rust/horizon/releases/download/{encoded}/{asset}"
                     ),
                     2
                 ))
@@ -290,7 +280,7 @@ fn decoy_asset_names_never_replace_the_exact_platform_asset() {
     assert!(draft.is_empty());
     assert_eq!(
         crate::signed::asset_url("../../x", "../evil.zip"),
-        "https://github.com/arismoko/horizon/releases/download/..%2F..%2Fx/..%2Fevil.zip"
+        "https://github.com/horizon-rust/horizon/releases/download/..%2F..%2Fx/..%2Fevil.zip"
     );
 }
 

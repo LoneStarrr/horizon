@@ -2,7 +2,7 @@
 use crate::wire::{Reader, Wire, WireError, Writer};
 use crate::{
     BlockEntityTypeKey, BlockKey, BoolGameRuleKey, DimensionKey, EffectKey, EnchantmentKey,
-    EntityTypeKey, FluidKey, ItemKey, MenuKey, TagKey, UnresolvedFluid,
+    EntityTypeKey, FluidKey, IntGameRuleKey, ItemKey, MenuKey, TagKey, UnresolvedFluid,
 };
 
 impl Wire for crate::InsideEffect {
@@ -33,6 +33,17 @@ impl Wire for crate::InsideEffect {
 }
 
 impl Wire for crate::EntityWrite {
+    layout_fields!(
+        "push" => Vec<f64>,
+        "set_movement" => Vec<f64>,
+        "stuck_in" => Vec<f64>,
+        "hurt.source" => Option<u32>,
+        "hurt.amount" => f32,
+        "set_fire_ticks" => i32,
+        "add_effect.effect" => crate::EffectKey,
+        "add_effect.duration" => i32,
+        "add_effect.amplifier" => u8,
+    );
     const LAYOUT_SEED: u64 = crate::wire::layout_seed(stringify!(crate::EntityWrite));
     const MIN: usize = 4;
     fn put(&self, out: &mut Writer) {
@@ -107,6 +118,7 @@ impl Wire for crate::EntityWrite {
 }
 
 impl Wire for crate::PlannedInside {
+    layout_fields!("effect" => crate::InsideEffect, "write" => crate::EntityWrite);
     const LAYOUT_SEED: u64 = crate::wire::layout_seed(stringify!(crate::PlannedInside));
     const MIN: usize = 4;
     fn put(&self, out: &mut Writer) {
@@ -136,6 +148,13 @@ impl Wire for crate::PlannedInside {
 }
 
 impl Wire for crate::InsideEffects {
+    layout_fields!(
+        "last_step" => i32,
+        "in_step" => Vec<bool>,
+        "before" => Vec<Vec<crate::EntityWrite>>,
+        "after" => Vec<Vec<crate::EntityWrite>>,
+        "planned" => Vec<crate::PlannedInside>,
+    );
     const LAYOUT_SEED: u64 = crate::wire::layout_seed(stringify!(crate::InsideEffects));
     const MIN: usize = <i32 as Wire>::MIN;
     fn put(&self, out: &mut Writer) {
@@ -264,14 +283,25 @@ impl Wire for crate::LoadedMods {
     }
 }
 impl Wire for crate::RegistrationContext {
-    const LAYOUT_SEED: u64 = crate::wire::layout_seed("RegistrationContext.instance_dir.v1");
-    const MIN: usize = <Option<crate::InstanceDirectory> as Wire>::MIN;
+    layout_fields!(
+        "instance_dir" => Option<crate::InstanceDirectory>,
+        "runtime" => Option<crate::RuntimeEnvironment>,
+        "startup" => Option<std::sync::Arc<dyn crate::StartupScreen>>,
+    );
+    const LAYOUT_SEED: u64 = crate::wire::layout_seed("RegistrationContext.runtime.startup.v3");
+    const MIN: usize = <Option<crate::InstanceDirectory> as Wire>::MIN
+        + <Option<crate::RuntimeEnvironment> as Wire>::MIN
+        + <Option<std::sync::Arc<dyn crate::StartupScreen>> as Wire>::MIN;
     fn put(&self, out: &mut Writer) {
         out.put(&self.instance_dir);
+        out.put(&self.runtime);
+        out.put(&self.startup);
     }
     fn take(input: &mut Reader<'_>) -> Result<Self, WireError> {
         let mut context = Self::new();
         context.instance_dir = input.take()?;
+        context.runtime = input.take()?;
+        context.startup = input.take()?;
         Ok(context)
     }
 }
@@ -279,6 +309,27 @@ impl Wire for crate::RegistrationContext {
 #[cfg(test)]
 mod resource_wire_tests {
     use super::*;
+    #[test]
+    fn registration_runtime_crosses_wire_without_guest_backend() {
+        for dist in [crate::Dist::Client, crate::Dist::DedicatedServer] {
+            for enabled in [false, true] {
+                let mut native = crate::RegistrationContext::new();
+                native.runtime = Some(crate::RuntimeEnvironment::new(
+                    dist,
+                    "26.3".into(),
+                    "nightly-test".into(),
+                    enabled,
+                ));
+                let mut out = Writer::new();
+                out.put(&native);
+                let guest: crate::RegistrationContext = Reader::new(out.bytes()).take().unwrap();
+                assert_eq!(guest.dist(), dist);
+                assert_eq!(guest.game_version(), "26.3");
+                assert_eq!(guest.horizon_version(), "nightly-test");
+                assert_eq!(guest.game_tests_enabled(), enabled);
+            }
+        }
+    }
 
     #[test]
     fn wire_tokens_and_package_inventory() {
@@ -311,8 +362,23 @@ mod resource_wire_tests {
             crate::PackageKind::Content,
             crate::Side::Both,
             vec!["test".into()],
-            vec!["other".into()],
-        );
+            vec![crate::PackageDependency::new(
+                "other".into(),
+                "^1".into(),
+                crate::DependencyKind::Optional,
+                crate::DependencyOrder::Before,
+                crate::Side::Server,
+                Some("Shared library".into()),
+                Some("https://example.org/library".into()),
+            )],
+        )
+        .with_details(crate::PackageDetails {
+            name: "Test".into(),
+            homepage: Some("https://example.org".into()),
+            runtime: Some(crate::PackageRuntime::Wasm),
+            properties: [("tier".into(), crate::PropertyValue::Integer(3))].into(),
+            ..Default::default()
+        });
         let mut out = Writer::new();
         out.put(&package);
         let decoded: crate::PackageInfo = Reader::new(out.bytes()).take().unwrap();
@@ -321,6 +387,29 @@ mod resource_wire_tests {
         assert_eq!(decoded.kind(), crate::PackageKind::Content);
         assert_eq!(decoded.side(), crate::Side::Both);
         assert!(decoded.depends_on("other"));
+        assert_eq!(decoded.dependencies()[0].version(), "^1");
+        assert_eq!(
+            decoded.dependencies()[0].kind(),
+            crate::DependencyKind::Optional
+        );
+        assert_eq!(
+            decoded.dependencies()[0].order(),
+            crate::DependencyOrder::Before
+        );
+        assert_eq!(decoded.dependencies()[0].side(), crate::Side::Server);
+        assert_eq!(decoded.dependencies()[0].reason(), Some("Shared library"));
+        assert_eq!(
+            decoded.dependencies()[0].url(),
+            Some("https://example.org/library")
+        );
+        assert_eq!(decoded.name(), "Test");
+        assert_eq!(decoded.homepage(), Some("https://example.org"));
+        assert_eq!(decoded.runtime(), Some(crate::PackageRuntime::Wasm));
+        assert_eq!(
+            decoded.property("tier"),
+            Some(&crate::PropertyValue::Integer(3))
+        );
+        assert_eq!(decoded.property("missing"), None);
         for end in 0..out.bytes().len() {
             assert!(
                 Reader::new(&out.bytes()[..end])
@@ -328,7 +417,7 @@ mod resource_wire_tests {
                     .is_err()
             );
         }
-        assert!(Reader::new(&[2, 0, 0, 0]).take::<crate::Side>().is_err());
+        assert!(Reader::new(&[3, 0, 0, 0]).take::<crate::Side>().is_err());
         assert!(
             Reader::new(&[2, 0, 0, 0])
                 .take::<crate::PackageKind>()
@@ -338,6 +427,73 @@ mod resource_wire_tests {
 }
 
 macro_rules! slot_keys {
+    (registries; $($key:path => $method:ident, $registry:literal, $resolve:expr;)+) => {
+        impl crate::RegistryEntry {
+            $(
+            #[doc = concat!("Resolve this entry as a `", stringify!($key),
+                "` through the current host. None for a different registry or an unknown entry.")]
+            pub fn $method(&self, host: &dyn crate::Host) -> Option<$key> {
+                if self.registry.namespace() != "minecraft" || self.registry.path() != $registry {
+                    return None;
+                }
+                host.registry_entry_key_slot(self).map($key)
+            }
+            )+
+        }
+        /// Resolve the actual load-owned typed slot after the game checks live membership.
+        // hidden: the game's RegistryEntry narrowing boundary, not a protocol-id conversion.
+        #[doc(hidden)]
+        pub fn registry_entry_key_slot(entry: &crate::RegistryEntry) -> Option<u32> {
+            if entry.registry.namespace() != "minecraft" {
+                return None;
+            }
+            match entry.registry.path() {
+                $($registry => ($resolve)(&entry.id),)+
+                _ => None,
+            }
+        }
+        #[cfg(test)]
+        mod registry_entry_narrowing_tests {
+            struct Host(std::cell::Cell<usize>);
+            impl crate::Host for Host {}
+            crate::impl_host_areas!(Host, except(keys));
+            impl crate::prelude::KeysHost for Host {
+                fn registry_entry_key_slot(&self, entry: &crate::RegistryEntry) -> Option<u32> {
+                    self.0.set(self.0.get() + 1);
+                    (entry.id.path() == "known").then_some(9123)
+                }
+            }
+            #[test]
+            fn every_family_checks_registry_and_preserves_host_issued_identity() {
+                let host = Host(std::cell::Cell::new(0));
+                $(
+                    let entry = crate::RegistryEntry::new(
+                        crate::Identifier::from_parts("minecraft", $registry).unwrap(),
+                        crate::Identifier::parse("example:known").unwrap(),
+                    );
+                    assert_eq!(entry.$method(&host).unwrap().0, 9123);
+                    let unknown = crate::RegistryEntry::new(
+                        entry.registry.clone(),
+                        crate::Identifier::parse("example:unknown").unwrap(),
+                    );
+                    assert_eq!(unknown.$method(&host), None);
+                    let before = host.0.get();
+                    let wrong_registry = crate::RegistryEntry::new(
+                        crate::Identifier::from_parts("other", $registry).unwrap(),
+                        entry.id.clone(),
+                    );
+                    assert_eq!(wrong_registry.$method(&host), None);
+                    assert_eq!(host.0.get(), before);
+                    let wrong_family = crate::RegistryEntry::new(
+                        crate::Identifier::parse("minecraft:not_a_registry").unwrap(),
+                        entry.id,
+                    );
+                    assert_eq!(wrong_family.$method(&host), None);
+                    assert_eq!(host.0.get(), before);
+                )+
+            }
+        }
+    };
     ($width:ty; $($key:ty),+ $(,)?) => {$ (
         impl Wire for $key {
 layout_fields!("slot" => $width);
@@ -357,7 +513,45 @@ layout_fields!("slot" => $width);
         }
     )+};
 }
-slot_keys!(u32; BlockEntityTypeKey, BlockKey, BoolGameRuleKey, DimensionKey, EffectKey, EnchantmentKey, EntityTypeKey, FluidKey, ItemKey, MenuKey, crate::client::particle_keys::ParticleKey, TagKey);
+// `EntityTypeKey` derives its own `Wire`.
+slot_keys!(u32; crate::GameEventKey, BlockEntityTypeKey, BlockKey, BoolGameRuleKey, IntGameRuleKey, DimensionKey, EffectKey, EnchantmentKey, FluidKey, ItemKey, MenuKey, crate::client::particle_keys::ParticleKey, TagKey);
+// The registry-entry key families: narrowing and host slot resolution share one
+// table. Tags and unresolved fluids are not registry-entry key families.
+slot_keys!(registries;
+    BlockEntityTypeKey => as_block_entity_type_key, "block_entity_type", |id: &crate::Identifier| {
+        crate::parts::resolved_block_entity_types().get()?.identifiers.get(id).copied()
+    };
+    BlockKey => as_block_key, "block", |id: &crate::Identifier| {
+        crate::content::registry_keys::block_definitions()?.names.identifiers.get(id).copied()
+    };
+    BoolGameRuleKey => as_bool_game_rule_key, "game_rule", |id: &crate::Identifier| {
+        let slot = *crate::parts::requested_keys().game_rules.identifiers.get(id)?;
+        crate::parts::game_rule_bool_slot(BoolGameRuleKey(slot))?;
+        Some(slot)
+    };
+    DimensionKey => as_dimension_key, "dimension", crate::content::registry_keys::existing_dimension_slot;
+    EffectKey => as_effect_key, "mob_effect", |id: &crate::Identifier| {
+        crate::parts::resolved_effects().get()?.names.identifiers.get(id).copied()
+    };
+    EnchantmentKey => as_enchantment_key, "enchantment", |id: &crate::Identifier| {
+        crate::content::registry_keys::ENCHANTMENTS.read().ok()?.as_ref()?.identifiers.get(id).copied()
+    };
+    EntityTypeKey => as_entity_type_key, "entity_type", |id: &crate::Identifier| {
+        crate::content::registry_keys::resolved_entity_types().get()?.identifiers.get(id).copied()
+    };
+    FluidKey => as_fluid_key, "fluid", |id: &crate::Identifier| {
+        crate::parts::resolved_fluids().get()?.identifiers.get(id).copied()
+    };
+    ItemKey => as_item_key, "item", |id: &crate::Identifier| {
+        crate::content::registry_keys::resolved_items().get()?.identifiers.get(id).copied()
+    };
+    MenuKey => as_menu_key, "menu", |id: &crate::Identifier| {
+        crate::content::registry_keys::MENUS.read().ok()?.as_ref()?.identifiers.get(id).copied()
+    };
+    crate::client::particle_keys::ParticleKey => as_particle_key, "particle_type", |id: &crate::Identifier| {
+        crate::client::particle_keys::particle_key(id).map(|key| key.0)
+    };
+);
 slot_keys!(u64; UnresolvedFluid);
 
 impl Wire for crate::Identifier {
@@ -392,7 +586,12 @@ impl Wire for crate::ConfigPath {
         out.put_str(self.as_str());
     }
     fn take(input: &mut Reader<'_>) -> Result<Self, WireError> {
-        Self::new(&input.take::<String>()?).map_err(|_| WireError::Invalid("invalid config path"))
+        let text = input.take::<String>()?;
+        if text.is_empty() {
+            Ok(Self::root())
+        } else {
+            Self::try_from(text).map_err(|_| WireError::Invalid("invalid config path"))
+        }
     }
 }
 impl Wire for crate::SpawnerKey {
@@ -640,7 +839,7 @@ impl Wire for crate::ModBlockEntity {
 }
 
 impl Wire for crate::ItemPlace {
-    layout_fields!("tag" => u32, "0:PlayerSlot.player" => u128, "0:PlayerSlot.slot" => i32, "1:PlayerHand.player" => u128, "1:PlayerHand.hand" => crate::Hand, "2:PlayerCursor.menu" => crate::MenuRef, "3:BlockEntity.level" => crate::LevelRef, "3:BlockEntity.pos" => [i32;3], "3:BlockEntity.side" => Option<crate::Direction>, "3:BlockEntity.slot" => usize, "4:ItemEntity.id" => u32, "5:EntitySlot.entity" => u32, "5:EntitySlot.slot" => usize, "6:Nested.parent" => Box<crate::ItemPlace>, "6:Nested.slot" => usize, "7:MenuSlot.menu" => crate::MenuRef, "7:MenuSlot.slot" => usize, "8:Mod.provider" => String, "8:Mod.key" => u64, "9:Equipment.entity" => u32, "9:Equipment.slot" => crate::EquipmentSlot);
+    layout_fields!("tag" => u32, "0:PlayerSlot.player" => u128, "0:PlayerSlot.slot" => i32, "1:PlayerHand.player" => u128, "1:PlayerHand.hand" => crate::Hand, "2:PlayerCursor.menu" => crate::MenuRef, "3:BlockEntity.level" => crate::LevelRef, "3:BlockEntity.pos" => [i32;3], "3:BlockEntity.side" => Option<crate::Direction>, "3:BlockEntity.slot" => usize, "4:ItemEntity.id" => u32, "5:EntitySlot.entity" => u32, "5:EntitySlot.slot" => usize, "6:Nested.parent" => Box<crate::ItemPlace>, "6:Nested.slot" => usize, "7:MenuSlot.menu" => crate::MenuRef, "7:MenuSlot.slot" => usize, "8:Mod.provider" => String, "8:Mod.key" => u64, "9:Equipment.entity" => u32, "9:Equipment.slot" => crate::EquipmentSlot, "10:Scratch.0" => u64, "11:Strict.0" => Box<crate::ItemPlace>, "12:OneByOne.0" => Box<crate::ItemPlace>, "13:InfiniteMaterials.player" => u128, "13:InfiniteMaterials.inner" => Box<crate::ItemPlace>, "14:ScratchSlots.0" => u64);
     const LAYOUT_SEED: u64 = crate::wire::layout_seed(stringify!(crate::ItemPlace));
     const MIN: usize = 4;
     fn put(&self, out: &mut Writer) {
@@ -702,6 +901,27 @@ impl Wire for crate::ItemPlace {
                     out.put_str(provider);
                     out.put(key)
                 }
+                Scratch(id) => {
+                    out.put(&10u32);
+                    out.put(id)
+                }
+                Strict(inner) => {
+                    out.put(&11u32);
+                    out.put(inner)
+                }
+                OneByOne(inner) => {
+                    out.put(&12u32);
+                    out.put(inner)
+                }
+                InfiniteMaterials { player, inner } => {
+                    out.put(&13u32);
+                    out.put(player);
+                    out.put(inner)
+                }
+                ScratchSlots(id) => {
+                    out.put(&14u32);
+                    out.put(id)
+                }
             }
         });
     }
@@ -747,6 +967,14 @@ impl Wire for crate::ItemPlace {
                     provider: crate::wire::intern(&input.take::<String>()?)?,
                     key: input.take()?,
                 },
+                10 => Scratch(input.take()?),
+                11 => Strict(input.take()?),
+                12 => OneByOne(input.take()?),
+                13 => InfiniteMaterials {
+                    player: input.take()?,
+                    inner: input.take()?,
+                },
+                14 => ScratchSlots(input.take()?),
                 n => return Err(WireError::Tag(n)),
             })
         })
@@ -767,7 +995,9 @@ mod tests {
 
     #[test]
     fn wire_checked_values_and_garbage() {
+        super::layout_tests::install_layout_resources();
         round(crate::ConfigPath::new("example/options.toml").unwrap());
+        round(crate::ConfigPath::root());
         round(crate::SpawnerKey::new("example:spawner").unwrap());
         round(crate::CustomSpawners::vanilla());
         round(crate::Identifier::parse("example:thing").unwrap());
@@ -1571,6 +1801,20 @@ impl crate::wire::Wire for crate::AttachmentWrite {
             2 => Self::Set,
             tag => return Err(crate::wire::WireError::Tag(tag)),
         })
+    }
+}
+
+// Biome keys carry a slot and an engine-owned generation. Validate on the receiving host.
+impl Wire for crate::BiomeKey {
+    layout_fields!("slot" => u32, "generation" => u64);
+    const LAYOUT_SEED: u64 = crate::wire::layout_seed("crate::BiomeKey");
+    const MIN: usize = <u32 as Wire>::MIN + <u64 as Wire>::MIN;
+    fn put(&self, out: &mut Writer) {
+        out.put(&self.0);
+        out.put(&self.1);
+    }
+    fn take(input: &mut Reader<'_>) -> Result<Self, WireError> {
+        Ok(Self(input.take()?, input.take()?))
     }
 }
 

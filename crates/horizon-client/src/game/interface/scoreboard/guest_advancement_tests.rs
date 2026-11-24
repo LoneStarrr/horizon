@@ -3,7 +3,7 @@ use crate::game::Dim;
 use horizon_core::geometry::Vec3;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn selector_reads_independent_host_and_guest_progress() {
     use horizon_client::{
         lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig},
@@ -47,6 +47,7 @@ fn selector_reads_independent_host_and_guest_progress() {
                 max_players: 2,
                 integrated: false,
                 levels: Default::default(),
+                level_seeds: Default::default(),
             },
         )
         .unwrap();

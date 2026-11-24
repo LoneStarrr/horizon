@@ -16,7 +16,9 @@ impl Mob {
         source: &Damage,
         damage: f32,
     ) {
-        self.knockback_full(level, power, xd, zd, source, damage, false);
+        level.through_short_knockback(|level| {
+            self.knockback_full(level, power, xd, zd, source, damage, false);
+        });
     }
     /// `getAttributeValue(KNOCKBACK_RESISTANCE)`: the mob's own, and what its gear adds.
     pub fn knockback_resistance(&self) -> f64 {
@@ -75,6 +77,10 @@ impl Mob {
         }
         let len = (xd * xd + zd * zd).sqrt();
         let (kx, kz) = (xd / len * power, zd / len * power);
+        // Shulker.setDeltaMovement ignores the shove after its sync and random draws.
+        if self.species() == Species::Shulker {
+            return;
+        }
         self.velocity = Vec3::new(
             self.velocity.x / 2.0 - kx,
             if self.on_ground {

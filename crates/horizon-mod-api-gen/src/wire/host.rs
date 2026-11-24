@@ -58,6 +58,17 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
     for owner in super::imports() {
         let name = snake(owner);
         let path = trait_path(owner);
+        if *owner == "ConfigFiles" {
+            let mut roots = String::new();
+            for (root, source, accessor) in super::FILE_ROOTS {
+                let access =
+                    super::names::root_access(source, accessor, &surface.methods, &surface.dropped);
+                let source = snake(source);
+                writeln!(roots, "{root} => {{ if !mod_api::__private::access_allowed({accessor:?}, mod_api::__private::LoadAccess::{access}) {{ return Err(ServeError::Phase {{ operation: {accessor:?}, phase: mod_api::__private::current_phase() }}); }} Ok(self.{source}()?.{accessor}()) }},").unwrap();
+            }
+            writeln!(methods, "pub unsafe fn config_files(&self, root: u8) -> Result<&'static dyn {path}, ServeError> {{ match root {{ {roots} _ => Err(ServeError::Decode(WireError::Invalid(\"file capability root\"))) }} }}").unwrap();
+            continue;
+        }
         if let Some((_, from, expr)) = super::REACHED.iter().find(|(o, ..)| o == owner) {
             let mutable = from.ends_with("_mut")
                 || (from.is_empty()
@@ -188,6 +199,7 @@ fn event_input(
     expr: &str,
     setup: &mut String,
     put: &mut String,
+    prepared: Option<&str>,
 ) {
     if types.defs[def].append.is_some() || types.defs[def].projection.is_some() {
         write!(
@@ -225,6 +237,18 @@ fn event_input(
     };
     for f in fields.iter() {
         let path = format!("{expr}.{}", f.rust);
+        if prepared == Some(f.rust.as_str()) {
+            put.push_str("w.put(&prepared.slot);w.put(&prepared.generation);");
+            continue;
+        }
+        if prepared.is_some() && f.rust == "slot" {
+            put.push_str("w.put(&slot_id);");
+            continue;
+        }
+        if prepared.is_some() && f.rust == "kind" {
+            put.push_str("w.put(&kind_id);");
+            continue;
+        }
         match &f.ty {
             Ty::Dyn(name, m) => {
                 write!(
@@ -245,7 +269,7 @@ fn event_input(
                     && types.defs[*d].lifetimes != 0
                     && types.defs[*d].view.is_none()
                 {
-                    event_input(types, *d, &path, setup, put);
+                    event_input(types, *d, &path, setup, put, None);
                 } else if lifetime_def(types, ty)
                     && !matches!(inner, Ty::Named(d) if types.defs[*d].view.is_some())
                 {
@@ -258,8 +282,22 @@ fn event_input(
     }
 }
 /// What a proxy answers when its guest call answers nothing. `reason`, where there was a call,
-/// is the expression naming why (`crate::wasm_call_refusal()`, the including crate's).
-fn fallback(types: &super::ty::Types<'_>, m: &Method, reason: Option<&str>) -> String {
+/// is the expression naming why (`crate::wasm_call_refusal()`, the including crate's). An
+/// isolated hook (arismoko/horizon#2414 ruling) unwinds instead: the isolated dispatch catches the unwind the
+/// same way it catches a native listener's panic, so a trapped or refused wasm call cannot fall
+/// back to `Continue` and leave an earlier listener's replacement standing (review round 1).
+fn fallback(
+    types: &super::ty::Types<'_>,
+    m: &Method,
+    reason: Option<&str>,
+    isolate: bool,
+) -> String {
+    if m.owner == "IPayloadHandler" && m.name == "handle" {
+        return match reason {
+            Some(reason) => format!("Err(mod_api::PayloadHandleError::Failed(format!(\"wasm call refused or trapped: {{}}\", {reason})))"),
+            None => "Err(mod_api::PayloadHandleError::Failed(String::from(\"wasm call refused or trapped\")))".into(),
+        };
+    }
     match &m.ret {
         // String-error operations can report a refused VM call directly. In particular,
         // callbacks must not turn a trap after staged effects into a successful commit.
@@ -271,7 +309,19 @@ fn fallback(types: &super::ty::Types<'_>, m: &Method, reason: Option<&str>) -> S
         },
         Ty::Result(ok, _) if **ok == Ty::Unit => "Ok(())".into(),
         Ty::Result(..) => "Err(call_refused())".into(),
-        Ty::Named(d) if types.defs[*d].rust.ends_with("::Flow") => "mod_api::Flow::Continue".into(),
+        Ty::Named(d) if types.defs[*d].rust.ends_with("::Flow") => {
+            if isolate {
+                match reason {
+                    Some(reason) => format!(
+                        "panic!(\"{}: wasm call refused or trapped: {{}}\", {reason})",
+                        m.name
+                    ),
+                    None => format!("panic!(\"{}: wasm call refused or trapped\")", m.name),
+                }
+            } else {
+                "mod_api::Flow::Continue".into()
+            }
+        }
         _ => "NoAnswer::no_answer()".into(),
     }
 }
@@ -353,7 +403,11 @@ pub unsafe fn resource_scope(cx:*mut Cx,native_root:bool)->HostResources {{
 "#
     )
 }
-pub(super) fn generate(surface: &mut super::Surface<'_>) -> Result<String, String> {
+pub(super) fn generate(
+    surface: &mut super::Surface<'_>,
+    prepared_hooks: &[(String, String)],
+    isolated_hooks: &std::collections::HashSet<String>,
+) -> Result<String, String> {
     let mut code = String::from(
         "// @generated by horizon-mod-api-gen; do not edit.\nuse mod_api::wire::{Reader, Writer, WireError, Slots};\n#[derive(Debug)] pub enum ServeError { Decode(WireError), Missing(&'static str), Stale, WrongThread, Phase { operation: &'static str, phase: mod_api::__private::ModPhase }, Unsupported(u32) } impl From<WireError> for ServeError { fn from(e: WireError) -> Self { Self::Decode(e) } } impl std::fmt::Display for ServeError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"{self:?}\") } } impl std::error::Error for ServeError {} fn missing(s: &'static str) -> ServeError { ServeError::Missing(s) }\n#[derive(Default)] pub struct Cx { pub frames: Vec<Frame>, pub held: Slots<Box<dyn std::any::Any + Send>>, pub module: *const crate::WasmMod, pub refused: std::collections::HashMap<String,std::collections::HashSet<String>>, static_strings: std::collections::HashMap<&'static str,u32> } impl Cx { pub fn frame(&self) -> Result<&Frame, ServeError> { self.frames.last().ok_or(ServeError::Missing(\"frame\")) } }\n",
     );
@@ -365,15 +419,46 @@ pub(super) fn generate(surface: &mut super::Surface<'_>) -> Result<String, Strin
     code.push_str(
         "pub fn export_id(owner: &str, name: &str) -> Option<u32> { match (owner,name) {\n",
     );
-    for (id, m) in surface
+    for m in surface
         .methods
         .iter()
         .filter(|m| super::exports().contains(&m.owner))
-        .enumerate()
     {
+        let id = super::names::export_id(m.owner, &m.name);
         writeln!(code, "({:?},{:?}) => Some({id}),", m.owner, m.name).unwrap();
     }
+    for abi in super::prepared::describe(&surface.methods, prepared_hooks)? {
+        for entry in abi.entries {
+            writeln!(
+                code,
+                "(\"ItemPart\",{:?}) => Some({}),",
+                entry.name, entry.id
+            )
+            .unwrap();
+        }
+    }
     code.push_str("_ => None } }\n");
+    code.push_str("pub const EXPORT_NAMES: &[(u32, &str)] = &[\n");
+    for m in surface
+        .methods
+        .iter()
+        .filter(|m| super::exports().contains(&m.owner))
+    {
+        let id = super::names::export_id(m.owner, &m.name);
+        writeln!(code, "({id}, {:?}),", format!("{}::{}", m.owner, m.name)).unwrap();
+    }
+    for abi in super::prepared::describe(&surface.methods, prepared_hooks)? {
+        for entry in abi.entries {
+            writeln!(
+                code,
+                "({}, {:?}),",
+                entry.id,
+                format!("ItemPart::{}", entry.name)
+            )
+            .unwrap();
+        }
+    }
+    code.push_str("];\n");
     code.push_str(
         "pub fn import_id(owner: &str, name: &str) -> Option<u32> { match (owner,name) {\n",
     );
@@ -386,11 +471,53 @@ pub(super) fn generate(surface: &mut super::Surface<'_>) -> Result<String, Strin
         writeln!(code, "({:?},{:?}) => Some({id}),", m.owner, m.name).unwrap();
     }
     code.push_str("_ => None } }\n");
+    // The import a mod's call arrives through, by the name it was built with: the game's own
+    // id for it, or whether the game has the call under another signature (changed) or not
+    // at all (removed).
+    let mut exact = String::new();
+    let mut known = String::new();
+    let mut names = String::new();
+    for (id, (m, held)) in imports(&surface.methods)
+        .iter()
+        .map(|m| (*m, false))
+        .chain(
+            held_methods(&surface.methods)
+                .into_iter()
+                .map(|m| (m, true)),
+        )
+        .enumerate()
+    {
+        writeln!(
+            exact,
+            "{:?} => Ok({id}),",
+            super::names::import_name(types, m, held)
+        )
+        .unwrap();
+        writeln!(known, "{:?} => Err(true),", super::names::key(m, held)).unwrap();
+        writeln!(
+            names,
+            "({:?},{:?}) => Some({:?}),",
+            format!("{}{}", if held { "held-" } else { "" }, m.owner),
+            m.name,
+            super::names::import_name(types, m, held)
+        )
+        .unwrap();
+    }
+    writeln!(
+        code,
+        "pub fn import_name(owner: &str, name: &str) -> Option<&'static str> {{ match (owner, name) {{ {names} _ => None }} }}"
+    )
+    .unwrap();
+    writeln!(
+        code,
+        "pub fn import_by_name(name: &str) -> Result<u32, bool> {{ match name {{ {exact} _ => match name.split_once('#').map_or(name, |(key, _)| key) {{ {known} _ => Err(false) }} }} }}"
+    )
+    .unwrap();
     code.push_str(
         r#"
 impl Cx {
     fn check_static_ack(&self, ack: u32) -> Result<(), ServeError> {
-        if ack != u32::MAX && ack as usize >= self.static_strings.len() {
+        if ack != mod_api::wire::NO_STATIC_ID && ack as usize >= self.static_strings.len() {
             return Err(WireError::Invalid("static string acknowledgement outside table").into());
         }
         Ok(())
@@ -403,8 +530,8 @@ impl Cx {
             if self.static_strings.len() >= mod_api::wire::MAX_STATIC_STRINGS {
                 // Admission is an optimization: a full group table cannot impose a
                 // stricter limit than the existing per-member static string storage.
-                out.put(&2u8);
-                out.put(&u32::MAX);
+                out.put(&mod_api::wire::STATIC_UNCACHED);
+                out.put(&mod_api::wire::NO_STATIC_ID);
                 out.put(text);
                 return Ok(());
             }
@@ -413,7 +540,7 @@ impl Cx {
             id
         };
         let definition = id != ack;
-        out.put(&u8::from(definition));
+        out.put(&if definition { mod_api::wire::STATIC_DEFINITION } else { mod_api::wire::STATIC_KNOWN });
         out.put(&id);
         if definition { out.put(text); }
         Ok(())
@@ -461,6 +588,9 @@ impl Cx {
         } else {
             String::new()
         };
+        if m.owner == "ConfigFiles" {
+            body.push_str("let file_root: u8 = input.take()?; if file_root > 2 { return Err(ServeError::Decode(WireError::Invalid(\"file capability root\"))); }");
+        }
         if m.ret == Ty::Str(super::ty::Str::Static) {
             body.push_str("let static_ack: u32 = input.take()?; unsafe { (&*cx).check_static_ack(static_ack)?; }");
         }
@@ -518,6 +648,8 @@ impl Cx {
                 "unsafe {{ (&*cx).held.get(held_id).map_err(|_| ServeError::Stale)?.downcast_ref::<OwnerThread<std::sync::Arc<dyn {}>>>().ok_or(ServeError::Stale)?.get()?.clone() }}",
                 trait_path(m.owner)
             )
+        } else if m.owner == "ConfigFiles" {
+            "unsafe { (&*cx).frame()?.config_files(file_root)? }".to_string()
         } else {
             format!(
                 "unsafe {{ (&*cx).frame()?.{}{}()? }}",
@@ -525,15 +657,7 @@ impl Cx {
                 if m.receiver == Some(true) { "_mut" } else { "" }
             )
         };
-        let accessor = super::REACHED
-            .iter()
-            .find(|(owner, _, _)| *owner == m.owner)
-            .and_then(|_| {
-                surface.dropped.iter().find(|candidate| {
-                    super::frame_accessor(candidate)
-                        && matches!(&candidate.ret, Ty::Dyn(name, _) if name == m.owner)
-                })
-            });
+        let accessor = super::names::frame_accessor_of(m, &surface.dropped);
         let mut access = String::new();
         for checked in accessor.into_iter().chain(std::iter::once(m)) {
             if let Some(level) = &checked.access {
@@ -556,7 +680,15 @@ impl Cx {
         }
         // Keep decoded values on the selected method's stack, not in the dispatcher's
         // shared frame: a native import may synchronously re-enter wasm.
-        writeln!(code, "{id} => {{ #[inline(never)] unsafe fn invoke(cx: *mut Cx, input: &mut Reader<'_>, out: &mut Writer) -> Result<(), ServeError> {{ {body} if !input.rest().is_empty() {{ return Err(ServeError::Decode(WireError::Tag(u32::MAX))); }} {access} let receiver = {receiver}; let answer = receiver.{}({}); {answer} Ok(()) }} unsafe {{ invoke(cx, &mut input, out)?; }} }},",m.name,args.join(",")).unwrap();
+        let prepared_check = if matches!(
+            m.name.as_str(),
+            "attach_item_part" | "attach_item_part_tag"
+        ) {
+            "let module=unsafe { (&*cx).module.as_ref() }.ok_or(ServeError::Missing(\"calling module\"))?; if let Err(reason)=module.check_prepared_hooks(p2.item_subscribed()) { unsafe { (&*cx).frame()?.registrar_mut()? }.registration_refusal(reason); return Ok(()); }"
+        } else {
+            ""
+        };
+        writeln!(code, "{id} => {{ #[inline(never)] unsafe fn invoke(cx: *mut Cx, input: &mut Reader<'_>, out: &mut Writer) -> Result<(), ServeError> {{ {body} if !input.rest().is_empty() {{ return Err(ServeError::Decode(WireError::Tag(u32::MAX))); }} {access} {prepared_check} let receiver = {receiver}; let answer = receiver.{}({}); {answer} Ok(()) }} unsafe {{ invoke(cx, &mut input, out)?; }} }},",m.name,args.join(",")).unwrap();
     }
     code.push_str("_ => return Err(ServeError::Unsupported(id)) } Ok(()) }\n");
     writeln!(
@@ -564,6 +696,10 @@ impl Cx {
         "pub const UNSUPPORTED_IMPORTS: &[&str] = &{import_gaps:?};"
     )
     .unwrap();
+    let mut prepared_impls = String::new();
+    if !prepared_hooks.is_empty() {
+        code.push_str("pub struct Prepared<'a> { slot:u32, generation:u32, kinds:Vec<String>, release:Option<Box<dyn FnOnce()+'a>> } impl Drop for Prepared<'_> { fn drop(&mut self) { if let Some(release)=self.release.take() { release(); } } }\n");
+    }
     let mut gaps = Vec::new();
     for owner in super::exports() {
         let receiver = if super::mod_receiver(owner).is_some() {
@@ -586,6 +722,9 @@ impl Cx {
         }
         for group in groups {
             writeln!(code, "impl {} for crate::{receiver} {{", trait_path(&group)).unwrap();
+            if receiver == "WasmHandler" && group == "ItemPart" && !prepared_hooks.is_empty() {
+                code.push_str("fn __prepare_equip(&self,stack:&mod_api::ItemStack,kinds:&[&str],reads:&[mod_api::EquipReadRow])->Result<Option<Box<dyn std::any::Any>>,&'static str> { let instance=self.module.equip_instance(); if crate::prepared::lookup(instance,stack).is_some() { return Ok(None); } let prepared=self.prepare_can_equip_with_reads(stack,kinds,reads).ok_or(\"equipment preparation refused\")?; Ok(Some(Box::new(crate::prepared::activate(instance,stack,prepared)))) }\n");
+            }
             if receiver == "WasmMod" && group == "Hooks" {
                 code.push_str(
                     "fn listeners(&self) -> &'static [mod_api::Listener] { self.listeners }\n",
@@ -601,10 +740,11 @@ impl Cx {
                         .iter()
                         .filter(|m| super::exports().contains(&m.owner)),
                 )
-                .enumerate()
+                .map(|m| (super::names::export_id(m.owner, &m.name), m))
                 .filter(|(_, m)| m.owner == *owner && m.via.as_deref().unwrap_or(m.owner) == group)
             {
                 let sig = rust_sig(types, m);
+                let payload_handler = m.owner == "IPayloadHandler" && m.name == "handle";
                 if super::SUBSCRIBED
                     .iter()
                     .any(|(o, n)| *o == m.owner && *n == m.name)
@@ -624,9 +764,44 @@ impl Cx {
                 }
                 if surface.dropped.iter().any(|d| std::ptr::eq(d, m)) || !dispatchable(types, m) {
                     gaps.push(format!("{}::{}", m.owner, m.name));
-                    writeln!(code, "{sig} {{ {} }}", fallback(types, m, None)).unwrap();
+                    writeln!(code, "{sig} {{ {} }}", fallback(types, m, None, false)).unwrap();
                     continue;
                 }
+                let prepared_field = prepared_hooks
+                    .iter()
+                    .find(|(name, _)| name == &m.name)
+                    .map(|(_, field)| field.as_str());
+                let prepared_event = if let Some(field) = prepared_field {
+                    if m.owner != "ItemPart" || m.name != "can_equip" || field != "stack" {
+                        return Err(format!(
+                            "unsupported prepared parameter {}::{}::{field}",
+                            m.owner, m.name
+                        ));
+                    }
+                    Some(
+                        m.params
+                            .iter()
+                            .enumerate()
+                            .find_map(|(i, (_, ty))| {
+                                let Ty::Ref(inner, true) = ty else {
+                                    return None;
+                                };
+                                let Ty::Named(d) = &**inner else {
+                                    return None;
+                                };
+                                types.defs[*d]
+                                    .borrow_fields()?
+                                    .iter()
+                                    .any(|f| f.rust == field)
+                                    .then_some(i)
+                            })
+                            .ok_or_else(|| {
+                                format!("prepared parameter {field} missing in {}", m.name)
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 let (mut setup, mut put, mut take, mut apply) =
                     (String::new(), String::new(), String::new(), String::new());
                 let mut backs = vec!["answer".to_string()];
@@ -643,20 +818,52 @@ impl Cx {
                         }
                         Ty::Named(d) if types.defs[*d].lifetimes != 0 => {
                             write!(setup, "let mut p{i}=p{i};").unwrap();
-                            event_input(types, *d, &format!("p{i}"), &mut setup, &mut put);
+                            event_input(
+                                types,
+                                *d,
+                                &format!("p{i}"),
+                                &mut setup,
+                                &mut put,
+                                prepared_field,
+                            );
                         }
                         Ty::Ref(inner, mutable) if matches!(&**inner, Ty::Named(d) if types.defs[*d].lifetimes != 0) =>
                         {
                             let Ty::Named(d) = &**inner else {
                                 unreachable!()
                             };
-                            event_input(types, *d, &format!("p{i}"), &mut setup, &mut put);
-                            for leaf in
-                                writeback_fields(types, *d, &format!("p{i}"), *mutable).unwrap()
-                            {
+                            event_input(
+                                types,
+                                *d,
+                                &format!("p{i}"),
+                                &mut setup,
+                                &mut put,
+                                prepared_field,
+                            );
+                            let leaves =
+                                writeback_fields(types, *d, &format!("p{i}"), *mutable).unwrap();
+                            let tick_reply = types.defs[*d]
+                                .rust
+                                .ends_with("BlockEntityTickEvent")
+                                .then(|| {
+                                    leaves
+                                        .iter()
+                                        .find(|leaf| leaf.path.ends_with(".reply"))
+                                        .expect("tick reply")
+                                        .local
+                                        .clone()
+                                });
+                            for leaf in leaves {
                                 let local = format!("b_{}", leaf.local);
                                 backs.push(local.clone());
-                                write!(take, "let {local}: {} = r.take()?;", leaf.owned).unwrap();
+                                if leaf.view
+                                    && let Some(reply) = &tick_reply
+                                {
+                                    write!(take, "let {local}: Option<{}> = if b_{reply} == mod_api::BlockEntityTickReply::Changed {{ Some(r.take()?) }} else {{ None }};", leaf.owned).unwrap();
+                                } else {
+                                    write!(take, "let {local}: {} = r.take()?;", leaf.owned)
+                                        .unwrap();
+                                }
                                 let path = leaf.path;
                                 if leaf.append {
                                     let owner = path.rsplit_once('.').unwrap().0;
@@ -664,7 +871,11 @@ impl Cx {
                                         .unwrap();
                                     write!(apply, "{owner}.__wire_apply({local});").unwrap();
                                 } else if leaf.view {
-                                    write!(apply, "{path}.__wire_apply({local});").unwrap();
+                                    if tick_reply.is_some() {
+                                        write!(apply, "if let Some(snapshot) = {local} {{ {path}.__wire_apply(snapshot); }}").unwrap();
+                                    } else {
+                                        write!(apply, "{path}.__wire_apply({local});").unwrap();
+                                    }
                                 } else if leaf.optional {
                                     write!(take,"if {path}.is_some() != {local}.is_some() {{ return Err(WireError::Tag(u32::MAX)); }}").unwrap();
                                     write!(apply,"if let (Some(target),Some(value)) = ({path}.as_deref_mut(),{local}) {{ *target=value; }}").unwrap();
@@ -679,12 +890,21 @@ impl Cx {
                             }
                         }
                         _ => {
-                            put.push_str(&if matches!(
+                            put.push_str(&if payload_handler && i == 0 {
+                                // The runtime checks contention before encoding. Keep the original
+                                // allocation alive so Busy can return ownership without copying.
+                                format!("w.put(&p{i});")
+                            } else if matches!(
                                 ty,
                                 Ty::Ref(..)
                                     | Ty::Str(super::ty::Str::Borrowed)
                                     | Ty::List(_, super::ty::List::Slice)
-                            ) {
+                            ) || matches!(ty, Ty::Option(inner) if matches!(
+                                **inner,
+                                Ty::Ref(_, false)
+                                    | Ty::Str(super::ty::Str::Borrowed)
+                                    | Ty::List(_, super::ty::List::Slice)
+                            )) {
                                 self::put(ty, &format!("p{i}"))
                             } else {
                                 format!("w.put_owned(p{i});")
@@ -701,11 +921,45 @@ impl Cx {
                 let class =
                     super::call_class(types, m).replace("super::Call::", "crate::CallClass::");
                 let tuple = format!("({},)", backs.join(","));
-                writeln!(code,"{sig} {{ let mut frame = Frame::default(); {setup} match self{module}.call({class}, frame, {id}, {}, |w| {{ {put} }}, |r| {{ let answer: {} = r.take()?; {take} if !r.rest().is_empty() {{ return Err(WireError::Tag(u32::MAX)); }} Ok({tuple}) }}) {{ Some({tuple}) => {{ {apply} answer }}, None => {} }} }}",if receiver=="WasmMod" {"None"} else {"Some(self.index)"},rust_ty(types,&m.ret,true),fallback(types,m,Some("crate::wasm_call_refusal()")),module=if receiver=="WasmMod" {""} else {".module"}).unwrap();
+                let refusal = if let Some(event) = prepared_event {
+                    format!("{{ p{event}.can_equip=false; }}")
+                } else {
+                    // A hook the catalog isolates (arismoko/horizon#2414) must fail loudly: the
+                    // isolated dispatch unwinds this proxy the same way it
+                    // unwinds a panicking native listener, instead of a silent
+                    // `Continue` that leaves an earlier replacement standing.
+                    let isolate = m.owner == "Hooks" && isolated_hooks.contains(&m.name);
+                    fallback(types, m, Some("crate::wasm_call_refusal()"), isolate)
+                };
+                let mut method = String::new();
+                if payload_handler {
+                    writeln!(method,"{sig} {{ let mut frame = Frame::default(); {setup} match self.module.call_payload(frame, {id}, Some(self.index), |w| {{ {put} }}, |r| {{ let answer: {} = r.take()?; {take} if !r.rest().is_empty() {{ return Err(WireError::Tag(u32::MAX)); }} Ok({tuple}) }}) {{ Ok(Some({tuple})) => {{ {apply} match answer {{ Err(mod_api::PayloadHandleError::Busy {{ holder, .. }}) => Err(mod_api::PayloadHandleError::Busy {{ payload: p0, holder }}), answer => answer }} }}, Ok(None) => {refusal}, Err(holder) => Err(mod_api::PayloadHandleError::Busy {{ payload: p0, holder }}) }} }}",rust_ty(types,&m.ret,true)).unwrap();
+                } else {
+                    writeln!(method,"{sig} {{ let mut frame = Frame::default(); {setup} match self{module}.call({class}, frame, {id}, {}, |w| {{ {put} }}, |r| {{ let answer: {} = r.take()?; {take} if !r.rest().is_empty() {{ return Err(WireError::Tag(u32::MAX)); }} Ok({tuple}) }}) {{ Some({tuple}) => {{ {apply} answer }}, None => {} }} }}",if receiver=="WasmMod" {"None"} else {"Some(self.index)"},rust_ty(types,&m.ret,true),refusal,module=if receiver=="WasmMod" {""} else {".module"}).unwrap();
+                }
+                if let Some(event) = prepared_event {
+                    let name = &m.name;
+                    let arguments = (0..m.params.len())
+                        .map(|i| format!("p{i}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    writeln!(code, "{sig} {{ if let Some(prepared)=crate::prepared::lookup(self.module.equip_instance(),p{event}.stack) {{ self.ask_{name}(&prepared,{arguments}); return; }} let Some(prepared)=self.prepare_{name}(p{event}.stack,&[p{event}.kind]) else {{ p{event}.can_equip=false; return; }}; self.ask_{name}(&prepared,{arguments}); }}").unwrap();
+                    let ask_sig = sig.replacen(
+                        &format!("fn {name}(&self,"),
+                        &format!("pub fn ask_{name}(&self,prepared:&Prepared<'_>,"),
+                        1,
+                    );
+                    let slots = super::prepared::SLOTS;
+                    let ask = method.replacen(&sig, &ask_sig, 1).replacen("let mut frame = Frame::default();", &format!("let Some(slot_id)={slots:?}.iter().position(|slot| *slot==p{event}.slot).map(|i|i as u32) else {{ p{event}.can_equip=false;return; }}; let Some(kind_id)=prepared.kinds.iter().position(|kind| kind==p{event}.kind).map(|i|i as u32) else {{ p{event}.can_equip=false;return; }}; if !self.module.check(prepared.slot,prepared.generation) {{ p{event}.can_equip=false; return; }} let mut frame = Frame::default();"), 1);
+                    writeln!(prepared_impls, "impl crate::WasmHandler {{ pub fn prepare_{name}(&self,stack:&mod_api::ItemStack,kinds:&[&str])->Option<Prepared<'static>> {{ self.prepare_{name}_with_reads(stack,kinds,&[]) }} pub fn prepare_{name}_with_reads(&self,stack:&mod_api::ItemStack,kinds:&[&str],reads:&[mod_api::EquipReadRow])->Option<Prepared<'static>> {{ let mut bytes=Writer::new(); bytes.put(stack); let kinds:Vec<String>=kinds.iter().map(|s|s.to_string()).collect(); bytes.put(&kinds); bytes.put(reads); if bytes.error().is_some() {{ return None; }} let (slot,generation)=self.module.prepare(bytes.bytes())?; let module=self.module.clone(); Some(Prepared {{ slot,generation,kinds,release:Some(Box::new(move || module.release(slot,generation))) }}) }} {ask} }}").unwrap();
+                } else {
+                    code.push_str(&method);
+                }
             }
             code.push_str("}\n");
         }
     }
+    code.push_str(&prepared_impls);
     writeln!(code, "pub const UNSUPPORTED_EXPORTS: &[&str] = &{gaps:?};").unwrap();
     // The API is qualified as crate in the shared signature writer, but lives in mod_api here.
     Ok(code
@@ -716,6 +970,7 @@ impl Cx {
         .replace("mod_api::refused", "crate::refused")
         .replace("mod_api::NoAnswer", "crate::NoAnswer")
         .replace("mod_api::wasm_call_refusal", "crate::wasm_call_refusal")
+        .replace("mod_api::prepared::", "crate::prepared::")
         .replace(
             "use mod_api::{NoAnswer, call_refused}",
             "use crate::{NoAnswer, call_refused}",
@@ -750,13 +1005,51 @@ fn host_and_coverage(root: &std::path::Path) -> Result<(String, String), String>
         ("capability_providers_generated.rs", providers.as_str()),
     ];
     let mut surface = super::surface(root, &included)?;
-    let count = surface
+    if !surface
         .methods
         .iter()
-        .filter(|m| super::exports().contains(&m.owner))
-        .position(|m| m.owner == "Hooks" && m.name == "subscribed")
-        .ok_or("Hooks::subscribed absent")?;
-    let mut code = generate(&mut surface)?;
+        .any(|m| m.owner == "Hooks" && m.name == "subscribed")
+    {
+        return Err("Hooks::subscribed absent".into());
+    }
+    // By name, like every export (#18253): a hook added before it moves no id.
+    let count = super::names::export_id("Hooks", "subscribed");
+    let catalog = crate::Catalog::load(root)?;
+    let prepared_hooks = catalog
+        .hooks
+        .iter()
+        .filter_map(|hook| {
+            hook.prepared
+                .as_deref()
+                .map(|parameter| (hook.name.clone(), parameter.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let isolated_hooks = catalog
+        .hooks
+        .iter()
+        .filter(|hook| hook.isolate)
+        .map(|hook| hook.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut code = generate(&mut surface, &prepared_hooks, &isolated_hooks)?;
+    let entries = super::prepared::describe(&surface.methods, &prepared_hooks)?
+        .into_iter()
+        .map(|abi| {
+            let entries: [(String, u32); 3] = abi
+                .entries
+                .into_iter()
+                .map(|entry| (entry.name, entry.id))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("prepare, ask and release entries");
+            (abi.hook, entries)
+        })
+        .collect::<Vec<_>>();
+    writeln!(
+        code,
+        "pub const PREPARED_EXPORTS: &[(&str, [(&str,u32);3])] = &{entries:?};"
+    )
+    .unwrap();
+
     let imports = code
         .lines()
         .find(|l| l.starts_with("pub const UNSUPPORTED_IMPORTS:"))
@@ -794,6 +1087,8 @@ fn host_and_coverage(root: &std::path::Path) -> Result<(String, String), String>
                 "borrow/resource shape not yet supported"
             } else if super::frame_accessor(m) {
                 "frame accessor; no bytes"
+            } else if prepared_hooks.iter().any(|(name, _)| *name == m.name) {
+                "prepared owned stack; borrowed scalar candidate calls"
             } else {
                 "Wire call"
             }
@@ -809,33 +1104,10 @@ fn host_and_coverage(root: &std::path::Path) -> Result<(String, String), String>
     report.push_str(include_str!("../../coverage-notes.md"));
     writeln!(code, "pub const SUBSCRIBED: u32 = {count};").unwrap();
     code.push_str("pub fn hook_id(name: &str) -> Option<mod_api::HookId> { match name {\n");
-    let ast = syn::parse_file(&generated.hooks).map_err(|e| e.to_string())?;
-    let ids = ast
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Enum(e) if e.ident == "HookId" => Some(
-                e.variants
-                    .iter()
-                    .map(|v| v.ident.to_string())
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .ok_or("HookId absent")?;
-    for hook in crate::Catalog::load(root)?.hooks {
-        if !ids.contains(&crate::hook_id(&hook.name)) {
-            continue;
-        }
-        writeln!(
-            code,
-            "{:?} => Some(mod_api::HookId::{}),",
-            hook.name,
-            crate::hook_id(&hook.name)
-        )
-        .unwrap();
+    for (variant, name) in &surface.hooks {
+        writeln!(code, "{:?} => Some(mod_api::HookId::{}),", name, variant).unwrap();
     }
-    code.push_str("_ => None } } pub fn subscriptions_of(owner: &str, names: Vec<String>) -> &'static [Option<mod_api::HookId>] { names.into_iter().filter_map(|name| { let id = hook_id(&name); if id.is_none() { log::warn!(\"wasm {owner}: unknown hook {name}\"); } id.map(Some) }).collect::<Vec<_>>().leak() }\n");
+    code.push_str("_ => None } } pub fn subscriptions_of(owner: &str, names: mod_api::wire::SubscriptionAnswer) -> &'static [Option<mod_api::HookId>] { names.into_iter().filter_map(|name| { let id = hook_id(&name); if id.is_none() { log::warn!(\"wasm {owner}: unknown hook {name}\"); } id.map(Some) }).collect::<Vec<_>>().leak() }\n");
     for path in surface.types.index.read.take() {
         crate::rerun_if_changed(&path.display());
     }
@@ -846,8 +1118,9 @@ fn host_and_coverage(root: &std::path::Path) -> Result<(String, String), String>
 mod tests {
     /// The wasm host's build script runs `generate_host`, so every file the generator reads must be
     /// one Cargo is told to watch: a hook signature moved in the vocabulary left the generated code
-    /// stale until the build script was touched (#3123).
+    /// stale until the build script was touched (arismoko/horizon#3123).
     #[test]
+    #[ignore = "daily"]
     fn host_generation_asks_cargo_to_watch_the_vocabulary_hook_sources() {
         let captured = std::thread::Builder::new()
             .stack_size(64 << 20)

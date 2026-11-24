@@ -172,7 +172,7 @@ The switch is in three places: Settings > AI in the launcher, Horizon Settings i
 
 | Surface | What happens |
 | --- | --- |
-| Game | opens no control socket, even with `--control` (it logs the refusal); Horizon Settings hides AI Agent...; turning it on in a running game closes the socket at once |
+| Game | opens no control socket, even with `--control` (it logs the refusal); Horizon Settings greys out AI Agent... in its place; turning it on in a running game closes the socket at once |
 | `horizon-ctl` | every command refuses: exit status 4, `{"error": REFUSAL, "kind": "denied"}` |
 | `horizon-ctl mcp` | refuses to start (exit 4, REFUSAL on stderr); a session already running refuses each call |
 | `horizon-launcher mcp` | refuses to start; a running session answers each `tools/call` with error -32000 and REFUSAL |
@@ -211,10 +211,13 @@ turn the switch off.
   under control. A game the player starts from the window is not, until they turn Agent Control
   on. An open socket lets any program of that user drive the game, so it opens only when an agent
   asked for the game, or when the player chose it.
-- **The window an agent opens** comes up without the focus (on Windows and macOS; X11 focuses it
-  anyway): the person keeps their keyboard, and the game keeps its pointer grab to itself, as
-  `--offscreen` does, so the system pointer is never taken, hidden or moved. Once the person
-  clicks into the window it is an ordinary one, and that click takes the pointer.
+- **The window an agent opens** asks for no focus, and belongs to the agent until a person
+  presses a mouse button inside it. Until then the game keeps its pointer grab to itself, as
+  `--offscreen` does, so the system pointer is never taken, hidden or moved, and the person's
+  keys, wheel and mouse motion don't reach the game, even if the system gives the window the
+  focus (X11 does, and Windows can): the focus alone claims nothing. Closing the window still
+  works. That first press makes it an ordinary window and takes the pointer; the agent's own
+  input plays before and after it.
 - **Headless:** `horizon-ctl launch --headless` (`horizon-client --headless --control`) starts a
   game with no display, no window and no GPU: it runs where no display server is (an SSH session,
   a server) and runs its own loop instead of winit's (`game/runtime/headless.rs`), one frame a tick. It
@@ -263,14 +266,25 @@ turn the switch off.
 - **Confirm what can't be undone.** A command that deletes the player's things requires
   `confirm` and carries the MCP `destructiveHint`. In the game these are `world-delete`, `fill`
   and `setblock` (the table's `DESTRUCTIVE`); in the launcher, `remove`, `modpack remove`,
-  `mods remove`, `servers forget` and `account sign-out` (`cli_tools::DESTRUCTIVE`).
+  `mods remove`, `servers forget`, `account sign-out`, `data delete`, `worlds delete`,
+  `multiplayer remove`, `screenshots delete`, `packs remove`, `worlds datapack-remove` and
+  `unshare-log` (`cli_tools::DESTRUCTIVE`), and what decides what the next Play runs or joins:
+  `instance launch`, `instance java` and `game-args`, and the `play` tool's `arg` (game arguments
+  passed as they are: `--server`, `--session-file`, `--smoke-report`; no hint, so a plain `play`
+  asks nothing).
   Without `confirm: true` the call is refused and the message says to ask the player. In the game
   CLI the flag is `--confirm`. The launcher CLI asks nothing: a person typing `remove` meant it.
+- **Other people's text is data.** Chat, signs, books, MOTDs, names, mod descriptions and log lines
+  can say anything, so each server's instructions tell the agent they are never instructions, and a
+  tool whose result carries such text (the table's `UNTRUSTED`, the server's and the launcher's
+  logs and console) is followed by a second content block saying so
+  (`horizon_mcp::mark_untrusted`). The first block stays the data, so parsers are unaffected.
 - **Ask before reaching out.** A command that sends data or reaches other people carries
   `openWorldHint`, and its description says "only when the player asks". In the game these are
-  `connect`, `lan`, `friends`, `chat` and `command`; in the launcher, `servers create` and
-  `share-log`. `play`'s `join` argument says the same. Bug and benchmark reports stay local;
-  there is no telemetry or data collection switch ([Horizon sends nothing](telemetry.md)).
+  `connect`, `lan`, `friends`, `chat` and `command`; in the launcher, `data allow`, `data send`,
+  `data bug`, `data benchmark`, `servers create` and `share-log` (`cli_tools::OPEN_WORLD`).
+  `play`'s `join` and `server` arguments say the same. `bug-report` writes a local file; opt-in data
+  collection is off until the player enables it ([Opt-in data collection](telemetry.md)).
 - **No secrets.** No surface returns tokens, session files, keychain entries or invite secrets
   the player didn't ask to share:
   - accounts are names and UUIDs;
@@ -292,16 +306,19 @@ turn the switch off.
    {"id": "done", "kind": "button", "label": "Done", "bounds": [...], "enabled": true}]}
 ```
 
-- **Ids are stable and readable.** An id is the label up to its `:`, as a slug (`FOV: 70` is
-  `fov`, `AI Agent...` is `ai-agent`). A repeated slug gets `-2`, `-3`; unlabelled elements are
-  `<kind>-<n>`. A slider's id doesn't change with its value. Slots are `slot-<ID>` with their
-  stack.
+- **Registered IDs do not change with the client's language.** For example, `singleplayer`,
+  `create-new-world`, `options`, `fov`, `done` and `back-to-game` work in Russian and English;
+  `label` still contains the translated text. Widgets without a registered ID use the drawn
+  label up to its `:` as a slug (for example, `My World` is `my-world`). These fallback IDs can
+  change with the label; read `ui` to find them. Repeated slugs get `-2`, `-3`; unlabelled
+  elements are `<kind>-<n>`. Slots are `slot-<ID>` with their stack.
 - **Kinds:** `button`, `slider` (`value` 0..1), `field`, `row` (a world, server, pack or
   language), `tab` (`selected`), `slot`.
 - **Actions:**
   - `click ID [right|middle] [shift]` clicks where the mouse would.
   - `set ID VALUE` moves a slider.
   - `type` types into the focused field.
+  - `click-button LABEL` takes the displayed label, not a registered ID.
 
   After a click, the next `ui`, `click` or `set` waits for a redrawn frame. Right after
   `launch`, they and `screen` and `click-button` wait for the first one.
@@ -330,9 +347,10 @@ who took over mid-test.
   recorded: a stray key or mouse move can't spoil the run. The run's own input (the socket, the
   replay) still plays. Clicking into the window or away from it takes effect when the run ends,
   and the game's pointer grab stays inside the game until then, so the system pointer is never
-  taken or moved; closing the window still ends the run. A key held as the run starts stays
-  down until it is pressed again. Outside these runs nothing is held back; a game no one at
-  the computer should touch runs `--offscreen` or `--headless`.
+  taken or moved; closing the window still ends the run. A click during the run doesn't claim
+  an agent's window no one has clicked yet: it takes one after the run. A key held as the run
+  starts stays down until it is pressed again. Outside these runs nothing is held back; a game
+  no one at the computer should touch runs `--offscreen` or `--headless`.
 - `state` and `status` have an `input` section: `last_origin`, per-origin `counts`,
   `user_since_agent` and `last_user_age_s`.
 - `input-log [--since SEQ] [--limit N] [--origin ORIGIN]` lists the newest 512 input events:
@@ -386,6 +404,41 @@ A recording is one folder, a bundle is that folder plus the logs in one zip:
   `state.jsonl` is the oracle for where the re-run should have ended. A server recording replays
   only `--in-place`, into the same world.
 
+### Fixed-clock offscreen export
+
+Start the game with `--offscreen` and enter a world or open a replay.
+
+```sh
+horizon-ctl export start portrait --size 1080x1920 --fps 30000/1001 --frames 90
+```
+
+The reply gives the absolute folder under the game's `exports/` and returns before frames are written.
+A PNG sequence is the default. To pipe RGB frames to the configured encoder in `horizon-export.txt`, use
+`--format encoder`. `export status` reports queued steps and frames written. `export stop` replies with
+`draining` while accepted frames are written and the output is finalized. `quit` cancels an active export,
+including one that is draining. On failure, `frames_written` is the count observed during abort.
+A PNG already being written may finish in the background. After the last readback, a stalled
+writer or manifest publication fails the export after 60 seconds. The final `export` event reports `finished` or `stopped` once
+`export.json` is published. If cancellation reaches a rename in progress, the failure event reports
+that publication could not be confirmed. Pass the last event sequence from before the start to
+`wait-for event export --since SEQ` if the export may finish before the wait starts.
+
+Use `--hold` to wait for `export step N`. You can issue control commands such as `tp` and `look` between
+steps. While a step is queued or an automatic export is running, only read-only commands, `export`,
+and `quit` are accepted. Captures wait for terrain,
+lighting, and uploads to settle, with a 30-second stall limit. For a live world they also wait for the
+server to send the view's remaining columns, even after the view's loading indicator expires. Use
+`--no-settle` to capture immediately.
+Use `--hud` to keep the HUD visible. During export, uploaded sections and their block entities
+appear fully visible so their fade-in does not depend on worker timing.
+
+The fixed clock drives the client and replay playhead. During live capture it also drives a private
+integrated server. External and published servers keep their own clocks. A standalone replay seeks back up to one second and ticks forward to the original
+position before capturing. An in-world replay starts where it is because it cannot rebuild the live world by
+seeking backwards. With settling enabled, replay exports advance through recorded portal
+loading intervals without writing frames. The output resumes at the next consecutive frame index
+once the destination has settled.
+
 ### Repeatable screenshots
 
 `HORIZON_STILL=1` (a dev switch, off by default) makes a frozen scene draw the same frame in every
@@ -422,9 +475,10 @@ of the frame ([#8750](https://github.com/horizon-rust/horizon/issues/8750)).
 - The server's own randoms and entity ids are its own: a summoned mob's facing and variant, and
   mob AI during a step, can differ when other server work drew on them first, and ids follow the
   order the server loads and creates entities in, which loading changes from run to run. What an
-  id seeds can then differ: a minecart's offset against z-fighting, a mob's client random. Give
-  facings and variants in the command (`{Rotation:[0f,0f]}`) for a repeatable scene. An end
-  crystal's spin and bob start from its position instead, so they are the same in every run.
+  id seeds can then differ: a minecart's offset against z-fighting, a mob's client random, a
+  dropped item's model when its model picks one at random. Give facings and variants in the
+  command (`{Rotation:[0f,0f]}`) for a repeatable scene. An end crystal's and a dropped item's spin
+  and bob start from their position instead, so they are the same in every run.
 - A script should wait until the world has loaded before it changes it: a command that acts on
   what is loaded (`kill @e`, `fill`) finds more or less of it otherwise.
 - The player still ticks while frozen, as in vanilla: stand the player on a block (it falls
@@ -433,7 +487,7 @@ of the frame ([#8750](https://github.com/horizon-rust/horizon/issues/8750)).
   using an item, riding, running out of air.
 - A shader pack's own buffers, kept from frame to frame, take `horizon-ctl screenshot-sequence
   FRAMES STEP_MS PATH`: the pack starts over (its buffers, images, shadow maps, smoothed values and
-  custom uniforms, or a Horizon pack's `history` and eased values) and draws FRAMES frames on a set
+  custom uniforms, or a Horizon pack's kept resources and eased values) and draws FRAMES frames on a set
   clock, frame n at n frames and (n - 1) × STEP_MS milliseconds (0 since the frame before on frame
   1, STEP_MS after; a decimal, `16.666667` for 60 fps). The last is written as `screenshot PATH`
   writes it (with its `-hdr.png` under HDR output), and the reply, once it is, names the pack and
@@ -454,7 +508,7 @@ of the frame ([#8750](https://github.com/horizon-rust/horizon/issues/8750)).
     network annotations;
   - the launcher: generated tools, `confirm`, the reference, the agent configs;
   - `horizon_core::no_ai`;
-  - `options_ui`: the AI Agent page, and that No AI hides it;
+  - `options_ui`: the AI Agent page, and that No AI greys its button out without moving the switch;
   - `input_trace`: origins, the ring, the intrusion rule, `input-log` and the recording writer;
   - `repro`: the format's round trip, the folder slug and the world copy.
 - **`tools/agent_control_e2e.py`** drives a real game, offscreen on macOS and on a virtual screen

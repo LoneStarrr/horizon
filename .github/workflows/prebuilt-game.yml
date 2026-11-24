@@ -1,126 +1,121 @@
 name: prebuilt game
-# The prebuilt game (#589): horizon-client as a Rust dylib plus every crate's metadata, one archive per OS, so the
-# launcher builds native trait mods against it with rustc alone, in seconds, instead of rebuilding the game.
-# Each OS builds with explicit --target <host>: target metadata lives in deps/, host proc-macros in host/.
-# Built with the pinned Rust (tools/ci/rust-version, which the launcher builds native mods with), because rustc reads only metadata from its own
-# version. Built once a day from main's head (a run whose commit already has a release stops early) and published as
-# a prerelease tagged prebuilt-<sha>, never marked latest. Exact-SHA SDKs are retained: Nightlies and installed
-# games can continue referencing older builds. Only compiler outputs go in:
-# tools/prebuilt_game.py refuses anything else, and nothing here reads vanilla data. A dispatch on another branch
-# builds and smokes every OS and publishes nothing.
+run-name: prebuilt game${{ inputs.off_main && ' (off main)' || '' }}
+# Manual recovery route under the same release authority as Nightly. Default is a full dry run.
+# The commit gets the Nightly's base rule (nightly.py base, docs/release-flow.md): on main, or, in a dry run with
+# off_main only, a commit a dry-run/* branch holds. Nothing on this route saves a cache (tests/test_nightly.py).
 on:
-  schedule:
-    - cron: '0 5 * * *'
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Full main SHA (empty means this workflow's exact commit)
+        type: string
+        default: ''
+      dry_run:
+        description: Build, smoke, index and sign with a throwaway key; publish nothing
+        type: boolean
+        default: true
+      off_main:
+        description: The commit is off main (a dry run only, a commit a dry-run/* branch holds)
+        type: boolean
+        default: false
 permissions:
   contents: read
+  actions: read
+  issues: read
 concurrency:
   group: prebuilt-game
   cancel-in-progress: false
-env:
-  TAG: prebuilt-${{ github.sha }}
 jobs:
-  fresh:
-    # Main's head may already have its build: a quiet day, or a second dispatch.
+  source:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
-      needed: ${{ steps.release.outputs.needed }}
+      commit: ${{ steps.source.outputs.commit }}
+      publish: ${{ steps.source.outputs.publish }}
     steps:
-      - id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if gh release view "$TAG" > /dev/null 2>&1; then echo needed=false; else echo needed=true; fi >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: fresh
-    if: needs.fresh.outputs.needed == 'true'
-    name: build ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - name: linux-server
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            server: true
-          # The launcher builds native mods with the windows-gnu toolchain and its own MinGW linker.
-          - name: windows
-            os: windows-latest
-            target: x86_64-pc-windows-gnu
-          - name: macos
-            os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: bash
-    env:
-      # v<layout>: the launcher asks only for the archive layout it reads (prebuilt_archive in
-      # crates/horizon-mod-package/src/index/native.rs); bump both when the folder's layout changes.
-      ARCHIVE: horizon-prebuilt-v5-${{ matrix.target }}${{ matrix.server && '-server' || '' }}.tar.gz
-    steps:
-      - uses: actions/checkout@v4
+      # The judge first, from this workflow's own commit, and the judged commit beside it: sibling folders, neither
+      # inside the other, so nothing the commit tracks (a symlink included) decides where the judge is written.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
+          path: trusted
+          sparse-checkout: tools
+          fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
-      - name: The launcher's pinned Rust
-        id: rust
-        run: |
-          echo "version=$(cat tools/ci/rust-version)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: ${{ steps.rust.outputs.version }}-${{ matrix.target }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: prebuilt-${{ matrix.name }}
-      - name: ALSA and udev headers
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
-      - name: Build and collect
-        run: python tools/prebuilt_game.py build prebuilt ${{ matrix.server && '--server' || '' }}
-      - name: The starter mod and the game executable build against the archive alone
-        run: python tools/prebuilt_game.py smoke prebuilt
-      - name: Exported names, toward Windows' 65,535
-        run: python tools/prebuilt_game.py exports prebuilt | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Archive
-        run: |
-          tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner -cf - -C prebuilt . | gzip -n > "$ARCHIVE"
-          echo "$(du -h "$ARCHIVE" | cut -f1) $ARCHIVE" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARCHIVE }}
-          path: ${{ env.ARCHIVE }}
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs: build
-    # A dispatch on any other branch builds and smokes every OS but releases nothing.
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: archives
-          merge-multiple: true
-      - name: Release prebuilt-<sha>
+          ref: ${{ inputs.commit || github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      # The Nightly's base rule (nightly.py base), in the judge's own clone, which holds main and the dry-run/* heads but
+      # never the commit fetched by its SHA. -E -s: no Python variables or user site; not -I, which would drop the
+      # script's own folder that nightly.py imports from (trusted/tools/ci, as cwd is trusted/).
+      - id: rule
+        shell: bash
+        working-directory: trusted
+        env:
+          COMMIT: ${{ inputs.commit || github.sha }}
+          PUBLISH: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+          OFF_MAIN: ${{ inputs.off_main }}
         run: |
           set -euo pipefail
-          cd archives
-          sha256sum horizon-prebuilt-*.tar.gz > SHA256SUMS
-          gh release create "$TAG" horizon-prebuilt-*.tar.gz SHA256SUMS --target "$GITHUB_SHA" --prerelease \
-            --latest=false --title "Prebuilt game ${GITHUB_SHA::10}" \
-            --notes "The game as a Rust dylib plus crate metadata, for the launcher's native mod builds (#589). Compiler outputs plus game-owned registry patch sources."
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git fetch -q --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          DRY_RUN=$([[ "$PUBLISH" == true ]] && echo false || echo true) NIGHTLY_OFF_MAIN="$OFF_MAIN" \
+            python3 -E -s tools/ci/nightly.py base "$COMMIT"
+      - id: source
+        shell: bash
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit || github.sha }}
+          PUBLISH: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
+          RELEASES_PAUSED: ${{ vars.RELEASES_PAUSED }}
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "$COMMIT" ]] || exit 1
+          if [[ "$PUBLISH" == true ]]; then
+            git fetch -q --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            python3 tools/prebuilt_game.py authorize "$COMMIT"
+          fi
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+  build:
+    needs: source
+    uses: ./.github/workflows/prebuilt-game-build.yml
+    with:
+      commit: ${{ needs.source.outputs.commit }}
+      dry_run: ${{ needs.source.outputs.publish != 'true' }}
+  publish:
+    needs: [source, build]
+    if: needs.build.outputs.needed == 'true'
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+    uses: ./.github/workflows/sdk-publish.yml
+    with:
+      commit: ${{ needs.source.outputs.commit }}
+      publish: ${{ needs.source.outputs.publish == 'true' }}
+    # Only the signing keys, and none in a dry run: its index and verify jobs run the built commit's own scripts.
+    # (RELEASE_SIGNING_KEY is the `release` environment's, which sdk-publish's sign job reads itself on a real run.)
+    secrets:
+      RELEASE_SIGNING_KEY: ${{ needs.source.outputs.publish == 'true' && secrets.RELEASE_SIGNING_KEY || '' }}
+      RELEASE_SIGNING_KEY_NEXT: ${{ needs.source.outputs.publish == 'true' && secrets.RELEASE_SIGNING_KEY_NEXT || '' }}
+  existing:
+    needs: [source, build]
+    if: needs.build.outputs.needed != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate the existing SDK instead of overwriting it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.source.outputs.commit }}
+        run: python3 tools/ci/nightly.py require-sdk "$COMMIT"

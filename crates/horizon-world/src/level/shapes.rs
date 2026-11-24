@@ -35,6 +35,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         neighbour_pos: BlockPos,
         neighbour: BlockStateId,
     ) -> BlockStateId {
+        // Asked before the hooks and again after, as in `tick_due_block`.
+        let suppressed = self.level.template_suppressed(state);
         let mut new = None;
         self.level.before_update_shape(
             self.ticks,
@@ -50,6 +52,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             && (new.0 as usize) < self.b.table.state_count()
         {
             return new;
+        }
+        if suppressed || self.level.template_suppressed(state) {
+            return state;
         }
         self.update_shape_at(0, state, pos, direction, neighbour_pos, neighbour)
     }
@@ -1008,7 +1013,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// The level's answer to a `kind` connection of the block `state` at `pos`
     /// toward `neighbour`, `direction` pointing from the block to it, once
-    /// vanilla's rule answered `vanilla`; vanilla's when no hook listens.
+    /// vanilla's rule answered `vanilla`; vanilla's when no hook listens. The
+    /// neighbour, the target, answers first (`IBlockExtension.canBeConnectedTo`),
+    /// then the connecting block's own rule has the last word.
     fn connects_to(
         &self,
         kind: ConnectionKind,
@@ -1020,8 +1027,17 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         vanilla: bool,
     ) -> bool {
         if self.level.has_connection_hook() {
+            let target = self.level.adjust_can_be_connected_to(
+                kind,
+                rel(pos, direction),
+                neighbour,
+                state,
+                direction.opposite(),
+                face_solid,
+                vanilla,
+            );
             self.level
-                .adjust_connects_to(kind, pos, state, neighbour, direction, face_solid, vanilla)
+                .adjust_connects_to(kind, pos, state, neighbour, direction, face_solid, target)
         } else {
             vanilla
         }

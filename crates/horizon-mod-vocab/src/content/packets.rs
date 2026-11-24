@@ -26,6 +26,28 @@ impl ServerboundPlayPacket {
     }
 }
 
+/// A clientbound play packet encoded in the server's vanilla protocol, for one player.
+///
+/// The game resolves the type name and decodes its body once before sending it: a body the
+/// player's client could not read is refused, not sent. Nothing applies the packet on the
+/// server side: the server's own state does not change.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct ClientboundPlayPacket {
+    /// Packet type, for example `minecraft:set_player_team` or `minecraft:set_objective`.
+    pub id: Identifier,
+    /// Vanilla packet body, without the packet id, length prefix or compression framing.
+    pub body: Vec<u8>,
+}
+
+impl ClientboundPlayPacket {
+    /// Construct a packet envelope; the game validates the body when it is submitted.
+    pub fn new(id: Identifier, body: Vec<u8>) -> Self {
+        Self { id, body }
+    }
+}
+
 /// Why the client could not submit a play packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -69,4 +91,28 @@ pub enum SendPacketError {
         /// Maximum number of payload bytes vanilla accepts.
         limit: u64,
     },
+}
+
+/// Why a client mod's `disconnect` was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum DisconnectError {
+    /// No server or world is joined: there is nothing to leave.
+    Unavailable,
+    /// The reason exceeds the text boundary's size or nesting limits.
+    Text(crate::TextFormError),
+}
+
+impl From<crate::TextFormError> for DisconnectError {
+    fn from(error: crate::TextFormError) -> Self {
+        Self::Text(error)
+    }
+}
+
+impl crate::NoBackend for DisconnectError {
+    /// No game: nothing is joined.
+    fn no_backend() -> Self {
+        Self::Unavailable
+    }
 }

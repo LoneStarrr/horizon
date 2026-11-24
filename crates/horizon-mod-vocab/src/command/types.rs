@@ -1,11 +1,21 @@
 //! Commands and their authority.
 
+/// Literal words use ASCII letters, digits, `_` and `-`, matched with their case as Brigadier's
+/// (`cu callItemClear`). Only the first word may additionally begin with one `/`: register
+/// `/set <x:word>` and type `//set stone` in chat.
+/// The command's literals retain `/set`. A slash alone, repeated leading slashes and
+/// slashes in later literal words are refused.
+///
 /// A command a native mod adds, as one usage: words, then arguments
 /// `<name:kind>`, optional ones last in brackets `[name:kind]`:
 /// `pay <player:player> <amount:integer>`, `balance [player:player]`,
 /// `eco give <player:player> <amount:integer>`. Kinds: `word`, `text` (the
 /// rest of the line, last), `integer`, `number`, `boolean`, `player`, `players`,
-/// `entity`, `entities`, `item`, `block_pos`, or a command argument type a mod registered with
+/// `entity`, `entities`, `item`, `block_pos`, `vec3` (a point, `Vec3Argument.vec3()`; delivered
+/// as `Vec3`), `id` (a free `namespace:path` identifier, delivered as that canonical string),
+/// `mod_id` (a loaded package id, delivered as a
+/// string), `resource:<registry>` (an id that registry holds, delivered as `Id`:
+/// `<kind:resource:minecraft:entity_type>`), or a command argument type a mod registered with
 /// `Registrar::register_command_argument`, named by its namespaced id:
 /// `machine use <machine:mymod:machine>`. Usages of one command share their
 /// words; the server merges them into one tree. Each executable usage keeps its own level:
@@ -26,6 +36,9 @@ pub struct Command {
     /// The operator level a player needs to run this usage (0: everyone).
     /// Shared prefixes stay visible when needed to reach a lower-level usage.
     pub level: u8,
+    /// The plain text a player below the whole command's level is answered with, instead of
+    /// vanilla's unknown command. `None` keeps vanilla's answer.
+    pub denied: Option<String>,
 }
 
 impl Command {
@@ -34,6 +47,7 @@ impl Command {
         Self {
             usage: usage.to_owned(),
             level: 0,
+            denied: None,
         }
     }
     /// The same, for operators of `level` and above.
@@ -41,7 +55,16 @@ impl Command {
         Self {
             usage: usage.to_owned(),
             level: level.min(4),
+            denied: None,
         }
+    }
+    /// The same usage, answering a player below the command's lowest usage level with `text` (plain,
+    /// unstyled), as Paper's `messages.no-permission` answers a command it refuses. A player who
+    /// may run some usage of the command, but not this one, gets vanilla's answer. Only the first
+    /// usage of a command that sets a text answers for it.
+    pub fn denied_message(mut self, text: &str) -> Self {
+        self.denied = Some(text.to_owned());
+        self
     }
 }
 
@@ -50,13 +73,13 @@ impl Command {
 #[non_exhaustive]
 #[derive(horizon_mod_api_macros::Wire)]
 pub enum Authority {
-    /// A single-player game with no server thread; never fires today.
+    /// A single-player game with no server thread; does not fire.
     LocalAuthoritative,
     /// The server thread of a single-player or LAN world.
     IntegratedServer,
     /// A dedicated server.
     DedicatedServer,
-    /// A client of someone else's server; never fires today.
+    /// A client of someone else's server; does not fire.
     RemoteClient,
 }
 

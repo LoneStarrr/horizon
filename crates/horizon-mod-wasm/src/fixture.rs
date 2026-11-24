@@ -19,6 +19,8 @@ pub fn module(bytes: &[u8]) -> Result<WasmMod, String> {
     .ok_or_else(|| "fixture exported no mod boundary".to_owned())
 }
 
+pub use crate::calls::{answering, by_name, host_shim, import_name, shim_keys};
+
 /// Resolve a production host row without pinning generated numeric IDs in a fixture.
 pub fn import_id(owner: &str, name: &str) -> Option<u32> {
     crate::boundary::import_id(owner, name)
@@ -40,11 +42,7 @@ pub fn cached_answer(
         command
     };
     let (module, source) = cache
-        .load_with_child_command(
-            &engine,
-            bytes,
-            Some((command, std::time::Duration::from_secs(60))),
-        )
+        .load_with_child_command(&engine, bytes, Some((command, cache.budget.limit)))
         .map_err(|e| e.to_string())?;
     let mut store = wasmtime::Store::new(&engine, ());
     store.set_epoch_deadline(u64::MAX / 2);

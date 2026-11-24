@@ -38,6 +38,7 @@ pub trait ConfiguredFeature: std::fmt::Debug + Send + Sync {
 /// [`FeatureRegion::block`] give and [`FeatureRegion::set_block`] takes. It
 /// means something only for the region that gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// no wire: a handle meaningful only to the region that gave it; never sent between processes
 #[non_exhaustive]
 pub struct FeatureState(pub(crate) u32);
 
@@ -56,6 +57,7 @@ impl FeatureState {
 
 /// `Heightmap.Types`: which of a column's heights to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// no wire: a parameter of a feature call into the engine, in process
 #[non_exhaustive]
 pub enum FeatureHeightmap {
     /// `WORLD_SURFACE_WG`: the top non-air block while the chunk generates.

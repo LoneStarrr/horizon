@@ -2,7 +2,7 @@
 //! priorities and interruption, per-mob state and random streams, the read
 //! view, `set_target`, and the no-mod-goals fast path.
 //!
-//! The `zombie` fixture is shared with the behavior tests (#824).
+//! The `zombie` fixture is shared with the behavior tests (arismoko/horizon#824).
 use super::super::creatures;
 use super::super::native_entity_refs::tests::with_game;
 use horizon_client::mobs::{self, Mob, goals::Cx};
@@ -86,11 +86,24 @@ impl EntityPart for ZombieGoals {
     }
 }
 
+/// How often the husk's part was asked for its goals (`a_screens_entity_registers_no_mod_goals`).
+static ASKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A part on the husk that only counts its `register_goals` calls.
+struct Asked;
+#[mod_api::horizon_part]
+impl EntityPart for Asked {
+    fn register_goals(&self, _: &mut GoalRegistrar<'_>) {
+        ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct Mod;
 #[mod_api::__subscriptions]
 impl Hooks for Mod {
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         r.entity_part("minecraft:zombie", ZombieGoals);
+        r.entity_part("minecraft:husk", Asked);
     }
 }
 
@@ -134,7 +147,7 @@ fn tick_goals(game: &mut super::super::Game<'_>, index: usize) {
 
 /// The same tick with a player view lent, as a server's mob tick lends a
 /// guest's, and the identity captured beside it — what a goal resolves
-/// (#1077): the real guest's uuid and entity id, never a scan per read. A
+/// (arismoko/horizon#1077): the real guest's uuid and entity id, never a scan per read. A
 /// lent view with no identity is a fake player's: nothing resolves.
 fn tick_goals_as(
     game: &mut super::super::Game<'_>,
@@ -147,7 +160,7 @@ fn tick_goals_as(
     let mut mobs = game.mobs.lift();
     let snapshot: Vec<_> = mobs
         .iter()
-        .map(|m| creatures::seen(m, game.level.player_uuid))
+        .map(|m| creatures::seen(m, game.level.player_uuid, game.items()))
         .collect();
     let mut index_by_id = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
     for (i, s) in snapshot.iter().enumerate() {
@@ -186,7 +199,7 @@ fn calls(id: u32) -> Vec<&'static str> {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn goals_register_after_the_species_own_and_only_on_their_type() {
     EVENTS.lock().unwrap().clear();
     let mut bare = Vec::new();
@@ -221,7 +234,7 @@ fn goals_register_after_the_species_own_and_only_on_their_type() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn two_mobs_keep_independent_state_and_random_streams() {
     EVENTS.lock().unwrap().clear();
     install_game_mods();
@@ -260,7 +273,7 @@ fn two_mobs_keep_independent_state_and_random_streams() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn reads_answer_the_tick_view_and_refuse_what_it_lacks() {
     EVENTS.lock().unwrap().clear();
     READS.lock().unwrap().clear();
@@ -288,7 +301,7 @@ fn reads_answer_the_tick_view_and_refuse_what_it_lacks() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn a_higher_priority_goal_interrupts_a_running_mod_goal() {
     EVENTS.lock().unwrap().clear();
     install_game_mods();
@@ -331,7 +344,7 @@ fn a_higher_priority_goal_interrupts_a_running_mod_goal() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn set_target_follows_the_write_rules() {
     use horizon_client::mobs::Who;
     struct SetTarget;
@@ -387,7 +400,7 @@ fn set_target_follows_the_write_rules() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn mobs_without_mod_goals_tick_as_before() {
     EVENTS.lock().unwrap().clear();
     with_game(|game| {
@@ -405,7 +418,7 @@ fn mobs_without_mod_goals_tick_as_before() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn the_host_answers_without_panicking() {
     /// Reads a block, a tag, the neighbour as a living and the day time
     /// through `cx.host()`, reporting what came back.
@@ -427,7 +440,7 @@ fn the_host_answers_without_panicking() {
             let stone = host.block_state_id("minecraft:stone");
             let tagged = host.entity_type_in_tag("minecraft:zombie", "minecraft:undead");
             // The time of day through the level handle, the canonical route
-            // since the Host rebuild (#1158): the handle's own backend read
+            // since the Host rebuild (arismoko/horizon#1158): the handle's own backend read
             // forwards through the view to the real backend.
             let day_time = host
                 .level("minecraft:overworld")
@@ -563,6 +576,7 @@ fn view_player(at: [f64; 3]) -> horizon_client::mobs::PlayerView {
         armor_cover: 0.0,
         invisible: false,
         spectator: false,
+        on_climbable: false,
         gold_armor: false,
         hurt_by: None,
         last_hurt: None,
@@ -584,7 +598,7 @@ fn view_player(at: [f64; 3]) -> horizon_client::mobs::PlayerView {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn a_client_copy_registers_no_mod_goals() {
     install_game_mods();
     with_game(|game| {
@@ -619,7 +633,35 @@ fn a_client_copy_registers_no_mod_goals() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
+fn a_screens_entity_registers_no_mod_goals() {
+    install_game_mods();
+    let asked = || ASKED.load(std::sync::atomic::Ordering::Relaxed);
+    super::super::native_entity_refs::tests::with_client_game(|game| {
+        let kind = game.res.mob_types().get("minecraft:husk").unwrap().clone();
+        // The authoritative construction asks the part…
+        let _ = Mob::new(90, kind, Vec3::new(0.5, 65.0, 0.5), 0.0);
+        let before = asked();
+        assert!(before >= 1, "the part is installed");
+        // …a screen drawing the type, by type and from saved data, does not.
+        let look = mod_api::GuiEntityLook::At([50.0, 40.0]);
+        let view = mod_api::GuiEntityView::new([26.0, 8.0, 75.0, 78.0], 30.0, 0.0625, look);
+        let mut data = horizon_core::nbt::Compound::new();
+        data.insert("IsBaby".into(), horizon_core::nbt::Tag::Byte(1));
+        for entity in [
+            mod_api::GuiEntity::kind("minecraft:husk"),
+            mod_api::GuiEntity::with_data("minecraft:husk", data),
+        ] {
+            let mut batch = horizon_client::hud::HudBatch::scratch([320, 240]);
+            assert_eq!(game.native_draw_entity(&mut batch, &entity, view), Ok(()));
+            assert!(!batch.vertices.is_empty());
+        }
+        assert_eq!(asked(), before, "a GUI draw runs no register_goals");
+    });
+}
+
+#[test]
+#[ignore = "daily"]
 fn a_goal_jump_goes_through_the_jump_control_input() {
     struct Jumper;
     impl Goal for Jumper {
@@ -671,7 +713,7 @@ fn a_goal_jump_goes_through_the_jump_control_input() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn set_target_refuses_what_the_write_handle_refuses() {
     use horizon_client::mobs::Who;
     /// What the `SetTarget` goal's call returned.
@@ -781,7 +823,7 @@ fn set_target_refuses_what_the_write_handle_refuses() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn move_and_look_inputs_pass_the_navigation_boundary() {
     /// The `move_to` answers, and what the look control ended up wanting.
     static RESULTS: Mutex<Vec<(bool, bool, Option<[f64; 3]>)>> = Mutex::new(Vec::new());
@@ -846,7 +888,7 @@ fn move_and_look_inputs_pass_the_navigation_boundary() {
 }
 
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn the_player_the_tick_sees_resolves_by_its_captured_identity() {
     /// What each read of the tick's player found: by uuid, by id (and where
     /// it stands), and whether it narrows to a mob handle.
@@ -918,7 +960,7 @@ fn the_player_the_tick_sees_resolves_by_its_captured_identity() {
 }
 
 /// What one mod-goal tick costs against a plain engine goal, in nanoseconds:
-/// printed once for the PR body (#1077). Run with `--ignored --nocapture`.
+/// printed once for the PR body (arismoko/horizon#1077). Run with `--ignored --nocapture`.
 #[test]
 #[ignore = "cost probe"]
 fn mod_goal_tick_cost() {
@@ -951,7 +993,7 @@ fn mod_goal_tick_cost() {
         let mut mobs = game.mobs.lift();
         let snapshot: Vec<_> = mobs
             .iter()
-            .map(|m| creatures::seen(m, game.level.player_uuid))
+            .map(|m| creatures::seen(m, game.level.player_uuid, game.items()))
             .collect();
         let mut test_level = horizon_client::health::TestLevel::new(0);
         let mut level = test_level.level();
@@ -1015,7 +1057,7 @@ impl Hooks for GoalsAndFinalize {
 /// attached when the mob was made (`part_goals::attach`, whose copies carry
 /// no goal and name themselves `ModGoal`) is still the mob's own afterwards.
 #[test]
-#[ignore = "needs prepared resources"]
+#[ignore = "daily"]
 fn a_finalize_spawn_listener_keeps_the_mod_goals() {
     // The mods install before the game opens: a game that opens resolves
     // the parts of whatever is installed, and the worker block metadata

@@ -52,28 +52,24 @@ pub(super) fn projectile_predicate_supported(tag: &horizon_core::nbt::Tag) -> bo
 }
 /// `InventoryScreen.containerTick`: a survival inventory left open when the
 /// player gains infinite materials becomes the creative one, so the player
-/// stays in a menu. A spectator's inventory is closed (`Playing`), which is
-/// what Horizon did for every mode before; vanilla has no spectator branch
-/// and leaves it open.
-fn inventory_after_mode(screen: Screen, creative: bool, spectator: bool) -> Screen {
-    if screen != Screen::Inventory {
-        return screen;
-    }
-    if creative {
-        Screen::Creative
-    } else if spectator {
-        Screen::Playing
-    } else {
-        screen
+/// stays in a menu. `CreativeModeInventoryScreen.containerTick` is the way
+/// back: without infinite materials, in any mode (spectator included), the
+/// creative screen is replaced by the survival one. Vanilla has no other
+/// branch: a spectator's open survival inventory stays open.
+fn inventory_after_mode(screen: Screen, creative: bool) -> Screen {
+    match screen {
+        Screen::Inventory if creative => Screen::Creative,
+        Screen::Creative if !creative => Screen::Inventory,
+        _ => screen,
     }
 }
 
 impl Game<'_> {
-    /// `InventoryScreen.containerTick` on a mode change: the inventory the player has
-    /// open follows the mode. (`CreativeModeInventoryScreen.containerTick`, the way back
-    /// to survival, is not ported yet.)
+    /// `InventoryScreen.containerTick` and `CreativeModeInventoryScreen.containerTick`
+    /// on a mode change: the inventory the player has open follows the mode.
     fn mode_changed_under_inventory(&mut self) {
-        match inventory_after_mode(self.screen, self.creative, self.spectator()) {
+        let from = self.screen;
+        match inventory_after_mode(from, self.creative) {
             Screen::Creative => {
                 if let Some(c) = self.carried.take() {
                     let _ = self.add_stack_to_inventory(c);
@@ -83,12 +79,15 @@ impl Game<'_> {
                 self.creative_screen.reopen();
                 self.refresh_saved_hotbars();
             }
-            next if next != self.screen => self.screen = next,
+            // `ItemPickerMenu` and the new `InventoryScreen` share
+            // `player.inventoryMenu`, and `removed` does nothing on a client
+            // player: the carried stack stays on the cursor.
+            next if next != from => self.set_screen(next),
             _ => {}
         }
     }
 
-    pub(super) fn spectator(&self) -> bool {
+    pub(in crate::game) fn spectator(&self) -> bool {
         self.mode == GameMode::Spectator
     }
     /// `Abilities.mayBuild`.
@@ -129,9 +128,9 @@ impl Game<'_> {
         }
         if mode == GameMode::Spectator {
             self.mining = None;
+            self.stop_active_item_use();
             self.left = false;
             self.dismount_for_spectator();
-            self.stop_active_item_use();
             if let Some(p) = self.player.as_mut() {
                 p.flying = true;
                 p.spectator = true;
@@ -297,7 +296,12 @@ impl Game<'_> {
         if self.spectator() {
             return true;
         }
-        !self.may_build() && !self.adventure_predicate("minecraft:can_break", pos)
+        !self.may_build() && !self.can_break_in_adventure(pos)
+    }
+    /// `ItemStack.canBreakBlockInAdventureMode`: an adventure player may break,
+    /// or prime TNT at, only a block their held stack's `can_break` matches.
+    pub(super) fn can_break_in_adventure(&self, pos: [i32; 3]) -> bool {
+        self.adventure_predicate("minecraft:can_break", pos)
     }
     /// `ItemStack.useOn` in adventure mode: the used item's `can_place_on`
     /// matches the clicked block (`Player.mayUseItemAt`).
@@ -320,6 +324,20 @@ impl Game<'_> {
                 "minecraft:can_place_on",
                 relative(pos, face.opposite()),
             )
+    }
+    /// `ItemStack.canPlaceOnBlockInAdventureMode` of the stack a use names.
+    pub(super) fn stack_can_place_on_in_adventure(
+        &self,
+        stack: &ItemStack,
+        clicked: [i32; 3],
+    ) -> bool {
+        self.stack_adventure_predicate(stack, "minecraft:can_place_on", clicked)
+    }
+    /// `ItemStack.useOn`'s gate before any item's own `useOn`: a player who
+    /// may build, or an adventure player whose held item's `can_place_on`
+    /// matches the clicked block.
+    pub(super) fn may_use_on(&self, clicked: [i32; 3]) -> bool {
+        self.may_build() || self.can_place_on_in_adventure(clicked)
     }
     /// `ServerPlayer.setGameMode(SPECTATOR)`: `stopRiding`.
     fn dismount_for_spectator(&mut self) {
@@ -345,6 +363,10 @@ fn relative(pos: [i32; 3], face: horizon_core::geometry::Direction) -> [i32; 3] 
         pos[2].wrapping_add(dz),
     ]
 }
+
+#[cfg(test)]
+#[path = "tests/adventure_gate_tests.rs"]
+mod adventure_gate_tests;
 
 #[cfg(test)]
 mod tests {
@@ -410,21 +432,23 @@ mod tests {
     /// screen is left where it is.
     #[test]
     fn a_survival_inventory_becomes_the_creative_one() {
-        assert!(inventory_after_mode(Screen::Inventory, true, false) == Screen::Creative);
-        let stays = inventory_after_mode(Screen::Inventory, false, false);
+        assert!(inventory_after_mode(Screen::Inventory, true) == Screen::Creative);
+        let stays = inventory_after_mode(Screen::Inventory, false);
         assert!(stays == Screen::Inventory, "survival keeps its inventory");
-        // A spectator's inventory is closed, which is what Horizon did for
-        // both before; vanilla has no spectator branch and leaves it open.
-        let closed = inventory_after_mode(Screen::Inventory, false, true);
-        assert!(closed == Screen::Playing);
+        // Vanilla's only branch is `hasInfiniteMaterials`: a spectator's open
+        // inventory stays open.
+        // `CreativeModeInventoryScreen.containerTick`: no infinite materials
+        // replaces the creative screen with the survival one, spectator
+        // included; infinite materials keep it.
+        assert!(inventory_after_mode(Screen::Creative, false) == Screen::Inventory);
+        assert!(inventory_after_mode(Screen::Creative, true) == Screen::Creative);
         for screen in [
             Screen::Playing,
-            Screen::Creative,
             Screen::Paused,
             Screen::Stats,
             Screen::Advancements,
         ] {
-            assert!(inventory_after_mode(screen, true, false) == screen);
+            assert!(inventory_after_mode(screen, true) == screen);
         }
     }
 
@@ -442,5 +466,49 @@ mod tests {
             loads_chunks(true, false),
             "survival, creative or adventure, rule on"
         );
+    }
+
+    /// `AbstractContainerMenu.removed` does nothing on a client player and
+    /// both screens share `player.inventoryMenu`: leaving creative keeps the
+    /// carried stack on the cursor.
+    #[test]
+    #[ignore = "daily"]
+    fn leaving_creative_keeps_the_carried_stack() {
+        use horizon_client::{command::args::GameMode, items::ItemStack};
+        let mut game = crate::game::native_machines::tests::server_game();
+        game.set_mode(GameMode::Creative);
+        game.screen = Screen::Creative;
+        game.carried = Some(ItemStack {
+            item: "minecraft:stone".into(),
+            count: 3,
+            damage: 0,
+            extra: None,
+        });
+        game.set_mode(GameMode::Survival);
+        assert!(game.screen == Screen::Inventory);
+        let kept = game.carried.as_ref().expect("the cursor stack is kept");
+        assert_eq!((&*kept.item, kept.count), ("minecraft:stone", 3));
+    }
+
+    /// `CreativeModeInventoryScreen.containerTick` is the other way back: the
+    /// tick swaps to the survival screen and the cursor stack stays.
+    #[test]
+    #[ignore = "daily"]
+    fn the_tick_swap_out_of_creative_keeps_the_carried_stack() {
+        use horizon_client::items::ItemStack;
+        let mut game = crate::game::native_machines::tests::server_game();
+        // The window's lead runs on a client's own game only.
+        game.options.execution_role = crate::game::execution_role::ExecutionRole::Client;
+        game.screen = Screen::Creative;
+        game.creative = false;
+        game.carried = Some(ItemStack {
+            item: "minecraft:stone".into(),
+            count: 3,
+            damage: 0,
+            extra: None,
+        });
+        let _ = game.tick();
+        assert!(game.screen == Screen::Inventory);
+        assert_eq!(game.carried.as_ref().map(|c| c.count), Some(3));
     }
 }

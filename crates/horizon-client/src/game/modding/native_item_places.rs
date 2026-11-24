@@ -3,8 +3,8 @@
 //! menu slot shows (ender chest, crafting grid, a mod's chest menu). Mods read and write
 //! them through `ItemPlace`'s `stack`, `insert` and `extract`, which come here for these places; a block entity's slots,
 //! a stack inside an item and a mod's own places go through their handlers.
+use super::Game;
 use super::transactions::After;
-use super::{Game, minecarts::CartKind};
 use horizon_client::{first_person::Hand, items::ItemStack};
 use mod_api::__private::game::*;
 use mod_api::{EquipmentSlot, ItemPlace, LivingRef, Transaction};
@@ -33,9 +33,7 @@ impl Game<'_> {
     ) -> Option<R> {
         let key = (i32::MAX - 15, super::minecarts::CART_KEY_Y, id as i32);
         let at = |p: &horizon_core::geometry::Vec3| [p.x, p.y, p.z];
-        let container = |c: &super::minecarts::Minecart| {
-            c.id == id && matches!(c.kind, CartKind::Chest | CartKind::Hopper)
-        };
+        let container = |c: &super::minecarts::Minecart| c.id == id && c.kind.slots() > 0;
         let position = if let Some(c) = self.carts.iter().find(|c| container(c)) {
             at(&c.position)
         } else if let Some(b) = self.boats.iter().find(|b| b.id == id && b.chest) {
@@ -81,6 +79,33 @@ impl Game<'_> {
             _ => None,
         }
     }
+    /// All player place mutations use the command/host slot writer (and its journal).
+    fn write_player_place(&mut self, place: &ItemPlace, stack: Option<ItemStack>) {
+        use super::commands::items::Slot;
+        let slot = match place {
+            ItemPlace::PlayerSlot {
+                slot: slot @ 0..=35,
+                ..
+            } => Slot::Inv(*slot as usize),
+            ItemPlace::PlayerSlot {
+                slot: slot @ 100..=103,
+                ..
+            } => Slot::Armor(103 - *slot as usize),
+            ItemPlace::PlayerSlot { slot: -106, .. } => Slot::Offhand,
+            ItemPlace::PlayerHand {
+                hand: Hand::Main, ..
+            } => Slot::Inv(self.selected),
+            ItemPlace::PlayerHand {
+                hand: Hand::Off, ..
+            } => Slot::Offhand,
+            ItemPlace::PlayerCursor { .. } => {
+                self.carried = stack;
+                return;
+            }
+            _ => return,
+        };
+        self.slot_set(&slot, stack);
+    }
     /// How many slots the inventory of entity `entity` in the level in place has, as
     /// `entity_slots` reaches them: none for an entity without one, and on a client.
     pub(super) fn entity_container_size(&self, entity: u32) -> Option<usize> {
@@ -100,14 +125,14 @@ impl Game<'_> {
             return None;
         }
         if let Some(c) = self.carts.iter().find(|c| c.id == entity) {
-            let container = matches!(c.kind, CartKind::Chest | CartKind::Hopper);
+            let container = c.kind.slots() > 0;
             return container.then_some(c.items.len());
         }
         let b = self.boats.iter().find(|b| b.id == entity)?;
         b.chest.then_some(b.items.len())
     }
     /// How many equipment slots living entity `entity`'s [`ENTITY_ITEMS`](mod_api::ENTITY_ITEMS)
-    /// answers (#932, NeoForge's `LivingEntityEquipmentWrapper`): a mob's or an armor stand's
+    /// answers (arismoko/horizon#932, NeoForge's `LivingEntityEquipmentWrapper`): a mob's or an armor stand's
     /// seven (main hand, off hand, feet, legs, chest, head and body, by `EquipmentSlot`'s
     /// ordinal; the saddle is not automation's to move), none for any other entity, and on a
     /// client.
@@ -131,6 +156,9 @@ impl Game<'_> {
     /// isn't here or is dead, an item entity not in the level in place, any other place
     /// (`ItemPlace::stack` reads those), and on a client.
     pub(super) fn game_stack(&mut self, place: &ItemPlace) -> Option<ItemStack> {
+        if let ItemPlace::Scratch(id) | ItemPlace::ScratchSlots(id) = place {
+            return self.scratch_held(*id);
+        }
         if self.block_entity_tick_items.is_some() {
             return self.scoped_game_stack(place);
         }
@@ -161,6 +189,11 @@ impl Game<'_> {
         }
         if !self.places_simulated() || stack.count == 0 {
             return 0;
+        }
+        // A write to a backed mod menu's storage (arismoko/horizon#3385) is noticed; none is backed in vanilla.
+        self.notice_menu_place_write(place);
+        if let ItemPlace::Scratch(id) | ItemPlace::ScratchSlots(id) = place {
+            return self.scratch_insert(*id, &stack);
         }
         let max = self.containers().max_stack(&stack);
         // Puts what of `rest` fits into `slot`.
@@ -262,9 +295,9 @@ impl Game<'_> {
                 }
                 return;
             }
-            if let Some(slot) = g.player_place(place) {
-                fill(slot, &mut rest);
-            }
+            let mut written = g.player_place(place).cloned().flatten();
+            fill(&mut written, &mut rest);
+            g.write_player_place(place, written);
             if let Some(rest) = (rest.count > 0)
                 .then(|| g.add_stack_to_inventory(rest))
                 .flatten()
@@ -293,6 +326,10 @@ impl Game<'_> {
         }
         if !self.places_simulated() {
             return 0;
+        }
+        self.notice_menu_place_write(place);
+        if let ItemPlace::Scratch(id) | ItemPlace::ScratchSlots(id) = place {
+            return self.scratch_extract(*id, &stack);
         }
         // How many of `stack` `held` gives.
         let taken = |held: Option<&ItemStack>| {
@@ -378,18 +415,18 @@ impl Game<'_> {
                 return;
             }
             g.journal_player(player);
-            if let Some(slot) = g.player_place(place) {
-                let kept = slot.as_ref().map(|held| left(held, took));
-                *slot = kept.filter(|kept| kept.count > 0);
-            }
+            let kept = g
+                .player_place(place)
+                .and_then(|slot| slot.as_ref().map(|held| left(held, took)));
+            g.write_player_place(place, kept.filter(|kept| kept.count > 0));
         });
         took
     }
-    /// Writes mob `entity`'s equipment `slot` (#932): the same write
+    /// Writes mob `entity`'s equipment `slot` (arismoko/horizon#932): the same write
     /// `native_living_set_equipment` makes — stack, attribute map, equip sound and game event
     /// — with the effects waiting for the root commit of the open transaction, so an abort of
     /// it is quiet. The equipment goes back then too (`journal_equipment`).
-    /// The equipment `slot` of living entity `entity` (#932): a mob's
+    /// The equipment `slot` of living entity `entity` (arismoko/horizon#932): a mob's
     /// (`equipment_stacks`, the worn stacks overlaid) or an armor stand's
     /// own, `None` where the slot is empty. None where neither kind is
     /// there — and on a client, whose copy writes nothing.
@@ -403,8 +440,64 @@ impl Game<'_> {
         let stand = self.armor_stands.iter().find(|a| a.id == entity)?;
         Some(stand.equipment.get(slot as usize).cloned())
     }
-    /// The equipment write `set_equipment` makes (#932), deferred: whether it
+    /// The equipment write `set_equipment` makes (arismoko/horizon#932), deferred: whether it
     /// landed. False where the entity is gone or a client's copy refuses.
+    /// Update the live stack at a worn or held place in place to `resource`'s components (keeping
+    /// its item and count), journaled in `tx`, without re-equipping it or replaying equip sounds,
+    /// game events or attribute updates.
+    pub(super) fn game_edit(
+        &mut self,
+        place: &ItemPlace,
+        resource: &ItemStack,
+        tx: &Transaction,
+    ) -> bool {
+        if !self.transaction_holds(tx) || !self.places_simulated() {
+            return false;
+        }
+        self.notice_menu_place_write(place);
+        if let ItemPlace::Equipment { entity, slot } = place {
+            let Some(epoch) = self.native_lifecycle.epoch() else {
+                return false;
+            };
+            let living = LivingRef::new(mod_api::EntityRef::new(epoch, *entity));
+            self.journal_equipment(*entity);
+            return self.edit_living_equipment_in_place(living, *slot, resource);
+        }
+        if matches!(
+            place,
+            ItemPlace::PlayerHand { .. } | ItemPlace::PlayerSlot { .. }
+        ) {
+            let Some(player) = self.place_player(place) else {
+                return false;
+            };
+            let mut edited = false;
+            self.native_as_player(player, |g| {
+                let Some((item, count)) = g
+                    .player_place(place)
+                    .as_deref()
+                    .and_then(Option::as_ref)
+                    .map(|old| (old.item.clone(), old.count))
+                else {
+                    return;
+                };
+                if item != resource.item || count == 0 {
+                    return;
+                }
+                let updated = ItemStack {
+                    count,
+                    ..resource.clone()
+                };
+                g.journal_player(player);
+                if let Some(slot) = g.player_place(place) {
+                    *slot = Some(updated);
+                    edited = true;
+                }
+            });
+            return edited;
+        }
+        false
+    }
+
     fn write_entity_equipment(
         &mut self,
         entity: u32,
@@ -420,6 +513,9 @@ impl Game<'_> {
     /// Drops `stack` at the middle of the block at `pos`, as a block entity's handler gives up
     /// what it can't put back.
     pub(super) fn drop_at(&mut self, pos: [i32; 3], stack: ItemStack) {
+        if self.entity_ids_exhausted() {
+            return;
+        }
         if self.places_simulated() && stack.count > 0 {
             // `Block.popResource`'s default pickup delay, at the root commit.
             self.after_commit(After::Drop(pos, stack));
@@ -470,6 +566,7 @@ pub(super) mod tests {
             max_players: 2,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         };
         game.lan_host(settings, net, config).unwrap();
     }
@@ -499,8 +596,230 @@ pub(super) mod tests {
         guest
     }
 
+    /// The single-player owner is a guest of the server thread: outside their own turn (a
+    /// payload handler, a server tick) their places are their guest record's, though their
+    /// UUID is the acting fallback, not the host game's own inventory (#18472).
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
+    fn the_owners_places_outside_their_turn_are_their_guest_records() {
+        with_game(|game| {
+            open_to_lan(game);
+            let owner = game.native_acting_id();
+            let mut player = guest(1);
+            player.uuid = owner;
+            player.inventory[3] = Some(ItemStack::new("minecraft:paper", 16));
+            game.lan.as_mut().unwrap().hub.guests.push(player);
+            game.inventory[3] = Some(ItemStack::new("minecraft:dirt", 1));
+            let slot = ItemPlace::PlayerSlot {
+                player: owner,
+                slot: 3,
+            };
+            let read = slot.stack(game).map(|stack| stack.item().id(&*game));
+            assert_eq!(read.as_deref(), Some("minecraft:paper"));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn whole_stack_component_edit_preserves_slot_and_refuses_item_or_count_changes() {
+        use mod_api::Tag;
+        with_game(|game| {
+            open_to_lan(game);
+            let mut player = guest(1);
+            player.inventory[3] = Some(ItemStack::new("minecraft:paper", 16));
+            game.lan.as_mut().unwrap().hub.guests.push(player);
+            let host_before = game.inventory.clone();
+            let dropped_before = game.dropped.len();
+            let inventory =
+                |game: &super::Game<'_>| game.lan.as_ref().unwrap().hub.guests[0].inventory.clone();
+            let mut expected = inventory(game);
+            let name = Tag::String("named paper".into());
+            expected[3].as_mut().unwrap().data_mut().custom_name = Some(name.clone());
+            let slot = ItemPlace::PlayerSlot {
+                player: 123,
+                slot: 3,
+            };
+            let result = game.transaction(|host, tx| {
+                Ok::<_, ()>(slot.edit(host, tx, |stack| {
+                    stack
+                        .apply_components(&[("minecraft:custom_name".into(), name)].into())
+                        .unwrap();
+                }))
+            });
+            assert_eq!(result, Ok(true));
+            assert_eq!(game.dropped.len(), dropped_before);
+            assert_eq!(
+                inventory(game),
+                expected,
+                "all 16 named paper stay in slot 3"
+            );
+            assert_eq!(game.inventory, host_before);
+
+            // Refusing the edit must not need an outer abort to keep the slot intact.
+            assert_eq!(
+                game.transaction(|host, tx| {
+                    Ok::<_, ()>(slot.edit(host, tx, |stack| stack.set_count(15).unwrap()))
+                }),
+                Ok(false)
+            );
+            assert_eq!(inventory(game), expected);
+            let stone = ItemStack::new("minecraft:stone", 16)
+                .try_into_api()
+                .unwrap();
+            assert_eq!(
+                game.transaction(|host, tx| {
+                    Ok::<_, ()>(slot.edit(host, tx, |stack| *stack = stone))
+                }),
+                Ok(false)
+            );
+            assert_eq!(inventory(game), expected);
+            assert_eq!(game.inventory, host_before);
+
+            let empty = ItemPlace::PlayerSlot {
+                player: 123,
+                slot: 4,
+            };
+            assert_eq!(
+                game.transaction(|host, tx| {
+                    Ok::<_, ()>(empty.edit(host, tx, |_| panic!("empty place ran editor")))
+                }),
+                Ok(false)
+            );
+            assert_eq!(inventory(game), expected);
+            assert_eq!(game.dropped.len(), dropped_before);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn whole_stack_component_edit_rolls_back_with_its_transaction() {
+        use mod_api::Tag;
+        with_game(|game| {
+            open_to_lan(game);
+            let mut player = guest(1);
+            player.inventory[3] = Some(ItemStack::new("minecraft:paper", 16));
+            game.lan.as_mut().unwrap().hub.guests.push(player);
+            let inventory =
+                |game: &super::Game<'_>| game.lan.as_ref().unwrap().hub.guests[0].inventory.clone();
+            let before = inventory(game);
+            let slot = ItemPlace::PlayerSlot {
+                player: 123,
+                slot: 3,
+            };
+            let mut named = ItemStack::new("minecraft:paper", 1);
+            named.data_mut().custom_name = Some(Tag::String("copied name".into()));
+            let source = named.try_into_api().unwrap();
+            let mut expected = before.clone();
+            expected[3].as_mut().unwrap().data_mut().custom_name =
+                Some(Tag::String("copied name".into()));
+            let expected_stack = expected[3].as_ref().unwrap().try_into_api().unwrap();
+            let original_stack = before[3].as_ref().unwrap().try_into_api().unwrap();
+            assert_eq!(
+                game.transaction(|host, tx| {
+                    assert!(slot.edit(host, tx, |stack| {
+                        stack.copy_component_from(&source, "minecraft:custom_name");
+                    }));
+                    assert_eq!(slot.stack(host), Some(expected_stack.clone()));
+                    Err::<(), ()>(())
+                }),
+                Err(())
+            );
+            assert_eq!(inventory(game), before);
+
+            // A child abort restores the slot even when the parent goes on to commit.
+            assert_eq!(
+                game.transaction(|host, _| {
+                    let child = host.transaction(|host, tx| {
+                        assert!(slot.edit(host, tx, |stack| {
+                            stack.copy_component_from(&source, "minecraft:custom_name");
+                        }));
+                        Err::<(), ()>(())
+                    });
+                    assert_eq!(child, Err(()));
+                    assert_eq!(slot.stack(host), Some(original_stack.clone()));
+                    Ok::<(), ()>(())
+                }),
+                Ok(())
+            );
+            assert_eq!(inventory(game), before);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn editing_worn_equipment_updates_in_place_without_reequipping() {
+        use mod_api::{EquipmentSlot, HostTransaction, ItemPlace, Tag};
+        with_game(|game| {
+            let kind = game.res.mob_types().get("minecraft:zombie").unwrap().clone();
+            let mut mob = horizon_client::mobs::Mob::new(
+                9010,
+                kind,
+                horizon_core::geometry::Vec3::new(0.5, 64.0, 0.5),
+                0.0,
+            );
+            mob.first_tick = false;
+            assert!(mob.set_equipment_stack(
+                EquipmentSlot::Chest as usize,
+                Some(ItemStack::new("minecraft:diamond_chestplate", 1)),
+            ));
+            game.mobs.push(mob);
+            let place = ItemPlace::Equipment {
+                entity: 9010,
+                slot: EquipmentSlot::Chest,
+            };
+            let mut named = ItemStack::new("minecraft:diamond_chestplate", 1);
+            named.data_mut().custom_name = Some(Tag::String("patched".into()));
+            let source = named.try_into_api().unwrap();
+
+            // Editing components in place must not queue After::Equip or replay equip sounds.
+            game.audio.capture = Some(Vec::new());
+            let committed: Result<(), ()> = game.transaction(|host, tx| {
+                assert!(place.edit(host, tx, |stack| {
+                    stack.copy_component_from(&source, "minecraft:custom_name");
+                }));
+                Ok(())
+            });
+            assert_eq!(committed, Ok(()));
+            let worn = horizon_client::mobs::finalize::item_stack(
+                game.mobs.iter().find(|m| m.id == 9010).unwrap(),
+                EquipmentSlot::Chest as usize,
+            )
+            .unwrap();
+            assert_eq!(
+                worn.data().and_then(|d| d.custom_name.as_ref()),
+                Some(&Tag::String("patched".into()))
+            );
+            assert!(
+                game.audio.capture.as_ref().unwrap().is_empty(),
+                "editing worn equipment in place must not play an equip sound: {:?}",
+                game.audio.capture
+            );
+
+            // Aborting the transaction rolls back the in-place equipment edit.
+            let mut other = ItemStack::new("minecraft:diamond_chestplate", 1);
+            other.data_mut().custom_name = Some(Tag::String("rolled-back".into()));
+            let other_api = other.try_into_api().unwrap();
+            let aborted: Result<(), ()> = game.transaction(|host, tx| {
+                assert!(place.edit(host, tx, |stack| {
+                    stack.copy_component_from(&other_api, "minecraft:custom_name");
+                }));
+                Err(())
+            });
+            assert_eq!(aborted, Err(()));
+            let worn = horizon_client::mobs::finalize::item_stack(
+                game.mobs.iter().find(|m| m.id == 9010).unwrap(),
+                EquipmentSlot::Chest as usize,
+            )
+            .unwrap();
+            assert_eq!(
+                worn.data().and_then(|d| d.custom_name.as_ref()),
+                Some(&Tag::String("patched".into()))
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn a_bucket_fills_and_empties_whole_through_its_place_and_splits_off_its_stack() {
         use horizon_client::chunk::Chunk;
         use mod_api::{BlockUpdateFlags, FLUIDS, ITEM_FLUIDS, move_resources};
@@ -583,7 +902,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_guests_place_is_written_as_theirs_and_an_abort_puts_it_back() {
         with_game(|game| {
             open_to_lan(game);
@@ -631,7 +950,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn an_armour_slot_holds_one() {
         with_game(|game| {
             open_to_lan(game);
@@ -654,7 +973,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn stand_equipment_effects_wait_for_root_commit() {
         with_game(|game| {
             let mut stand = horizon_client::entities::ArmorStand::new(
@@ -743,12 +1062,12 @@ pub(super) mod tests {
         30
     }
 
-    /// A living entity's [`ENTITY_ITEMS`] is its equipment (#932): seven slots by
+    /// A living entity's [`ENTITY_ITEMS`] is its equipment (arismoko/horizon#932): seven slots by
     /// `EquipmentSlot`'s ordinal, the armour ones taking only what their `equippable`
     /// names for that kind, the writes transactional — an abort puts the equipment back
     /// and stays quiet, a commit is `set_equipment`'s write.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn living_equipment_moves_through_the_entity_items_handler() {
         with_game(|game| {
             let id = zombie(game);
@@ -818,9 +1137,9 @@ pub(super) mod tests {
     }
 
     /// A committed equipment write through the handler is `set_equipment`'s: the same
-    /// stacks, and the same attribute map (#941's live map reads the worn armour).
+    /// stacks, and the same attribute map (arismoko/horizon#941's live map reads the worn armour).
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_committed_equipment_write_matches_set_equipments() {
         use mod_api::EquipmentSlot;
         with_game(|game| {
@@ -865,7 +1184,7 @@ pub(super) mod tests {
                 b.equipment_stacks().get(4).cloned(),
                 "the same worn stack"
             );
-            // The attribute map answers the same armour for both (#941).
+            // The attribute map answers the same armour for both (arismoko/horizon#941).
             let read = |game: &super::Game<'_>, id: u32| {
                 let living = game.living(game.entity(id).unwrap()).unwrap();
                 let host: &dyn mod_api::Host = game;
@@ -880,7 +1199,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_creative_players_selected_stack_takes_what_fits_and_keeps_it() {
         with_game(|game| {
             open_to_lan(game);
@@ -911,7 +1230,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_kept_handler_reaches_nothing_once_its_cart_is_removed() {
         use super::super::{
             commands::Target,
@@ -939,7 +1258,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn bound_armour_comes_off_only_in_creative() {
         with_game(|game| {
             open_to_lan(game);
@@ -979,7 +1298,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn an_equippable_whose_entity_tag_holds_the_player_fits_its_slot() {
         use mod_api::{ComponentId, Tag};
         with_game(|game| {
@@ -1017,7 +1336,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_kept_handler_reaches_nothing_once_its_world_closes() {
         use super::super::minecarts::{CartKind, Minecart};
         with_game(|game| {
@@ -1071,7 +1390,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_chest_menus_slots_write_the_chest_and_the_inventory_and_an_abort_puts_them_back() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
         use mod_api::BlockUpdateFlags;
@@ -1154,7 +1473,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_chests_menu_over_the_furnace_set_in_its_place_reaches_none_of_its_slots() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
         use mod_api::BlockUpdateFlags;
@@ -1220,7 +1539,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn an_armour_slot_and_the_craft_result_take_only_what_the_inventory_menu_lets_them() {
         with_game(|game| {
             open_to_lan(game);
@@ -1249,7 +1568,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_crafting_grid_write_makes_its_result_at_the_commit() {
         with_game(|game| {
             open_to_lan(game);
@@ -1291,7 +1610,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_mods_chest_menu_is_written_by_slot_and_a_replaced_menu_writes_nothing() {
         with_game(|game| {
             open_to_lan(game);
@@ -1328,7 +1647,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_furnace_menus_fuel_slot_takes_one_bucket_as_its_slot_does() {
         use horizon_client::{chunk::Chunk, lan::menu::Slots};
         use mod_api::BlockUpdateFlags;
@@ -1379,7 +1698,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_stale_menus_cursor_reaches_nothing_of_the_next_ones() {
         with_game(|game| {
             open_to_lan(game);
@@ -1403,7 +1722,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_grid_written_in_and_around_an_aborted_child_makes_its_result_from_what_stays() {
         with_game(|game| {
             open_to_lan(game);
@@ -1448,7 +1767,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_players_items_go_where_inventory_add_puts_them_and_an_abort_puts_them_back() {
         with_game(|game| {
             open_to_lan(game);
@@ -1549,7 +1868,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_trade_between_two_players_moves_both_offers() {
         with_game(|game| {
             traders(game, None);
@@ -1565,7 +1884,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_trade_into_a_full_inventory_moves_nothing() {
         with_game(|game| {
             // The buyer's other slots and off hand hold stone, so only slot 0 is free once the
@@ -1579,7 +1898,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_stale_offer_moves_nothing() {
         with_game(|game| {
             traders(game, None);
@@ -1605,7 +1924,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn scoped_boat_slots_use_the_open_menu_and_refuse_a_removed_owner() {
         use super::super::boats::Boat;
         use horizon_core::geometry::Vec3;
@@ -1647,7 +1966,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_chest_minecarts_items_are_its_slots() {
         use super::super::minecarts::{CartKind, Minecart};
         with_game(|game| {
@@ -1657,7 +1976,10 @@ pub(super) mod tests {
                 .push(Minecart::new(500, CartKind::Chest, position));
             let host: &mut dyn ServerHost = game;
             let cart = host.entity(500).unwrap();
-            assert_eq!(cart.kind(host).as_deref(), Some("minecraft:chest_minecart"));
+            assert_eq!(
+                cart.kind(host).map(|kind| kind.id(host)).as_deref(),
+                Some("minecraft:chest_minecart")
+            );
             let items = cart.capability(host, &ENTITY_ITEMS, ()).unwrap();
             assert_eq!(items.size(host), 27);
             let sticks =
@@ -1689,7 +2011,7 @@ pub(super) mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn cart_slot_edits_prefer_the_menu_and_refuse_a_removed_owner() {
         use super::super::minecarts::{CART_KEY_Y, CartKind, Minecart};
         use horizon_core::geometry::Vec3;
@@ -1870,7 +2192,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_hopper_pushes_into_a_mod_entity_below_it_through_the_side_it_faces() {
         let bin = Bin::default();
         with_bin_pigs(&bin, |game| {
@@ -1893,7 +2215,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_hopper_pushes_into_a_block_with_no_block_entity_whose_provider_voids_the_items() {
         use mod_api::{self, Hooks, ModEntry, Mods, Registrar};
         /// A trash can's one slot: it takes anything and keeps nothing.
@@ -1981,7 +2303,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_hopper_pulls_from_a_mod_entity_above_it_through_its_bottom() {
         let bin = Bin::default();
         *bin.held.lock().unwrap() = Some(("minecraft:stick".into(), 5));
@@ -2004,7 +2326,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_hopper_still_fills_a_chest_minecart_and_a_player_is_not_reached() {
         use super::super::minecarts::{CartKind, Minecart};
         let bin = Bin::default();
@@ -2038,7 +2360,7 @@ pub(super) mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dropper_puts_into_a_mod_entity_in_front_of_it() {
         use horizon_client::chunk::Chunk;
         let bin = Bin::default();
@@ -2081,7 +2403,7 @@ pub(super) mod tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_crafter_puts_into_a_mod_entity_and_dispenses_only_what_it_refuses() {
         use horizon_client::chunk::Chunk;
         use horizon_core::{position::BlockPos, random::RandomSource as _};
@@ -2150,7 +2472,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mod_without_an_automation_provider_leaves_hoppers_on_the_vanilla_path() {
         use horizon_core::random::RandomSource as _;
         use mod_api::{
@@ -2185,13 +2507,13 @@ pub(super) mod tests {
         });
     }
 
-    /// #932, review: an armor stand's equipment through the same handler —
+    /// arismoko/horizon#932, review: an armor stand's equipment through the same handler —
     /// a hopper dressing a stand — journaled like a mob's, an abort putting
-    /// #932, review: an armor stand's equipment through the same handler —
+    /// arismoko/horizon#932, review: an armor stand's equipment through the same handler —
     /// a hopper dressing a stand — journaled like a mob's, an abort putting
     /// it back and a commit matching `set_equipment`.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn an_armor_stands_equipment_moves_through_the_handler() {
         use horizon_client::entities::ArmorStand;
         use horizon_core::geometry::Vec3;
@@ -2289,6 +2611,184 @@ pub(super) mod tests {
                 assert_eq!(items.amount(host, 4), 0);
             }
             assert_eq!(stand_slot(game, 0), None);
+        });
+    }
+
+    /// A chunk at the origin, open to LAN, with a full water cauldron at (2, 64, 0).
+    fn with_cauldron(game: &mut super::Game<'_>) -> mod_api::LevelRef {
+        use horizon_client::chunk::Chunk;
+        use mod_api::BlockUpdateFlags;
+        open_to_lan(game);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        let level = game.level("minecraft:overworld").unwrap();
+        let state = horizon_world::chunk::BlockState {
+            name: "minecraft:water_cauldron".to_owned(),
+            properties: [("level".to_owned(), "3".to_owned())].into_iter().collect(),
+        };
+        let full = game.pack.assets.registry.resolve(&state).unwrap();
+        let flags = BlockUpdateFlags::NEIGHBORS;
+        assert_eq!(
+            game.level_set_block(level, [2, 64, 0], full, flags),
+            Ok(true)
+        );
+        level
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_scratch_stack_lives_in_its_transaction_and_keeps_its_item() {
+        use mod_api::{FLUIDS, ITEM_FLUIDS, move_resources};
+        with_game(|game| {
+            let level = with_cauldron(game);
+            let cauldron = game.world.block(2, 64, 0);
+            let api = |name, count| ItemStack::new(name, count).try_into_api().unwrap();
+            let bucket = api("minecraft:bucket", 1);
+            let buckets = ItemResource::of(&bucket);
+            let stick = ItemResource::of(&api("minecraft:stick", 1));
+            let host: &mut dyn ServerHost = game;
+            // Made in a transaction that aborts, it goes with it.
+            let made = host.transaction(|host, tx| {
+                Err::<(), _>(host.scratch_stack(tx, bucket.clone()).unwrap().unwrap())
+            });
+            let lost = made.unwrap_err();
+            let gone = host.transaction(|host, tx| Ok::<_, ()>(host.scratch_take(tx, &lost)));
+            assert_eq!(gone, Ok(None));
+            let got = host.transaction(|host, tx| {
+                let place = host.scratch_stack(tx, bucket.clone()).unwrap().unwrap();
+                assert_eq!(place.insert(host, tx, &buckets, 2), 2);
+                // Another item has nowhere to go: a scratch stack doesn't spill.
+                assert_eq!(place.insert(host, tx, &stick, 1), 0);
+                assert_eq!(place.amount(host), 3);
+                // Filling it would make it a water bucket, another item: refused.
+                let block = level.capability(host, &FLUIDS, [2, 64, 0], None).unwrap();
+                let held = place.capability(host, &ITEM_FLUIDS).unwrap();
+                let filled = move_resources(host, &block, &held, |_| true, 1000, tx);
+                assert_eq!(filled, Ok(0));
+                Ok::<_, ()>(host.scratch_take(tx, &place))
+            });
+            assert_eq!(got, Ok(Some(api("minecraft:bucket", 3))));
+            assert_eq!(game.world.block(2, 64, 0), cauldron);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_scratch_stack_merges_into_its_parent_and_ends_with_the_outermost() {
+        with_game(|game| {
+            open_to_lan(game);
+            let bucket = ItemStack::new("minecraft:bucket", 1)
+                .try_into_api()
+                .unwrap();
+            let buckets = ItemResource::of(&bucket);
+            let host: &mut dyn ServerHost = game;
+            let place = host.transaction(|host, _| {
+                // Made and filled in a child that commits: the parent keeps it as it was left.
+                let place = host
+                    .transaction(|host, tx| {
+                        let place = host.scratch_stack(tx, bucket.clone()).unwrap().unwrap();
+                        assert_eq!(place.insert(host, tx, &buckets, 1), 1);
+                        Ok::<_, ()>(place)
+                    })
+                    .unwrap();
+                assert_eq!(place.amount(host), 2);
+                // A child that writes it and aborts puts it back.
+                let aborted = host.transaction(|host, tx| {
+                    assert_eq!(place.insert(host, tx, &buckets, 3), 3);
+                    assert_eq!(place.amount(host), 5);
+                    Err::<(), _>(())
+                });
+                assert_eq!(aborted, Err(()));
+                assert_eq!(place.amount(host), 2);
+                Ok::<_, ()>(place)
+            });
+            // The outermost close ends it: nothing reads or takes it after.
+            let place = place.unwrap();
+            assert_eq!(place.amount(host), 0);
+            let taken = host.transaction(|host, tx| Ok::<_, ()>(host.scratch_take(tx, &place)));
+            assert_eq!(taken, Ok(None));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_strict_slot_refuses_what_the_plain_slot_spreads() {
+        use horizon_client::chunk::Chunk;
+        use mod_api::BlockUpdateFlags;
+        with_game(|game| {
+            open_to_lan(game);
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+            let level = game.level("minecraft:overworld").unwrap();
+            let chest = game.pack.assets.registry.default_state("minecraft:chest");
+            let flags = BlockUpdateFlags::NEIGHBORS;
+            assert_eq!(
+                game.level_set_block(level, [0, 64, 0], chest.unwrap(), flags),
+                Ok(true)
+            );
+            let slots = |game: &mut super::Game<'_>| {
+                let Some(BlockEntity::Chest(items)) =
+                    game.world.block_entities.get_mut(&(0, 64, 0))
+                else {
+                    panic!("no chest")
+                };
+                items[..2].to_vec()
+            };
+            if let Some(BlockEntity::Chest(items)) = game.world.block_entities.get_mut(&(0, 64, 0))
+            {
+                items[0] = Some(ItemStack::new("minecraft:stick", 64));
+            }
+            let stick =
+                ItemResource::of(&ItemStack::new("minecraft:stick", 1).try_into_api().unwrap());
+            let place = ItemPlace::BlockEntity {
+                level,
+                pos: [0, 64, 0],
+                side: None,
+                slot: 0,
+            };
+            let strict = ItemPlace::Strict(Box::new(place.clone()));
+            let host: &mut dyn ServerHost = game;
+            let went = |host: &mut dyn ServerHost, at: &ItemPlace| {
+                host.transaction(|host, tx| Ok::<_, ()>(at.insert(host, tx, &stick, 5)))
+            };
+            assert_eq!(went(&mut *host, &strict), Ok(0));
+            assert_eq!(went(&mut *host, &place), Ok(5));
+            assert_eq!(
+                slots(game),
+                [
+                    Some(ItemStack::new("minecraft:stick", 64)),
+                    Some(ItemStack::new("minecraft:stick", 5))
+                ]
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn one_by_one_shows_one_bucket_of_sixteen_and_fills_one() {
+        use mod_api::{FLUIDS, ITEM_FLUIDS, move_resources};
+        with_game(|game| {
+            let level = with_cauldron(game);
+            let mut player = guest(1);
+            player.inventory[0] = Some(ItemStack::new("minecraft:bucket", 16));
+            game.lan.as_mut().unwrap().hub.guests.push(player);
+            let one = ItemPlace::OneByOne(Box::new(ItemPlace::PlayerSlot {
+                player: 123,
+                slot: 0,
+            }));
+            let host: &mut dyn ServerHost = game;
+            assert_eq!(one.amount(host), 1);
+            let block = level.capability(host, &FLUIDS, [2, 64, 0], None).unwrap();
+            let bucket = one.capability(host, &ITEM_FLUIDS).unwrap();
+            let moved = host
+                .transaction(|host, tx| move_resources(host, &block, &bucket, |_| true, 1000, tx));
+            assert_eq!(moved, Ok(1000));
+            let held = game.lan.as_ref().unwrap().hub.guests[0].inventory.clone();
+            assert_eq!(held[0], Some(ItemStack::new("minecraft:bucket", 15)));
+            let water = Some(ItemStack::new("minecraft:water_bucket", 1));
+            assert!(held.contains(&water));
         });
     }
 }

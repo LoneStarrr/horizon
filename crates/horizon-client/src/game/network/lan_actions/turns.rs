@@ -38,7 +38,12 @@ impl Game<'_> {
         self.leave_guest(swap);
         match result {
             Ok(result) => Ok(result),
-            Err(payload) => std::panic::resume_unwind(payload),
+            Err(payload) => {
+                // The record now holds what the turn did before the panic; the restore above
+                // also hid the turn from `lan_acting`, so crash teardown is told here.
+                self.lan_interrupted_turns.push(conn);
+                std::panic::resume_unwind(payload)
+            }
         }
     }
 
@@ -76,7 +81,11 @@ impl Game<'_> {
         }
         match result {
             Ok(result) => self.lan.is_some().then_some(result),
-            Err(payload) => std::panic::resume_unwind(payload),
+            Err(payload) => {
+                // `as_guest` saw this turn end normally: the panic was caught inside it.
+                self.lan_interrupted_turns.push(conn);
+                std::panic::resume_unwind(payload)
+            }
         }
     }
 
@@ -201,6 +210,10 @@ impl Game<'_> {
         motion.invulnerable = abilities.invulnerable || g.handover.is_some();
         // `ServerPlayer.isInvulnerableTo`'s connection term, as of now.
         motion.client_loaded = g.client_loaded();
+        // The mods' collision exclusions are the guest's (arismoko/horizon#3717).
+        motion
+            .collision_exclusions
+            .clone_from(&g.collision_exclusions);
         let _ = motion.set_health(g.health, false);
         motion.health.food.food = g.food;
         motion.health.food.saturation = g.saturation;
@@ -248,6 +261,7 @@ impl Game<'_> {
                 level: g.xp_level,
                 progress: g.xp_progress,
                 total: g.xp_total,
+                score: g.score,
             },
         );
         let level_up_sound = std::mem::replace(&mut self.level_up_sound, play.level_up_sound);
@@ -259,7 +273,7 @@ impl Game<'_> {
         }
         // The window's screens are the host's: a sign, book, command block or
         // mount menu the guest's action opens is not drawn over the host's
-        // world (#687). The guest's client opens its own.
+        // world (arismoko/horizon#687). The guest's client opens its own.
         let screen = std::mem::replace(&mut self.screen, Screen::Playing);
         let host_sign = self.sign_edit.take();
         let host_book = self.book.take();
@@ -278,7 +292,7 @@ impl Game<'_> {
         let destroy_delay = std::mem::replace(&mut self.destroy_delay, play.destroy_delay);
         let using = std::mem::replace(&mut self.using, play.using.take());
         let use_duration = std::mem::replace(&mut self.use_duration, play.use_duration);
-        let use_ticks_set = std::mem::replace(&mut self.use_ticks_set, play.use_ticks_set);
+        let use_start = std::mem::replace(&mut self.use_start, std::mem::take(&mut play.use_start));
         let use_delay = std::mem::replace(&mut self.use_delay, play.use_delay);
         let shield_cooldown = std::mem::replace(&mut self.shield_cooldown, play.shield_cooldown);
         let cooldowns = std::mem::replace(&mut self.cooldowns, std::mem::take(&mut play.cooldowns));
@@ -294,6 +308,7 @@ impl Game<'_> {
         self.right = play.using.is_some() || self.using.is_some();
         // The guest's vehicle (Entity.vehicle) for its turn.
         let riding = std::mem::replace(&mut self.riding, g.vehicle);
+        self.lan_outer_ridings.push(riding);
         // `Entity.isPassenger()` for that turn, from the same vehicle: the
         // guest's body keeps no swim (`Entity.updateSwimming` needs it false).
         // Taken from `g.vehicle` each turn, so boarding and getting out land.
@@ -384,14 +399,14 @@ impl Game<'_> {
             &mut self.applied_modifiers,
             std::mem::take(&mut play.modifiers),
         );
-        // Its worn armour on its attributes, when it changed.
+        // Its equipment on its attributes, when it changed (once its tick saw a new hand item).
         let selected_item = self.inventory.get(self.selected).and_then(Option::as_ref);
         let unchanged = play.equipped.as_deref().is_some_and(|eq| {
             eq.len() == self.armor.len() + 1
                 && eq[..self.armor.len()] == self.armor[..]
                 && eq[self.armor.len()].as_ref() == selected_item
         });
-        if !unchanged {
+        if !unchanged && (play.equipped.is_none() || self.held_item_ticked()) {
             let mut equipped: Vec<Option<ItemStack>> = self.armor.to_vec();
             equipped.push(selected_item.cloned());
             self.apply_equipment();
@@ -440,8 +455,9 @@ impl Game<'_> {
             mining,
             destroy_delay,
             using,
+
             use_duration,
-            use_ticks_set,
+            use_start,
             use_delay,
             shield_cooldown,
             cooldowns,
@@ -495,7 +511,7 @@ impl Game<'_> {
             .unwrap_or_default();
         // The callbacks a turn ends with (combat, armor, the totem, the food hook) can reach a
         // mod and panic. The swap is still restored below and the guest's progress written
-        // back; the panic resumes at the end (#2240). `as_guest_at` calls this after catching a
+        // back; the panic resumes at the end (arismoko/horizon#2240). `as_guest_at` calls this after catching a
         // panic of the turn itself, so a panic here then goes on in place of that one.
         let callbacks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if !turn_events.is_empty() {
@@ -537,6 +553,15 @@ impl Game<'_> {
             Ok(totem) => (totem, None),
             Err(payload) => (None, Some(payload)),
         };
+        // Crash teardown treats the turn as interrupted until it has been put back without a
+        // panic: the callbacks below run after the restore and can panic too.
+        self.lan_interrupted_turns.push(swap.conn);
+        // A turn opened inside this one by a raw `enter_guest` that a panic left open: its
+        // player's record is displaced too, and the pop below would forget them.
+        if let Some(at) = self.lan_guest_swaps.iter().rposition(|&c| c == swap.conn) {
+            let above = self.lan_guest_swaps[at + 1..].to_vec();
+            self.lan_interrupted_turns.extend(above);
+        }
         let GuestSwap {
             attachments,
             conn,
@@ -570,8 +595,9 @@ impl Game<'_> {
             mining,
             destroy_delay,
             using,
+
             use_duration,
-            use_ticks_set,
+            use_start,
             use_delay,
             shield_cooldown,
             cooldowns,
@@ -747,6 +773,7 @@ impl Game<'_> {
         self.level.spawn = respawn.1;
         // ServerPlayer.displayClientMessage(_, true): the guest's action bar.
         let guest_message = std::mem::replace(&mut self.message, message);
+        self.lan_outer_ridings.pop();
         let guest_vehicle = std::mem::replace(&mut self.riding, riding);
         self.left = left;
         self.right = right;
@@ -754,7 +781,7 @@ impl Game<'_> {
         play.destroy_delay = std::mem::replace(&mut self.destroy_delay, destroy_delay);
         play.using = std::mem::replace(&mut self.using, using);
         play.use_duration = std::mem::replace(&mut self.use_duration, use_duration);
-        play.use_ticks_set = std::mem::replace(&mut self.use_ticks_set, use_ticks_set);
+        play.use_start = std::mem::replace(&mut self.use_start, use_start);
         play.use_delay = std::mem::replace(&mut self.use_delay, use_delay);
         play.shield_cooldown = std::mem::replace(&mut self.shield_cooldown, shield_cooldown);
         play.cooldowns = std::mem::replace(&mut self.cooldowns, cooldowns);
@@ -846,6 +873,7 @@ impl Game<'_> {
             g.xp_level = new_xp.level;
             g.xp_progress = new_xp.progress;
             g.xp_total = new_xp.total;
+            g.score = new_xp.score;
             self.mode = mode;
             self.creative = creative;
             self.entity_reach = entity_reach;
@@ -1039,6 +1067,9 @@ impl Game<'_> {
         if let Some(payload) = panic {
             std::panic::resume_unwind(payload);
         }
+        if let Some(i) = self.lan_interrupted_turns.iter().rposition(|&c| c == conn) {
+            self.lan_interrupted_turns.remove(i);
+        }
     }
 
     /// `ServerLevel.broadcastDamageEvent` for a guest that took an unblocked hit.
@@ -1064,7 +1095,7 @@ impl Game<'_> {
 
     /// `LivingEntity.playHurtSound` for a guest: the server's `Entity.playSound`
     /// reaches every player around but the hurt one, whose own client plays it
-    /// from `handleDamageEvent` (#4149).
+    /// from `handleDamageEvent` (arismoko/horizon#4149).
     pub(super) fn guest_hurt_sound(&mut self, conn: u32, sound: &str) {
         let Some(at) = self
             .lan

@@ -3,7 +3,7 @@
 //! their face is lost or when badly hurt, and shrugging off arrows while
 //! closed.
 use super::{
-    Damage, DamageKind, Mob, MobEvent, MobWorld, Species, Who,
+    Damage, Mob, MobEvent, MobWorld, Species, Who,
     anim::{Poses, State},
     control::LookKind,
     goals::{
@@ -15,7 +15,7 @@ use crate::projectiles::{Projectile, ProjectileWorld, STEPS};
 use horizon_core::geometry::trig::Mth;
 use horizon_core::{
     geometry::{Aabb, Direction, ShapeOp, Vec3, VoxelShape},
-    random::{LegacyRandom, RandomSource},
+    random::{LevelRandom, RandomSource},
 };
 use std::f32::consts::PI;
 
@@ -49,9 +49,23 @@ pub fn peek_height_scale(m: &Mob) -> Option<f32> {
     (m.extra.variant3 == DOWN && peek > 0.0).then_some(1.0 + peek)
 }
 
+/// `Shulker.finalizeSpawn`: a new shulker faces yaw 0 (`setYRot(0.0F)`), its body follows (`yBodyRot`), and
+/// `setOldPosAndRot` brings the previous rotations (and the head's, which a creation path drew at random) to
+/// it. Only the spawn path calls it: a shulker loaded from NBT keeps its saved `Rotation`.
+pub fn finalize_spawn(m: &mut Mob) {
+    if m.species() == crate::mobs::Species::Shulker {
+        m.yaw = 0.0;
+        m.previous_yaw = 0.0;
+        m.body_yaw = 0.0;
+        m.previous_body_yaw = 0.0;
+        m.head_yaw = 0.0;
+        m.previous_head_yaw = 0.0;
+        m.previous_head_pitch = m.head_pitch;
+    }
+}
+
 pub fn register(m: &mut Mob) {
     m.no_gravity = true;
-    m.yaw = 0.0;
     m.body_yaw = 0.0;
     m.previous_body_yaw = 0.0;
     if m.extra.color == 0 && m.extra.variant == 0 {
@@ -390,13 +404,14 @@ fn teleport(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) -> bool {
             1.0,
             1.0,
         ));
-        super::living::teleports::snap_to(
+        super::living::teleports::snap_to_with(
             m,
             Vec3::new(
                 f64::from(t[0]) + 0.5,
                 f64::from(t[1]),
                 f64::from(t[2]) + 0.5,
             ),
+            w.section_writer.clone(),
         );
         // `level.gameEvent(GameEvent.TELEPORT, oldPos, Context.of(this))`:
         // the BlockPos overload uses `Vec3.atCenterOf(oldPos)`, between the
@@ -524,9 +539,10 @@ pub fn keep_eased_peek(slot: &mut Mob, old: &Mob) {
 /// [`shell_tick`].
 pub fn tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     m.velocity = Vec3::ZERO;
+    // `LivingEntity.travel` still moves it by that zero motion: the move meets
+    // nothing below, so `setOnGroundWithMovement` clears a loaded `OnGround`.
+    m.on_ground = false;
     m.body_yaw = 0.0;
-    m.yaw = 0.0;
-    m.head_pitch = 0.0;
     shell_tick(m, w, events);
 }
 /// `Shulker.tick`'s own part, which runs with or without AI: a shell that
@@ -677,9 +693,9 @@ pub fn render_offset(m: &Mob, alpha: f32) -> glam::DVec3 {
         -f64::from(current[2] - old[2]) * scale,
     )
 }
-/// `Shulker.hurtServer` before the damage: arrows bounce off a closed shell.
-pub fn accepts(m: &Mob, source: &Damage) -> bool {
-    !(m.extra.counter == 0 && source.kind == DamageKind::Arrow)
+/// `Shulker.hurtServer`: direct AbstractArrow entities, including ThrownTrident, bounce off a closed shell.
+pub fn accepts(m: &Mob, source: &Damage, attack: &crate::health::Attack) -> bool {
+    !(m.extra.counter == 0 && attack.direct_is_arrow(source))
 }
 /// `Shulker.hurtServer` after the damage: below half health, a one in four
 /// chance to teleport away.
@@ -718,7 +734,7 @@ pub fn hurt_teleport(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
 pub fn run_pending_teleports(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut LegacyRandom,
+    level_random: &mut LevelRandom,
     events: &mut Vec<MobEvent>,
 ) {
     hurt_teleport(m, w, events);
@@ -732,7 +748,7 @@ pub fn run_pending_teleports(
 pub fn ai_step(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut LegacyRandom,
+    level_random: &mut LevelRandom,
     events: &mut Vec<MobEvent>,
 ) {
     run_pending_teleports(m, w, level_random, events);
@@ -744,7 +760,7 @@ pub fn ai_step(
 fn hit_by_shulker_bullet(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut LegacyRandom,
+    level_random: &mut LevelRandom,
     events: &mut Vec<MobEvent>,
 ) {
     let old_position = m.position;
@@ -899,30 +915,30 @@ impl Goal for Peek {
     }
 }
 /// The shell's texture: plain or dyed.
-pub fn texture(m: &Mob) -> String {
+pub fn texture(m: &Mob) -> &'static str {
     const COLORS: [&str; 16] = [
-        "white",
-        "orange",
-        "magenta",
-        "light_blue",
-        "yellow",
-        "lime",
-        "pink",
-        "gray",
-        "light_gray",
-        "cyan",
-        "purple",
-        "blue",
-        "brown",
-        "green",
-        "red",
-        "black",
+        "entity/shulker/shulker_white",
+        "entity/shulker/shulker_orange",
+        "entity/shulker/shulker_magenta",
+        "entity/shulker/shulker_light_blue",
+        "entity/shulker/shulker_yellow",
+        "entity/shulker/shulker_lime",
+        "entity/shulker/shulker_pink",
+        "entity/shulker/shulker_gray",
+        "entity/shulker/shulker_light_gray",
+        "entity/shulker/shulker_cyan",
+        "entity/shulker/shulker_purple",
+        "entity/shulker/shulker_blue",
+        "entity/shulker/shulker_brown",
+        "entity/shulker/shulker_green",
+        "entity/shulker/shulker_red",
+        "entity/shulker/shulker_black",
     ];
     // Shulker.getColor: the saved byte is signed; 16 and above are undyed, and
     // DyeColor.byId sends a negative id to white (OutOfBoundsStrategy.ZERO).
     match m.extra.color as i8 {
-        16.. => "entity/shulker/shulker".into(),
-        c => format!("entity/shulker/shulker_{}", COLORS[c.max(0) as usize]),
+        16.. => "entity/shulker/shulker",
+        c => COLORS[c.max(0) as usize],
     }
 }
 /// `attachFace.getOpposite().getRotation()` by attach face: the open
@@ -1098,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn teleport_closes_raw_peek_without_adding_covered() {
         assert!(super::super::world::with_built_test_world(
             &[],
@@ -1120,7 +1136,9 @@ mod tests {
             |world, _| {
                 let mut m = shulker();
                 m.position = Vec3::new(0.5, 64.0, 0.5);
-                m.random = LegacyRandom::new(0);
+                m.random = horizon_core::random::EntityRandom::own(
+                    horizon_core::random::LegacyRandom::new(0),
+                );
                 let mut events = Vec::new();
                 set_peek(&mut m, 100, &mut events, world.attributes);
                 assert!(modifiers(&m, world.attributes).is_empty());
@@ -1221,6 +1239,22 @@ mod tests {
         assert_eq!(posted(&events), ["minecraft:container_close"]);
     }
 
+    /// `Shulker.setDeltaMovement` is empty: a hit's knockback leaves the shell where it is.
+    #[test]
+    fn a_hit_does_not_move_a_shulker() {
+        let mut m = shulker();
+        m.on_ground = true;
+        m.knockback(
+            &mut crate::health::TestLevel::new(0).level(),
+            0.4,
+            3.0,
+            -4.0,
+            &Damage::of(crate::mobs::DamageKind::Thrown),
+            1.0,
+        );
+        assert_eq!(m.velocity, Vec3::ZERO);
+    }
+
     /// A shulker fixed to a block face.
     pub(super) fn shulker() -> Mob {
         let mut kind = kind();
@@ -1281,8 +1315,13 @@ mod tests {
     #[test]
     fn a_closed_shell_refuses_an_arrow() {
         let mut fixture = crate::health::TestLevel::new(0);
-        let mut level = fixture.level();
-        let source = Damage::of(DamageKind::Arrow);
+        let attack = crate::health::Attack {
+            projectile: Some(2),
+            projectile_is_arrow: true,
+            ..Default::default()
+        };
+        let mut level = fixture.level().attacked_by(&attack);
+        let source = Damage::of(super::super::DamageKind::Arrow);
         let mut closed = shulker();
         closed.extra.counter = 0;
         let health = closed.health;
@@ -1333,6 +1372,19 @@ mod tests {
         assert_eq!(m.extra.counter, 0);
         assert_eq!(m.extra.scratch[0], 0);
         assert_eq!(render_offset(&m, 0.0), glam::DVec3::ZERO);
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn loaded_rotation_survives_a_shulker_tick() {
+        assert!(crate::mobs::world::with_test_world(&[], |world, _| {
+            let mut m = shulker();
+            m.yaw = 73.0;
+            m.head_pitch = -24.0;
+            register(&mut m);
+            tick(&mut m, world, &mut Vec::new());
+            assert_eq!([m.yaw, m.head_pitch], [73.0, -24.0]);
+        }));
     }
 
     #[test]

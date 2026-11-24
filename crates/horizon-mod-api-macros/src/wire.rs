@@ -57,23 +57,23 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
         return Ok(quote! {
             #[automatically_derived]
             impl #imp #w::Wire for #name #ty #clause {
-                const MIN: usize = <#via as #w::Wire>::MIN;
-                const LAYOUT_SEED: u64 = #w::layout_name("via");
-                fn layout(visiting: &mut Vec<&'static str>) -> u64 {
+                const MIN: ::core::primitive::usize = <#via as #w::Wire>::MIN;
+                const LAYOUT_SEED: ::core::primitive::u64 = #w::layout_name("via");
+                fn layout(visiting: &mut ::std::vec::Vec<&'static ::core::primitive::str>) -> ::core::primitive::u64 {
                     <#via as #w::Wire>::layout(visiting)
                 }
                 fn put(&self, out: &mut #w::Writer) {
                     out.put(&<#via as ::core::convert::From<&Self>>::from(self));
                 }
                 fn put_owned(self, out: &mut #w::Writer) { self.put(out); }
-                fn take(input: &mut #w::Reader<'_>) -> Result<Self, #w::WireError> {
+                fn take(input: &mut #w::Reader<'_>) -> ::core::result::Result<Self, #w::WireError> {
                     <Self as ::core::convert::TryFrom<#via>>::try_from(input.take::<#via>()?)
-                        .map_err(|_| #w::WireError::Invalid(stringify!(#name)))
+                        .map_err(|_| #w::WireError::Invalid(::core::stringify!(#name)))
                 }
             }
         });
     }
-    let mut layout = quote!(#w::layout_name(stringify!(#name)));
+    let mut layout = quote!(#w::layout_name(::core::stringify!(#name)));
     let mut min = quote!(0usize);
     let mut puts = Vec::new();
     let mut owned = Vec::new();
@@ -96,7 +96,8 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
                     .as_ref()
                     .map_or_else(|| index.to_string(), ToString::to_string);
                 let ft = &field.ty;
-                schema.push(quote!((#label, <#ft as #w::Wire>::layout(&mut vec![]))));
+                schema
+                    .push(quote!((#label, <#ft as #w::Wire>::layout(&mut ::std::vec::Vec::new()))));
                 check_owned(&field.ty)?;
                 let ft = &field.ty;
                 min = quote!(#min + <#ft as #w::Wire>::MIN);
@@ -110,7 +111,7 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
         }
         Data::Enum(data) => {
             shape = "enum";
-            schema.push(quote!(("tag", <u32 as #w::Wire>::layout(&mut vec![]))));
+            schema.push(quote!(("tag", <::core::primitive::u32 as #w::Wire>::layout(&mut ::std::vec::Vec::new()))));
             min = quote!(4usize);
             nested = data
                 .variants
@@ -119,7 +120,8 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
             for (index, variant) in data.variants.iter().enumerate() {
                 let index = index as u32;
                 let case = &variant.ident;
-                layout = quote!(#w::layout_mix(#layout, #w::layout_name(stringify!(#case))));
+                layout =
+                    quote!(#w::layout_mix(#layout, #w::layout_name(::core::stringify!(#case))));
                 let (pat, _, binds) = fields(&variant.fields);
                 let pat = quote!(Self::#case #pat);
                 // `fields` returns a constructor beginning with Self; enum cases supply that prefix.
@@ -128,7 +130,9 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
                 let mut os = Vec::new();
                 if matches!(variant.fields, Fields::Unit) {
                     let label = format!("{index}:{case}");
-                    schema.push(quote!((#label, <() as #w::Wire>::layout(&mut vec![]))));
+                    schema.push(
+                        quote!((#label, <() as #w::Wire>::layout(&mut ::std::vec::Vec::new()))),
+                    );
                 }
                 for (field_index, (field, bind)) in variant.fields.iter().zip(binds).enumerate() {
                     let field_name = field
@@ -137,7 +141,9 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
                         .map_or_else(|| field_index.to_string(), ToString::to_string);
                     let label = format!("{index}:{case}.{field_name}");
                     let ft = &field.ty;
-                    schema.push(quote!((#label, <#ft as #w::Wire>::layout(&mut vec![]))));
+                    schema.push(
+                        quote!((#label, <#ft as #w::Wire>::layout(&mut ::std::vec::Vec::new()))),
+                    );
                     check_owned(&field.ty)?;
                     layout = field_layout(layout, field, &w);
                     ps.push(quote!(out.put(#bind);));
@@ -147,10 +153,10 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
                 owned.push(quote!(#pat => { out.put(&#index); #(#os)* }));
                 takes.push(quote!(#index => #build,));
             }
-            puts = vec![quote!(match self { #(#puts,)* _ => unreachable!() })];
-            owned = vec![quote!(match self { #(#owned,)* _ => unreachable!() })];
+            puts = vec![quote!(match self { #(#puts,)* _ => ::core::unreachable!() })];
+            owned = vec![quote!(match self { #(#owned,)* _ => ::core::unreachable!() })];
             takes = vec![
-                quote!(match input.take::<u32>()? { #(#takes)* tag => return Err(#w::WireError::Tag(tag)) }),
+                quote!(match input.take::<::core::primitive::u32>()? { #(#takes)* tag => return ::core::result::Result::Err(#w::WireError::Tag(tag)) }),
             ];
         }
         Data::Union(_) => return Err(syn::Error::new_spanned(name, "Wire cannot encode a union")),
@@ -162,9 +168,9 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
         layout = quote!(const { #layout });
     }
     let take = if nested {
-        quote!(input.nested(|input| Ok(#(#takes)*)))
+        quote!(input.nested(|input| ::core::result::Result::Ok(#(#takes)*)))
     } else {
-        quote!(Ok(#(#takes)*))
+        quote!(::core::result::Result::Ok(#(#takes)*))
     };
     let put = if nested {
         quote!(out.nested(|out| { #(#puts)* }))
@@ -181,7 +187,7 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
     let schema = internal_field_layouts.then(|| {
         quote! {
             #[cfg(test)]
-            fn __field_layouts() -> Option<Vec<(&'static str, u64)>> { Some(vec![#(#schema),*]) }
+            fn __field_layouts() -> ::core::option::Option<::std::vec::Vec<(&'static ::core::primitive::str, ::core::primitive::u64)>> { ::core::option::Option::Some(::std::vec![#(#schema),*]) }
         }
     });
     Ok(quote! {
@@ -189,9 +195,9 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
         #[automatically_derived]
             impl #imp #w::Wire for #name #ty #clause {
             #schema
-            const MIN: usize = #min;
-            const LAYOUT_SEED: u64 = #w::layout_name(stringify!(#name));
-            fn layout(visiting: &mut Vec<&'static str>) -> u64 {
+            const MIN: ::core::primitive::usize = #min;
+            const LAYOUT_SEED: ::core::primitive::u64 = #w::layout_name(::core::stringify!(#name));
+            fn layout(visiting: &mut ::std::vec::Vec<&'static ::core::primitive::str>) -> ::core::primitive::u64 {
                 let identity = ::core::any::type_name::<Self>();
                 if visiting.contains(&identity) { return #w::layout_name("recursive"); }
                 visiting.push(identity);
@@ -201,7 +207,7 @@ pub(crate) fn expand(mut input: DeriveInput) -> syn::Result<TokenStream> {
             }
             fn put(&self, out: &mut #w::Writer) { #put }
             fn put_owned(self, out: &mut #w::Writer) { #put_owned }
-            fn take(input: &mut #w::Reader<'_>) -> Result<Self, #w::WireError> { #take }
+            fn take(input: &mut #w::Reader<'_>) -> ::core::result::Result<Self, #w::WireError> { #take }
         }
     })
 }

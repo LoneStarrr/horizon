@@ -178,7 +178,7 @@ pub fn write_nbt(m: &Mob, map: &mut Compound) {
 /// `VillagerDataFinalized` nor `VillagerData` keeps the constructor's random
 /// profession and stays unfinalized.
 pub fn read_nbt(m: &mut Mob, tag: &Tag) {
-    let saved = tag.get("VillagerData").is_some();
+    let saved = matches!(tag.get("VillagerData"), Some(Tag::Compound(_)));
     let finalized = saved || crate::entity_nbt::flag(tag, "VillagerDataFinalized");
     // `readAdditionalSaveData` redraws only for a finalized save that carries
     // no `VillagerData` (`orElseGet(initializeZombieVillagerData)`); every
@@ -233,7 +233,13 @@ mod tests {
             let _ = after.next_int_bound(15);
             // `LivingEntity`'s yaw, drawn after `defineSynchedData`.
             let _ = after.next_float();
-            let m = Mob::with_random(1, kind(), Vec3::ZERO, 0.0, LegacyRandom::new(seed));
+            let m = Mob::with_random(
+                1,
+                kind(),
+                Vec3::ZERO,
+                0.0,
+                horizon_core::random::EntityRandom::own(LegacyRandom::new(seed)),
+            );
             assert_eq!(
                 i32::from(m.extra.profession.index().unwrap()),
                 first,
@@ -255,14 +261,64 @@ mod tests {
             read_nbt(m, &tag);
         };
         // Seed 42: the constructor's draw is 5, its second draw 3.
-        let mut kept = Mob::with_random(1, kind(), Vec3::ZERO, 0.0, LegacyRandom::new(42));
+        let mut kept = Mob::with_random(
+            1,
+            kind(),
+            Vec3::ZERO,
+            0.0,
+            horizon_core::random::EntityRandom::own(LegacyRandom::new(42)),
+        );
         let before = kept.random.state();
         load(&mut kept, "{}");
         assert_eq!(kept.extra.profession.index(), Some(5));
         assert_eq!(kept.random.state(), before);
-        let mut redrawn = Mob::with_random(1, kind(), Vec3::ZERO, 0.0, LegacyRandom::new(42));
+        let mut redrawn = Mob::with_random(
+            1,
+            kind(),
+            Vec3::ZERO,
+            0.0,
+            horizon_core::random::EntityRandom::own(LegacyRandom::new(42)),
+        );
         load(&mut redrawn, "{VillagerDataFinalized:1b}");
         assert_eq!(redrawn.extra.profession.index(), Some(3));
+    }
+
+    /// Non-compound `VillagerData` (e.g. `{VillagerData:0}`) fails `VillagerData.CODEC`
+    /// and is treated as absent through the full entity loader, both with and
+    /// without an explicit `VillagerDataFinalized: 1b`.
+    #[test]
+    fn non_compound_villager_data_is_treated_as_absent_on_load() {
+        let types = std::collections::HashMap::from([("minecraft:zombie_villager".into(), kind())]);
+        let load = |snbt: &str| {
+            let tag = horizon_core::nbt::parse_snbt(snbt).unwrap().0;
+            crate::entity_nbt::mob_from_nbt_with_random(
+                &tag,
+                &types,
+                1,
+                None,
+                horizon_core::random::EntityRandom::own(LegacyRandom::new(42)),
+            )
+            .expect("zombie villager")
+        };
+
+        let unfinalized =
+            load(r#"{id:"minecraft:zombie_villager",Pos:[0.0d,64.0d,0.0d],VillagerData:0}"#);
+        assert_eq!(unfinalized.extra.profession.index(), Some(5));
+        assert_eq!(
+            crate::entity_nbt::mob_to_nbt(&unfinalized, [1, 2, 3, 4], None, None, |_| None)
+                .get("VillagerDataFinalized"),
+            Some(&Tag::Byte(0))
+        );
+
+        let finalized = load(
+            r#"{id:"minecraft:zombie_villager",Pos:[0.0d,64.0d,0.0d],VillagerData:0,VillagerDataFinalized:1b}"#,
+        );
+        assert_eq!(finalized.extra.profession.index(), Some(3));
+        assert_eq!(
+            crate::entity_nbt::mob_to_nbt(&finalized, [1, 2, 3, 4], None, None, |_| None)
+                .get("VillagerDataFinalized"),
+            Some(&Tag::Byte(1))
+        );
     }
 
     #[test]
@@ -332,6 +388,7 @@ mod tests {
         let world = crate::world::World::new(air, 0);
         let lid_openers = std::collections::HashMap::new();
         let w = MobWorld {
+            mob_maps: horizon_client::neoforge_mob_maps::NeoForgeMobMaps::vanilla(),
             goal_host: None,
             live_mobs: None,
             teams: Default::default(),
@@ -360,6 +417,8 @@ mod tests {
             others_index: None,
             passenger_objects: &[],
             others_villagers: None,
+            village: None,
+            species_slots: None,
             others_solid: None,
             daylight: true,
             monsters_burn: false,
@@ -387,6 +446,7 @@ mod tests {
             asks_living_destroy_block: false,
             asks_baby_spawn: false,
             border: None,
+            section_writer: None,
         };
         for no_ai in [false, true] {
             let kind = std::sync::Arc::new(types.types["minecraft:zombie_villager"].clone());

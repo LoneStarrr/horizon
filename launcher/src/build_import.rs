@@ -12,6 +12,7 @@
 use crate::backend::{self, CLIENT};
 use crate::i18n::{tr, trf};
 use crate::native_mods::{self, Target};
+use horizon_port_pack::zip_intake::{self, Archive};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Cursor, Read, Seek};
@@ -92,8 +93,17 @@ fn base_for(
 
 /// Installs the game program at `path` (or the one inside an archive there) as a new version on
 /// the game files of `requested` (default: [`base_for`]), prepared from another version where it
-/// can be, and selects it. Importing the same program again selects the version it made before.
+/// can be, and uses it for the selected Horizon instance. Importing the same program again uses
+/// the version it made before.
 pub fn import(path: &Path, requested: Option<&str>) -> Result<String, String> {
+    import_for(path, requested, &crate::instances::selected())
+}
+
+pub fn import_for(
+    path: &Path,
+    requested: Option<&str>,
+    instance: &crate::instances::Instance,
+) -> Result<String, String> {
     let file = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -102,7 +112,10 @@ pub fn import(path: &Path, requested: Option<&str>) -> Result<String, String> {
     if !is_game(&program) {
         return Err(not_a_game(&file));
     }
-    let selected = backend::Settings::load().selected;
+    let selected = instance
+        .resolve_version(None)
+        .ok()
+        .filter(|tag| instance.version.is_some() || !crate::developer_install::is_developer(tag));
     let base = base_for(&backend::installed(), requested, selected.as_deref())?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tag = install_in(&backend::version_dir(""), &base, &program, &file, &date)?;
@@ -114,10 +127,7 @@ pub fn import(path: &Path, requested: Option<&str>) -> Result<String, String> {
         ));
     }
     backend::reuse_prepared_for(&tag);
-    // Read again: the window may have saved other settings during the copy.
-    let mut settings = backend::Settings::load();
-    settings.selected = Some(tag.clone());
-    settings.save()?;
+    crate::instances::use_version_for(&instance.id, &tag)?;
     Ok(tag)
 }
 
@@ -154,7 +164,7 @@ fn read_program(path: &Path, file: &str) -> Result<Vec<u8>, String> {
     if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
         return from_tar(open()?, file);
     }
-    let zip = match zip::ZipArchive::new(open()?) {
+    let zip = match zip_intake::open(open()?) {
         Ok(zip) => zip,
         // A download cut short, say.
         Err(e) if lower.ends_with(".zip") => return Err(format!("{file}: {e}")),
@@ -173,7 +183,7 @@ fn holds_no_game(file: &str) -> String {
 
 /// The game in `zip`, else (`nested`) in the first zip or .tar.gz it holds.
 fn from_zip<R: Read + Seek>(
-    mut zip: zip::ZipArchive<R>,
+    mut zip: Archive<R>,
     file: &str,
     nested: bool,
 ) -> Result<Vec<u8>, String> {
@@ -207,7 +217,7 @@ fn from_zip<R: Read + Seek>(
     if !name.ends_with(".zip") {
         return from_tar(&archive[..], file);
     }
-    let zip = zip::ZipArchive::new(Cursor::new(archive)).map_err(|e| format!("{name}: {e}"))?;
+    let zip = zip_intake::open(Cursor::new(archive)).map_err(|e| format!("{name}: {e}"))?;
     from_zip(zip, file, false)
 }
 
@@ -252,8 +262,8 @@ fn is_game(program: &[u8]) -> bool {
     };
     magic.iter().any(|m| program.starts_with(m))
         && program
-            .windows(horizon_mod_package::game_identity::MARK.len())
-            .any(|w| w == horizon_mod_package::game_identity::MARK)
+            .windows(horizon_platform::mod_package::game_identity::MARK.len())
+            .any(|w| w == horizon_platform::mod_package::game_identity::MARK)
 }
 
 /// Installs `program` in `versions` as a copy of installed version `base` with it in place of
@@ -392,7 +402,12 @@ mod tests {
         } else {
             b"\x7fELF"
         };
-        [magic, body, &horizon_mod_package::game_identity::MARK[..]].concat()
+        [
+            magic,
+            body,
+            &horizon_platform::mod_package::game_identity::MARK[..],
+        ]
+        .concat()
     }
 
     #[test]
@@ -481,25 +496,32 @@ mod tests {
     fn only_a_horizon_game_for_this_computer_is_imported() {
         assert!(is_game(&program(b"")));
         let marked = program(b"");
-        let unmarked = &marked[..marked.len() - horizon_mod_package::game_identity::MARK.len()];
+        let unmarked =
+            &marked[..marked.len() - horizon_platform::mod_package::game_identity::MARK.len()];
         assert!(!is_game(unmarked));
         // Retired WIT levels, partial signatures and mutated signatures aren't game identity.
         for mark in [
             &b"horizon-mod-api-level:0007;"[..],
-            &horizon_mod_package::game_identity::MARK
-                [..horizon_mod_package::game_identity::MARK.len() - 1],
+            &horizon_platform::mod_package::game_identity::MARK
+                [..horizon_platform::mod_package::game_identity::MARK.len() - 1],
             &b"horizon-game-executable:"[..],
         ] {
             assert!(!is_game(&[unmarked, mark].concat()));
         }
-        assert!(!is_game(&horizon_mod_package::game_identity::MARK));
+        assert!(!is_game(
+            &horizon_platform::mod_package::game_identity::MARK
+        ));
         let other = if cfg!(windows) {
             &b"\x7fELF"[..]
         } else {
             &b"MZ"[..]
         };
         assert!(!is_game(
-            &[other, &horizon_mod_package::game_identity::MARK[..]].concat()
+            &[
+                other,
+                &horizon_platform::mod_package::game_identity::MARK[..]
+            ]
+            .concat()
         ));
         let d = dir("zip");
         let zip_path = d.join("horizon-client-windows-x86_64.zip");

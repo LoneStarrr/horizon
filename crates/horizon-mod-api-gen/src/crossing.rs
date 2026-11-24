@@ -1,4 +1,4 @@
-//! How a game internal crosses to a wasm mod (#589 W): one rule for both sides, the mod's generated
+//! How a game internal crosses to a wasm mod (arismoko/horizon#589 W): one rule for both sides, the mod's generated
 //! view and the game's generated table, read from the same `internals.json` signatures.
 //!
 //! - A **copy** is plain data all the way down, at most [`LEAVES`] scalars: it crosses as a value.
@@ -168,7 +168,7 @@ pub enum Foreign {
     Bits,
 }
 
-/// The types of crates outside the workspace that cross by copy (#1409): the key and mouse
+/// The types of crates outside the workspace that cross by copy (arismoko/horizon#1409): the key and mouse
 /// state the input internals take. Their definitions are read from the source Cargo locked for
 /// the game, and listed in `internals.json` like the workspace's.
 pub const CROSSING_FOREIGN: &[(&str, Foreign)] = &[
@@ -392,7 +392,7 @@ fn bits_struct(tokens: &proc_macro2::TokenStream, name: &str) -> Option<syn::Ite
 }
 
 /// Crates whose types are the mod API's own: the staging pass never widens them.
-const API_CRATES: &[&str] = &["mod_api", "mod_points", "point_shape"];
+const API_CRATES: &[&str] = &["mod_api", "mod_points", "horizon_engine_slots"];
 
 /// The game's crate: its paths are spelled from `crate`.
 const GAME: &str = "horizon_client";
@@ -1308,6 +1308,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn checked_in_foreign_layouts_match_the_locked_source() {
         let root = checkout();
         assert_eq!(
@@ -1372,6 +1373,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_stale_crossing_foreign_path_fails_with_its_name() {
         let metadata = cargo_metadata(&checkout()).unwrap();
         for (stale, foreign) in [

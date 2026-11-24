@@ -4,7 +4,7 @@ use super::*;
 include!("position_load_tests.rs");
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn neutral_load_restores_only_the_saved_live_target_with_or_without_listeners() {
     use std::sync::{Arc, Mutex};
 
@@ -112,7 +112,7 @@ fn neutral_load_restores_only_the_saved_live_target_with_or_without_listeners() 
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn resident_other_and_fangs_load_tick_and_reset() {
     super::super::native_entity_refs::tests::with_game(|game| {
         game.others.clear();
@@ -163,7 +163,7 @@ fn resident_other_and_fangs_load_tick_and_reset() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn comparator_and_hopper_live_state_survives_chunk_reload() {
     use super::super::{Audio, Options, Progress, Settings, load_resources};
     use horizon_client::{containers::BlockEntity, items::ItemStack, save};
@@ -432,7 +432,7 @@ fn comparator_and_hopper_live_state_survives_chunk_reload() {
 const MOUNT: [i32; 4] = [1, 2, 3, 4];
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn deferred_zombie_finalization_keeps_unknown_profession_through_save_and_cure() {
     super::super::native_entity_refs::tests::with_game(|game| {
         let mut tag = entity("minecraft:zombie_villager");
@@ -482,7 +482,12 @@ fn deferred_zombie_finalization_keeps_unknown_profession_through_save_and_cure()
             restored.position,
             0.0,
         );
-        super::super::zombie_villagers::convert_to_villager(&restored, &mut cured, false);
+        super::super::zombie_villagers::convert_to_villager(
+            &restored,
+            &mut cured,
+            false,
+            &world_stations!(game).enchantments,
+        );
         assert_eq!(cured.extra.profession.id(), "example:engineer");
     });
 }
@@ -661,7 +666,7 @@ fn saved_attachments_read_over_a_constructed_map_but_not_a_live_one() {
 /// with its `UUID`, and `horizon:attachments` where the mod set one), loaded and saved again:
 /// each comes back on the entity with its UUID, and its attachments with it.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn an_older_save_loads_its_entities_attachments_back_onto_them() {
     use super::super::{Audio, Game, Options, Progress, Settings, load_resources};
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -753,7 +758,7 @@ fn an_older_save_loads_its_entities_attachments_back_onto_them() {
     }
     // The level is a server's, whose attachments a mod reaches.
     game.options.dedicated = Some(Vec::new());
-    game.world.loaded_entities.push(((0, 0), tags));
+    game.world.queue_entity_nbt((0, 0), tags);
     game.spawn_loaded_entities();
     let saved = game.entity_chunks(&HashSet::from([(0, 0)]), false);
     let saved: Vec<&Tag> = saved.iter().flat_map(|(_, tags)| tags).collect();
@@ -808,7 +813,7 @@ fn an_older_save_loads_its_entities_attachments_back_onto_them() {
 /// A lingering potion's cloud is an entity of its chunk: unloading the chunk writes it and
 /// takes it out of the level, so loading the chunk again gives back one cloud, not two.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_lingering_cloud_leaves_with_its_chunk() {
     use super::super::{Audio, Game, Options, Progress, Settings, load_resources};
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -864,14 +869,14 @@ fn a_lingering_cloud_leaves_with_its_chunk() {
             .filter(|c| c.potion.is_some())
             .count()
     };
-    game.world.loaded_entities.push(((0, 0), vec![cloud]));
+    game.world.queue_entity_nbt((0, 0), vec![cloud]);
     game.spawn_loaded_entities();
     assert_eq!(clouds(&game), 1, "the cloud loads");
     let unloaded = game.entity_chunks(&HashSet::from([(0, 0)]), true);
     let written: Vec<Tag> = unloaded.into_iter().flat_map(|(_, tags)| tags).collect();
     assert_eq!(written.len(), 1, "the unload writes the cloud");
     assert_eq!(clouds(&game), 0, "and takes it out of the level");
-    game.world.loaded_entities.push(((0, 0), written));
+    game.world.queue_entity_nbt((0, 0), written);
     game.spawn_loaded_entities();
     assert_eq!(clouds(&game), 1, "loading the chunk again gives one cloud");
 }
@@ -942,7 +947,7 @@ fn a_fresh_add_is_told_apart_from_a_load_and_unmarked() {
 /// `NeutralMob.addPersistentAngerSaveData` names the mob the anger is at,
 /// also one never saved yet (a mob gets its UUID when it is first saved).
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn anger_at_a_mob_not_saved_yet_names_it() {
     use crate::game::{Audio, Options, Progress, Settings, load_resources};
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());

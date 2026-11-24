@@ -130,7 +130,7 @@ impl Game<'_> {
                 if !self.can_be_affected_resolved(Some(id as i32), &kind, name, Some(effect.id)) {
                     return false;
                 }
-                let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) else {
+                let Some(m) = self.mobs.iter_mut().find(|m| m.id == id && !m.removed) else {
                     return false;
                 };
                 let changed = m.add_effect_instance(name, instance);
@@ -295,7 +295,7 @@ impl Game<'_> {
                 }
                 self.mobs
                     .iter_mut()
-                    .find(|m| m.id == id)
+                    .find(|m| m.id == id && !m.removed)
                     .is_some_and(|m| m.retain_effects(|e| e.registry_index != Some(def.index)))
             }
             _ => false,
@@ -338,7 +338,7 @@ impl Game<'_> {
                     .map(|(name, _)| *name)
                     .collect();
                 // The refused removals keep their effects; the rest go.
-                self.mobs.iter_mut().find(|m| m.id == id).is_some_and(|m| {
+                self.mobs.iter_mut().find(|m| m.id == id && !m.removed).is_some_and(|m| {
                     m.retain_effects(|e| {
                         e.registry_index.is_some_and(|index| keep.contains(&index))
                     })
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn active_effect_ids_are_load_owned_slots() {
         with_game(|game| {
             let kind = game
@@ -401,7 +401,7 @@ mod tests {
     /// `MobEffectInstance.showIcon` crosses `add_effect` and the reads both ways, for a player and
     /// a mob, apart from the particle flag; adding it again with the other value changes it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_effects_icon_flag_is_written_and_read_for_players_and_mobs() {
         use horizon_client::motion::PlayerMotion;
         with_game(|game| {
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn resolved_keys_keep_the_mobs_hidden_effect_identity() {
         with_game(|game| {
             let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn indexed_consumable_effects_apply_to_a_mob() {
         use horizon_client::items::ItemStack;
         use horizon_core::random::RandomSource;
@@ -519,7 +519,7 @@ mod tests {
     /// interpolates during its first tick, a missing one reads 0, and no other
     /// entity reads.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_client_reads_the_local_players_effect_blend_factors() {
         use super::super::execution_role::ExecutionRole;
         use horizon_client::{effects::EffectInstance, motion::PlayerMotion};
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mob_takes_effects_by_the_games_own_paths() {
         with_game(|game| {
             for (id, kind) in [

@@ -11,7 +11,8 @@ fn pig(types: &crate::mobs::MobTypes, no_ai: bool, immune: bool, fire: i32) -> M
     mob.ai.goals = GoalSelector::default();
     mob.ai.targets = GoalSelector::default();
     mob.fire_ticks = fire;
-    mob.random = horizon_core::random::LegacyRandom::new(1);
+    mob.random =
+        horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(1));
     mob
 }
 
@@ -45,7 +46,7 @@ fn step(mob: &mut Mob, w: &MobWorld, environment: &str) -> (f32, i32, usize) {
 }
 
 #[test]
-#[ignore = "requires prepared 26.3 resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn wet_fire_damage_and_extinguishing_follow_the_full_mob_tick() {
     let root = std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES");
     assert!(crate::mobs::world::with_resource_test_world(

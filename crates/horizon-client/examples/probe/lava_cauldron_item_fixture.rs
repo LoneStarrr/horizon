@@ -60,7 +60,9 @@ pub fn main() -> horizon_client::Result<()> {
         let mut item = ItemEntity {
             attachment_lifetime: Default::default(),
             fall_distance: 0.0,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
             rotation: [0.0; 2],
             join: Default::default(),
             health: 5,
@@ -86,8 +88,13 @@ pub fn main() -> horizon_client::Result<()> {
         };
         output.push_str(f[0]);
         for _ in 0..2 {
+            // As the game ticks an item: `Entity.baseTick`'s burning, then the block effects.
             if item.health > 0 {
-                item.environment_tick(&world, &facts, assets.registry, &can_hurt);
+                let in_lava = item.in_lava(&world, &facts);
+                item.burning_tick(in_lava, &can_hurt);
+            }
+            if item.health > 0 {
+                item.environment_tick(&world, &facts, assets.registry, &can_hurt, false);
             }
             output.push_str(&format!(
                 "\t{},{},{}",

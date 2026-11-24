@@ -1,15 +1,11 @@
 //! Validated flat packages and launcher-owned horizon-mixins input.
 use super::{Bundle, MANIFEST};
-use horizon_mod_package::{manifest, Package};
+use horizon_platform::mod_package::mod_surface::uses::USES_FILE;
+use horizon_platform::mod_package::{manifest, Package};
 use std::{fs, path::Path};
 
 pub(super) fn read(dir: &Path) -> Result<Option<Bundle>, String> {
-    for old in [
-        "horizon-native.json",
-        "horizon-mixin.toml",
-        "native",
-        "rust",
-    ] {
+    for old in manifest::LEGACY_PATHS {
         if dir.join(old).exists() {
             return Err(format!("{}: unsupported package path {old}", dir.display()));
         }
@@ -18,9 +14,7 @@ pub(super) fn read(dir: &Path) -> Result<Option<Bundle>, String> {
         return Ok(None);
     }
     let package = Package::read(dir)?;
-    if package.manifest.native.is_none()
-        && (package.manifest.wasm.is_none() || package.manifest.inject.is_empty())
-    {
+    if package.manifest.native.is_none() {
         return Ok(None);
     }
     if let Some(state) = package
@@ -81,8 +75,13 @@ pub(super) fn tool_manifest(bundle: &Bundle) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// The copied package and its compatibility metadata must identify the same installed build.
 fn checked_files(bundle: &Bundle) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
-    Package::read(&bundle.dir)?.directory_files(&bundle.dir)
+    let mut files = Package::read(&bundle.dir)?.directory_files(&bundle.dir)?;
+    if let Ok(table) = fs::read(bundle.dir.join(USES_FILE)) {
+        files.insert(USES_FILE.to_owned(), table);
+    }
+    Ok(files)
 }
 
 pub(super) fn files(bundle: &Bundle) -> Result<Vec<(String, std::path::PathBuf)>, String> {
@@ -95,6 +94,8 @@ pub(super) fn files(bundle: &Bundle) -> Result<Vec<(String, std::path::PathBuf)>
         .collect())
 }
 
+/// The package's files and its uses table, which is no source file: a copy is judged against
+/// another game build as the package was.
 pub(super) fn copy(bundle: &Bundle, to: &Path) -> Result<(), String> {
     copy_files(to, checked_files(bundle)?)
 }
@@ -124,36 +125,38 @@ fn copy_files(to: &Path, files: impl IntoIterator<Item = (String, Vec<u8>)>) -> 
 ///
 /// A package that can't be read stops the scan, naming the mod: every enabled native mod compiles
 /// into one game binary, and every other native refusal stops that build the same way. Leaving
-/// one mod out would quietly build a different set than the player enabled.
+/// one mod out would quietly build a different set than the player enabled. The one exception is
+/// an installed `.hmod` in the format from before the SDK, which [`super::stage_installed`] leaves
+/// out with a warning in the build log: it can never build.
 pub(super) fn checked_bundles(folder: &Path) -> Result<Vec<Bundle>, String> {
-    let paths = horizon_mod_package::find(folder)
+    let paths = horizon_platform::mod_package::find(folder)
         .into_iter()
-        .chain(horizon_mod_package::find(
+        .chain(horizon_platform::mod_package::find(
             &folder
                 .parent()
                 .unwrap_or(folder)
-                .join(horizon_mod_package::mod_list::DIR),
+                .join(horizon_platform::mod_package::mod_list::DIR),
         ));
-    if let Some((id, error)) = horizon_mod_package::selection::package_errors(paths)
+    if let Some((id, error)) = horizon_platform::mod_package::selection::package_errors(paths)
         .into_iter()
         .next()
     {
         return Err(format!("{id}: {error}"));
     }
     let found = super::scan_bundles(folder)?;
-    let wasm: Vec<_> = horizon_mod_package::find(folder)
+    let wasm: Vec<_> = horizon_platform::mod_package::find(folder)
         .into_iter()
-        .chain(horizon_mod_package::find(
+        .chain(horizon_platform::mod_package::find(
             &folder
                 .parent()
                 .unwrap_or(folder)
-                .join(horizon_mod_package::mod_list::DIR),
+                .join(horizon_platform::mod_package::mod_list::DIR),
         ))
-        .filter_map(|path| horizon_mod_package::Package::read(&path).ok())
+        .filter_map(|path| horizon_platform::mod_package::Package::read(&path).ok())
         .filter(|package| package.manifest.wasm.is_some())
         .collect();
     for bundle in &found {
-        let dependent = horizon_mod_package::Package::read(&bundle.dir)?;
+        let dependent = horizon_platform::mod_package::Package::read(&bundle.dir)?;
         for library in &wasm {
             if !dependent
                 .manifest
@@ -228,7 +231,7 @@ mod mixed_tests {
             format!(
                 "{}[wasm]\nsha512='{}'\ntoolchain='t'\nbuilt_with='t'\n",
                 header("lib"),
-                horizon_mod_package::manifest::sha512_of(module),
+                horizon_platform::mod_package::manifest::sha512_of(module),
             ),
         )
         .unwrap();
@@ -269,7 +272,7 @@ mod state_tests {
     fn native_state_is_refused_before_staging() {
         let dir = super::super::tests::dir("state-refusal");
         super::super::tests::write_bundle(&dir, "stateful", "");
-        let path = dir.join(horizon_mod_package::manifest::MANIFEST);
+        let path = dir.join(horizon_platform::mod_package::manifest::MANIFEST);
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("\n[[native.state]]\nid='autosave'\ntarget='game::Game'\nty='u32'\ninitial='0'\nconstructor=[]\n");
         std::fs::write(path, text).unwrap();

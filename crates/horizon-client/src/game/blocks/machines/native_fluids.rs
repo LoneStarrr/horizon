@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_cauldron_move_the_target_takes_part_of_gives_the_whole_levels_that_fit() {
         use super::super::super::native_entity_refs::tests::with_game;
         use horizon_client::chunk::Chunk;
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mods_cauldron_fills_and_drains_by_its_levels_and_a_refusal_names_both_sides() {
         use super::super::super::native_entity_refs::tests::{
             record_key, run_fresh_cases, with_game_at,
@@ -621,6 +621,9 @@ mod tests {
                     honey: r.declare_fluid("honey"),
                     water: r.fluid_key("minecraft:water"),
                 };
+                // Its provider is declared only in the later cauldron-content event below.
+                // Coverage queries must not execute that future callback early.
+                assert!(!r.is_block_capability_registered(&FLUIDS, &keys.snow_cauldron));
                 record_key(&self.0, keys);
             }
             fn register_cauldron_fluid_content(
@@ -988,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_scoped_tank_can_refuse_a_fluid() {
         use super::super::super::native_entity_refs::tests::{run_fresh_cases, with_game_at};
         if run_fresh_cases(

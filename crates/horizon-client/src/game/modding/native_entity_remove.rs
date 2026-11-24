@@ -4,6 +4,8 @@
 //! `Entity.spawnAtLocation` drops an item at one.
 //! Outside a mod block-entity tick, `Entity.setRemoved` tells the world at the call:
 //! the handle and selectors stop finding it, passengers get off and mods hear it leave.
+//! Inside a transaction the handle stops finding it at the call, and the rest waits for the root
+//! commit (`transactions/entities.rs`); an abort leaves it as it was.
 //! Dropped-item removal inside that tick is instead staged with its final snapshot;
 //! scoped reads hide it immediately, while the leave notification waits for publication. A mob's list entry is marked at once too; the other
 //! kinds stay in their lists until the level's next sweep of departed
@@ -32,57 +34,55 @@ impl Game<'_> {
         match self.native_entity_target(entity) {
             // A part leaves the level with its dragon, never alone.
             None | Some(Target::Player | Target::Guest(_) | Target::DragonPart(_)) => false,
+            Some(Target::Item(id)) if self.block_entity_tick_key.is_some() => {
+                self.stage_tick_item(id, None).unwrap_or(false)
+            }
+            Some(t) if self.journal_removal(entity, t, killed) => true,
             Some(Target::Mob(id)) => {
                 self.remove_mob_now(id, killed);
                 true
             }
-            Some(Target::Item(id)) if self.block_entity_tick_key.is_some() => {
-                self.stage_tick_item(id, None).unwrap_or(false)
-            }
             Some(t) => {
-                // Read before the entity counts as removed: its handle stops resolving.
-                let vehicle_y = match t {
-                    Target::Boat(id) => {
-                        self.boats.iter().find(|b| b.id == id).map(|b| b.position.y)
-                    }
-                    Target::Cart(id) => {
-                        self.carts.iter().find(|c| c.id == id).map(|c| c.position.y)
-                    }
-                    _ => None,
-                };
-                let passengers: Vec<_> = self
-                    .entity_passengers(entity)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|passenger| {
-                        vehicle_y.is_none()
-                            || !matches!(
-                                self.native_entity_target(*passenger),
-                                Some(Target::Mob(_))
-                            )
-                    })
-                    .collect();
-                // `Entity.setRemoved`: the reason first, so the hooks below see
-                // it removed; then the passengers get off and the level is told.
-                // Only players and mobs ride, so this kind has no vehicle to leave.
-                self.persist.removals.push(t);
-                self.retire_vehicle_registration(t);
-                if vehicle_y.is_some() {
-                    self.persist.notified_vehicle_removals.insert(entity.id());
-                }
-                for passenger in passengers {
-                    self.entity_stop_riding(passenger);
-                }
-                if let Some(y) = vehicle_y {
-                    // Notify actual Mob edges here, including rejected objects.
-                    // A reentrant physical sweep must not notify them again.
-                    self.dismount_destroyed_vehicle_mobs(entity.id(), y);
-                    self.score_destroyed_vehicle_once(entity.id());
-                }
-                self.native_entity_left(entity.id());
+                self.remove_target_now(entity, t);
                 true
             }
         }
+    }
+    /// `Entity.setRemoved` of `t`, which `entity` names and is no mob, player or dragon part.
+    pub(in crate::game) fn remove_target_now(&mut self, entity: EntityRef, t: Target) {
+        // Read before the entity counts as removed: its handle stops resolving.
+        let vehicle_y = match t {
+            Target::Boat(id) => self.boats.iter().find(|b| b.id == id).map(|b| b.position.y),
+            Target::Cart(id) => self.carts.iter().find(|c| c.id == id).map(|c| c.position.y),
+            _ => None,
+        };
+        let passengers: Vec<_> = self
+            .entity_passengers(entity)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|passenger| {
+                vehicle_y.is_none()
+                    || !matches!(self.native_entity_target(*passenger), Some(Target::Mob(_)))
+            })
+            .collect();
+        // `Entity.setRemoved`: the reason first, so the hooks below see
+        // it removed; then the passengers get off and the level is told.
+        // Only players and mobs ride, so this kind has no vehicle to leave.
+        self.persist.removals.push(t);
+        self.retire_vehicle_registration(t);
+        if vehicle_y.is_some() {
+            self.persist.notified_vehicle_removals.insert(entity.id());
+        }
+        for passenger in passengers {
+            self.entity_stop_riding(passenger);
+        }
+        if let Some(y) = vehicle_y {
+            // Notify actual Mob edges here, including rejected objects.
+            // A reentrant physical sweep must not notify them again.
+            self.dismount_destroyed_vehicle_mobs(entity.id(), y);
+            self.score_destroyed_vehicle_once(entity.id());
+        }
+        self.native_entity_left(entity.id());
     }
     /// Drops `stack` at the entity's feet, `y_offset` above
     /// (`Entity.spawnAtLocation`), or 0.15 out along a frame or painting's
@@ -96,6 +96,9 @@ impl Game<'_> {
         stack: ItemStack,
         y_offset: f32,
     ) -> Option<EntityRef> {
+        if self.entity_ids_exhausted() {
+            return None;
+        }
         if !self.stack_spawns(&stack) {
             return None;
         }
@@ -118,8 +121,7 @@ impl Game<'_> {
             _ => at,
         };
         // Found by its id: the hooks the spawn runs may add entities after it.
-        let id = self.next_entity + 1;
-        self.spawn_at_location(Vec3::new(x, y, z), f64::from(y_offset), stack);
+        let (id, _) = self.spawn_at_location(Vec3::new(x, y, z), f64::from(y_offset), stack)?;
         self.dropped
             .iter()
             .rev()
@@ -128,10 +130,24 @@ impl Game<'_> {
     }
     /// A mob leaves the level: its effects act first when it was killed.
     fn remove_mob_now(&mut self, id: u32, killed: bool) {
-        let Some(i) = self.mobs.iter().position(|m| m.id == id && !m.removed) else {
+        if !self.mobs.iter().any(|m| m.id == id && !m.removed) {
+            return;
+        }
+        if killed {
+            self.mob_removal_effects(id);
+        }
+        if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
+            m.removed = true;
+        }
+        self.native_entity_left(id);
+    }
+    /// What a killed mob's effects do on removal (Oozing's slimes, Weaving's cobwebs, Wind
+    /// Charged's burst).
+    pub(in crate::game) fn mob_removal_effects(&mut self, id: u32) {
+        let Some(i) = self.mobs.iter().position(|m| m.id == id) else {
             return;
         };
-        if killed && !self.mobs[i].extra.effects.is_empty() {
+        if !self.mobs[i].extra.effects.is_empty() {
             let m = &self.mobs[i];
             let names: Vec<&'static str> = m
                 .extra
@@ -144,9 +160,6 @@ impl Game<'_> {
             if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
                 m.random = random;
             }
-        }
-        if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
-            m.removed = true;
         }
     }
     /// `AbstractMinecartContainer.remove` and `AbstractChestBoat.remove`: a
@@ -240,7 +253,7 @@ impl Game<'_> {
 mod tests {
     use crate::game::api_values::{StackReadError, TryIntoApi, test_snapshot};
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn destroying_a_cart_spills_all_slots_after_the_removal_flush() {
         use super::super::{
             minecarts::{CartKind, Minecart},
@@ -276,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn selectors_stop_matching_a_discarded_entity_before_the_sweep() {
         use super::super::{commands::OtherEntity, native_entity_refs::tests::with_game};
         use horizon_core::geometry::Vec3;
@@ -310,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    #[ignore = "daily"]
     fn removal_dismounts_and_tells_mods_once_at_the_call() {
         use super::super::{boats::Boat, native_entity_refs::tests::with_game};
         use horizon_client::mobs::Mob;
@@ -373,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn discard_other_clears_nbt_and_saved_entity() {
         use super::super::{commands::OtherEntity, native_entity_refs::tests::with_game};
         use horizon_client::{chunk::Chunk, save::SaveDir};
@@ -429,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn discard_mob_and_refuse_players_and_stale_handles() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::{mobs::Mob, motion::PlayerMotion};
@@ -456,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn spawn_at_location_drops_an_item_above_the_entity() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::{items::ItemStack, mobs::Mob};
@@ -509,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn spawn_at_location_offsets_hanging_entities_out_from_the_wall() {
         use super::super::native_entity_refs::tests::with_game;
         use horizon_client::entities::{ItemFrame, Painting};
@@ -532,7 +545,7 @@ mod tests {
                     invisible: false,
                     check_interval: 0,
                     custom_name: None,
-                    random: horizon_core::random::LegacyRandom::new(0),
+                    random: horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(0)),
                 });
             }
             game.paintings.push(Painting {
@@ -571,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn kill_command_forgets_other_entity_data() {
         use super::super::{commands::OtherEntity, native_entity_refs::tests::with_game};
         use horizon_core::geometry::Vec3;

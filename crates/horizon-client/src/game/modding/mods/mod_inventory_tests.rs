@@ -168,7 +168,7 @@ impl Hooks for Guard {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn code_only_reload_publishes_one_new_inventory_after_prepare_and_preserves_old_readers() {
     let fixture = Fixture::new("inventory-reload");
     hmod(&fixture.0, "machine_sample");
@@ -200,7 +200,7 @@ fn code_only_reload_publishes_one_new_inventory_after_prepare_and_preserves_old_
                 std::fs::write(pack.join("pack.mcmeta"), serde_json::to_vec(&serde_json::json!({
                 "pack": {"description":"inventory fixture", "min_format":horizon_core::version::DATA_PACK_FORMAT, "max_format":horizon_core::version::DATA_PACK_FORMAT}
             })).unwrap()).unwrap();
-                std::fs::write(recipes.join("requires_code.json"), br#"{"type":"inventorytest:probe","neoforge:conditions":[{"type":"neoforge:mod_loaded","modid":"machine_sample"}]}"#).unwrap();
+                std::fs::write(recipes.join("requires_code.json"), br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stick"},"neoforge:conditions":[{"type":"neoforge:mod_loaded","modid":"machine_sample"}]}"#).unwrap();
                 let tags = pack.join("data/inventorytest/tags/item");
                 std::fs::create_dir_all(&tags).unwrap();
                 std::fs::write(tags.join("requires_code.json"), br#"{"neoforge:conditions":[{"type":"neoforge:mod_loaded","modid":"machine_sample"}],"values":["minecraft:diamond"]}"#).unwrap();
@@ -260,7 +260,7 @@ fn code_only_reload_publishes_one_new_inventory_after_prepare_and_preserves_old_
                 let old_songs = game.items().songs.clone();
                 let read_tags = |game: &Game<'_>| game.items().item_tags.clone();
                 let read = |game: &Game<'_>| {
-                    crate::game::lan::server_sources(
+                    crate::game::lan::sync::server_sources(
                         &game.options.resources,
                         &game.res.core.item_data,
                         &game.pack_files(),
@@ -307,7 +307,10 @@ fn code_only_reload_publishes_one_new_inventory_after_prepare_and_preserves_old_
                     (false, false, false, false, false, false)
                 );
                 assert!(old_songs.contains_key("inventorytest:requires_code"));
-                assert!(!read_tags(game).contains_key("inventorytest:requires_code"));
+                // Tag files ignore load conditions, including mod_loaded.
+                assert!(
+                    read_tags(game)["inventorytest:requires_code"].contains("minecraft:diamond")
+                );
                 assert!(old_tags["inventorytest:requires_code"].contains("minecraft:diamond"));
                 assert!(has_recipe(&old));
                 assert!(mod_api::__private::set_mod_enabled("machine_sample", true));

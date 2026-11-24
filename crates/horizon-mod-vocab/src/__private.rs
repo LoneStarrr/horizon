@@ -5,6 +5,54 @@ use crate::*;
 #[path = "__private/registry_installation.rs"]
 mod registry_installation;
 
+/// Native libraries' launcher-to-game registration contract, not a mod-facing API.
+/// The launcher generates manifest rows independently of hook factories. The game checks
+/// them against the packages beside its executable (`horizon_mod_package::runtime`).
+/// These types live in the shared API closure so every library uses the same Rust ABI.
+pub mod native {
+    /// A point listener a library registered. None exists since the injection points were removed
+    /// (#19576): `NativeMod::slots` returns an empty list of it.
+    pub enum SlotListener {}
+
+    /// One dynamically loaded native library, registered before the engine seal.
+    pub struct NativeMod {
+        /// Hook factories owned by this library.
+        pub entries: fn() -> Vec<crate::ModEntry>,
+        /// Always empty since the injection points were removed (#19576). The field stays until
+        /// the next planned break of this registration ABI.
+        pub slots: fn() -> Vec<SlotListener>,
+        /// Manifest identities (empty for the patch library).
+        pub built: &'static [BuiltMod],
+        /// Install patch copies and return their verification rows.
+        pub installs: fn() -> Vec<(&'static str, &'static [&'static str], bool)>,
+    }
+
+    impl NativeMod {
+        /// The library's registration, as its generated entry module builds it.
+        pub fn new(
+            entries: fn() -> Vec<crate::ModEntry>,
+            slots: fn() -> Vec<SlotListener>,
+            built: &'static [BuiltMod],
+            installs: fn() -> Vec<(&'static str, &'static [&'static str], bool)>,
+        ) -> Self {
+            Self {
+                entries,
+                slots,
+                built,
+                installs,
+            }
+        }
+    }
+
+    /// One native mod supplied by a library, with its manifest's `side`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct BuiltMod {
+        pub id: &'static str,
+        pub version: &'static str,
+        pub side: crate::Side,
+    }
+}
+
 /// Switch an installed mod's dispatches on or off, returning whether it was found.
 pub fn set_mod_enabled(id: &str, on: bool) -> bool {
     crate::set_mod_enabled(id, on)
@@ -36,14 +84,45 @@ pub fn listened(hook: HookId) -> bool {
     crate::listened(hook)
 }
 
+/// Whether at least one enabled mod subscribes to `hook`, visiting only its subscribers.
+pub fn enabled_listened(hook: HookId) -> bool {
+    crate::runtime::enabled_listened(hook)
+}
+
+/// Whether any part subscribed to the scoped entity hook `hook` is attached to
+/// entity type `kind`, so a family's walk can resolve its rows' slots once per
+/// pass instead of naming each row's type.
+pub fn entity_part_hooked(hook: HookId, name: &'static str, kind: &str) -> bool {
+    crate::parts::parts(hook, name)
+        .for_hook(hook)
+        .is_some_and(|table| !table.entity(|| Some(kind)).is_empty())
+}
+
+/// Whether a block entity type has opted into the scene-only ticker.
+pub fn scene_block_entity_ticker(kind: &str) -> Option<BlockEntityTypeKey> {
+    let hook = HookId::BlockEntitySceneTick;
+    if !crate::parts::has_part_hook(hook) {
+        return None;
+    }
+    let parts = crate::parts::parts(hook, "block_entity_scene_tick");
+    if parts
+        .for_hook(hook)?
+        .block_entity_kind(|| Some(kind))
+        .is_empty()
+    {
+        return None;
+    }
+    crate::content::registry_keys::block_entity_type_key(kind)
+}
+
 /// A read backend wrapper for a host the game builds narrowed: the mob tick's
-/// goal view hands itself out as its own backend (#1077).
+/// goal view hands itself out as its own backend.
 pub fn backend_ref(inner: &dyn Backend) -> crate::BackendRef<'_> {
     crate::BackendRef::of(inner)
 }
 /// Call `read` on `host`'s real backend, or `None` where the host has none:
 /// the mob tick's goal view forwards the level's own reads — blocks, loaded
-/// chunks, time, height, weather, block entities — through it (#1077); the
+/// chunks, time, height, weather, block entities — through it; the
 /// entity data its snapshot does not carry stays refused. Returned borrows stay tied to the host.
 pub fn backend_read<'a, R>(
     host: &'a dyn crate::Host,
@@ -62,6 +141,25 @@ pub fn installed_code_ids() -> impl Iterator<Item = &'static str> {
     crate::mods().iter().map(|entry| entry.id)
 }
 
+/// What the installed code mod `id` carries that a joining client must have, as the end of a
+/// sentence about the mod: its first subscription to a client-side hook, its first part that
+/// subscribes to one, or its first required payload channel sent to clients. The engine refuses
+/// a `side = "server"` mod that has one. Read once the parts are installed.
+pub fn client_requirement(id: &str) -> Option<String> {
+    let mine = || crate::mods().iter().filter(|entry| entry.id == id);
+    if let Some(hook) = mine().find_map(|entry| entry.client_hook()) {
+        return Some(format!("listens to the client hook {hook}"));
+    }
+    let installed = crate::parts::installed()?;
+    if let Some((part, hook)) = installed.client_part(id) {
+        return Some(format!(
+            "attaches the part {part}, which listens to the client hook {hook}"
+        ));
+    }
+    let channel = installed.keys.payloads.as_ref()?.client_bound(id)?;
+    Some(format!("sends the required payload {channel} to clients"))
+}
+
 /// The command argument types mods registered at startup, by namespaced id, for the game's
 /// command trees. Not part of the mod surface.
 pub fn command_argument_types() -> Vec<(String, std::sync::Arc<dyn crate::CommandArgumentType>)> {
@@ -69,6 +167,24 @@ pub fn command_argument_types() -> Vec<(String, std::sync::Arc<dyn crate::Comman
         .iter()
         .map(|info| (info.id.to_string(), info.argument.clone()))
         .collect()
+}
+
+/// The selector tokens mods registered at startup, by name, for the game's command
+/// registries. Not part of the mod surface.
+pub fn entity_selector_types() -> impl Iterator<Item = (&'static str, &'static crate::SelectorBase)>
+{
+    crate::parts::installed_entity_selectors()
+        .iter()
+        .map(|info| (info.name.as_ref(), &info.base))
+}
+
+/// Resolve an installed selector's handler by reference, without allocating or cloning a resource.
+pub fn entity_selector_type(name: &str) -> Option<&'static dyn crate::EntitySelectorType> {
+    let selectors = crate::parts::installed_entity_selectors();
+    selectors
+        .binary_search_by(|info| info.name.as_ref().cmp(name))
+        .ok()
+        .map(|index| selectors[index].selector.as_ref())
 }
 
 /// The startup package inventory at an owning engine load boundary.
@@ -90,6 +206,123 @@ pub mod built {
         env!("OUT_DIR"),
         "/mod_api_exports_private_built.rs"
     ));
+    /// The generator's surface snapshot, constructed by the game and only read by mods.
+    pub fn terrain_column(
+        height: i32,
+        block: String,
+        water: Option<i32>,
+        biome: String,
+    ) -> crate::TerrainColumn {
+        crate::TerrainColumn {
+            height,
+            block,
+            water,
+            biome,
+        }
+    }
+    /// The loaded client surface snapshot, constructed by the game and only read by mods.
+    pub fn surface_column(
+        height: i32,
+        block: crate::BlockState,
+        biome: String,
+        sky_light: u8,
+        block_light: u8,
+    ) -> crate::SurfaceColumn {
+        crate::SurfaceColumn {
+            height,
+            block,
+            biome,
+            sky_light,
+            block_light,
+        }
+    }
+    /// A chunk journal entry, constructed by the game and read by mods.
+    pub fn chunk_delta(pos: [i32; 2], loaded: bool) -> crate::ChunkDelta {
+        crate::ChunkDelta { pos, loaded }
+    }
+    /// The current result of replaying a loaded chunk journal.
+    pub fn chunk_deltas(
+        cursor: crate::ChunkDeltaCursor,
+        full: bool,
+        changes: Vec<crate::ChunkDelta>,
+    ) -> crate::ChunkDeltas {
+        crate::ChunkDeltas {
+            cursor,
+            full,
+            changes,
+        }
+    }
+    /// A retained material run, constructed by the game from the LOD tile.
+    pub fn lod_column_footprint(
+        min_y: i16,
+        top_y: i16,
+        state: crate::BlockStateId,
+        biome: String,
+        sky_light: u8,
+        block_light: u8,
+    ) -> crate::LodColumnFootprint {
+        crate::LodColumnFootprint {
+            min_y,
+            top_y,
+            state,
+            biome,
+            sky_light,
+            block_light,
+        }
+    }
+    /// A retained LOD tile's exact cell ordering and scale.
+    pub fn lod_tile_footprint(
+        cell_width: i32,
+        columns: Vec<Option<crate::LodColumnFootprint>>,
+    ) -> crate::LodTileFootprint {
+        crate::LodTileFootprint {
+            cell_width,
+            columns,
+        }
+    }
+    /// The replay this window plays, constructed by the game and only read by mods.
+    pub fn replay_state(
+        recording: String,
+        standalone: bool,
+        position_ms: u32,
+        duration_ms: u32,
+        speed: f64,
+        paused: bool,
+        ended: bool,
+    ) -> crate::ReplayState {
+        crate::ReplayState {
+            recording,
+            standalone,
+            position_ms,
+            duration_ms,
+            speed,
+            paused,
+            ended,
+        }
+    }
+    /// The mod export's status snapshot, constructed by the game.
+    pub fn export_status(
+        request: u32,
+        name: String,
+        state: crate::ExportState,
+        [frame, frames]: [u32; 2],
+        [width, height]: [u32; 2],
+        (fps_num, fps_den): (u32, u32),
+        bytes: u64,
+    ) -> crate::ExportStatus {
+        crate::ExportStatus {
+            request,
+            name,
+            state,
+            frame,
+            frames,
+            width,
+            height,
+            fps_num,
+            fps_den,
+            bytes,
+        }
+    }
     /// Wrap a slot in the persistent instance group store.
     pub fn instance_group_ref(generation: u64, slot: u32) -> crate::InstanceGroupRef {
         crate::InstanceGroupRef::from_parts(generation, slot).expect("published group generation")
@@ -119,6 +352,19 @@ pub mod game {
         fn fields(&self) -> Self::Fields<'_>;
     }
 
+    /// A control prompt resolved by the client, with its layout size and any physical pad source.
+    pub fn input_glyph(
+        label: String,
+        size: [f32; 2],
+        controller: Option<(ControllerGlyphFamily, ControllerButton)>,
+    ) -> InputGlyph {
+        InputGlyph {
+            label,
+            size,
+            controller,
+        }
+    }
+
     /// A block entity handle the game names.
     pub fn block_entity_ref(
         level: LevelRef,
@@ -139,6 +385,10 @@ pub mod game {
     pub fn boss_bar_ref(epoch: WorldEpoch, uuid: u128) -> BossBarRef {
         BossBarRef { epoch, uuid }
     }
+    /// A team handle the game names.
+    pub fn team_ref(epoch: WorldEpoch, name: String) -> TeamRef {
+        TeamRef { epoch, name }
+    }
     /// A chunk handle the game names.
     pub fn chunk_ref(level: LevelRef, pos: [i32; 2]) -> ChunkRef {
         ChunkRef { level, pos }
@@ -154,6 +404,14 @@ pub mod game {
     /// A player handle the game names.
     pub fn player_ref(entity: EntityRef, uuid: u128) -> PlayerRef {
         PlayerRef { entity, uuid }
+    }
+    /// The player a completion is for, as the game knows them.
+    pub fn command_sender(uuid: u128, name: String, permission: PermissionLevel) -> CommandSender {
+        CommandSender {
+            uuid,
+            name,
+            permission,
+        }
     }
     /// A stack's modifiers for `item_attribute_modifier`, as its component
     /// gives them.
@@ -245,6 +503,21 @@ pub mod game {
             BossBarRefFields {
                 epoch: self.epoch,
                 uuid: self.uuid,
+            }
+        }
+    }
+
+    #[non_exhaustive]
+    pub struct TeamRefFields<'a> {
+        pub epoch: WorldEpoch,
+        pub name: &'a str,
+    }
+    impl Fields for TeamRef {
+        type Fields<'a> = TeamRefFields<'a>;
+        fn fields(&self) -> TeamRefFields<'_> {
+            TeamRefFields {
+                epoch: self.epoch,
+                name: &self.name,
             }
         }
     }
@@ -493,7 +766,5 @@ pub fn fluid_state(
 
 #[path = "__private/ingredient_parser.rs"]
 pub mod ingredient_parser;
-#[path = "__private/points.rs"]
-pub mod points;
 
 include!(concat!(env!("OUT_DIR"), "/mod_api_exports_private.rs"));

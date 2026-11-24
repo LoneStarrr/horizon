@@ -49,7 +49,7 @@ fn horse(seed: i64, types: &crate::mobs::MobTypes) -> Mob {
         kind,
         Vec3::new(0.5, 64.0, 0.5),
         0.0,
-        LegacyRandom::new(seed),
+        horizon_core::random::EntityRandom::own(LegacyRandom::new(seed)),
     );
     m.on_ground = true;
     // `isVehicle`: a mob's back is enough to bolt.
@@ -62,6 +62,7 @@ fn horse(seed: i64, types: &crate::mobs::MobTypes) -> Mob {
 /// `RandomPos.generateRandomDirection`'s x, y, z draws, ten times: no further
 /// and no fewer, so a horse never bolts into the hill or onto the pond.
 #[test]
+#[ignore = "daily"]
 fn a_bucking_horse_bolts_only_where_the_filters_allow() {
     use crate::mobs::world::with_built_test_world;
     let mut out = None;

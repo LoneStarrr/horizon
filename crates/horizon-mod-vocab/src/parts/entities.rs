@@ -19,15 +19,16 @@ where
 pub type EntityProvider<T, C = ()> = dyn EntityCapabilityProvider<T, C>;
 
 /// Whether any mod attached an entity part, so `Mob` construction asks for
-/// goals and the mob tick builds a goal read view.
+/// goals, the mob tick builds a goal read view, and the general entity tick
+/// asks its dispatch.
 pub fn has_entity_parts() -> bool {
     !crate::mods().is_empty()
         && installed().is_some_and(|installed| !installed.keys.entities.is_empty())
 }
 
-/// The entity parts attached to entity type `id` (`minecraft:zombie`), in
-/// dispatch order, for the goal registration at every `Mob` construction
-/// (#1077).
+/// The entity parts attached to entity type `id` (`minecraft:zombie`,
+/// `mymod:robot`), in dispatch order, for the goal registration at every
+/// `Mob` construction.
 pub fn entity_parts() -> PartsRef {
     let Some(installed) = installed() else {
         return PartsRef::Shared(&NO_PARTS);
@@ -54,9 +55,18 @@ pub fn entity_parts() -> PartsRef {
 impl Parts {
     /// The entity parts attached to entity type `id` (`minecraft:zombie`), in
     /// dispatch order, for the goal registration at every `Mob` construction
-    /// (#1077).
+    ///.
     pub fn entity_parts(&self, id: &str) -> &[Attached<dyn EntityPart>] {
         self.entities.get(id).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl HookParts {
+    pub(crate) fn entity<'k>(
+        &self,
+        id: impl FnOnce() -> Option<&'k str>,
+    ) -> &[Attached<dyn EntityPart>] {
+        attached(&self.entities, id)
     }
 }
 
@@ -84,7 +94,7 @@ pub fn entity_providers<T: ?Sized + 'static, C: Copy + 'static>(
         .keys
         .entity_capabilities
         .get(key.name)?
-        .get(&*entity.kind(host)?)?;
+        .get(entity.kind(host)?.id(host).as_str())?;
     Some(EntityProviders {
         parts,
         entity,
@@ -125,10 +135,32 @@ impl dyn Registrar + '_ {
     /// Attach `part` to the entity type `entity` (`minecraft:zombie`): its
     /// [`EntityPart::register_goals`] runs at every `Mob` construction of that
     /// type, spawning or loading, and its goals join the mob's selectors
-    /// beside vanilla's (#1077).
+    /// beside vanilla's.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn entity_part<P: EntityPart>(&mut self, entity: &str, part: P) {
         self.attach_entity_part(entity, type_name::<P>(), Arc::new(part));
+    }
+    /// [`Self::entity_part`] for a Part with typed state (`EntityPartState`): each entity
+    /// of type `entity` keeps one `P::Data`, under `P::DATA`. Refused, and reported as the
+    /// mod's registration refusal, when `P::DATA` syncs, copies on death, holds a resource
+    /// handle, is outside the mod's namespaces, or names a key this mod already declared with
+    /// another type. The entity type is checked once every type is known, when the game
+    /// loads: only mob types (vanilla and mod) and mod general entity types keep Part state,
+    /// and `minecraft:player`, any other vanilla family and an unknown id refuse the load,
+    /// naming the type. `entity_part` itself checks no type.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn entity_part_with_state<P: crate::EntityPartState>(
+        &mut self,
+        entity: &str,
+        part: P,
+    ) -> Result<(), crate::EntityPartStateError> {
+        self.declare_entity_part_state(
+            entity,
+            type_name::<P>(),
+            crate::PartStateDeclaration::of(P::DATA),
+        )?;
+        self.entity_part(entity, part);
+        Ok(())
     }
     /// Answer entity capability `key` for entity type `kind` (`mymod:robot`,
     /// `minecraft:player`) with `provider`, which gives a handler for one entity, or none:
@@ -168,14 +200,28 @@ impl dyn Registrar + '_ {
 pub trait EntitiesRegistrar {
     /// Attach `part`, of kind `kind`, to the entity type `entity`
     /// (`minecraft:zombie`, `mymod:golem`): its `register_goals` runs at every
-    /// `Mob` construction of that type (#1077).
+    /// `Mob` construction of that type.
     ///
     /// Not on wasm: the goal surface a part's `register_goals` hands the game
-    /// does not cross yet (#1077); entity parts are a native mod's for now.
+    /// does not cross; entity parts are a native mod's .
     /// The gate keeps a wasm mod's call a compile error, not a runtime one;
     /// the generator still keeps the method off the wasm world by this doc.
     #[cfg(not(target_arch = "wasm32"))]
     fn attach_entity_part(&mut self, entity: &str, kind: &'static str, part: Arc<dyn EntityPart>);
+
+    /// Record the state declaration of entity Part `part` on entity type `entity`, or refuse
+    /// it (as the mod's registration refusal too): see `PartStateDeclaration::check`, a key
+    /// outside this mod's namespaces, or one it declared with another Wire layout. Mods reach
+    /// it through `entity_part_with_state`.
+    ///
+    /// Not on wasm: entity parts and their state declarations are registered only by native mods.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn declare_entity_part_state(
+        &mut self,
+        entity: &str,
+        part: &'static str,
+        declaration: crate::PartStateDeclaration,
+    ) -> Result<(), crate::EntityPartStateError>;
 
     /// Answer entity capability `name` for entity type `kind` with `provider`; mods reach it
     /// through `entity_capability`.

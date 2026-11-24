@@ -1,13 +1,14 @@
 //! Horizon's own registry (docs/modding/src/reference/registry-index.md): mods, modpacks and resource packs made for
 //! Horizon, reviewed as pull requests in horizon-rust/horizon-mods. One file lists them all,
 //! `index.json`; every download is checked against it before it reaches the game folder
-//! (`horizon_mod_package::index::check_file`: size, SHA-256, the author's signature, the file's own
+//! (`horizon_platform::mod_package::index::check_file`: size, SHA-256, the author's signature, the file's own
 //! manifest), and files the index says were taken down are refused and turned off.
 use super::{
     details::{Details, GitHub, Link},
     download, installed, java, FileRef, Kind, Project, Query, Source, SourceId, Version, GAME,
 };
-use horizon_mod_package::index::{self, Index, Trust};
+use crate::i18n::{tr, trf};
+use horizon_platform::mod_package::index::{self, Index, Trust};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,31 @@ pub fn is_native_mod(id: &str) -> bool {
     known_index()
         .and_then(|index| Some(index.project(id)?.kind == index::Kind::NativeMod))
         .unwrap_or(false)
+}
+
+/// How many of the registry's projects this Horizon left out because none of their versions
+/// passes the index's rules (mods published for the earlier mod system), by the index already
+/// read (never the network): None when no index was read.
+pub fn projects_left_out() -> Option<usize> {
+    let index = known_index()?;
+    // With those listed whose versions for this game all are (`Blocked::EarlierSystem`), which
+    // the list hides too.
+    let mut ids: Vec<&str> = index
+        .left_out
+        .iter()
+        .filter(|l| l.version.is_none() && index.project(&l.id).is_none())
+        .map(|l| l.id.as_str())
+        .chain(
+            index
+                .projects
+                .iter()
+                .filter(|p| matches!(blocked(&index, p), Some(Blocked::EarlierSystem)))
+                .map(|p| p.id.as_str()),
+        )
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Some(ids.len())
 }
 
 /// The GitHub stars of the registry's project `id`, by the index already read (never the
@@ -318,31 +344,36 @@ pub fn trust_and_capabilities(
     let Some(p) = index.project(id) else {
         return Vec::new();
     };
+    // Shown to players: in their words, through `tr`; the policy is a link beside them
+    // ([`POLICY`]), not a bare address in the text.
     let mut lines = vec![if official(p) {
-        "Made by Horizon".to_owned()
+        tr("Made by Horizon").to_string()
     } else {
-        format!(
-            "Made by {}. Not made or endorsed by the Horizon project ({POLICY})",
-            p.authors.join(", ")
+        trf(
+            "Made by {authors}, not by the Horizon project",
+            &[("authors", &p.authors.join(", "))],
         )
     }];
     lines.push(match &p.key {
-        Some(_) => "Signed by its author: the launcher checks the signature".to_owned(),
-        None => "Unsigned: the launcher checks its checksum only".to_owned(),
+        Some(_) => tr("Signed by its author: Horizon checks it really is theirs").to_string(),
+        None => tr(
+            "Not signed by its author: Horizon checks the download arrives complete and unchanged",
+        )
+        .to_string(),
     });
     if p.kind == index::Kind::NativeMod {
         lines.push(
-            "Native code: it is compiled into the game and runs with full access to your computer. Its source was reviewed before it was listed".into(),
+            tr("Native code: it is built into the game and runs with full access to your computer. Its source was reviewed before it was listed").to_string(),
         );
         if let Some(v) = p.versions.iter().find(|v| v.game == GAME) {
             let pin = v.api.split('/').nth(1).unwrap_or_default();
             lines.push(
                 instance
-                    .and_then(|i| crate::native_fit::line(i, &p.id, pin))
+                    .and_then(|i| crate::native_fit::line(i, pin))
                     .unwrap_or_else(|| {
-                        format!(
-                            "Built by the launcher on Horizon {}",
-                            &pin[..pin.len().min(7)]
+                        trf(
+                            "Built for {build}",
+                            &[("build", &crate::native_mods::sdk_cache::known_name(pin))],
                         )
                     }),
             );
@@ -351,25 +382,96 @@ pub fn trust_and_capabilities(
     if let Some(v) = p.versions.first().filter(|_| p.kind == index::Kind::Mod) {
         lines.extend(
             v.capabilities
+                .known()
                 .iter()
-                .map(|c| format!("May {}", c.describe())),
+                .map(|c| trf("May {what}", &[("what", tr(c.describe()))])),
         );
+        // Capabilities this Horizon lacks are the project's verdict (`Project::blocked`), said once.
         if v.capabilities.is_empty() {
-            lines.push("Asks for nothing beyond its own log".into());
+            lines.push(tr("Asks for nothing beyond its own log").to_string());
         }
     }
     lines
 }
 
-fn project_of(p: &index::Project) -> Option<Project> {
+/// How long the registry lets a summary be: it cuts a longer one there, mid-word.
+const SUMMARY_CUT: usize = 160;
+
+/// A registry summary as players read it: one the registry cut mid-word ends at its last whole
+/// word, with "…".
+fn summary(text: &str) -> String {
+    let cut = text.chars().count() >= SUMMARY_CUT
+        && text.chars().last().is_some_and(char::is_alphanumeric);
+    match text.rfind(char::is_whitespace).filter(|_| cut) {
+        Some(end) => format!("{}…", text[..end].trim_end_matches([',', ';', ':'])),
+        None => text.to_owned(),
+    }
+}
+
+/// Why a project has versions for this game but none this Horizon may install.
+enum Blocked {
+    /// They ask for capabilities this Horizon doesn't have: made for the earlier mod system.
+    EarlierSystem,
+    /// They were taken down, for this reason.
+    TakenDown(String),
+    /// Shader packs made for this shader API, which the installed game doesn't serve.
+    OtherShaderApi(String),
+}
+
+/// Whether version `v` of `p` is a shader pack made for a shader API line the installed game
+/// doesn't serve ([`crate::game_shader_api::served`]).
+fn needs_other_shader_api(p: &index::Project, v: &index::Version) -> bool {
+    p.kind == index::Kind::Shader
+        && index::needs_other_shader_api(p, v, &crate::game_shader_api::served())
+}
+
+/// A project's newest version the installed game may get (`Index::installable`); a shader
+/// pack's, for a shader API line that game serves.
+fn installable<'a>(index: &Index, p: &'a index::Project) -> Option<&'a index::Version> {
+    match p.kind {
+        index::Kind::Shader => index.installable_for(p, GAME, &crate::game_shader_api::served()),
+        _ => index.installable(p, GAME),
+    }
+}
+
+fn blocked(index: &Index, p: &index::Project) -> Option<Blocked> {
+    let for_game: Vec<&index::Version> = p.versions.iter().filter(|v| v.game == GAME).collect();
+    if for_game.is_empty() || installable(index, p).is_some() {
+        return None;
+    }
+    if for_game.iter().all(|v| needs_other_shader_api(p, v)) {
+        return Some(Blocked::OtherShaderApi(for_game[0].api.clone()));
+    }
+    let revoked = for_game
+        .iter()
+        .find_map(|v| index.revoked(&p.id, &v.file.sha256));
+    Some(match revoked {
+        Some(r) if for_game.iter().all(|v| v.capabilities.unknown().is_empty()) => {
+            Blocked::TakenDown(r.reason.clone())
+        }
+        _ => Blocked::EarlierSystem,
+    })
+}
+
+fn project_of(index: &Index, p: &index::Project) -> Option<Project> {
     let mut game_versions: Vec<String> = p.versions.iter().map(|v| v.game.clone()).collect();
     game_versions.dedup();
+    // Versions for this game, none of which this Horizon may install: say why, once, here.
+    let blocked = blocked(index, p).map(|why| match why {
+        Blocked::TakenDown(reason) => {
+            trf("Taken down: {reason}", &[("reason", &reason)]).to_string()
+        }
+        Blocked::EarlierSystem => {
+            tr("Made for Horizon's earlier mod system: it can't be installed yet.").to_string()
+        }
+        Blocked::OtherShaderApi(api) => made_for_other_shader_api(&api),
+    });
     Some(Project {
         source: SourceId::Horizon,
         id: p.id.clone(),
         slug: p.id.clone(),
         title: p.name.clone(),
-        summary: p.summary.clone(),
+        summary: summary(&p.summary),
         author: p.authors.join(", "),
         downloads: p.downloads,
         page: format!("{SITE}/{}", p.id),
@@ -378,6 +480,7 @@ fn project_of(p: &index::Project) -> Option<Project> {
         kind: kind_of(&p.kind)?,
         game_versions,
         loaders: vec![LOADER.into()],
+        blocked,
     })
 }
 
@@ -399,10 +502,23 @@ fn version_of(index: &Index, p: &index::Project, v: &index::Version) -> Version 
             primary: true,
         }],
         required: v.requires.iter().map(|r| r.id.clone()).collect(),
+        optional: Vec::new(),
         blocked: index
             .revoked(&p.id, &v.file.sha256)
-            .map(|r| format!("taken down: {}", r.reason)),
+            .map(|r| format!("taken down: {}", r.reason))
+            .or_else(|| unsupported_capabilities(&v.capabilities))
+            .or_else(|| needs_other_shader_api(p, v).then(|| other_shader_api(&v.api))),
     }
+}
+
+fn unsupported_capabilities(capabilities: &index::Capabilities) -> Option<String> {
+    let unknown = capabilities.unknown();
+    (!unknown.is_empty()).then(|| {
+        trf(
+            "Can't install: it was made for Horizon's earlier mod system ({names})",
+            &[("names", &unknown.join(", "))],
+        )
+    })
 }
 
 /// A GitHub login as GitHub allows it (letters, digits, single dashes, at most 39), so an index
@@ -459,7 +575,8 @@ pub const SORTS: [super::details::Sort; 3] = [
 /// The projects of the query's kind whose words match and that have every category and tag the
 /// filters ask for, for this game unless `everything`: the
 /// most downloaded first, or the newest (first published) or most recently updated (latest
-/// version) when the query asks, ties by downloads.
+/// version) when the query asks, ties by downloads; those no version of which installs here are
+/// left out, or last with `everything`.
 fn search(index: &Index, query: &Query) -> Vec<Project> {
     use super::details::Sort;
     let mut found: Vec<&index::Project> = index
@@ -497,9 +614,16 @@ fn search(index: &Index, query: &Query) -> Vec<Project> {
         }),
         _ => found.sort_by_key(|p| std::cmp::Reverse(p.downloads)),
     }
+    // What can't be installed here is left out (the note above the list counts it), or with
+    // `everything` goes after what can, each in the order asked for.
+    let mut found: Vec<Project> = found
+        .into_iter()
+        .filter_map(|p| project_of(index, p))
+        .filter(|p| query.everything || p.blocked.is_none())
+        .collect();
+    found.sort_by_key(|p| p.blocked.is_some());
     found
         .into_iter()
-        .filter_map(project_of)
         .skip(query.offset)
         .take(query.limit)
         .collect()
@@ -539,7 +663,7 @@ impl Source for Registry {
         let p = index
             .project(id)
             .ok_or_else(|| format!("{id} isn't in Horizon's registry."))?;
-        project_of(p).ok_or_else(|| {
+        project_of(&index, p).ok_or_else(|| {
             format!(
                 "{} is a {} in Horizon's registry: this launcher can't install those yet.",
                 p.name,
@@ -585,7 +709,7 @@ impl Source for Registry {
         let mut body = p.description.clone();
         if let Some(v) = newest.filter(|v| !v.capabilities.is_empty()) {
             body.push_str("\n\n## What it may do\n\n");
-            for c in &v.capabilities {
+            for c in v.capabilities.known() {
                 body.push_str(&format!("- May {}\n", c.describe()));
             }
         }
@@ -598,7 +722,12 @@ impl Source for Registry {
                     .project(&r.id)
                     .and_then(|m| Some((m, m.versions.iter().find(|w| w.version == r.version)?)));
                 let Some((m, w)) = found else { continue };
-                let may: Vec<&str> = w.capabilities.iter().map(|c| c.describe()).collect();
+                let may: Vec<&str> = w
+                    .capabilities
+                    .known()
+                    .iter()
+                    .map(|c| c.describe())
+                    .collect();
                 let may = match may.is_empty() {
                     true => String::new(),
                     false => format!(": may {}", may.join(", ")),
@@ -729,9 +858,15 @@ fn install_from(
     home: &Path,
     progress: &dyn Fn(&str, f32),
 ) -> Result<Vec<installed::Entry>, String> {
+    let _game = crate::game_shader_api::for_home(home);
     let p = index
         .project(&project.id)
         .ok_or_else(|| format!("{} isn't in Horizon's registry.", project.title))?;
+    // Before the version is picked: by the launcher's own line, a pack made only for the
+    // game's line would look like one for another game.
+    if p.kind == index::Kind::Shader {
+        crate::game_shader_api::said().map_err(|e| format!("{}: {e}.", p.name))?;
+    }
     let v = newest(index, p)?;
     install_version(index, local, p, v, home, progress).map(|e| vec![e])
 }
@@ -767,20 +902,46 @@ fn fetch_datapack_from(
     Ok((path, v.version.clone()))
 }
 
-/// A project's newest version for this game that wasn't taken down.
+/// A project's newest version for this game that wasn't taken down, asks for no capability this
+/// Horizon doesn't know (as [`Index::installable`], which the page and automatic updates go by)
+/// and, for a shader pack, is for a shader API line the installed game serves.
 fn newest<'a>(index: &Index, p: &'a index::Project) -> Result<&'a index::Version, String> {
-    let mut taken_down = None;
+    let (mut taken_down, mut other_api, mut earlier) = (None, None, None);
     for v in p.versions.iter().filter(|v| v.game == GAME) {
         if let Some(r) = index.revoked(&p.id, &v.file.sha256) {
             taken_down.get_or_insert(r);
+        } else if let Some(why) = unsupported_capabilities(&v.capabilities) {
+            earlier.get_or_insert(why);
+        } else if needs_other_shader_api(p, v) {
+            other_api.get_or_insert(v.api.as_str());
         } else {
             return Ok(v);
         }
     }
-    Err(match taken_down {
-        Some(r) => format!("{} was taken down: {}", p.name, r.reason),
-        None => format!("{} has no version for {GAME} to install.", p.name),
+    Err(match (taken_down, other_api, earlier) {
+        (_, Some(api), _) => format!("{} {}.", p.name, other_shader_api(api)),
+        (_, None, Some(why)) => format!("{}: {why}.", p.name),
+        (Some(r), None, None) => format!("{} was taken down: {}", p.name, r.reason),
+        (None, None, None) => format!("{} has no version for {GAME} to install.", p.name),
     })
+}
+
+/// What the browser and the installed packs say of a shader pack made for shader API `api`,
+/// which the installed game doesn't serve.
+pub fn made_for_other_shader_api(api: &str) -> String {
+    format!(
+        "Made for shader API {api}: this Horizon serves {}.",
+        crate::game_shader_api::served().join(", ")
+    )
+}
+
+/// Why a shader pack made for shader API `api` doesn't run: the game's own words for it
+/// (`horizon_shader_api::Manifest::parse`).
+fn other_shader_api(api: &str) -> String {
+    format!(
+        "needs shader API {api}; this Horizon serves {}",
+        crate::game_shader_api::served().join(", ")
+    )
 }
 
 /// Installs version `v` of the registry's mod, resource pack or shader pack `p` into the game
@@ -803,6 +964,164 @@ fn install_version(
     Ok(entry)
 }
 
+/// An installed entry with nothing behind it that loads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stale {
+    /// Its file isn't there: the install replaces the entry and touches no file.
+    Missing,
+    /// A native mod in the format this Horizon retired (`horizon-native.json`, as `zoom` 2.0.0
+    /// was before the id came back as a wasm mod), where a plain mod now installs. Left in
+    /// `horizon-native-mods/`, it would count as a native mod to build that can't be read.
+    Retired,
+    /// A `.hmod` archive right where the new file goes that this Horizon can't read as a mod
+    /// (as `zoom` 1.0.0 was, made for the earlier mod system): it is moved aside
+    /// ([`displace`]) and the new file takes its place.
+    Outdated,
+}
+
+/// Whether `old`'s file is gone, retired or outdated, where the new file goes to `relative`. Any
+/// other error reading it (a file another program holds, no permission) is none of these: the
+/// install inspects it and refuses.
+fn stale_entry(home: &Path, old: &installed::Entry, native: bool, relative: &str) -> Option<Stale> {
+    let path = home.join(&old.file);
+    let plain = match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Stale::Missing),
+        Err(_) => return None,
+        Ok(meta) => meta.file_type().is_file(),
+    };
+    // Only a regular file is opened: a pipe could block here, under the instance's lock.
+    if !plain || native {
+        return None;
+    }
+    let archive = fs::File::open(&path)
+        .ok()
+        .filter(|f| f.metadata().is_ok_and(|m| m.is_file()))
+        .and_then(|f| zip::ZipArchive::new(f).ok())?;
+    if Path::new(&old.file).starts_with(crate::native_mods::INSTALLED) {
+        let retired = archive.index_for_name("horizon-native.json").is_some();
+        return retired.then_some(Stale::Retired);
+    }
+    // An archive that opens and still isn't a mod won't be one on a later try.
+    let outdated = old.kind == Kind::Mod
+        && old.file == relative
+        && horizon_platform::mod_package::Package::read(&path).is_err();
+    outdated.then_some(Stale::Outdated)
+}
+
+/// Removes `old`'s retired native file, only when it is a plain file (never a link) right in
+/// the instance's `horizon-native-mods/`, and no other entry of the browser's list names it.
+fn remove_retired<'a>(
+    home: &Path,
+    old: &installed::Entry,
+    mut others: impl Iterator<Item = &'a installed::Entry>,
+) -> Result<(), String> {
+    let path = home.join(&old.file);
+    let plain = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+    let folder = fs::canonicalize(home.join(crate::native_mods::INSTALLED)).ok();
+    let canonical = fs::canonicalize(&path).ok();
+    let inside = canonical.as_deref().and_then(Path::parent) == folder.as_deref();
+    let shared = others.any(|e| e.file == old.file);
+    if !plain || folder.is_none() || !inside || shared {
+        return Err(format!(
+            "{}'s old native file {} wasn't removed: it isn't a file of its own in {}. Remove {}, then install it again.",
+            old.title,
+            old.file,
+            crate::native_mods::INSTALLED,
+            old.title
+        ));
+    }
+    fs::remove_file(&path).map_err(|e| {
+        format!(
+            "{}'s old native file {} wasn't removed: {e}. Remove {}, then install it again.",
+            old.title, old.file, old.title
+        )
+    })
+}
+
+/// A name beside `file` that nothing has yet, made as an empty file so no later call gets it:
+/// `<name>.replaced-<secs>`, then `-1`, `-2`… The game loads only `.hmod` files and mod folders
+/// (`mod_package::find`), so it never reads one.
+fn reserve_backup(file: &Path, secs: u64) -> Result<PathBuf, String> {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0u32.. {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
+        let backup = file.with_file_name(format!("{name}.replaced-{secs}{suffix}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(_) => return Ok(backup),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", backup.display())),
+        }
+    }
+    unreachable!("a free name comes before u32 runs out")
+}
+
+/// Moves `old`'s outdated file at `target` aside, so the new one never overwrites it. Refused
+/// when the instance's mod folder leads somewhere else (a link or junction) or the path is no
+/// longer a plain file. Whatever file is there at the move is the one kept, even if it changed
+/// since it was inspected: where it is now, beside where it was, under a name the game doesn't
+/// load. It stays there for the player: nothing here says it is of no use (an older launcher
+/// may not read a newer mod). `None` when it is gone by now.
+fn displace(home: &Path, old: &installed::Entry, target: &Path) -> Result<Option<PathBuf>, String> {
+    let folder = target.parent().and_then(|dir| fs::canonicalize(dir).ok());
+    let inside = fs::canonicalize(home)
+        .ok()
+        .zip(folder)
+        .is_some_and(|(home, dir)| {
+            let named = |n: &std::ffi::OsStr| n.eq_ignore_ascii_case(java::MODS_DIR);
+            dir.parent() == Some(&home) && dir.file_name().is_some_and(named)
+        });
+    if !inside {
+        return Err(format!(
+            "{}'s old file {} wasn't replaced: {} leads outside the game folder.",
+            old.title,
+            old.file,
+            java::MODS_DIR
+        ));
+    }
+    match fs::symlink_metadata(target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => {
+            return Err(format!(
+                "{}'s old file {} wasn't replaced: it isn't a plain file any more.",
+                old.title, old.file
+            ));
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let backup = reserve_backup(target, secs)?;
+    if let Err(e) = fs::rename(target, &backup) {
+        let _ = fs::remove_file(&backup);
+        return match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(format!("{}: {e}", target.display())),
+        };
+    }
+    Ok(Some(backup))
+}
+
+/// `error`, once the displaced file is back at `target`, over the new one if that is there. A
+/// failure to do that says where the file is.
+fn put_back(error: String, backup: &Path, target: &Path) -> String {
+    match fs::rename(backup, target) {
+        Ok(()) => error,
+        Err(e) => format!(
+            "{error}; your previous file is kept as {}: {e}",
+            backup.display()
+        ),
+    }
+}
+
 /// [`install_version`], with `guard` asked about the downloaded file once it passed the index's
 /// checks and before it replaces anything: its error leaves everything as it was.
 fn install_version_guarded(
@@ -815,9 +1134,17 @@ fn install_version_guarded(
     progress: &dyn Fn(&str, f32),
 ) -> Result<installed::Entry, String> {
     let _lock = crate::browser::lock_home(home).map_err(|e| e.to_string())?;
-    let project = project_of(p).ok_or_else(|| format!("{} can't be installed here.", p.name))?;
+    let project =
+        project_of(index, p).ok_or_else(|| format!("{} can't be installed here.", p.name))?;
     if let Some(r) = index.revoked(&p.id, &v.file.sha256) {
         return Err(format!("{} was taken down: {}", p.name, r.reason));
+    }
+    // Every install comes here, a modpack's pinned ones too: refused before the download.
+    if p.kind == index::Kind::Shader {
+        crate::game_shader_api::said().map_err(|e| format!("{}: {e}.", p.name))?;
+    }
+    if needs_other_shader_api(p, v) {
+        return Err(format!("{} {}.", p.name, other_shader_api(&v.api)));
     }
     let native = p.kind == index::Kind::NativeMod;
     let relative = match native {
@@ -827,10 +1154,13 @@ fn install_version_guarded(
     let mut list = installed::Installed::load(home);
     let ours = |e: &installed::Entry| e.source == SourceId::Horizon && e.project == p.id;
     let old = list.entries.iter().find(|e| ours(e)).cloned();
+    let stale = old
+        .as_ref()
+        .and_then(|old| stale_entry(home, old, native, &relative));
     if let Some(old) = &old {
         let mut different = old.kind != project.kind;
-        if !different && project.kind == Kind::Mod {
-            let path = home.join(&old.file);
+        let path = home.join(&old.file);
+        if !different && stale.is_none() && project.kind == Kind::Mod {
             let installed_native = index::native::holds(&path);
             let kind = if installed_native {
                 index::Kind::NativeMod
@@ -848,7 +1178,7 @@ fn install_version_guarded(
             ));
         }
     }
-    if old.as_ref().is_some_and(|o| o.version == v.version) {
+    if stale.is_none() && old.as_ref().is_some_and(|o| o.version == v.version) {
         return Ok(old.expect("checked"));
     }
     let target = home.join(&relative);
@@ -875,7 +1205,12 @@ fn install_version_guarded(
     let file = &version_of(index, p, v).files[0];
     let staging = home.join("mod-browser/downloads");
     let path = fetch(file, &staging, local, &|f| progress(&line, f))?;
-    let checked = index::check_file(index, p, v, &path).and_then(|trust| {
+    // A shader pack for a line the game serves and this launcher doesn't: the game checks it.
+    let served = match p.kind {
+        index::Kind::Shader => crate::game_shader_api::served(),
+        _ => vec![horizon_shader_api::API.to_owned()],
+    };
+    let checked = index::check_file_for(index, p, v, &path, &served).and_then(|trust| {
         // Only Rust and TOML sources, for the mod the index names: nothing in it runs here.
         match native {
             true => index::native::Bundle::read(&path).and_then(|b| match b.manifest.id == p.id {
@@ -890,13 +1225,29 @@ fn install_version_guarded(
         .inspect_err(|_| {
             let _ = fs::remove_file(&path);
         })?;
+    // Before the new file goes in: a removal that fails leaves everything as it was, so the
+    // install can be tried again.
+    if let (Some(Stale::Retired), Some(old)) = (stale, &old) {
+        let others = list.entries.iter().filter(|e| !ours(e));
+        remove_retired(home, old, others).map_err(|e| taken_back(e, &path))?;
+    }
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    fs::rename(&path, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let displaced = match (stale, &old) {
+        (Some(Stale::Outdated), Some(old)) => {
+            displace(home, old, &target).map_err(|e| taken_back(e, &path))?
+        }
+        _ => None,
+    };
+    fs::rename(&path, &target).map_err(|e| {
+        let e = format!("{}: {e}", target.display());
+        let e = displaced.iter().fold(e, |e, d| put_back(e, d, &target));
+        taken_back(e, &path)
+    })?;
     if let Some(old) = old
         .as_ref()
-        .filter(|o| o.file != relative)
+        .filter(|o| stale.is_none() && o.file != relative)
         .and_then(|o| o.path(home))
     {
         let _ = fs::remove_file(old);
@@ -919,8 +1270,35 @@ fn install_version_guarded(
     };
     list.entries.retain(|e| !ours(e));
     list.entries.push(entry.clone());
-    list.save(home)?;
+    // A stale entry stays listed: without the file the new one would be in its way on a retry.
+    // A displaced file comes back instead: the player keeps the old mod with its old entry.
+    list.save(home).map_err(|e| match (&displaced, stale) {
+        (Some(d), _) => put_back(e, d, &target),
+        (None, Some(_)) => taken_back(e, &target),
+        (None, None) => e,
+    })?;
+    if let Some(backup) = displaced {
+        eprintln!(
+            "{}: kept your previous {} as {}",
+            p.name,
+            entry.file,
+            backup.display()
+        );
+    }
     Ok(entry)
+}
+
+/// `error`, once the new file at `file` is taken back out: a failure to do that is said too,
+/// never swallowed.
+fn taken_back(error: String, file: &Path) -> String {
+    match fs::remove_file(file) {
+        Ok(()) => error,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => error,
+        Err(e) => format!(
+            "{error}; taking {} back out failed too: {e}",
+            file.display()
+        ),
+    }
 }
 
 /// The mod id of an installed mod (`horizon-mods/<id>`, `horizon-mods/<id>.hmod` or

@@ -72,7 +72,7 @@ struct Open {
 }
 
 /// `EntityTypeTags.CAN_WEAR_HORSE_ARMOR`.
-fn can_wear_horse_armor(species: Species) -> bool {
+pub(super) fn can_wear_horse_armor(species: Species) -> bool {
     matches!(species, Species::Horse | Species::ZombieHorse)
 }
 /// Whether `item` fits the body slot of the species (`isEquippableInSlot`).
@@ -189,8 +189,11 @@ impl Game<'_> {
     pub(super) fn mount_menu_columns(&self) -> Option<usize> {
         self.mount_menu.open.as_ref().map(|o| o.columns)
     }
-    /// The menu ends when the mount dies or is more than 4 blocks away
-    /// (`AbstractMountInventoryMenu.stillValid`).
+    /// The menu ends when the mount dies or its box leaves the entity
+    /// interaction range plus 4 of the player's eyes
+    /// (`AbstractMountInventoryMenu.stillValid` with
+    /// `Player.isWithinEntityInteractionRange(mount, 4.0)`: 7 blocks away, 9
+    /// in creative).
     pub(super) fn tick_mount_menu(&mut self) {
         // A server's menu ends when the server closes it.
         if self.remote.is_some() {
@@ -199,15 +202,14 @@ impl Game<'_> {
         let Some(open) = self.mount_menu.open.as_ref() else {
             return;
         };
-        let valid = self.mount_mob_index(open.mob).is_some_and(|i| {
-            let m = &self.mobs[i];
-            let c = m.center();
-            m.alive()
-                && self.eye_position().is_some_and(|e| {
-                    let d = (e[0] - c[0]).powi(2) + (e[1] - c[1]).powi(2) + (e[2] - c[2]).powi(2);
-                    d <= 16.0 + 4.0
-                })
-        });
+        let mob = open.mob;
+        let mount = self
+            .mount_mob_index(mob)
+            .map(|i| (self.mobs[i].alive(), self.mobs[i].bounds()));
+        let valid = match mount {
+            Some((true, bounds)) => self.within_entity_interaction_range(&bounds, 4.0),
+            _ => false,
+        };
         if !valid {
             self.close_container();
             self.set_screen(Screen::Playing);
@@ -280,6 +282,11 @@ impl Game<'_> {
                 horizon_client::item_sync::equip_sound(s, self.res.items())
                     .unwrap_or_else(|| "minecraft:item.armor.equip_generic".into())
             })
+        };
+        let slot = if saddle_put_on { "saddle" } else { "body" };
+        let sound = match (sound, put_on) {
+            (Some(sound), Some(stack)) => self.mod_equip_sound(stack, slot, Some(sound)),
+            (sound, _) => sound,
         };
         let m = &mut self.mobs[index];
         let id = m.id;
@@ -461,7 +468,7 @@ impl Game<'_> {
             *self.slot_mut(slot) = Some(stack);
         }
     }
-    /// `HorseInventoryScreen`'s background, slot frames and the mount.
+    /// `AbstractMountInventoryScreen.extractBackground`: original texture, then GUI atlas slots.
     pub(super) fn draw_mount_background(&self, batch: &mut HudBatch, ox: f32, oy: f32) {
         let Some(open) = self.mount_menu.open.as_ref() else {
             return;
@@ -473,7 +480,13 @@ impl Game<'_> {
         } else {
             "gui/container/horse"
         };
-        batch.sprite_region(atlas, background, [ox, oy, 176.0, 166.0], 256.0, 256.0);
+        batch.texture_blit(
+            atlas,
+            background,
+            [ox, oy, 176.0, 166.0],
+            [0.0; 2],
+            [256.0; 2],
+        );
         if open.columns > 0 {
             batch.sprite_region(
                 atlas,
@@ -485,27 +498,28 @@ impl Game<'_> {
         }
         if open.show_saddle {
             batch.sprite(atlas, "gui/sprites/container/slot", ox + 7.0, oy + 17.0);
-            if open.saddle.is_none() {
-                batch.sprite(
-                    atlas,
-                    "gui/sprites/container/slot/saddle",
-                    ox + 8.0,
-                    oy + 18.0,
-                );
-            }
         }
         if open.show_armor {
             batch.sprite(atlas, "gui/sprites/container/slot", ox + 7.0, oy + 35.0);
-            if open.armor.is_none() {
-                let sprite = if llama::is_llama(open.species) {
-                    "gui/sprites/container/slot/llama_armor"
-                } else if nautilus::is_nautilus(open.species) {
-                    "gui/sprites/container/slot/nautilus_armor_inventory"
-                } else {
-                    "gui/sprites/container/slot/horse_armor"
-                };
-                batch.sprite(atlas, sprite, ox + 8.0, oy + 36.0);
-            }
+        }
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+        if open.show_saddle && open.saddle.is_none() {
+            batch.sprite(
+                atlas,
+                "gui/sprites/container/slot/saddle",
+                ox + 8.0,
+                oy + 18.0,
+            );
+        }
+        if open.show_armor && open.armor.is_none() {
+            let sprite = if llama::is_llama(open.species) {
+                "gui/sprites/container/slot/llama_armor"
+            } else if nautilus::is_nautilus(open.species) {
+                "gui/sprites/container/slot/nautilus_armor_inventory"
+            } else {
+                "gui/sprites/container/slot/horse_armor"
+            };
+            batch.sprite(atlas, sprite, ox + 8.0, oy + 36.0);
         }
         let grey = rgba(64, 64, 64, 255);
         let title = match self.mobs.iter().find(|m| m.id == open.mob) {
@@ -566,6 +580,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let mut verts = Vec::new();
+        let worn = self.mob_armor_layers(&m);
         // A screen preview: custom entity model animations see is_in_gui = 1.
         horizon_client::mobs::cem_anim::in_gui(|| {
             horizon_client::mobs::render::render_with(
@@ -575,6 +590,7 @@ impl Game<'_> {
                 &lookup,
                 240 | 240 << 8,
                 self.res.mob_data(),
+                &worn,
                 &[],
                 &mut verts,
             );
@@ -614,6 +630,10 @@ impl Game<'_> {
         batch.clip_since(start, x0, y0, x1, y1);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mount_menu_reach_tests.rs"]
+mod reach_tests;
 
 #[cfg(test)]
 mod tests {

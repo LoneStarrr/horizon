@@ -1,18 +1,20 @@
 use super::*;
+use std::fs::{self, File};
 use wasmtime::{Instance, Store};
 
-fn wasm(answer: i32) -> Vec<u8> {
+pub(super) fn wasm(answer: i32) -> Vec<u8> {
     wat::parse_str(format!(
         "(module (func (export \"answer\") (result i32) i32.const {answer}))"
     ))
     .unwrap()
 }
-fn fixture() -> (tempfile::TempDir, ModuleCache, Engine, Vec<u8>) {
+pub(super) fn fixture() -> (tempfile::TempDir, ModuleCache, Engine, Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
     let cache = ModuleCache::new(dir.path().join(".horizon-cache/wasm"));
+    assert_eq!(cache.disabled, None);
     (dir, cache, crate::runtime::engine().unwrap(), wasm(42))
 }
-fn entry(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) -> PathBuf {
+pub(super) fn entry(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) -> PathBuf {
     cache
         .root
         .join(format!("{}.cwasm", ModuleCache::key(engine, bytes)))
@@ -36,18 +38,28 @@ fn entries(cache: &ModuleCache) -> Vec<PathBuf> {
         .map(|entry| entry.unwrap().path())
         .collect()
 }
-fn replace_artifact(path: &Path, bytes: &[u8]) {
+#[cfg(not(windows))]
+fn replace_artifact(_: &ModuleCache, path: &Path, bytes: &[u8]) {
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
     temporary.write_all(bytes).unwrap();
     temporary.as_file().sync_all().unwrap();
     temporary.persist(path).unwrap();
 }
-fn assert_compiled(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) {
+#[cfg(windows)]
+pub(super) fn replace_artifact(cache: &ModuleCache, path: &Path, bytes: &[u8]) {
+    cache
+        .folder
+        .as_ref()
+        .unwrap()
+        .write(path.file_name().unwrap(), bytes)
+        .unwrap();
+}
+pub(super) fn assert_compiled(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) {
     let (module, source) = cache.load_or_compile(engine, bytes).unwrap();
     assert_eq!(source, Source::Compiled);
     assert_eq!(answer(engine, &module), 42);
 }
-fn assert_cached(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) {
+pub(super) fn assert_cached(cache: &ModuleCache, engine: &Engine, bytes: &[u8]) {
     let (module, source) = cache.load_or_compile(engine, bytes).unwrap();
     assert_eq!(source, Source::Cached);
     assert_eq!(answer(engine, &module), 42);
@@ -104,6 +116,7 @@ fn configurations_coexist_without_eviction() {
     let (_dir, cache, _, bytes) = fixture();
     let production = crate::runtime::engine().unwrap();
     let mut config = wasmtime::Config::new();
+    crate::runtime::without_threads(&mut config);
     config.epoch_interruption(crate::runtime::ENGINE_CONFIG.1);
     config.max_wasm_stack(horizon_guest_stack::GUEST_STACK_BYTES);
     // Wasmtime validates this bound even for synchronous engines. No async
@@ -134,11 +147,18 @@ fn truncated_entry_is_replaced() {
     assert_eq!(source, Source::Cached);
     let path = entry(&cache, &engine, &bytes);
     let artifact = fs::read(&path).unwrap();
-    replace_artifact(&path, &artifact[..10]);
+    #[cfg(windows)]
+    {
+        assert_eq!(answer(&engine, &mapped), 42);
+        drop(mapped);
+    }
+    replace_artifact(&cache, &path, &artifact[..10]);
+    #[cfg(not(windows))]
     assert_eq!(answer(&engine, &mapped), 42);
     assert_compiled(&cache, &engine, &bytes);
     assert_cached(&cache, &engine, &bytes);
     assert_eq!(entries(&cache).len(), 1);
+    #[cfg(not(windows))]
     assert_eq!(answer(&engine, &mapped), 42);
 }
 
@@ -149,7 +169,7 @@ fn damaged_header_is_replaced() {
     let path = entry(&cache, &engine, &bytes);
     let mut artifact = fs::read(&path).unwrap();
     artifact[0] ^= 0xff;
-    replace_artifact(&path, &artifact);
+    replace_artifact(&cache, &path, &artifact);
     assert_compiled(&cache, &engine, &bytes);
     assert_cached(&cache, &engine, &bytes);
 }
@@ -198,7 +218,7 @@ fn stale_temporaries_are_removed_and_fresh_ones_kept() {
 
 #[test]
 fn the_key_is_one_sha256_per_input() {
-    let engine = Engine::default();
+    let engine = crate::runtime::test_engine();
     let a = ModuleCache::key(&engine, &wasm(42));
     assert_eq!(a.len(), 129);
     assert_eq!(a, ModuleCache::key(&engine, &wasm(42)));
@@ -339,7 +359,7 @@ fn group_linker_uses_cache_and_programmatic_linking_leaves_it_empty() {
         use crate::link::{Group, Member};
         let (_dir, cache, _, _) = fixture();
         // Programmatic linking does not install a production epoch deadline.
-        let engine = Engine::default();
+        let engine = crate::runtime::test_engine();
         let bytes = wat::parse_str(
             r#"(module
         (@custom "dylink.0" "\01\04\00\00\00\00")
@@ -382,6 +402,7 @@ fn failed_replacement_keeps_compiled_module_and_cleans_temp_files() {
     assert_eq!(entries(&cache), vec![path]);
 }
 
+#[cfg(unix)]
 #[test]
 fn compiler_actor() {
     let Some(input) = std::env::var_os("HORIZON_COMPILER_INPUT") else {
@@ -416,6 +437,7 @@ fn compiler_actor() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "local child measurement; set HORIZON_CACHE_BENCH_WASM"]
 fn measure_child_compile() {
@@ -428,7 +450,11 @@ fn measure_child_compile() {
         let start = std::time::Instant::now();
         assert!(
             std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "module_cache::tests::compiler_actor"])
+                .args([
+                    "--include-ignored",
+                    "--exact",
+                    "module_cache::tests::compiler_actor"
+                ])
                 .env_clear()
                 .env("HORIZON_COMPILER_INPUT", &input.0)
                 .env("HORIZON_COMPILER_OUTPUT", ModuleCache::key(&engine, &bytes))
@@ -444,6 +470,7 @@ fn measure_child_compile() {
     eprintln!("child compile {} bytes: {times:?}", bytes.len());
 }
 
+#[cfg(unix)]
 #[test]
 fn compiler_key_mismatch_writes_nothing() {
     let (_dir, cache, _, bytes) = fixture();
@@ -453,39 +480,53 @@ fn compiler_key_mismatch_writes_nothing() {
     assert!(entries(&cache).is_empty());
 }
 
+#[cfg(unix)]
 fn actor_command(input: &Path, key: &str, mode: &str) -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .env_clear()
-        .args(["--exact", "module_cache::tests::compiler_actor"])
+        .args([
+            "--include-ignored",
+            "--exact",
+            "module_cache::tests::compiler_actor",
+        ])
         .env("HORIZON_COMPILER_INPUT", input)
         .env("HORIZON_COMPILER_OUTPUT", key)
         .env("HORIZON_COMPILER_MODE", mode);
     command
 }
+#[cfg(unix)]
 fn happy(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "happy")
 }
+#[cfg(unix)]
 fn killed(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "midwrite")
 }
+#[cfg(unix)]
 fn blocked(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "blocked")
 }
+#[cfg(unix)]
 fn wrong(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "wrong")
 }
+#[cfg(unix)]
 fn crash(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "crash")
 }
+#[cfg(unix)]
 fn nonzero(input: &Path, key: &str) -> std::process::Command {
     actor_command(input, key, "nonzero")
 }
+#[cfg(unix)]
 fn missing(_: &Path, _: &str) -> std::process::Command {
     std::process::Command::new("/no-such-horizon-compiler-2878")
 }
 
+#[cfg(unix)]
 #[test]
+#[ignore = "daily"]
 fn child_success_avoids_in_process_compile() {
     let (_dir, cache, _, bytes) = fixture();
     let engine = crate::runtime::engine().unwrap();
@@ -502,8 +543,10 @@ fn child_success_avoids_in_process_compile() {
     assert_eq!(entries(&cache).len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
-fn child_failures_fall_back_to_identical_compilation() {
+#[ignore = "daily"]
+fn child_failures_refuse_without_unbounded_compilation() {
     for (command, marker) in [
         (wrong as fn(&Path, &str) -> std::process::Command, None),
         (crash, None),
@@ -514,27 +557,40 @@ fn child_failures_fall_back_to_identical_compilation() {
     ] {
         let (_dir, cache, _, bytes) = fixture();
         let engine = crate::runtime::engine().unwrap();
-        let (module, source) = cache
+        let error = cache
             .load_with_child(
                 &engine,
                 &bytes,
                 Some((command, std::time::Duration::from_secs(10))),
             )
-            .unwrap();
-        assert_eq!(source, Source::Compiled);
+            .unwrap_err();
+        if marker.is_some() {
+            assert!(
+                error.downcast_ref::<CompileTimeout>().is_some(),
+                "{error:#}"
+            );
+        } else {
+            assert!(
+                error.downcast_ref::<CompileUnavailable>().is_some(),
+                "{error:#}"
+            );
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("cannot enforce compilation budget"));
+            assert!(diagnostic.contains("private writable .horizon-cache/wasm"));
+        }
         if let Some(marker) = marker {
             assert!(cache.root.parent().unwrap().join(marker).exists());
         }
-        assert_eq!(answer(&engine, &module), 42);
-        assert_eq!(cache.compiles.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            module.serialize().unwrap(),
-            Module::new(&engine, &bytes).unwrap().serialize().unwrap()
+        assert_eq!(cache.compiles.load(Ordering::Relaxed), 0);
+        assert!(
+            !cache
+                .entry_path(&ModuleCache::key(&engine, &bytes))
+                .exists()
         );
         assert!(
             entries(&cache)
                 .iter()
-                .all(|p| p.extension().unwrap() == "cwasm")
+                .all(|path| path.extension().unwrap() == "cwasm")
         );
     }
 }
@@ -555,6 +611,7 @@ fn internal_compiler_flag_refuses_malformed_arguments() {
     assert_eq!(crate::compile_child([OsString::from("--help")]), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn compiler_refuses_correctly_keyed_input_outside_cache_folder() {
     let dir = tempfile::tempdir().unwrap();
@@ -579,6 +636,7 @@ fn compiler_refuses_correctly_keyed_input_outside_cache_folder() {
     }));
 }
 
+#[cfg(unix)]
 #[test]
 fn compiler_keeps_old_live_input_and_other_writer_temporary() {
     let (_dir, cache, _, bytes) = fixture();
@@ -663,7 +721,7 @@ fn startup_cleanup_preserves_symlink_targets_and_unrelated_files() {
     fs::write(&unrelated, b"notes").unwrap();
     let directory = cache.root.join("directory.cwasm");
     fs::create_dir(&directory).unwrap();
-    drop(ModuleCache::new_with_limit(cache.root.clone(), false, 0));
+    drop(ModuleCache::new_with_limit(cache.root.clone(), 0));
     assert_eq!(fs::read(target).unwrap(), b"target data");
     assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
     assert_eq!(fs::read(unrelated).unwrap(), b"notes");
@@ -688,7 +746,7 @@ fn startup_size_limit_removes_oldest_first() {
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
             .unwrap();
     }
-    let next = ModuleCache::new_with_limit(cache.root.clone(), false, 10);
+    let next = ModuleCache::new_with_limit(cache.root.clone(), 10);
     assert!(!paths[0].exists());
     assert_eq!(fs::read(&paths[1]).unwrap(), b"1234");
     assert_eq!(fs::read(&paths[2]).unwrap(), b"1234");

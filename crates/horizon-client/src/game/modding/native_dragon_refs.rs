@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn dragon_target_change_can_be_cancelled() {
         struct Cancel;
         #[mod_api::__subscriptions]
@@ -179,8 +179,59 @@ mod tests {
         });
     }
 
+    /// `dragon_change_phase` listener of these tests: it records `(current, new_phase)` and
+    /// cancels every change.
+    struct PhaseRules(std::sync::Arc<std::sync::Mutex<Vec<(DragonPhase, DragonPhase)>>>);
+    #[mod_api::__subscriptions]
+    impl mod_api::Hooks for PhaseRules {
+        fn dragon_change_phase(
+            &self,
+            _: &mut dyn mod_api::ServerHost,
+            event: &mut mod_api::DragonChangePhaseEvent<'_>,
+        ) -> mod_api::Flow {
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.current, *event.new_phase));
+            mod_api::Flow::Cancel
+        }
+    }
+
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn a_mods_set_phase_is_not_asked_of_listeners_and_returns_as_before() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mods = vec![mod_api::ModEntry::new(
+            "phase-rules",
+            Box::new(PhaseRules(heard.clone())),
+        )]
+        .into();
+        mod_platform::testing::with_mods(mods, || {
+            with_game(|game| {
+                let (_, dragon) = dragon_in(game);
+                assert!(dragon.set_phase(game, DragonPhase::HoldingPattern));
+                assert_eq!(dragon.phase(game), Some(DragonPhase::HoldingPattern));
+                assert!(dragon.set_phase(game, DragonPhase::Landing));
+                assert_eq!(dragon.phase(game), Some(DragonPhase::Landing));
+                // The phase it holds is no change, as before.
+                assert!(dragon.set_phase(game, DragonPhase::Landing));
+                assert!(heard.lock().unwrap().is_empty());
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn without_a_listener_a_phase_is_set_as_before() {
+        with_game(|game| {
+            let (_, dragon) = dragon_in(game);
+            assert!(dragon.set_phase(game, DragonPhase::Landing));
+            assert_eq!(dragon.phase(game), Some(DragonPhase::Landing));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn the_dragon_is_a_mob_with_mob_state() {
         with_game(|game| {
             let kind = game
@@ -262,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_phase_is_read_set_synced_and_saved() {
         with_game(|game| {
             let (entity, dragon) = dragon_in(game);
@@ -337,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn leaving_flaming_discards_the_cloud_at_once() {
         use super::super::dragon::Breath;
         with_game(|game| {
@@ -383,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_invulnerable_player_is_not_a_target() {
         with_game(|game| {
             let (entity, _) = dragon_in(game);
@@ -446,7 +497,7 @@ mod tests {
                 ])
             );
             assert_eq!(
-                game.entity_kind(*part).as_deref(),
+                game.entity_kind(*part).map(|kind| kind.id(game)).as_deref(),
                 Some("minecraft:ender_dragon")
             );
             assert_eq!(game.entity_rotation(*part), Some([0.0, 0.0]));
@@ -467,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_dragons_parts_resolve_as_entities_of_their_own() {
         with_game(|game| {
             let (entity, _) = dragon_in(game);
@@ -513,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_dragon_that_has_no_id_yet_has_no_parts() {
         with_game(|game| {
             game.dragon.replace(Dragon::new(Vec3::ZERO, 0.0, 0));
@@ -525,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_clients_dragon_parts_resolve_through_its_own_copy() {
         use super::super::execution_role::ExecutionRole;
         use horizon_protocol::connection::Pipe;

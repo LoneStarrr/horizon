@@ -137,6 +137,14 @@ impl Game<'_> {
                 }
             }
         }
+        // The scrollbar comes after the tabs, so its request wins where they meet.
+        let scroll_mouse = (self.cursor.0 - ox, self.cursor.1 - oy);
+        if let Some(cursor) = self
+            .creative_screen
+            .scrollbar_cursor(scroll_mouse, &self.pack.names)
+        {
+            horizon_client::widgets::request_cursor(cursor);
+        }
         let background = if tab.search {
             "gui/container/creative_inventory/tab_item_search"
         } else if tab.inventory {
@@ -144,13 +152,17 @@ impl Game<'_> {
         } else {
             "gui/container/creative_inventory/tab_items"
         };
-        if let Some(mut r) = self.gui.atlas.sprites.get(background).copied() {
-            r.u1 = r.u0 + (r.u1 - r.u0) * Creative::WIDTH / r.w as f32;
-            r.v1 = r.v0 + (r.v1 - r.v0) * Creative::HEIGHT / r.h as f32;
-            batch.rect_uv(ox, oy, Creative::WIDTH, Creative::HEIGHT, r, u32::MAX);
-        }
+        // `CreativeModeInventoryScreen.extractBackground`: the selected tab's original image.
+        batch.texture_blit_baked(
+            &self.gui.atlas,
+            background,
+            [ox, oy, Creative::WIDTH, Creative::HEIGHT],
+            [0.0; 2],
+            [256.0; 2],
+        );
         let (tx, ty) = Creative::tab_position(tab);
         batch.sprite(&self.gui.atlas, &tab_sprite(tab, true), ox + tx, oy + ty);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         for t in tabs.iter().filter(|t| self.creative_screen.on_page(t)) {
             let (tx, ty) = Creative::tab_position(t);
             let stack = ItemStack {
@@ -272,21 +284,8 @@ impl Game<'_> {
         }
         let effect_tip = self.draw_inventory_effects(batch, (ox, oy), Creative::WIDTH as i32);
         self.draw_creative_pages(batch, ox, oy);
-        for t in tabs.iter().filter(|t| self.creative_screen.on_page(t)) {
-            let (tx, ty) = Creative::tab_position(t);
-            if self.cursor.0 >= ox + tx
-                && self.cursor.0 < ox + tx + 26.0
-                && self.cursor.1 >= oy + ty
-                && self.cursor.1 < oy + ty + 32.0
-            {
-                self.tooltip(
-                    batch,
-                    &self.creative_tab_title(t),
-                    self.cursor.0,
-                    self.cursor.1,
-                );
-            }
-        }
+        let browser_tip = self.draw_mod_browser(batch);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
         self.draw_carried(batch);
         if tab.inventory {
             if Self::creative_trash_hovered(batch, self.cursor) {
@@ -319,11 +318,15 @@ impl Game<'_> {
             self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
         }
         // CreativeModeInventoryScreen.checkTabHovering: a tab says its name.
-        if let Some(i) = Creative::hovered_tab(&tabs, (ox, oy), self.cursor)
+        if let Some(i) =
+            Creative::hovered_tab(&tabs, self.creative_screen.page, (ox, oy), self.cursor)
             && let Some(t) = tabs.get(i)
         {
             let title = self.creative_tab_title(t);
             self.tooltip(batch, &title, self.cursor.0, self.cursor.1);
+        }
+        if let Some(tooltip) = browser_tip {
+            self.draw_mod_browser_tooltip(batch, tooltip);
         }
     }
     pub(super) fn creative_trash_hovered(batch: &HudBatch, cursor: (f32, f32)) -> bool {
@@ -423,22 +426,24 @@ impl Game<'_> {
             }
             return;
         }
-        let tabs = self.creative_screen.tabs.clone();
-        for (i, t) in tabs.iter().enumerate() {
-            if !self.creative_screen.on_page(t) {
-                continue;
-            }
+        // Only the clicked tab's index is needed: cloning the tabs here copied
+        // every tab's items on each click, saved hotbars' stacks included.
+        let creative = &self.creative_screen;
+        let clicked = creative.tabs.iter().position(|t| {
             let (tx, ty) = Creative::tab_position(t);
-            if cx >= ox + tx && cx < ox + tx + 26.0 && cy >= oy + ty && cy < oy + ty + 32.0 {
-                select_creative_tab(&mut self.creative_screen, &mut self.inv_clicks, i);
-                // The tab's slots and page replace the previous tab's: the
-                // build reads the new ones from this click on.
-                self.build_screen();
-                self.refresh_saved_hotbars();
-                self.inv_drag = None;
-                self.last_inv_click = None;
-                return;
-            }
+            creative.on_page(t)
+                && cx >= ox + tx
+                && cx < ox + tx + 26.0
+                && cy >= oy + ty
+                && cy < oy + ty + 32.0
+        });
+        if let Some(i) = clicked {
+            select_creative_tab(&mut self.creative_screen, &mut self.inv_clicks, i);
+            self.build_screen();
+            self.refresh_saved_hotbars();
+            self.inv_drag = None;
+            self.last_inv_click = None;
+            return;
         }
         if self.creative_inventory_open() {
             if Self::creative_trash_hovered(&batch, self.cursor) {

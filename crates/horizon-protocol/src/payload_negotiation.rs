@@ -58,6 +58,23 @@ pub enum Mismatch {
     Missing,
     Version,
     Direction,
+    /// Typed declarations of one version whose value types have other schemas.
+    Schema,
+}
+
+/// What a typed declaration's version holds after the application version, before its
+/// schema fingerprint (mod_api's `PAYLOAD_SCHEMA_MARKER`).
+pub const SCHEMA_MARKER: &str = "+payload-schema.";
+
+/// Whether two versions are typed declarations of one application version with other schemas.
+fn schema_differs(local: &str, peer: &str) -> bool {
+    match (
+        local.rsplit_once(SCHEMA_MARKER),
+        peer.rsplit_once(SCHEMA_MARKER),
+    ) {
+        (Some((local, a)), Some((peer, b))) => local == peer && a != b,
+        _ => false,
+    }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -316,7 +333,11 @@ impl Control {
 pub struct Negotiation {
     local: Manifest,
     offered: bool,
+    /// Whether this end sent a Query.
+    queried: bool,
     protocol_required: bool,
+    /// Whether the peer sent any control message.
+    heard: bool,
     frozen: Option<Vec<Entry>>,
 }
 impl Negotiation {
@@ -324,25 +345,33 @@ impl Negotiation {
         Self {
             local,
             offered: false,
+            queried: false,
             protocol_required: false,
+            heard: false,
             frozen: None,
         }
     }
-    /// Call once at setup. Empty installations emit no control traffic.
-    pub fn initial(&self) -> Option<Control> {
-        (!self.local.entries.is_empty()).then_some(Control::Query)
+    /// Call once at setup, or not at all: empty installations emit no control traffic, and
+    /// an endpoint may leave the first Query to its peer.
+    pub fn initial(&mut self) -> Option<Control> {
+        let query = !self.local.entries.is_empty();
+        self.queried |= query;
+        query.then_some(Control::Query)
     }
     /// Require a marked response for Horizon-branded peers, including empty installations.
-    /// Both endpoints announce this before their existing configuration barrier.
+    /// Both endpoints announce this before their existing configuration barrier: a Query
+    /// when this end has sent none and neither offered nor froze yet.
     pub fn require_protocol(&mut self) -> Option<Control> {
         self.protocol_required = true;
-        (self.local.entries.is_empty() && !self.offered && self.frozen.is_none())
-            .then_some(Control::Query)
+        let query = !self.queried && !self.offered && self.frozen.is_none();
+        self.queried |= query;
+        query.then_some(Control::Query)
     }
     pub fn accepted(&self) -> Option<&[Entry]> {
         self.frozen.as_deref()
     }
     pub fn receive(&mut self, control: Control) -> Result<Option<Control>, Error> {
+        self.heard = true;
         if self.frozen.is_some() {
             return Err(match control {
                 Control::Offer(_) => Error::UnexpectedOffer,
@@ -377,6 +406,19 @@ impl Negotiation {
         }
         Ok(())
     }
+    /// [`Self::finish_without_offer`] for a client meeting a Horizon server that predates
+    /// this negotiation (servers before 2026-11-16 never send on [`CHANNEL`]). A required
+    /// peer that sent nothing at all is admitted like a vanilla peer, with only optional
+    /// declarations dropped, and this returns `true`. A peer that sent anything keeps every
+    /// check: without its Offer it is still `MissingProtocolResponse`.
+    pub fn finish_allowing_silent_peer(&mut self) -> Result<bool, Error> {
+        let silent = self.protocol_required && !self.heard && self.frozen.is_none();
+        if silent {
+            self.frozen = Some(intersect(&self.local, &Manifest::default())?);
+        }
+        self.finish_without_offer()?;
+        Ok(silent)
+    }
 }
 fn intersect(local: &Manifest, peer: &Manifest) -> Result<Vec<Entry>, Error> {
     let l: BTreeMap<_, _> = local
@@ -394,13 +436,19 @@ fn intersect(local: &Manifest, peer: &Manifest) -> Result<Vec<Entry>, Error> {
         let b = p.get(key);
         let mismatch = match b {
             None => Some(Mismatch::Missing),
+            Some(b) if schema_differs(&a.version, &b.version) => Some(Mismatch::Schema),
             Some(b) if a.version != b.version => Some(Mismatch::Version),
             Some(b) if a.flow != b.flow => Some(Mismatch::Direction),
             _ => None,
         };
         if let Some(reason) = mismatch {
-            // Optional permits absence, not contradictory declarations at both ends.
-            if b.is_some() || !a.optional {
+            // Optional permits absence, not contradictory declarations at both ends. Another
+            // value schema on both optional ends is absence: neither end can read the other.
+            let absent = match b {
+                None => a.optional,
+                Some(b) => reason == Mismatch::Schema && a.optional && b.optional,
+            };
+            if !absent {
                 return Err(Error::Incompatible {
                     phase: a.phase,
                     id: a.id.clone(),

@@ -1,4 +1,4 @@
-//! Splitscreen (in parts; #3541): more players on this computer in P1's world, each its own `Game`
+//! Splitscreen (in parts; arismoko/horizon#3541): more players on this computer in P1's world, each its own `Game`
 //! in this process that joins P1's server thread through memory. Every player renders offscreen
 //! on one device and the window's compositor copies their frames into their views (halves for
 //! two, `split_layout`). Keyboard and mouse drive the player whose view was clicked last (Esc
@@ -362,7 +362,7 @@ impl<'a> Split<'a> {
         let window = self.host.window.clone().ok_or("no window")?;
         let mut old = self.host.renderer.take().ok_or("no renderer")?;
         old.release_surface();
-        let api = self.host.settings.horizon.api;
+        let api = self.host.settings.horizon.effective_api();
         let batching = self.host.settings.horizon.translucent_batching;
         let shader_pack = super::shader_packs::picked_pack_shape(&self.host.settings);
         let built = build_renderer(
@@ -447,7 +447,7 @@ impl<'a> Split<'a> {
         self.host.window = Some(window.clone());
         let old = self.host.renderer.take().ok_or("no renderer")?;
         old.take_back(main.compositor);
-        let api = self.host.settings.horizon.api;
+        let api = self.host.settings.horizon.effective_api();
         let batching = self.host.settings.horizon.translucent_batching;
         let shader_pack = super::shader_packs::picked_pack_shape(&self.host.settings);
         let built = build_renderer(
@@ -831,10 +831,18 @@ impl ApplicationHandler for Split<'_> {
                 }
             }
         }
-        self.pads
-            .play_rumbles(&mut self.host.pad, self.p1_pad.owner);
+        self.pads.play_rumbles(
+            &mut self.host.pad,
+            self.p1_pad.owner,
+            self.host.settings.controller.impulse_triggers,
+            false,
+        );
         for g in &mut self.guests {
-            self.pads.play_rumbles(&mut g.game.pad, g.pad);
+            // A guest's game has no output path of its own: the router drives its pad's four
+            // motors, with that player's own Impulse Triggers setting.
+            let impulse = g.game.settings.controller.impulse_triggers;
+            self.pads
+                .play_rumbles(&mut g.game.pad, g.pad, impulse, true);
         }
         self.turn(0);
         let rendered = Instant::now();

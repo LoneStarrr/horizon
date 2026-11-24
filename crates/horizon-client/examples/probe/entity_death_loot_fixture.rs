@@ -297,7 +297,7 @@ pub fn main() -> horizon_client::Result<()> {
                 world_seed,
             };
             // Vanilla's entity tables all name a random sequence: no level random.
-            let mut level = horizon_core::random::LegacyRandom::new(0);
+            let mut level = horizon_core::random::LevelRandom::for_level(LegacyRandom::new(0));
             let (items, _) = drops::die(&mut m, &death, &mut sequences, &mut level);
             for d in items {
                 let _ = match d {
@@ -313,6 +313,7 @@ pub fn main() -> horizon_client::Result<()> {
                             &mut level_random,
                             Some((&mut sequences, world_seed)),
                         );
+                        let stacks = block_items.split_stacks(stacks);
                         for s in stacks
                             .iter()
                             .filter(|s| enderman::carried_block_drop_kept(s))
@@ -325,6 +326,7 @@ pub fn main() -> horizon_client::Result<()> {
                         }
                         Ok(())
                     }
+                    drops::Drop::Aged(s, _) => writeln!(out, "{}", line(&s)),
                     drops::Drop::Experience(amount) => {
                         let mut left = amount.max(0) as u32;
                         while left > 0 {

@@ -9,6 +9,7 @@ use crate::worldgen::{
     DecodeError,
     biome::{BiomeError, BiomeResolver, MultiNoiseBiomeSource},
     climate::{ClimateSampler, ClimateVolume},
+    mod_biome_sources::{LevelBiomeSource, mod_biome_sources},
 };
 use horizon_core::{
     density::{DensitySampler, SampleError, SamplerContext},
@@ -24,6 +25,8 @@ pub enum BiomeSourceError {
     Sample(SampleError),
     Regions(RegionError),
     MissingPreset,
+    /// A mod's biome source that is gone or no longer fits the world's biomes.
+    Registered(String),
 }
 impl std::fmt::Display for BiomeSourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,13 +68,17 @@ pub enum ResolvedBiomeSource {
     MultiNoise(MultiNoiseBiomeSource),
     /// A multi-noise preset with a world's mod regions.
     Regions(RegionBiomeSource),
+    /// A biome source a mod registered, over one world's seed.
+    Registered(LevelBiomeSource<String>),
 }
 impl BiomeSourceDefinition {
     /// Resolve a decoded definition using immutable, authenticated quantized
     /// preset tables. This does not execute vanilla's built-in preset builders.
+    /// Only a mod's registered source reads the world's `seed`.
     pub fn resolve(
         &self,
         presets: &BTreeMap<String, String>,
+        seed: i64,
     ) -> Result<ResolvedBiomeSource, BiomeSourceError> {
         Ok(match self {
             Self::Fixed(biome) => ResolvedBiomeSource::Fixed(FixedBiomeSource {
@@ -95,6 +102,13 @@ impl BiomeSourceDefinition {
                     presets.get(name).ok_or(BiomeSourceError::MissingPreset)?,
                 )?)
             }
+            Self::Registered(id) => ResolvedBiomeSource::Registered(
+                LevelBiomeSource::resolve(id, mod_biome_sources(), seed, |name| {
+                    Some(name.to_owned())
+                })
+                .ok_or_else(|| BiomeSourceError::Registered(format!("unknown biome source {id}")))?
+                .map_err(BiomeSourceError::Registered)?,
+            ),
         })
     }
 }
@@ -118,6 +132,7 @@ impl ResolvedBiomeSource {
                 .map(|(_, name)| name.as_str())
                 .collect(),
             Self::Regions(source) => source.biomes().collect(),
+            Self::Registered(source) => source.biomes().iter().map(String::as_str).collect(),
         }
     }
     /// A multi-noise source with `layout`'s regions over it, read from the generator's
@@ -152,6 +167,7 @@ impl ResolvedBiomeSource {
             Self::End(source) => BiomeSourceResolver::End(source, erosion),
             Self::MultiNoise(source) => BiomeSourceResolver::MultiNoise(source.resolver(climate)),
             Self::Regions(source) => BiomeSourceResolver::Regions(source.resolver(climate)),
+            Self::Registered(source) => BiomeSourceResolver::Registered(source),
         }
     }
 }
@@ -162,6 +178,7 @@ pub enum BiomeSourceResolver<'a> {
     End(&'a EndBiomeSource<String>, &'a dyn DensitySampler),
     MultiNoise(BiomeResolver<'a>),
     Regions(RegionResolver<'a>),
+    Registered(&'a LevelBiomeSource<String>),
 }
 impl<'a> BiomeSourceResolver<'a> {
     pub fn sample(
@@ -175,9 +192,10 @@ impl<'a> BiomeSourceResolver<'a> {
             Self::End(source, erosion) => source.noise_biome(quart, *erosion, context)?.as_str(),
             Self::MultiNoise(source) => source.sample(context, quart)?,
             Self::Regions(source) => source.sample(context, quart)?,
+            Self::Registered(source) => source.noise_biome(quart).as_str(),
         })
     }
-    /// Native fixed/checkerboard/End sources do not pre-sample a climate volume.
+    /// Native fixed/checkerboard/End and registered sources do not pre-sample a climate volume.
     /// Multi-noise preparation samples the full supplied quart extent once.
     pub fn prepare_volume(
         &self,
@@ -188,6 +206,23 @@ impl<'a> BiomeSourceResolver<'a> {
         match self {
             Self::MultiNoise(source) => Ok(Some(source.prepare_volume(context, minimum, extents)?)),
             Self::Regions(source) => Ok(Some(source.prepare_volume(context, minimum, extents)?)),
+            _ => Ok(None),
+        }
+    }
+    pub(crate) fn prepare_volume_with_buffers(
+        &self,
+        context: &mut SamplerContext,
+        minimum: [i32; 3],
+        extents: [i32; 3],
+        storage: &mut [Vec<f32>; 6],
+    ) -> Result<Option<ClimateVolume>, BiomeSourceError> {
+        match self {
+            Self::MultiNoise(source) => Ok(Some(
+                source.prepare_volume_with_buffers(context, minimum, extents, storage)?,
+            )),
+            Self::Regions(source) => Ok(Some(
+                source.prepare_volume_with_buffers(context, minimum, extents, storage)?,
+            )),
             _ => Ok(None),
         }
     }

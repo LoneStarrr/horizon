@@ -33,25 +33,17 @@ pub fn packs_dir() -> PathBuf {
         .unwrap_or_default()
         .join("resourcepacks")
 }
-mod folder;
-
-/// `Util.getPlatform().openPath`: the system file manager on the folder.
+/// `Blaze3D.openPath`: the desktop's handler on the folder (the default file manager).
 pub fn open_folder(dir: &Path) {
-    if let Err(e) = folder::command(dir).and_then(|mut command| command.spawn()) {
+    if let Err(e) = horizon_client::desktop::open_path(dir) {
         log::warn!("Horizon: could not open {}: {e}", dir.display());
     }
 }
-/// `Util.getPlatform().openUri`: the system browser on the link.
+/// `Blaze3D.openUri`: the system browser on the link.
 pub fn open_uri(uri: &str) {
-    // URLs need Windows' registered protocol handler, not Explorer's path
-    // handling. ShellExecute also preserves the URL as one Unicode value,
-    // without interpolating its query string into a command interpreter.
-    #[cfg(windows)]
-    if let Err(error) = open::that_detached(uri) {
+    if let Err(error) = horizon_client::desktop::open_uri(uri) {
         log::warn!("Horizon: could not open URI {uri}: {error}");
     }
-    #[cfg(not(windows))]
-    open_folder(Path::new(uri));
 }
 /// The resource root to load from: the selection and a server's packs, which go on top
 /// (`Pack.Position.TOP`, fixed), laid over `base`. `base` is the mods' content root
@@ -477,6 +469,7 @@ impl Game<'_> {
     pub(super) fn apply_staged_pack(&mut self, staged: StagedPack) -> horizon_client::Result<()> {
         let StagedPack {
             root,
+            root_feature_flags,
             client_applies,
             gui,
             pack,
@@ -491,6 +484,9 @@ impl Game<'_> {
             language,
         } = staged;
         let loop_context = self.prepare_loop_context(&root)?;
+        // Refresh modifiers from the newly staged packs, including removals.
+        let tab_modifiers = horizon_client::polytone_creative_tabs::TabModifier::read_all(&root);
+        self.creative_screen.set_pack_modifiers(tab_modifiers);
         let standalone_geometry =
             super::native_block_entity_draw::StandaloneGeometry::new(&pack, &gui);
         // Keep the working GPU resources, and hand its window surface over.
@@ -508,7 +504,7 @@ impl Game<'_> {
                     &gui,
                     self.renderer.as_ref(),
                     Some(textures),
-                    self.settings.horizon.api,
+                    self.settings.horizon.effective_api(),
                     self.settings.horizon.translucent_batching,
                     self.settings.vsync,
                     &self.settings.horizon,
@@ -548,7 +544,13 @@ impl Game<'_> {
         self.armor_stand_assets.apply_resources(armor_stand_assets);
         self.random_tick_sections.clear();
         self.portals.sections.clear();
+        self.forget_stand_rests();
+        // Each level keeps its own portal answers: the parked ones are stale too.
+        for level in self.levels.parked.values_mut() {
+            level.portal_sections.clear();
+        }
         self.options.resources = root.clone();
+        self.mods.root_feature_flags = root_feature_flags;
         self.falling_vertices.get_mut().clear();
         self.pack = pack;
         let skip = self
@@ -570,6 +572,7 @@ impl Game<'_> {
         // Kept mod block entities name the old atlas's sprites, and their view distances the old
         // registry's states.
         self.kept_block_entities.get_mut().clear();
+        self.live_scenes.get_mut().clear();
         self.mod_view_distances.take();
         // The atlas's sprites moved: the particle engine re-reads every rect
         // and the packs' sprite sets, or every particle draws a stale region.
@@ -660,6 +663,8 @@ impl Game<'_> {
         self.creative_screen.invalidate_build();
         super::client_reload::apply_client_reload(&self.mod_phase, client_applies);
         self.install_loop_context(loop_context);
+        self.resolve_entity_renderers();
+        super::native_special_renderers::reload();
         self.texture_atlases_stitched();
         self.native_model_baking_completed();
         self.native_client_resources_reloaded();
@@ -703,7 +708,7 @@ pub(super) fn stage_pack(
     .map_err(|e| e.to_string())?;
     // The world's models and sprites and the GUI atlas read the same root and nothing of
     // each other: about a second each, side by side.
-    let mod_image = horizon_client_render::render_slots::world_drawn_hooked();
+    let mod_image = super::resource_tables::mod_image_slot();
     // The sound events, the GUI sprites' metadata and the language are read here too, not in
     // the frame that applies the reload (about 20 ms of it).
     let (render, atlas, panorama, (sounds, ui_metadata, language)) = std::thread::scope(|s| {
@@ -762,6 +767,7 @@ pub(super) fn stage_pack(
     progress.set(3);
     Ok(StagedPack {
         root,
+        root_feature_flags: mod_sources.candidate_feature_flags(),
         client_applies,
         gui,
         pack,
@@ -781,6 +787,7 @@ pub(super) fn stage_pack(
 /// it on the render thread).
 pub(super) struct StagedPack {
     pub root: PathBuf,
+    root_feature_flags: Option<Arc<[String]>>,
     pub waypoint_styles: horizon_client::locator_bar::WaypointStyles,
     pub armor_stand_assets: super::armor_stands::ArmorStandAssets,
     pub frame_models: [super::frames::FrameModel; 4],
@@ -929,7 +936,7 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fluid_models_reload_recollects_before_baking() {
         // Concurrent resource loads replace the process-wide fluid looks and models.
         if super::super::native_entity_refs::tests::run_fresh_cases(
@@ -1037,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "full content root: needs prepared vanilla data"]
+    #[ignore = "daily"]
     fn resource_pack_overrides_mod_and_vanilla() {
         use std::fs;
         let vanilla =

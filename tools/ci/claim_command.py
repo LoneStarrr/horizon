@@ -8,20 +8,14 @@ A comment on an issue, on its first line:
 
     /claim             assigns the commenter (GitHub lets an issue's commenters be assigned, no role needed)
     /unclaim           unassigns the commenter
-    /unclaim @login    the repository owner, Ludovic and trusted reviewers release someone else's claim
-
-Trailing command punctuation is allowed. `/claim` ignores explanatory text; `/unclaim` targets the commenter
-unless the entire remainder of that first line is a login.
+    /unclaim @login    the council and the trusted reviewers (.github/trusted-reviewers.txt) release another's claim
 
 An assigned issue is taken, and so is one claimed on Discord (Kira's `in progress` label). Trackers and proposals
 (labels `tracker`, `proposal`, `not claimable`, set by maintainers) are never claimed whole. Refused with a one-line
-answer: a pull request (claim the issue it fixes), a closed or locked issue, or an issue someone else holds.
-A success answers with a 👍 on the comment; the assignment shows in the thread, and the issue's `help wanted` label
-becomes `claimed` (and back when its last holder unclaims).
-A contributor holds at most 5 claimed issues without an open pull request of theirs that links one: a `/claim`
-past that is refused with the count (owner, 2026-11-10). Claims already over the limit stay. The repository's owner,
-members and collaborators (the comment's author association), the trusted reviewers and the logins in the repository
-variable `CLAIM_LIMIT_EXEMPT` (comma-separated) are not limited.
+answer: a pull request (claim the issue it fixes), a closed or locked issue, an issue someone else holds, more than
+8 open claims at once, not counting issues the claimant's own open pull request already fixes (the council and the trusted reviewers have
+no limit). For the first hour after an issue is filed only its author can `/claim` it (the council and the trusted reviewers
+included; an issue filed by a bot has no such hour). A success answers with a 👍 on the comment; the assignment shows in the thread.
 A claim made here is released after 5 days unless an open pull request links the issue (`Fixes #N`, a mention, or the
 sidebar's link); assignments made by hand are never released. No code of any pull request is read or run: only the
 comment's text, its author and the API's answers, which reach this script as env vars.
@@ -31,7 +25,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import string
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -41,19 +34,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nightly_set as ns  # noqa: E402  (the same trusted reviewers and owner)
 
-PREFIX = "🤖 Agent: "
+PREFIX = "🤖 Claims: "
+MAX_CLAIMS = 8
 STALE = timedelta(days=5)
+# ASSIGNED_ISSUES asks GitHub for `timelineItems(last: 100, ...)`; a saturated window is not evidence
+# that no older open pull request links the issue.
+TIMELINE_WINDOW = 100
+AUTHOR_GRACE = timedelta(hours=1)  # an issue's author alone may claim it for this long after filing it
 LOGIN = re.compile(r"^@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$")
+USAGE = "Use `/claim` or `/unclaim` (the trusted reviewers: `/unclaim @login`)."
 # The login GitHub shows for this workflow's token: `github-actions[bot]` in REST, `github-actions` in GraphQL.
 BOT_LOGINS = ("github-actions", "github-actions[bot]")
 # Kira's Discord `/claim` marks an issue with this label (horizon-rust/kira, WORK.label): it is taken too.
 KIRA_LABEL = "in progress"
 # Issues nobody claims whole (ari, 2026-11-02): a tracker lists other issues, a proposal waits for a decision.
 UNCLAIMABLE = ("tracker", "proposal", "not claimable")
-# Claimed issues a contributor may hold with no open pull request of theirs linking them (owner, 2026-11-10).
-LIMIT = 5
-# Author associations GitHub gives the repository's own people: they are not limited.
-STAFF = ("OWNER", "MEMBER", "COLLABORATOR")
 
 
 class Refused(Exception):
@@ -72,28 +67,44 @@ def safe(text: str) -> str:
 
 
 def parse(body: str) -> Command | None:
-    """Read the first word, allowing trailing punctuation; only an exact unclaim login selects another person."""
+    """The command on a comment's first line; None when it isn't one. Raises Refused when it is one, but wrong."""
     line = next((line.strip() for line in body.splitlines() if line.strip()), "")
     # Agents start every comment with "🤖 Agent:" (CLAUDE.md), so their `/claim` follows it.
     line = re.sub(r"^🤖\s*Agent:\s*", "", line)
-    words = line.split(maxsplit=1)
-    command = words[0].rstrip(string.punctuation).lower() if words else ""
-    if command not in ("/claim", "/unclaim"):
+    m = re.match(r"^/(\w+)(?:\s+(.*))?$", line)
+    if not m or m.group(1).lower() not in ("claim", "unclaim"):
         return None
-    verb = command[1:]
-    rest = words[1] if len(words) > 1 else ""
-    who = LOGIN.match(rest) if verb == "unclaim" else None
-    return Command(verb, who.group(1) if who else None)
+    verb, rest = m.group(1).lower(), (m.group(2) or "").strip()
+    if not rest:
+        return Command(verb)
+    who = LOGIN.match(rest)
+    if verb == "claim" or not who:
+        raise Refused(f"`{safe(rest)}` isn't understood here. {USAGE}")
+    return Command(verb, who.group(1))
 
 
-def is_team(actor: ns.Actor, reviewers: ns.Reviewers, repo: str) -> bool:
-    """The repository owner or an account trusted by numeric ID."""
-    return (actor.login.lower() == repo.split("/")[0].lower() or ns.is_owner(actor)
-            or (reviewers.listed(actor.id) and not reviewers.paused))
+def is_team(actor: ns.Actor, reviewers: ns.Reviewers) -> bool:
+    """A council member, or a listed reviewer while the list isn't paused. By numeric ID, never by login."""
+    return ns.is_owner(actor) or (reviewers.listed(actor.id) and not reviewers.paused)
 
 
 def assignees(issue: dict) -> list[str]:
     return [a["login"] for a in issue.get("assignees") or []]
+
+
+def grace_refusal(issue: dict, login: str, now: datetime) -> str | None:
+    """Why only the author may claim this issue yet (None when `login` may). Issues filed by bots have no window."""
+    author = issue.get("user") or {}
+    name = str(author.get("login") or "")
+    if not name or author.get("type") == "Bot" or name.endswith("[bot]") or not issue.get("created_at"):
+        return None
+    created = datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))
+    if now - created >= AUTHOR_GRACE or name.lower() == login.lower():
+        return None
+    mins = max(0, int((now - created).total_seconds() // 60))
+    ago = "less than a minute" if mins == 0 else f"{mins} minute{'s' if mins != 1 else ''}"
+    until = (created + AUTHOR_GRACE).astimezone(timezone.utc).strftime("%H:%M")
+    return f"@{name} filed this issue {ago} ago: they have the first hour to claim it (until {until} UTC)."
 
 
 def target_refusal(issue: dict) -> str | None:
@@ -117,46 +128,6 @@ def gh(*args: str, check: bool = True, stdin: str | None = None) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-LINKS = """
-fragment Links on Issue {
-  closedByPullRequestsReferences(first: 50, includeClosedPrs: false) {
-    pageInfo { hasNextPage endCursor } nodes { state author { login } }
-  }
-  timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
-    pageInfo { hasNextPage endCursor }
-    nodes { ... on CrossReferencedEvent { source { ... on PullRequest { state author { login } } } } }
-  }
-}"""
-
-HELD_ISSUES = """
-query($owner: String!, $name: String!, $login: String!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    issues(first: 50, states: OPEN, filterBy: {assignee: $login}, after: $cursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        number
-        ...Links
-      }
-    }
-  }
-}""" + LINKS
-
-# The rest of one issue's links, when HELD_ISSUES got only their first page; each connection is paged on its own.
-ISSUE_LINKS = """
-query($owner: String!, $name: String!, $number: Int!, $refs: String, $events: String, $wantRefs: Boolean!) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      closedByPullRequestsReferences(first: 50, after: $refs, includeClosedPrs: false) @include(if: $wantRefs) {
-        pageInfo { hasNextPage endCursor } nodes { state author { login } }
-      }
-      timelineItems(first: 100, after: $events, itemTypes: [CROSS_REFERENCED_EVENT]) @skip(if: $wantRefs) {
-        pageInfo { hasNextPage endCursor }
-        nodes { ... on CrossReferencedEvent { source { ... on PullRequest { state author { login } } } } }
-      }
-    }
-  }
-}"""
-
 ASSIGNED_ISSUES = """
 query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
@@ -179,6 +150,41 @@ query($owner: String!, $name: String!, $cursor: String) {
 }"""
 
 
+CLAIMED_ISSUES = """
+query($owner: String!, $name: String!, $login: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(first: 100, states: OPEN, filterBy: {assignee: $login}, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
+          pageInfo { hasNextPage endCursor }
+          nodes { author { login } }
+        }
+      }
+    }
+  }
+}"""
+
+# The rest of one issue's closing pull requests, when the first ten are not all of them.
+CLOSING_PRS = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 50, includeClosedPrs: false, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } }
+      }
+    }
+  }
+}"""
+
+
+def authored_by(connection: dict, login: str) -> bool:
+    """Whether one of the connection's pull requests is `login`'s (a deleted account has no author)."""
+    return any((pr.get("author") or {}).get("login", "").lower() == login.lower() for pr in connection["nodes"])
+
+
 class Api:
     """The few GitHub calls this needs; tests replace it."""
 
@@ -197,37 +203,36 @@ class Api:
     def unassign(self, n: int, login: str) -> None:
         gh("api", "-X", "DELETE", f"repos/{self.repo}/issues/{n}/assignees", "-f", f"assignees[]={login}")
 
-    def label(self, n: int, add: str, remove: str) -> None:
-        """Swaps one label for another; removing a label the issue lacks is not an error."""
-        gh("api", f"repos/{self.repo}/issues/{n}/labels", "-f", f"labels[]={add}")
-        gh("api", "-X", "DELETE", f"repos/{self.repo}/issues/{n}/labels/{remove.replace(' ', '%20')}", check=False)
-
-    def graphql(self, query: str, **variables) -> dict:
+    def open_claims(self, login: str) -> int:
+        # An issue the claimant's own open pull request fixes (closing keyword or sidebar link) is done on their
+        # side: it no longer counts, since a review can take days (rdbtCVS, 2026-10-30). Someone else's pull
+        # request linking it does not lift the claimant's limit, so it is read from the issue, not searched.
         owner, name = self.repo.split("/")
-        args = ["api", "graphql", "-F", f"owner={owner}", "-F", f"name={name}", "-f", f"query={query}"]
-        for key, value in variables.items():
-            if value is not None:
-                args += ["-F", f"{key}={str(value).lower() if isinstance(value, bool) else value}"]
-        return json.loads(gh(*args))["data"]["repository"]
-
-    def held_issues(self, login: str) -> list[dict]:
-        """The open issues assigned to `login`, each with every open pull request that links it (all pages)."""
-        out, cursor = [], None
+        held, cursor = 0, None
         while True:
-            page = self.graphql(HELD_ISSUES, login=login, cursor=cursor)["issues"]
-            out += page["nodes"]
+            args = ["api", "graphql", "-f", f"owner={owner}", "-f", f"name={name}", "-f", f"login={login}",
+                    "-f", f"query={CLAIMED_ISSUES}"]
+            if cursor:
+                args += ["-f", f"cursor={cursor}"]
+            page = json.loads(gh(*args))["data"]["repository"]["issues"]
+            held += sum(not self.fixed_by(node, login) for node in page["nodes"])
             if not page["pageInfo"]["hasNextPage"]:
-                break
+                return held
             cursor = page["pageInfo"]["endCursor"]
-        for issue in out:
-            for field, cursor_name in (("closedByPullRequestsReferences", "refs"), ("timelineItems", "events")):
-                links = issue[field]
-                while links["pageInfo"]["hasNextPage"]:
-                    more = self.graphql(ISSUE_LINKS, number=issue["number"], wantRefs=cursor_name == "refs",
-                                        **{cursor_name: links["pageInfo"]["endCursor"]})["issue"][field]
-                    links["nodes"] += more["nodes"]
-                    links["pageInfo"] = more["pageInfo"]
-        return out
+
+    def fixed_by(self, issue: dict, login: str) -> bool:
+        """Whether an open pull request of `login` fixes the issue (a node of CLAIMED_ISSUES), reading on
+        through the closing pull requests while the claimant's is not among those seen."""
+        owner, name = self.repo.split("/")
+        connection = issue["closedByPullRequestsReferences"]
+        while True:
+            if authored_by(connection, login):
+                return True
+            if not connection["pageInfo"]["hasNextPage"]:
+                return False
+            raw = gh("api", "graphql", "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={issue['number']}",
+                     "-f", f"cursor={connection['pageInfo']['endCursor']}", "-f", f"query={CLOSING_PRS}")
+            connection = json.loads(raw)["data"]["repository"]["issue"]["closedByPullRequestsReferences"]
 
     def react(self, comment_id: int) -> None:
         gh("api", f"repos/{self.repo}/issues/comments/{comment_id}/reactions", "-f", "content=+1")
@@ -239,9 +244,9 @@ class Api:
         owner, name = self.repo.split("/")
         out, cursor = [], None
         while True:
-            args = ["api", "graphql", "-F", f"owner={owner}", "-F", f"name={name}", "-f", f"query={ASSIGNED_ISSUES}"]
+            args = ["api", "graphql", "-f", f"owner={owner}", "-f", f"name={name}", "-f", f"query={ASSIGNED_ISSUES}"]
             if cursor:
-                args += ["-F", f"cursor={cursor}"]
+                args += ["-f", f"cursor={cursor}"]
             page = json.loads(gh(*args))["data"]["repository"]["issues"]
             out += page["nodes"]
             if not page["pageInfo"]["hasNextPage"]:
@@ -249,27 +254,9 @@ class Api:
             cursor = page["pageInfo"]["endCursor"]
 
 
-def exempt_logins(raw: str) -> set[str]:
-    """The logins of `CLAIM_LIMIT_EXEMPT`, comma-separated, compared without case as GitHub does."""
-    return {login.strip().lstrip("@").lower() for login in raw.split(",") if login.strip().lstrip("@")}
-
-
-def without_pull_request(issues: list[dict], login: str) -> list[int]:
-    """The numbers of `issues` (GraphQL nodes from HELD_ISSUES) that no open pull request by `login` links."""
-    def by_them(pr: dict | None) -> bool:
-        pr = pr or {}
-        return pr.get("state") == "OPEN" and ((pr.get("author") or {}).get("login") or "").lower() == login.lower()
-    return [i["number"] for i in issues
-            if not any(by_them(pr) for pr in i["closedByPullRequestsReferences"]["nodes"])
-            and not any(by_them(e.get("source")) for e in i["timelineItems"]["nodes"])]
-
-
-def run(api, cmd: Command, actor: ns.Actor, number: int, reviewers: ns.Reviewers,
-        association: str = "NONE", exempt: frozenset[str] | set[str] = frozenset()) -> str | None:
+def run(api, cmd: Command, actor: ns.Actor, number: int, reviewers: ns.Reviewers, now: datetime) -> str | None:
     """Does the command; returns the comment to post, or None when a 👍 says it. Raises Refused for a refusal.
-    Claims are GitHub assignees, so they are held by login; who may act for others is decided by ID.
-    `association` is the comment's author association, which exempts the repository's own people from the limit, and
-    `exempt` the lowercased logins of `CLAIM_LIMIT_EXEMPT`."""
+    Claims are GitHub assignees, so they are held by login; who may act for others is decided by ID."""
     login = actor.login
     issue = api.issue(number)
     if issue is None:
@@ -291,42 +278,20 @@ def run(api, cmd: Command, actor: ns.Actor, number: int, reviewers: ns.Reviewers
         if KIRA_LABEL in labels:
             raise Refused(f"someone claimed this issue on Discord (Kira's `{KIRA_LABEL}` label): pick another, or ask "
                           "in the thread.")
-        limited = association not in STAFF and login.lower() not in exempt and not is_team(actor, reviewers, api.repo)
-        if limited:
-            open_claims = without_pull_request(api.held_issues(login), login)
-            if len(open_claims) >= LIMIT:
-                listed = ", ".join(f"#{n}" for n in sorted(open_claims))
-                raise Refused(f"you already hold {len(open_claims)} claimed issues with no open pull request of yours "
-                              f"({listed}), and the limit is {LIMIT}. Opening a pull request that links one of them, "
-                              "or `/unclaim` on one, frees a slot.")
+        if (why := grace_refusal(issue, login, now)):
+            raise Refused(why)
+        if not is_team(actor, reviewers) and api.open_claims(login) >= MAX_CLAIMS:
+            raise Refused(f"You hold {MAX_CLAIMS} open issues: finish or `/unclaim` one first.")
         if login.lower() not in {a.lower() for a in api.assign(number, login)}:
             raise Refused("GitHub didn't assign you; nothing changed.")
-        # Runs for different issues aren't serialized (one queue for the whole repository would let GitHub cancel
-        # the pending runs of a burst, leaving comments unanswered), so two claims made at once can both pass the
-        # count above. Counting again after assigning catches that: whoever then sees more than the limit backs out.
-        if limited:
-            try:
-                recount = len(without_pull_request(api.held_issues(login), login))
-            except RuntimeError:  # an unchecked claim isn't kept: undo it, then the caller reports GitHub's refusal
-                api.unassign(number, login)
-                raise
-        if limited and recount > LIMIT:
-            api.unassign(number, login)
-            raise Refused(f"another of your claims was made at the same moment and together they pass the limit of "
-                          f"{LIMIT} claimed issues with no open pull request of yours, so this one was undone. "
-                          "`/claim` again if you still have a free slot.")
-        api.label(number, "claimed", "help wanted")
         return None
     who = cmd.who or login
-    if who.lower() != login.lower() and not is_team(actor, reviewers, api.repo):
-        raise Refused(f"Only the repository owner, Ludovic and the trusted reviewers in `{ns.REVIEWERS}` "
-                      "release someone else's claim.")
+    if who.lower() != login.lower() and not is_team(actor, reviewers):
+        raise Refused(f"Only the council and the trusted reviewers in `{ns.REVIEWERS}` release someone else's claim.")
     if who.lower() not in held:
         raise Refused("You don't hold this issue." if who.lower() == login.lower() else f"`{safe(who)}` doesn't hold this issue.")
     real = next(h for h in holders if h.lower() == who.lower())
     api.unassign(number, real)
-    if len(holders) == 1:
-        api.label(number, "help wanted", "claimed")
     if who.lower() == login.lower():
         return None
     return f"{PREFIX}released @{real}'s claim, on behalf of @{login}. `/claim` takes it."
@@ -345,8 +310,7 @@ def command() -> int:
         except ns.Refused as e:
             raise Refused(str(e)) from e
         reviewers = ns.read_reviewers(Path(ns.REVIEWERS).read_text())
-        text = run(api, cmd, actor, number, reviewers, os.environ.get("AUTHOR_ASSOCIATION", "NONE"),
-                   exempt_logins(os.environ.get("CLAIM_LIMIT_EXEMPT", "")))
+        text = run(api, cmd, actor, number, reviewers, datetime.now(timezone.utc))
     except Refused as e:
         text = f"{PREFIX}refused, {e} (asked by @{safe(login)})"
     except RuntimeError as e:
@@ -366,6 +330,11 @@ def stale_claims(issue: dict, now: datetime) -> list[str]:
     """The assignees of one issue (GraphQL node) whose claim this workflow made over 5 days ago, when no open pull
     request links the issue."""
     events = issue["timelineItems"]["nodes"]
+    if len(events) >= TIMELINE_WINDOW:
+        # ASSIGNED_ISSUES asks for `timelineItems(last: 100)`: a full window can hide an older open PR
+        # that links this issue. Failing closed keeps the claim rather than unassigning a contributor
+        # who is in fact covered by a pull request we can no longer see.
+        return []
     if issue["closedByPullRequestsReferences"]["nodes"] or any(
             e["__typename"] == "CrossReferencedEvent" and (e.get("source") or {}).get("state") == "OPEN"
             for e in events):
@@ -388,8 +357,7 @@ def stale_claims(issue: dict, now: datetime) -> list[str]:
 def release(api, now: datetime, dry_run: bool) -> list[tuple[int, str]]:
     done = []
     for issue in api.assigned_issues():
-        stale = stale_claims(issue, now)
-        for login in stale:
+        for login in stale_claims(issue, now):
             done.append((issue["number"], login))
             if dry_run:
                 continue
@@ -398,8 +366,6 @@ def release(api, now: datetime, dry_run: bool) -> list[tuple[int, str]]:
                         f"{PREFIX}released @{login}'s claim: {STALE.days} days without an open pull request that links "
                         f"this issue. `/claim` again when you pick it back up (a draft pull request with "
                         f"`Fixes #{issue['number']}` keeps the claim).")
-        if stale and not dry_run and len(stale) == len(issue["assignees"]["nodes"]):
-            api.label(issue["number"], "help wanted", "claimed")
     return done
 
 

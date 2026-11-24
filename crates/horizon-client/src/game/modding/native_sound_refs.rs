@@ -27,7 +27,7 @@ impl Game<'_> {
     }
     /// Whether the server's registry has `sound`, when it is a vanilla
     /// event; a mod's goes by name.
-    fn native_sound_known(&self, sound: &str) -> bool {
+    pub(super) fn native_sound_known(&self, sound: &str) -> bool {
         !sound.starts_with("minecraft:")
             || self.lan.as_ref().is_none_or(|host| {
                 host.hub
@@ -161,7 +161,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn sounds_reach_the_right_connections() {
         with_game(|game| {
             let net = NetConfig {
@@ -183,6 +183,7 @@ pub(super) mod tests {
                 max_players: 3,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             let settings = LanSettings {
                 port: 0,
@@ -273,7 +274,7 @@ pub(super) mod tests {
     /// random; and a player exactly at the range edge is outside
     /// `PlayerList.broadcast`.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn queued_sounds_draw_sound_seeds_at_play_and_cut_at_the_range_edge() {
         use horizon_core::random::RandomSource;
 
@@ -297,6 +298,7 @@ pub(super) mod tests {
                 max_players: 3,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             let settings = LanSettings {
                 port: 0,

@@ -84,7 +84,7 @@ impl Game<'_> {
         let declared = action_for_job(MenuJob::of(button)?, &self.pad_actions())?;
         let [x, y, w, h] = declared.rect;
         let at = (x + w / 2.0, y + h / 2.0);
-        // A button that registers no focus target (a sign's Done) is still pressed.
+        // A declared button that registers no focus target is still pressed.
         let target = self
             .pad_targets()
             .into_iter()
@@ -156,7 +156,7 @@ impl Game<'_> {
     /// `pad status`: the glyphs drawn now and where: the part each is for, its label, its text's
     /// place, what it covers, and its sprite (none: the label on a key).
     pub(super) fn pad_glyphs_status(&self) -> Vec<serde_json::Value> {
-        let view = self.gui_scale().map_or((0.0, 0.0), |b| (b.width, b.height));
+        let view = self.gui_batch().map_or((0.0, 0.0), |b| (b.width, b.height));
         let atlas = &self.gui.atlas;
         self.pad_glyphs(view)
             .iter()

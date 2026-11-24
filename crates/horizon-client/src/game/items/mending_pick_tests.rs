@@ -23,8 +23,13 @@ fn table(id: &str, slots: &[&str], effect: bool) -> Enchantments {
         .unwrap()
 }
 
-fn repair(id: &str, chest: bool, table: &Enchantments) -> (u32, u32) {
-    mod_platform::testing::with_mods(Default::default(), || {
+fn repair_with(
+    id: &str,
+    chest: bool,
+    table: &Enchantments,
+    mods: mod_api::Mods,
+) -> (u32, u32) {
+    mod_platform::testing::with_mods(mods, || {
         let mut result = None;
         crate::game::native_entity_refs::tests::with_game(|game| {
             let root = tempfile::tempdir().unwrap();
@@ -44,7 +49,7 @@ fn repair(id: &str, chest: bool, table: &Enchantments) -> (u32, u32) {
             let packs = game.reload_datapacks(false, &[]).unwrap();
             let resources = game.options.resources.clone();
             game.world_tables = game
-                .build_world_tables(&packs, false, &resources, game.mods.data_switched)
+                .stage_world_tables(&packs, false, &resources)
                 .unwrap()
                 .0;
             game.world_tables.as_mut().unwrap().stations.enchantments =
@@ -81,8 +86,12 @@ fn repair(id: &str, chest: bool, table: &Enchantments) -> (u32, u32) {
     })
 }
 
+fn repair(id: &str, chest: bool, table: &Enchantments) -> (u32, u32) {
+    repair_with(id, chest, table, Default::default())
+}
+
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn mending_pick_data_pack_effect() {
     assert_eq!(
         repair("test:patch", false, &table("test:patch", &["any"], true)),
@@ -91,7 +100,7 @@ fn mending_pick_data_pack_effect() {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn mending_pick_redefined_mending_without_effect() {
     assert_eq!(
         repair(
@@ -104,7 +113,7 @@ fn mending_pick_redefined_mending_without_effect() {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn mending_pick_head_effect_excludes_chestplate() {
     assert_eq!(
         repair("test:patch", true, &table("test:patch", &["head"], true)),
@@ -129,7 +138,7 @@ impl mod_api::Hooks for GrantMending {
 }
 
 #[test]
-#[ignore = "requires prepared resources"]
+#[ignore = "daily"]
 fn mending_pick_uses_hook_granted_enchantment() {
     crate::game::api_values::install_stack_hooks();
     let _ = horizon_items::native_enchantment_hooks::install(
@@ -155,4 +164,27 @@ fn mending_pick_uses_hook_granted_enchantment() {
             assert!(current.enchantments().is_empty());
         });
     });
+}
+
+struct ZeroRepair;
+
+#[mod_api::__subscriptions]
+impl mod_api::Hooks for ZeroRepair {
+    fn player_item_mend(&self, _: &mut dyn mod_api::ServerHost, event: &mut mod_api::PlayerItemMendEvent<'_>) {
+        event.repair = 0;
+    }
+}
+
+/// A listener that refuses the repair without spending XP must end the mending
+/// walk, not retry the same stack forever (kacpherek on #18864).
+#[test]
+#[ignore = "daily"]
+fn mending_stops_when_a_listener_zeroes_repair_without_spending_xp() {
+    let mods = vec![mod_api::ModEntry::new("zero_repair", Box::new(ZeroRepair))].into();
+    let table = table("test:patch", &["any"], true);
+    assert_eq!(
+        repair_with("test:patch", false, &table, mods),
+        (20, 1),
+        "damage must stay and the unspent XP must be returned"
+    );
 }

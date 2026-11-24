@@ -13,6 +13,7 @@
 //!   official server's (its status ping), over time, written down once a minute (`history`:
 //!   totals only), cached a minute.
 //! - `/hub/…`: the hub's votes (`hub`) and bug reports (`intake`).
+//! - `POST /v1/report`: a bug or performance report from the game, opened as an issue (`intake`, `game_report`).
 //! - `GET /healthz`.
 //!
 //! Abuse limits: a token bucket per IP address (kept in memory for an hour, never stored), a
@@ -35,6 +36,7 @@ use horizon_telemetry::batch;
 
 pub mod classes;
 pub mod export;
+pub mod game_report;
 pub mod github;
 pub mod history;
 pub mod hub;
@@ -57,10 +59,10 @@ pub struct Config {
     pub requests_per_hour: f64,
     /// Items one install may send a day.
     pub items_per_day: u32,
-    /// Behind a proxy (Railway, Fly…): the client's address is read from `client_ip_header`.
+    /// Behind a proxy (Cloudflare, Fly…): the client's address is read from `client_ip_header`.
     pub trust_proxy: bool,
     /// The one header the proxy in front sets to the client's address, overwriting whatever the
-    /// client sent (`HORIZON_TELEMETRY_CLIENT_IP_HEADER`, e.g. `x-real-ip` on Railway). Its last
+    /// client sent (`HORIZON_TELEMETRY_CLIENT_IP_HEADER`, e.g. `cf-connecting-ip` behind Cloudflare). Its last
     /// comma-separated entry is used. Read only with `trust_proxy`; without it the TCP peer counts,
     /// which behind a proxy is the proxy, so every client shares one bucket (the server warns at
     /// start).
@@ -87,6 +89,9 @@ pub struct Config {
     pub hub_posts_per_hour: f64,
     /// Bug reports taken a day, from everyone: each one opens a GitHub issue.
     pub hub_reports_per_day: u32,
+    /// Reports from the game taken a day, from everyone (`POST /v1/report`): each one opens a GitHub
+    /// issue. Apart from the website's, so neither uses up the other's.
+    pub game_reports_per_day: u32,
     /// Days reports are kept (opened as issues long before).
     pub hub_keep_days: u32,
     /// The bearer token the protected export (`export`) wants; unset, it answers 404.
@@ -106,6 +111,9 @@ pub struct Config {
     pub aggregate_days: Option<Vec<u32>>,
 }
 
+/// The website: the browser origin answered by default, and where a game report's capture link must point.
+pub(crate) const WEBSITE: &str = "https://playhorizon.dev";
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -115,7 +123,7 @@ impl Default for Config {
             items_per_day: 100,
             trust_proxy: false,
             client_ip_header: None,
-            allow_origin: "https://playhorizon.dev".into(),
+            allow_origin: WEBSITE.into(),
             live_per_hour: 600.0,
             live_window: horizon_telemetry::live::WINDOW,
             live_max_sessions: 200_000,
@@ -125,6 +133,7 @@ impl Default for Config {
             hub_per_hour: 600.0,
             hub_posts_per_hour: 20.0,
             hub_reports_per_day: 30,
+            game_reports_per_day: 20,
             hub_keep_days: 90,
             export_token: None,
             github_token: None,
@@ -141,7 +150,7 @@ impl Config {
     /// `…_REQUESTS_PER_HOUR`, `…_ITEMS_PER_DAY`, `…_TRUST_PROXY` (1), `…_ALLOW_ORIGIN`,
     /// `…_LIVE_PER_HOUR`, `…_LIVE_WINDOW_SECONDS`, `…_LIVE_MAX_SESSIONS`, `…_LIVE_MINUTE_DAYS`,
     /// `…_LIVE_HOUR_DAYS`, `…_OFFICIAL_SERVER` (`off` for none), `…_HUB_PER_HOUR`,
-    /// `…_HUB_POSTS_PER_HOUR`, `…_HUB_REPORTS_PER_DAY`, `…_HUB_KEEP_DAYS`, `…_GITHUB_TOKEN`,
+    /// `…_HUB_POSTS_PER_HOUR`, `…_HUB_REPORTS_PER_DAY`, `…_GAME_REPORTS_PER_DAY`, `…_HUB_KEEP_DAYS`, `…_GITHUB_TOKEN`,
     /// `…_GITHUB_REPO`, `…_READS_PER_HOUR`, `…_AGGREGATE_BUILDS_PER_HOUR` and `…_AGGREGATE_DAYS`, plus `TELEMETRY_EXPORT_TOKEN` (or `HORIZON_TELEMETRY_EXPORT_TOKEN`) for the
     /// protected export. An empty token counts as unset.
     pub fn from_env() -> Self {
@@ -197,6 +206,9 @@ impl Config {
             hub_reports_per_day: var("HUB_REPORTS_PER_DAY")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.hub_reports_per_day),
+            game_reports_per_day: var("GAME_REPORTS_PER_DAY")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.game_reports_per_day),
             hub_keep_days: var("HUB_KEEP_DAYS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.hub_keep_days),
@@ -235,7 +247,7 @@ impl Config {
     pub fn client_ip_refusal(&self) -> Option<String> {
         (self.trust_proxy && self.client_ip_header.is_none()).then(|| {
             "HORIZON_TELEMETRY_TRUST_PROXY=1 needs HORIZON_TELEMETRY_CLIENT_IP_HEADER, the header your proxy \
-             overwrites with the client's address (x-real-ip on Railway, as the Dockerfile sets): without it \
+             overwrites with the client's address (cf-connecting-ip behind Cloudflare, as the Dockerfile sets): without it \
              every client would count as the proxy and share one rate-limit bucket. Not starting."
                 .into()
         })
@@ -276,7 +288,7 @@ pub struct App {
     /// The same for the website's reads of the totals.
     read_buckets: Mutex<Buckets>,
     /// Totals built from the database, from everyone (`aggregate_builds_per_hour`).
-    builds: Mutex<HashMap<(), (f64, Instant)>>,
+    builds: Mutex<Bucketed<()>>,
     /// Who is playing now (`live`).
     live: Mutex<Live>,
     /// `GET /v1/live`'s answer and when it was made.
@@ -303,7 +315,7 @@ pub struct App {
     filer: Option<Arc<Filer>>,
 }
 
-type Buckets = HashMap<IpAddr, (f64, Instant)>;
+type Buckets = Bucketed<IpAddr>;
 
 const CACHE_FOR: Duration = Duration::from_secs(600);
 
@@ -413,7 +425,7 @@ impl App {
     }
 
     /// The address requests are counted under, for the rate limits only: kept in memory, never
-    /// stored or logged. Behind a proxy (Railway) the TCP peer is the proxy, so with `trust_proxy`
+    /// stored or logged. Behind a proxy (Cloudflare's tunnel) the TCP peer is the proxy, so with `trust_proxy`
     /// it is the last entry of the one configured header (`client_ip_header`), which the proxy
     /// overwrites. No other header is read: which one a client can't forge depends on the platform.
     /// An IPv6 client counts by its /64.
@@ -519,13 +531,78 @@ impl App {
     }
 }
 
+/// Most addresses one rate-limit map holds (a few tens of bytes each: about 15 MB at the cap).
+const MAX_BUCKETS: usize = 200_000;
+
 /// Takes a token for `key` from its bucket in `buckets` (`per_hour`, bursts of a tenth of it);
-/// false when it has none left.
-fn take<K: Hash + Eq>(buckets: &Mutex<HashMap<K, (f64, Instant)>>, per_hour: f64, key: K) -> bool {
+/// false when it has none left. A map at its cap drops the buckets that have refilled (they are
+/// the same as a new one) and, if that frees nothing, turns new addresses away until the upkeep
+/// or time does: `maintain` runs only every few minutes, a big IPv6 range makes keys faster.
+fn take<K: Hash + Eq>(buckets: &Mutex<Bucketed<K>>, per_hour: f64, key: K) -> bool {
+    take_capped(buckets, per_hour, key, MAX_BUCKETS)
+}
+
+/// A map of token buckets by key, and when a full map last looked for buckets that had refilled.
+#[derive(Debug)]
+pub(crate) struct Bucketed<K> {
+    map: HashMap<K, (f64, Instant)>,
+    swept: Option<Instant>,
+}
+
+impl<K> Default for Bucketed<K> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            swept: None,
+        }
+    }
+}
+
+impl<K> std::ops::Deref for Bucketed<K> {
+    type Target = HashMap<K, (f64, Instant)>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl<K> std::ops::DerefMut for Bucketed<K> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+/// How often a full map looks over all its buckets for refilled ones: the look is as long as the
+/// map, and the map's lock is held for it.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+fn take_capped<K: Hash + Eq>(
+    buckets: &Mutex<Bucketed<K>>,
+    per_hour: f64,
+    key: K,
+    max: usize,
+) -> bool {
     let rate = per_hour / 3600.0;
     let burst = (per_hour / 10.0).max(1.0);
     let mut buckets = buckets.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
+    if buckets.map.len() >= max && !buckets.map.contains_key(&key) {
+        // Requests for new keys against a full map would each look over the whole of it: once a
+        // second is enough, as the buckets refill over minutes.
+        if buckets
+            .swept
+            .is_some_and(|at| now.duration_since(at) < SWEEP_EVERY)
+        {
+            return false;
+        }
+        buckets.swept = Some(now);
+        buckets.map.retain(|_, (tokens, at)| {
+            *tokens + now.duration_since(*at).as_secs_f64() * rate < burst
+        });
+        if buckets.map.len() >= max {
+            return false;
+        }
+    }
+    let buckets = &mut buckets.map;
     let (tokens, at) = buckets.entry(key).or_insert((burst, now));
     *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * rate).min(burst);
     *at = now;
@@ -889,12 +966,33 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/hub/vote", post(hub::vote).options(hub::preflight))
         .route("/hub/votes", get(hub::votes))
         .route("/hub/report", post(intake::report).options(hub::preflight))
+        .route("/v1/report", post(intake::game))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(app)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_full_bucket_map_stops_growing() {
+        let buckets = Mutex::new(Bucketed::default());
+        // Two buckets' worth of addresses against a cap of two: the third is turned away, not stored.
+        assert!(take_capped(&buckets, 3600.0, 1u32, 2));
+        assert!(take_capped(&buckets, 3600.0, 2u32, 2));
+        assert!(!take_capped(&buckets, 3600.0, 3u32, 2));
+        assert_eq!(buckets.lock().unwrap().len(), 2);
+        // Known addresses still count as before.
+        assert!(take_capped(&buckets, 3600.0, 1u32, 2));
+        // A refilled bucket is the same as none: it makes room.
+        buckets.lock().unwrap().get_mut(&2).unwrap().1 -= Duration::from_secs(3600);
+        // The full map looked over its buckets just now (the refusal above): it does not again within
+        // the second, so a flood of new keys does not make every request scan it.
+        assert!(!take_capped(&buckets, 3600.0, 3u32, 2));
+        buckets.lock().unwrap().swept = Instant::now().checked_sub(SWEEP_EVERY);
+        assert!(take_capped(&buckets, 3600.0, 3u32, 2));
+        assert_eq!(buckets.lock().unwrap().len(), 2);
+    }
+
     use super::*;
 
     #[test]

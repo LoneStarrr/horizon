@@ -5,6 +5,9 @@
 //! --bins -p horizon-prepare -p horizon-server), the exporters horizon-prepare compiles, its sources (the launcher compares
 //! them to its own), and PLAY.txt. It holds none of Minecraft's files: players prepare those
 //! from their own copy. .github/workflows/release.yml makes the release folders with it.
+//! First build the shared wasm standard library beside the programs with
+//! `cargo run --locked -p cargo-horizon-mod -- wasm-std PROGRAM_FOLDER/horizon-wasm-std.wasm`.
+//! Both package routes require and copy it; preflight never silently omits it.
 //!
 //! `package-server ENGINE OUTDIR`: a server folder (docs/server.md): the server build of the game
 //! (`cargo build --release -p horizon-game --no-default-features`, without sound or controllers)
@@ -17,12 +20,16 @@
 //! into every size the platforms and the website use, and packs `packaging/icons/horizon.ico`
 //! and `horizon.icns`. `docs/media/brand/README.md` lists what goes where.
 //!
-//! `mixins-tool release | patch SOURCE | identity TARGET`: what
-//! `.github/workflows/prebuilt-mixins-tool.yml` needs to build the horizon-mixins tool the launcher
-//! downloads. `release` prints the release's tag, the pinned commit and its source archive as
-//! `name=value` lines; `patch` applies the carried patch to an unpacked source, with the applier
-//! the launcher uses for its own source build; `identity` prints the lines the launcher checks in
-//! the archive's `identity.txt`.
+//! `mixins-tool release | patch SOURCE | identity TARGET`: the pinned horizon-mixins tool's
+//! delivery contract. `release` prints its tag, pinned commit and source archive as `name=value`
+//! lines; `patch` applies the carried patch to an unpacked source with the same applier as the
+//! launcher's source build; `identity` prints the lines checked in a prebuilt's `identity.txt`.
+//! The unsigned prebuilt-tool publishing workflow is deliberately not enabled.
+//! `sdk-index DIST COMMIT DATE [--nightly NAME] [--previous BUILD DIFF]`: writes `DIST/sdk.json`,
+//! the mod SDK's index, over the release assets in DIST (`tools/prebuilt_game.py index` calls it),
+//! then reads it back and checks every asset against it. `--previous` names the SDK published
+//! before this one and DIFF the `horizon-stage surface-diff --json` of its surface against this
+//! one's, which fill the index's surface comparison.
 //! `perf-wasm`: builds `crates/horizon-perf` for `wasm32-unknown-unknown` with the `wasm` feature
 //! and writes `target/perf-wasm/{horizon_perf.wasm,horizon_perf.js}`, which horizon-rust/horizon-site imports into
 //! its static assets (docs/perf-platform.md §7.1).
@@ -33,25 +40,25 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | mod-api [notes|coverage] | tokens | icons | perf-wasm | mixins-tool release | mixins-tool patch SOURCE | mixins-tool identity TARGET";
+const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | mod-api [notes|coverage] | tokens | icons | perf-wasm | mixins-tool release | mixins-tool patch SOURCE | mixins-tool identity TARGET | sdk-index DIST COMMIT DATE [--nightly NAME] [--previous BUILD DIFF]";
 
 /// What the release folder takes from the repository at HEAD, as `git archive` writes it.
-const ARCHIVED: [&str; 5] = [
+/// `LICENSES/` holds the GPL text the LGPL in `LICENSE` builds on (LGPL-3.0 section 4b asks for
+/// both beside the program) and the MIT notice of the code released before the change.
+const ARCHIVED: [&str; 6] = [
     "tools",
     "mods/horizon/src/test/java",
     "crates/horizon-prepare",
     "research-lock.json",
     "LICENSE",
+    "LICENSES",
 ];
 
-/// The programs that sit beside the client: horizon-ctl, the command line and MCP server that
-/// play the game, horizon-prepare, which prepares the resources from the player's own
-/// Minecraft, and horizon-server, which hosts a server with the client as its engine
-/// (docs/server.md).
-const TOOLS: [&str; 3] = ["horizon-ctl", "horizon-prepare", "horizon-server"];
-
-/// The programs beside the engine in a server folder.
-const SERVER_TOOLS: [&str; 2] = ["horizon-prepare", "horizon-server"];
+// The programs that sit beside the client (horizon-ctl, the command line and MCP server that play
+// the game; horizon-prepare, which prepares the resources from the player's own Minecraft;
+// horizon-server, which hosts a server with the client as its engine, docs/server.md) and the
+// wasm runtime are listed, with the checkout's exporters, in the SDK's required inputs
+// (`horizon_mod_package::sdk::inputs`): routes `package` and `package-server`.
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +70,9 @@ fn main() -> ExitCode {
         [task] if task == "mod-api" => mod_api::run(),
         [task, notes] if task == "mod-api" && notes == "notes" => mod_api::notes(),
         [task, coverage] if task == "mod-api" && coverage == "coverage" => mod_api::coverage(),
+        [task, dist, commit, date, options @ ..] if task == "sdk-index" => {
+            sdk_index(Path::new(dist), commit, date, options)
+        }
         [task] if task == "tokens" => tokens(),
         [task] if task == "icons" => icons(),
         [task, what] if task == "mixins-tool" && what == "release" => {
@@ -134,7 +144,7 @@ fn perf_wasm() -> Result<(), String> {
     let status = Command::new(&cargo)
         .current_dir(repo)
         .args([
-            "build",
+            "rustc",
             "--release",
             "--lib",
             "-p",
@@ -143,9 +153,11 @@ fn perf_wasm() -> Result<(), String> {
             "wasm",
             "--target",
             "wasm32-unknown-unknown",
+            "--crate-type",
+            "cdylib",
         ])
         .status()
-        .map_err(|e| format!("{cargo} build: {e}"))?;
+        .map_err(|e| format!("{cargo} rustc: {e}"))?;
     if !status.success() {
         return Err(
             "the wasm build failed; `rustup target add wasm32-unknown-unknown` installs the target"
@@ -313,37 +325,87 @@ fn icons() -> Result<(), String> {
     Ok(())
 }
 
+fn sdk_index(dist: &Path, commit: &str, date: &str, options: &[String]) -> Result<(), String> {
+    use horizon_mod_package::sdk::{Build, GAME, INDEX, Index};
+    let (mut nightly, mut previous) = (None, None);
+    let mut rest = options;
+    loop {
+        rest = match rest {
+            [] => break,
+            [flag, name, more @ ..] if flag == "--nightly" => {
+                nightly = Some(name.clone());
+                more
+            }
+            [flag, build, diff, more @ ..] if flag == "--previous" => {
+                previous = Some((build, Path::new(diff)));
+                more
+            }
+            _ => return Err(USAGE.to_string()),
+        };
+    }
+    let rust = fs::read_to_string(repo_root()?.join("tools/ci/rust-version"))
+        .map_err(|e| format!("tools/ci/rust-version: {e}"))?;
+    let build = Build {
+        commit: commit.to_owned(),
+        game: GAME.to_owned(),
+        date: date.to_owned(),
+        nightly,
+    };
+    let mut index =
+        Index::of_folder(dist, build, rust.trim().to_owned()).map_err(|e| e.to_string())?;
+    if let Some((build, diff)) = previous {
+        let text = fs::read(diff).map_err(|e| format!("{}: {e}", diff.display()))?;
+        index.compare(build, &text).map_err(|e| e.to_string())?;
+    }
+    let path = dist.join(INDEX);
+    fs::write(&path, index.to_json()).map_err(|e| format!("{}: {e}", path.display()))?;
+    let read = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Index::read(&read, commit)
+        .and_then(|read| read.verify_folder(dist))
+        .map_err(|e| e.to_string())?;
+    println!(
+        "wrote {} listing {} assets",
+        path.display(),
+        index.assets.len()
+    );
+    Ok(())
+}
+
 fn package(binary: &Path, out: &Path) -> Result<(), String> {
+    preflight("package", binary)?;
     let repo = new_folder(out)?;
     copy_into(binary, out)?;
-    copy_runtime(binary, &TOOLS, out)?;
+    copy_runtime("package", binary, out)?;
     copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     let play = repo.join("packaging/PLAY.txt");
     copy(&play, &out.join("PLAY.txt"))
 }
 
 fn package_server(engine: &Path, out: &Path) -> Result<(), String> {
+    preflight("package-server", engine)?;
     let repo = new_folder(out)?;
     copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     copy(engine, &out.join(program_name(engine, "horizon-engine")))?;
-    copy_runtime(engine, &SERVER_TOOLS, out)
+    copy_runtime("package-server", engine, out)
 }
 
-/// Release builds supply only our compiled classes and their integrity manifest.
+/// Every required input of `route` (the SDK's one list) is there before anything is emptied,
+/// built or copied; the refusal names all the missing ones.
+fn preflight(route: &str, program: &Path) -> Result<(), String> {
+    horizon_mod_package::sdk::inputs()
+        .check(route, program, &repo_root()?)
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// Release builds supply only our compiled classes and their integrity manifest (a required
+/// input, checked by `preflight`).
 fn copy_exporters(from: &Path, to: &Path) -> Result<(), String> {
-    if !from.join("manifest.json").is_file() {
-        return Err("Missing exporters/manifest.json; run horizon-prepare compile-exporters and copy its bundle to exporters/".into());
-    }
-    copy_exporter_tree(from, to)
-}
-
-fn copy_exporter_tree(from: &Path, to: &Path) -> Result<(), String> {
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
         let target = to.join(path.file_name().unwrap());
         if path.is_dir() {
-            copy_exporter_tree(&path, &target)?;
+            copy_exporters(&path, &target)?;
         } else {
             copy(&path, &target)?;
         }
@@ -376,25 +438,12 @@ fn program_name(program: &Path, name: &str) -> String {
     }
 }
 
-/// Both bundle layouts require the same wasm runtime beside their engine.
-fn copy_runtime(program: &Path, tools: &[&str], out: &Path) -> Result<(), String> {
-    copy_beside(program, tools, out)?;
-    copy_into(&program.with_file_name("horizon-wasm-std.wasm"), out)
-}
-
-/// Copies `tools`, built beside `program`, into `out`.
-fn copy_beside(program: &Path, tools: &[&str], out: &Path) -> Result<(), String> {
-    for tool in tools {
-        let path = program
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join(program_name(program, tool));
-        if !path.is_file() {
-            return Err(format!(
-                "{} is missing; build it too: cargo build --release -p horizon-game -p horizon-client-lib --bins -p horizon-prepare -p horizon-server",
-                path.display()
-            ));
-        }
+/// Copies the files `route` needs beside `program` (its companion programs and the wasm
+/// runtime) into `out`.
+fn copy_runtime(route: &str, program: &Path, out: &Path) -> Result<(), String> {
+    let inputs = horizon_mod_package::sdk::inputs();
+    let route = inputs.route(route).map_err(|e| e.to_string())?;
+    for path in route.program_files(program) {
         copy_into(&path, out)?;
     }
     Ok(())
@@ -624,6 +673,34 @@ mod tests {
             assert_eq!(mode("tools") & 0o100, 0o100);
         }
         fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn missing_inputs_are_named_before_the_folder_is_touched() {
+        let base = std::env::temp_dir().join(format!("xtask-preflight-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in [
+            "horizon-client",
+            "horizon-ctl",
+            "horizon-prepare",
+            "horizon-server",
+        ] {
+            fs::write(bin.join(name), b"").unwrap();
+        }
+        let out = base.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("kept"), b"").unwrap();
+        let error = package(&bin.join("horizon-client"), &out).unwrap_err();
+        assert!(error.contains("horizon-wasm-std.wasm"), "{error}");
+        assert!(!error.contains("horizon-ctl,"), "{error}");
+        assert!(
+            out.join("kept").is_file(),
+            "the packager ran before the check"
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

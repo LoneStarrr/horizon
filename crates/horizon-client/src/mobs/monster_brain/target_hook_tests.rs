@@ -34,14 +34,17 @@ impl MobHooks for Decide {
 }
 
 #[test]
-#[ignore = "requires prepared entity resources in .local/horizon-client"]
+#[ignore = "daily"]
 fn start_attacking_brain_honors_cancel_and_redirect() {
     // First obtain a real mob view to which the hook can redirect.
     let mut redirected = None;
     assert!(
         with_test_world(&[], |_, types| {
             let kind = Arc::new(types.types["minecraft:iron_golem"].clone());
-            redirected = Some(Mob::new(8, kind, Vec3::new(2.5, 64.0, 0.5), 0.0).seen(None));
+            redirected = Some(
+                Mob::new(8, kind, Vec3::new(2.5, 64.0, 0.5), 0.0)
+                    .seen(None, &crate::items::Items::empty()),
+            );
         }),
         "prepared entity resources are required"
     );

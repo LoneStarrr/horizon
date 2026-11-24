@@ -27,6 +27,9 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
             .add_empty_chunk(ChunkPos::new(x, 0))
             .unwrap();
     }
+    for x in 0..9 {
+        game.load_ticking_neighbourhood(x, 0);
+    }
     for command in [
         "forceload add 0 0 143 15",
         "tick freeze",
@@ -74,7 +77,7 @@ fn step(game: &mut Game<'_>, ticks: u32) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_zombie_takes_revenge_only_on_a_cow_inside_its_home() {
     let mut resources = None;
     let mut game = game(&mut resources);

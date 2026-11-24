@@ -26,6 +26,10 @@ pub struct BiomeFacts {
     pub full_moon: bool,
     /// `spawns_coral_variant_zombie_nautilus` (the warm ocean).
     pub coral_nautilus: bool,
+    /// `#minecraft:spawns_white_rabbits` (`Rabbit.getRandomRabbitVariant`).
+    pub white_rabbit: bool,
+    /// `#minecraft:spawns_gold_rabbits` (`Rabbit.getRandomRabbitVariant`).
+    pub gold_rabbit: bool,
 }
 /// `SpawnPlacements.isSpawnPositionOk` for the entity type `entity`, of species `species`.
 pub fn placement_ok(entity: &str, species: Species, w: &MobWorld, x: i32, y: i32, z: i32) -> bool {
@@ -139,11 +143,14 @@ pub fn villager_type(b: &BiomeFacts) -> u8 {
     }
 }
 #[cfg(test)]
-mod tests {
+#[path = "spawn_group_variant_tests.rs"]
+mod spawn_group_variant_tests;
+#[cfg(test)]
+pub(in crate::mobs) mod tests {
     use super::*;
     use crate::mobs::finalize::{Attr, has_modifier, value};
 
-    fn types() -> Option<crate::mobs::MobTypes> {
+    pub(in crate::mobs) fn types() -> Option<crate::mobs::MobTypes> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.local/horizon-client")
             .join(horizon_core::VANILLA_VERSION);
@@ -199,7 +206,16 @@ mod tests {
             }
         }
     }
-    fn run_finalize(m: &mut Mob, difficulty: LocalDifficulty) {
+    pub(in crate::mobs) fn run_finalize(m: &mut Mob, difficulty: LocalDifficulty) {
+        run_finalize_in(m, difficulty, None);
+    }
+    /// [`run_finalize`] for a member of a pack: `group` is the `SpawnGroupData` the previous
+    /// member returned (`None` for the first), and the result is what this one returns.
+    pub(in crate::mobs) fn run_finalize_in(
+        m: &mut Mob,
+        difficulty: LocalDifficulty,
+        group: Option<crate::mobs::finalize::Group>,
+    ) -> Option<crate::mobs::finalize::Group> {
         static LEVEL: std::sync::OnceLock<std::sync::Mutex<Level>> = std::sync::OnceLock::new();
         let mut level = LEVEL
             .get_or_init(|| {
@@ -228,7 +244,7 @@ mod tests {
             created: Vec::new(),
             jockey_rider: None,
         };
-        cx.finalize(m, crate::mobs::spawn_rules::Reason::Natural, None);
+        cx.finalize(m, crate::mobs::spawn_rules::Reason::Natural, group)
     }
 
     fn spawn(types: &crate::mobs::MobTypes, kind: &str, id: u32) -> Mob {

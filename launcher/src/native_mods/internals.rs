@@ -1,7 +1,7 @@
 //! Declared internals, shared by both native build routes.
-use super::{api, inject};
+use super::api;
 use crate::i18n::trf;
-use horizon_mod_package::internals::{self, ListedInternal};
+use horizon_platform::mod_package::internals::{self, ListedInternal};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -14,7 +14,6 @@ pub(super) const INTERNALS: &str = "internals.json";
 pub(super) struct Catalog {
     pub(super) internals: Vec<ListedInternal>,
     pub(super) discovery: bool,
-    pub(super) points: Vec<inject::ListedPoint>,
 }
 
 pub(super) struct Facade {
@@ -24,7 +23,6 @@ pub(super) struct Facade {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Error {
-    Inject(String),
     Missing {
         mod_id: String,
         path: String,
@@ -51,7 +49,6 @@ pub(super) enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            Self::Inject(error) => error.clone(),
             Self::Missing { mod_id, path } => trf(
                 "E_INTERNAL_MISSING: {mod} uses {path}, which this game doesn't have; run cargo horizon-mod internals sync to discover this pin's used internals.",
                 &[("mod", mod_id), ("path", path)],
@@ -106,23 +103,13 @@ impl From<internals::Error> for Error {
 }
 
 impl Catalog {
-    pub(super) fn target(&self, at: &str) -> Option<&ListedInternal> {
-        self.internals.iter().find(|item| {
-            !item.shape_only
-                && plain_path(&item.path) == plain_path(at)
-                && matches!(item.kind.as_str(), "fn" | "method" | "struct")
-        })
-    }
-
     /// `manifest` with each absent `hash` taken from this catalog, the pinned game's as the build
     /// checks it (`[native] horizon` fixes it exactly). The build records this form in
     /// `native-mods.json`; a declaration that doesn't resolve keeps no hash and is refused by
     /// [`Self::check`].
     pub(super) fn read(dir: &Path) -> Result<Self, String> {
         let path = dir.join(INTERNALS);
-        let listed = inject::catalog(&dir.join(inject::POINTS))?;
         Ok(Self {
-            points: listed.points,
             internals: internals::read(&path)?,
             discovery: false,
         })
@@ -134,16 +121,9 @@ impl Catalog {
     /// [`Self::check`].
     pub(super) fn pinned(
         &self,
-        manifest: &horizon_mod_package::Manifest,
-    ) -> horizon_mod_package::Manifest {
+        manifest: &horizon_platform::mod_package::Manifest,
+    ) -> horizon_platform::mod_package::Manifest {
         let mut pinned = manifest.clone();
-        for inject in pinned
-            .inject
-            .iter_mut()
-            .filter(|inject| inject.hash.is_none())
-        {
-            inject.hash = self.target(&inject.at).map(|item| item.hash.clone());
-        }
         for declared in pinned
             .internals
             .iter_mut()
@@ -161,8 +141,10 @@ impl Catalog {
         pinned
     }
 
-    pub(super) fn check(&self, manifest: &horizon_mod_package::Manifest) -> Result<(), Error> {
-        super::slots::check(self, manifest).map_err(Error::Inject)?;
+    pub(super) fn check(
+        &self,
+        manifest: &horizon_platform::mod_package::Manifest,
+    ) -> Result<(), Error> {
         for declared in &manifest.internals {
             internals::check(&self.internals, &manifest.id, declared)?;
         }
@@ -171,7 +153,7 @@ impl Catalog {
 
     pub(super) fn prepare<'a>(
         &self,
-        manifests: impl IntoIterator<Item = &'a horizon_mod_package::Manifest>,
+        manifests: impl IntoIterator<Item = &'a horizon_platform::mod_package::Manifest>,
     ) -> Result<BTreeMap<&'a str, Facade>, Error> {
         manifests
             .into_iter()
@@ -188,7 +170,7 @@ impl Catalog {
 
     pub(super) fn log_mixins(
         &self,
-        manifest: &horizon_mod_package::Manifest,
+        manifest: &horizon_platform::mod_package::Manifest,
     ) -> Result<(), String> {
         if manifest
             .native
@@ -204,7 +186,10 @@ impl Catalog {
     }
 
     /// Discovery opens the staged view, not the production declaration boundary.
-    fn discovery_facade(&self, manifest: &horizon_mod_package::Manifest) -> Result<Facade, Error> {
+    fn discovery_facade(
+        &self,
+        manifest: &horizon_platform::mod_package::Manifest,
+    ) -> Result<Facade, Error> {
         let mut manifest = manifest.clone();
         manifest.internals.clear();
         let mut facade = self.facade(&manifest)?;
@@ -225,7 +210,10 @@ impl Catalog {
     }
 
     /// Re-exports are the compiler's boundary: no module wildcard can widen the declaration.
-    pub(super) fn facade(&self, manifest: &horizon_mod_package::Manifest) -> Result<Facade, Error> {
+    pub(super) fn facade(
+        &self,
+        manifest: &horizon_platform::mod_package::Manifest,
+    ) -> Result<Facade, Error> {
         self.check(manifest)?;
         let mut tree = Module::default();
         let mut crates = BTreeSet::from(["horizon_client".into()]);
@@ -353,7 +341,7 @@ impl Module {
     }
 }
 
-pub(super) fn needed(manifest: &horizon_mod_package::Manifest) -> bool {
+pub(super) fn needed(manifest: &horizon_platform::mod_package::Manifest) -> bool {
     !manifest.internals.is_empty()
 }
 
@@ -391,13 +379,12 @@ mod tests {
     fn fixture(name: &str) -> (std::path::PathBuf, super::super::Bundle, Catalog) {
         let dir = super::super::tests::dir(&format!("internals-{name}"));
         super::super::tests::write_bundle(&dir, "example", "");
-        fs::write(dir.join("Cargo.toml"), "[package]\nname='example'\nversion='1.0.0'\nedition='2024'\n[dependencies]\nhorizon-mod-api={version='0.1'}\n").unwrap();
-        let path = dir.join(horizon_mod_package::manifest::MANIFEST);
+        fs::write(dir.join("Cargo.toml"), "[package]\nname='example'\nversion='1.0.0'\nedition='2024'\n[dependencies]\nhorizon-mod-api={path='.horizon/sdk/api/crates/horizon-mod-api'}\n").unwrap();
+        let path = dir.join(horizon_platform::mod_package::manifest::MANIFEST);
         let text = fs::read_to_string(&path).unwrap().replace("[native]", "internals = [{ path = 'horizon_client::game::Game', hash = '1234' }, { path = 'horizon_client::game::maps::dimension_id', hash = '5678' }]\n[native]\n");
         fs::write(path, text).unwrap();
         let bundle = super::super::bundle_in(&dir).unwrap().unwrap();
         let catalog = Catalog {
-            points: Vec::new(),
             discovery: false,
             internals: serde_json::from_value(serde_json::json!([
                 { "path": "horizon_client::game::Game", "kind": "struct", "signature": "struct Game<'a> { world: World }", "hash": "1234" },
@@ -412,12 +399,13 @@ mod tests {
     #[test]
     fn reads_and_pins_only_declared_internals() {
         let (dir, bundle, catalog) = fixture("pins");
+        let build = serde_json::json!({"commit": "c".repeat(40)});
         fs::write(
             dir.join(INTERNALS),
-            serde_json::to_string(&catalog.internals).unwrap(),
+            serde_json::json!({"schema": 1, "build": build, "internals": catalog.internals})
+                .to_string(),
         )
         .unwrap();
-        fs::write(dir.join(inject::POINTS), r#"{"points":[],"wire":[]}"#).unwrap();
         let read = Catalog::read(&dir).unwrap();
         let mut manifest = bundle.manifest.clone();
         manifest.internals[0].hash = None;
@@ -480,7 +468,7 @@ mod tests {
         field.hash = "field".into();
         field.signature = "u8".into();
         catalog.internals.insert(2, field);
-        bundle.manifest.internals[1] = horizon_mod_package::manifest::Internal {
+        bundle.manifest.internals[1] = horizon_platform::mod_package::manifest::Internal {
             path: method.path.clone(),
             kind: Some("method".into()),
             hash: Some(method.hash),

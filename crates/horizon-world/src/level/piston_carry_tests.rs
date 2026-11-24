@@ -1,4 +1,4 @@
-//! Pistons carry a mod block entity while its block moves (#3184), when the
+//! Pistons carry a mod block entity while its block moves (arismoko/horizon#3184), when the
 //! block's `piston_carries_block_entity` lets it move. The level holds the block entities;
 //! these tests stand in for it with a map. They need the prepared resources,
 //! as the other level tests do.
@@ -131,12 +131,11 @@ impl World {
     fn get(&self, pos: BlockPos) -> BlockStateId {
         self.level.block_state(pos)
     }
-    /// Scheduled ticks, block events and block entities, as `ServerLevel.tick`.
+    /// `ServerLevel.tick`: block phases inside handlingTick, block entities outside.
     fn full_tick(&mut self) {
         let b = &self.f.behaviours;
         self.level.inner.time += 1;
-        b.tick_scheduled(&mut self.level, &mut self.ticks);
-        b.run_block_events(&mut self.level, &mut self.ticks);
+        b.tick_level_blocks(&mut self.level, &mut self.ticks);
         b.tick_block_entities(&mut self.level, &mut self.ticks);
     }
     fn progress(&self, pos: BlockPos) -> Option<f32> {

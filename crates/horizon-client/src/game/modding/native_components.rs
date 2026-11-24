@@ -165,6 +165,20 @@ impl Game<'_> {
         self.items().get(&stack.item)?;
         Some(self.use_duration(stack))
     }
+    /// `IItemExtension.getCreatorModId`, behind ItemResource's read: the item
+    /// id's namespace, or what the item's `creator_mod_id` Part answers.
+    pub(in crate::game) fn item_resource_creator_mod_id(
+        &self,
+        stack: &ItemStack,
+    ) -> Option<String> {
+        self.items().get(&stack.item)?;
+        let namespace = stack.item.split_once(':').map_or("minecraft", |(ns, _)| ns);
+        let mut mod_id = Some(namespace.to_owned());
+        if mod_api::__private::item_listens(mod_api::HookId::CreatorModId, &stack.item) {
+            self.native_creator_mod_id(stack, &mut mod_id);
+        }
+        mod_id
+    }
     /// `ItemStack.isBarVisible`, `getBarWidth`, `getBarColor`, before client-only hooks.
     pub(in crate::game) fn item_resource_bar(&self, stack: &ItemStack) -> Option<mod_api::ItemBar> {
         use super::api_values::TryIntoApi;
@@ -315,8 +329,10 @@ impl Game<'_> {
             return None;
         }
         self.native_entity_read_target(target)?;
-        let target = self.entity_kind(target)?;
-        let actor = self.entity_kind(attacker.entity())?;
+        let target = self.entity_kind(target).map(|kind| kind.id(self))?;
+        let actor = self
+            .entity_kind(attacker.entity())
+            .map(|kind| kind.id(self))?;
         let source = self.item_resource_damage_source(stack, attacker)?;
         let source = source.damage_type.to_string();
         let effective = self.item_combat_stack(stack);
@@ -421,8 +437,9 @@ impl Game<'_> {
         if horizon_protocol::item::custom::id(id).is_none() {
             return Err(NativeComponentError::UnknownType);
         }
-        horizon_protocol::item::custom::validate(&value)
-            .map_err(NativeComponentError::InvalidValue)?;
+        horizon_core::nbt::validate_component_value(&value).map_err(|error| {
+            NativeComponentError::InvalidValue(horizon_protocol::Error::new(error))
+        })?;
         let default = self
             .items()
             .get(&stack.item)
@@ -464,7 +481,7 @@ mod equippable_slot_tests {
 
     /// `Equippable.slot`: armour goes where it is worn, a plain item goes nowhere.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_equippable_slot_follows_the_equippable_component() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             let slot = |item: &str| game.item_equippable_slot(&ItemStack::new(item, 1));
@@ -484,7 +501,7 @@ mod enchantment_conflict_tests {
     use mod_api::{Identifier, ItemResource, LevelRef, WorldEpoch};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn enchanting_a_resource_uses_the_active_levels_random_and_preserves_the_input() {
         with_game(|game| {
             let level = game.level("minecraft:overworld").unwrap();
@@ -546,7 +563,7 @@ mod enchantment_conflict_tests {
     /// `Enchantment.areCompatible`: the same enchantment twice and the exclusive sets conflict,
     /// others and unknown ids do not.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn enchantments_compatible_follows_the_exclusive_sets() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             assert!(!game.enchantments_compatible("minecraft:sharpness", "minecraft:smite"));
@@ -571,7 +588,7 @@ mod item_resource_property_tests {
     }
     /// All seven reads and their game consumers, with independently recorded vanilla outcomes.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn effective_resource_properties_match_vanilla() {
         let inputs = std::env::var("HORIZON_ITEM_PROPERTIES_CASES")
             .map(|path| std::fs::read_to_string(path).unwrap())
@@ -649,7 +666,7 @@ mod item_resource_property_tests {
     }
     /// Changed defaults and a patched mod consumable exercise the real game consumers.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn item_resource_changed_defaults_and_consumption() {
         use horizon_client::items::ItemStack;
         use mod_api::{ComponentId, ItemResource, Tag};
@@ -833,7 +850,7 @@ mod item_resource_property_tests {
 #[cfg(test)]
 mod hot_key_tests {
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn resolved_keys_select_fuel_and_compost_metadata() {
         mod_platform::testing::with_mods(Vec::new().into(), || {
             crate::game::native_entity_refs::tests::with_game(|game| {
@@ -911,7 +928,7 @@ mod combat_query_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn stack_combat_queries_match_attacks_and_preserve_equipment_and_rng() {
         with_game(|game| {
             let attacker = actor(game);
@@ -1080,7 +1097,7 @@ mod combat_query_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn stack_combat_immunity_honors_default_override_tag_and_removal() {
         with_game(|game| {
             let attacker = actor(game);
@@ -1126,7 +1143,7 @@ mod combat_query_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn stack_combat_prototype_overrides_and_removals_match_attacks() {
         with_game(|game| {
             let attacker = actor(game);

@@ -15,6 +15,7 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 #[test]
+#[ignore = "daily"]
 fn client_and_server_layouts_require_and_ship_std() {
     let root = std::env::temp_dir().join(format!("xtask-packaging-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
@@ -25,6 +26,7 @@ fn client_and_server_layouts_require_and_ship_std() {
         "crates/horizon-prepare/fixture",
         "research-lock.json",
         "LICENSE",
+        "LICENSES/GPL-3.0.txt",
         "packaging/PLAY.txt",
         "exporters/manifest.json",
     ] {
@@ -96,6 +98,7 @@ fn client_and_server_layouts_require_and_ship_std() {
                 fs::read(out.join("horizon-wasm-std.wasm")).unwrap(),
                 b"wasm-member"
             );
+            assert!(out.join("LICENSES/GPL-3.0.txt").is_file());
             let engine = if task == "package" {
                 "horizon-client"
             } else {

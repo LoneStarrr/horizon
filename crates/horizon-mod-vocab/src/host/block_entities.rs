@@ -9,13 +9,20 @@ pub trait BlockEntitiesHost {
     /// the level it shows. An entity taken out for its tick cannot be read in that tick.
     #[access(WorldOnly)]
     fn block_entity(&self, level: LevelRef, pos: [i32; 3]) -> Option<BlockEntityRef>;
+    /// Side: both.
+    /// The handle [`BlockEntitiesHost::block_entity`] gives, and also for a block entity
+    /// out of the world for its own tick, whose identity and attachments stay in place
+    /// meanwhile: what its Part state (`BlockEntityPartState`) checks a handle against.
+    /// Its data reads still find nothing during that tick.
+    #[access(WorldOnly)]
+    fn block_entity_identity(&self, level: LevelRef, pos: [i32; 3]) -> Option<BlockEntityRef>;
 }
 /// The server host's methods of the `block_entities` area, implemented by the game and reached through [`ServerHost`].
 #[horizon_mod_api_macros::host_area]
 pub trait BlockEntitiesServerHost {
     /// Side: server.
     /// Sends clients the block at `pos` and its block entity's update tag
-    /// (`native_block_entity_update_tag`) again, as `Level.sendBlockUpdated`
+    /// (`block_entity_update_tag`) again, as `Level.sendBlockUpdated`
     /// does: with the level's other block changes, to the players who see its
     /// chunk, once however often it is called before then. Changes made in a
     /// block entity's tick go out at the start of the next tick, as vanilla's
@@ -122,9 +129,9 @@ pub trait BlockEntitiesBackendMut {
         data: Compound,
     ) -> Result<bool, BlockEntityError>;
     /// Side: server.
-    /// `BlockEntity.setChanged`: the chunk is saved again and comparators re-read the
-    /// container (`updateNeighbourForOutputSignal`). Inside a transaction it runs once at the
-    /// root commit. Returns Stale for an invalidated handle or a level not writable here.
+    /// `BlockEntity.setChanged`: mark the chunk and notify comparators immediately, even
+    /// inside a transaction and for equal contents. Aborting storage does not undo an issued
+    /// notification. Returns Stale for an invalidated handle or a level not writable here.
     #[access(WorldOnly)]
     fn block_entity_set_changed(
         &mut self,
@@ -142,9 +149,9 @@ pub trait BlockEntitiesBackendMut {
         name: Option<&str>,
     ) -> Result<bool, BlockEntityError>;
     /// Side: server.
-    /// Set a mod block entity's menu data slot in place, joining the current transaction
-    /// and its setChanged notice. Ok(false) for a vanilla entity, an invalid slot or
-    /// no change; Stale for an invalidated or unwritable handle. Does not resize slots.
+    /// Set a mod block entity's menu data slot in place, joining the current transaction.
+    /// This raw storage write issues no notification; call set_changed explicitly if needed.
+    /// Ok(false) for a vanilla entity, invalid slot or no change. Does not resize slots.
     #[access(WorldOnly)]
     fn block_entity_set_data_slot(
         &mut self,
@@ -153,8 +160,8 @@ pub trait BlockEntitiesBackendMut {
         value: i32,
     ) -> Result<bool, BlockEntityError>;
     /// Side: server.
-    /// Sizes a mod block entity's menu data explicitly, using the same write
-    /// target, journal and Changed notice as scalar data-slot writes.
+    /// Sizes a mod block entity's menu data explicitly, using the same silent storage write
+    /// and journal as scalar data-slot writes.
     /// Removed, replaced or reloaded holders return BlockEntityDataError::Stale.
     #[access(WorldOnly)]
     fn block_entity_set_data_slots(
@@ -163,8 +170,8 @@ pub trait BlockEntitiesBackendMut {
         values: Vec<i32>,
     ) -> Result<bool, BlockEntityDataError>;
     /// Side: server.
-    /// Replace internal storage under the existing transaction; external ITEMS routing is separate.
-    /// Removed, replaced or reloaded holders return BlockEntityItemError::Stale.
+    /// Replace internal storage silently under the existing transaction; ITEMS routing is
+    /// separate. Removed, replaced or reloaded holders return BlockEntityItemError::Stale.
     #[access(WorldOnly)]
     fn block_entity_set_item_slot(
         &mut self,

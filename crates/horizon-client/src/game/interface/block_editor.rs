@@ -317,6 +317,8 @@ impl Game<'_> {
             }
             items
         }) else {
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             return;
         };
         let atlas = &self.gui.atlas;
@@ -327,7 +329,9 @@ impl Game<'_> {
             rgba(0x10, 0x10, 0x10, 0xC0),
             rgba(0x10, 0x10, 0x10, 0xD0),
         );
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let Some(mut screen) = self.block_editor.take() else {
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
             return;
         };
         // Buttons first, then the labels and boxes, as `Screen` renders its
@@ -406,6 +410,9 @@ impl Game<'_> {
                 }
             }
         }
+        self.block_editor = Some(screen);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
+        let screen = self.block_editor.as_ref().unwrap();
         // The focus navigator's pointer is hidden, not an actual mouse hover.
         let navigation_focus = self.pad_focus_rect();
         let focus = navigation_focus.map_or(screen.focus, |rect| {
@@ -429,7 +436,6 @@ impl Game<'_> {
                 ui::tooltip_menu(batch, atlas, &lines, cursor, rect);
             }
         }
-        self.block_editor = Some(screen);
     }
 
     pub(super) fn block_editor_click(&mut self) {
@@ -847,7 +853,7 @@ mod tests {
     /// A single-player jigsaw edit is applied by the game that is its own
     /// server, as `handleSetJigsawBlock` does there, and marks the chunk.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_local_jigsaw_edit_applies_and_marks_the_chunk() {
         let mut resources = None;
         let mut game = crate::game::game_tests::tests::server_game(&mut resources);

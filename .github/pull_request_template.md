@@ -1,13 +1,13 @@
-<!-- Opened by an AI agent? First line: "> 🤖 Opened by <your GitHub login>'s AI agent (<tool, model>), not by <your GitHub login> personally." Use your own login, not someone else's. -->
-
 ## What and why
 
-<!-- What this changes, and why. Link the issue it fixes ("Fixes #123"). Over about 500 lines: link the issue with its
-     approved spec too ("Spec: #123"), CONTRIBUTING.md "Large pull requests". -->
+<!-- What this changes, and why. Link the issue it fixes ("Fixes #123"). Over about 3000 lines of code
+     (docs, tests and moved lines don't count): link the issue with its approved spec too ("Spec: #123"), CONTRIBUTING.md
+     "Large pull requests". -->
 
 ## Kind
 
-<!-- Tick one: it sets the pull request's label (CONTRIBUTING.md "Pull requests"). -->
+<!-- Tick one: it sets the pull request's label (CONTRIBUTING.md "Pull requests"). Start the title with it too:
+     `kind(area): what changes`, for example `parity(mobs): ...`. -->
 
 - [ ] parity: Horizon now does what vanilla 26.3 does
 - [ ] bug: a crash or a breakage
@@ -27,6 +27,14 @@
        look are off by default;
      - no new built-in server address outside the Horizon layer. -->
 
+## Build time
+
+<!-- Only for a pull request that moves gameplay code out of horizon-client (#18047). Name the placement: below
+     horizon-client (it still recompiles when the moved code changes) or beside it (it does not). Paste the output of
+     `python3 tools/build_times.py run --only incremental --crates <crate> --file <crate>=<file> --profiles dev`
+     twice: before, on the base, with the crate and file the code is in there; after, on this branch, with the new
+     crate and the moved file. Delete this section otherwise. -->
+
 ## Vanilla reference
 
 <!-- The vanilla classes and methods this follows (tools/rea_vanilla.py), and the harness that checks it.
@@ -36,11 +44,15 @@
 
 <!-- Paste the block `python3 tools/pr_ready.py` prints (`--base upstream/main` from a fork). -->
 
-Tried in game: <what you did and saw, or "no: <why>", or "n/a">
+## Proof
 
-## Screenshots
+<!-- For a change players see or feel in the game: show it working on this pull request's head commit
+     (CONTRIBUTING.md "Pull requests"). Before and after screenshots or a short video, or the lan_e2e, harness or
+     horizon-ctl commands you ran with their output. A unit test alone isn't proof. Without it the pull request gets
+     needs-proof and waits. Delete this section only for tooling, docs, tests or a refactor. -->
 
-<!-- For anything players see: before and after. Delete this section otherwise. -->
+<!-- Please tick "Allow edits by maintainers": we push small fixups ourselves instead of a round trip.
+     See CONTRIBUTING.md. -->
 
-<!-- On this fork we never push to your branch: small fixes are carried in our own commits on top of yours in a
-     rollup, and your pull request shows as merged. See CONTRIBUTING.md. -->
+<!-- Written with an AI agent? Last line: "🤖 Agent: <model> via <tool>: <what it did>." One sentence per model
+     (AGENTS.md, "Mark what an agent posts, once"). -->

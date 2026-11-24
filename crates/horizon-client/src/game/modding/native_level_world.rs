@@ -92,8 +92,13 @@ impl LevelAccess for RainView<'_> {
 }
 
 impl Game<'_> {
-    /// `Level.getSkyDarken`: the same dimension, time and weather calculation used by gameplay.
-    pub(super) fn sky_darken_in(&self, world: &World, dimension: Dim) -> i32 {
+    /// The attribute stack a level reads (`Level.environmentAttributes`): its environment, its
+    /// rain and thunder levels and its day clock's time.
+    fn level_environment_in(
+        &self,
+        world: &World,
+        dimension: Dim,
+    ) -> (&horizon_client::environment::Environment, (f32, f32), i64) {
         // A client of a server has the environment its server's type made for a mod's level.
         let environment = match self
             .remote
@@ -111,13 +116,50 @@ impl Game<'_> {
                 Dim::End => self.res.end_environment(),
             },
         };
-        let (rain, thunder) = weather_for_level(
+        let weather = weather_for_level(
             world.shape,
             dimension == Dim::End,
             self.world.weather.levels(1.0),
         );
         let day_time = self.command_clock_time(&self.level_clock_name(dimension));
+        (environment, weather, day_time)
+    }
+
+    /// `Level.getSkyDarken`: the same dimension, time and weather calculation used by gameplay.
+    pub(super) fn sky_darken_in(&self, world: &World, dimension: Dim) -> i32 {
+        let (environment, (rain, thunder), day_time) = self.level_environment_in(world, dimension);
         horizon_client::environment::sky_darken(environment, day_time, rain, thunder)
+    }
+
+    /// `level.environmentAttributes().getValue(attribute, pos)` of a server level, active or
+    /// parked, for a float attribute: the level's stack with the one biome at `pos` (no
+    /// interpolator). None on a client, for a stale level, an unknown id or another type.
+    pub(super) fn level_environment_float(
+        &self,
+        level: LevelRef,
+        attribute: &str,
+        pos: [f64; 3],
+    ) -> Option<f32> {
+        if !self.is_logical_server() {
+            return None;
+        }
+        let world = self.native_level_read_world(level)?;
+        let (environment, weather, _) =
+            self.level_environment_in(world, Dim::from_id(level.dimension_id()));
+        // `Mth.floor` of each coordinate, as the biome layer reads the position.
+        let block = pos.map(|v| v.floor() as i32);
+        let biomes = world_biomes!(self);
+        let map = |zoomed: bool| {
+            let info = biomes.get(self.native_biome_index(level, block, zoomed)?);
+            Some(environment.biome(&info.name).unwrap_or(&info.attributes))
+        };
+        let id = attribute.strip_prefix("minecraft:").unwrap_or(attribute);
+        // Each timeline reads the clock it names, 0 for one the world has not met.
+        let clock = |name: &str| self.command_clock_time(name);
+        match environment.value_at(id, &clock, weather, map(false), map(true))? {
+            horizon_world::environment_attributes::Value::Float(value) => Some(value),
+            _ => None,
+        }
     }
 
     /// `Level.getSkyDarken` for an active or parked level, without switching dimensions.
@@ -242,6 +284,17 @@ impl Game<'_> {
             .rules
             .bool_slot(mod_api::__private::game_rule_bool_slot(key)?)
     }
+    /// Read a registered integer game rule.
+    pub(super) fn level_game_rule_int(
+        &self,
+        level: LevelRef,
+        key: mod_api::IntGameRuleKey,
+    ) -> Option<i32> {
+        self.native_level_world(level)?;
+        self.ui
+            .rules
+            .int_slot(mod_api::__private::game_rule_int_slot(key)?)
+    }
     /// Game rule `rule` (`minecraft:keep_inventory` or `keep_inventory`), as
     /// `/gamerule` queries it: None for an unknown rule.
     pub(super) fn level_game_rule(
@@ -251,6 +304,55 @@ impl Game<'_> {
     ) -> Result<Option<GameRuleValue>, LevelReadError> {
         self.native_level_world_result(level)?;
         Ok(self.ui.rules.get(rule))
+    }
+    /// `/gamerule <rule> <value>` from a mod: the world's rule changes, `game_rule_changed`
+    /// fires with no actor and the clients get the rules. The rule already at `value` is true
+    /// with nothing fired; an unknown rule, a value of the other kind or out of range is false.
+    pub(super) fn level_set_game_rule(
+        &mut self,
+        level: LevelRef,
+        rule: &str,
+        value: GameRuleValue,
+    ) -> bool {
+        if self.native_level_world(level).is_none() {
+            return false;
+        }
+        let Some(rule) = self.ui.rules.rule(rule).cloned() else {
+            return false;
+        };
+        let fits = match (rule.default, value) {
+            (GameRuleValue::Bool(_), GameRuleValue::Bool(_)) => true,
+            (GameRuleValue::Int(_), GameRuleValue::Int(v)) => (rule.min..=rule.max).contains(&v),
+            _ => false,
+        };
+        if fits && self.ui.rules.get(&rule.name) != Some(value) {
+            self.set_game_rule(&rule, value, None);
+        }
+        fits
+    }
+    /// `/time set <time>` in the level a handle names, on its default clock: `time_skip`
+    /// (cause `mod`) may keep the old time; the clock's partial tick restarts.
+    pub(super) fn level_set_clock_time(&mut self, level: LevelRef, time: i64) -> bool {
+        if time < 0 || self.native_level_world(level).is_none() {
+            return false;
+        }
+        let dim = Dim::from_id(level.dimension_id());
+        if self.dimension_type_of(dim).default_clock.is_none() {
+            return false;
+        }
+        let clock = self.level_clock_name(dim);
+        let total = self.command_clock_time(&clock);
+        if total == time {
+            return true;
+        }
+        let mut cancel = false;
+        self.native_time_skip(level.dimension_id(), total, time, "mod", &mut cancel);
+        if cancel {
+            return false;
+        }
+        self.set_command_clock_time(&clock, time);
+        self.command_clock_state(&clock).partial = 0.0;
+        true
     }
     /// Every game rule the world has (`GameRules`) with its current value, by `minecraft:` id
     /// (`max_minecart_speed` only with minecart improvements): None for a stale handle and on
@@ -342,7 +444,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn dimension_shape_reads_current_parked_and_stale_levels() {
         use super::super::Dim;
         use horizon_client::chunk::LevelShape;
@@ -384,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn rain_at_a_position_checks_sky_roof_and_biome() {
         with_game(|game| {
             game.install_live_features();
@@ -438,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn enabled_features_default_to_vanilla_and_follow_the_world() {
         with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
@@ -466,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn native_mod_reads_registered_bool_rule_by_key() {
         use std::sync::OnceLock;
         static KEY: OnceLock<mod_api::BoolGameRuleKey> = OnceLock::new();
@@ -493,6 +595,51 @@ mod tests {
                 game.ui.rules = gamerules::GameRules::with_registry(registry, &[]);
                 let level = game.level("minecraft:overworld").unwrap();
                 assert_eq!(level.game_rule_bool(game, *KEY.get().unwrap()), Some(true));
+            })
+        });
+    }
+
+    /// arismoko/horizon#3316's case: `example:cap` (8, 0..=64) refuses `/gamerule example:cap 70`, takes 12, and
+    /// keeps 12 through a save and load of the rules.
+    #[test]
+    #[ignore = "daily"]
+    fn a_mod_int_rule_is_range_checked_by_gamerule_and_saved() {
+        use std::sync::OnceLock;
+        static KEY: OnceLock<mod_api::IntGameRuleKey> = OnceLock::new();
+        struct RuleMod;
+        #[mod_api::__subscriptions]
+        impl Hooks for RuleMod {
+            fn register(
+                &self,
+                registrar: &mut dyn mod_api::Registrar,
+                _: &mod_api::RegistrationContext,
+            ) {
+                registrar.game_rule_category("machines").unwrap();
+                let key = registrar
+                    .game_rule_int("cap", "example:machines", 8, 0, 64)
+                    .unwrap();
+                let _ = KEY.set(key);
+            }
+        }
+        let mods: mod_api::Mods = vec![ModEntry::new("example", Box::new(RuleMod))].into();
+        with_mods(mods, || {
+            with_game(|game| {
+                let registry = Arc::new(crate::game::api_values::game_rule_registry());
+                game.level.rule_registry = registry.clone();
+                game.ui.rules = gamerules::GameRules::with_registry(registry.clone(), &[]);
+                game.load_world_state().unwrap();
+                game.set_allow_commands(true);
+                game.build_registries();
+                let key = *KEY.get().unwrap();
+                let level = game.level("minecraft:overworld").unwrap();
+                assert_eq!(level.game_rule_int(game, key), Some(8));
+                assert!(!game.run_command("gamerule example:cap 70"));
+                assert_eq!(level.game_rule_int(game, key), Some(8));
+                assert!(game.run_command("gamerule example:cap 12"));
+                assert_eq!(level.game_rule_int(game, key), Some(12));
+                let saved = game.ui.rules.to_nbt().tag;
+                game.ui.rules = gamerules::GameRules::from_nbt_with_registry(&saved, &[], registry);
+                assert_eq!(level.game_rule_int(game, key), Some(12));
             })
         });
     }
@@ -532,7 +679,7 @@ mod tests {
     /// A listener of a change no player made reads every server rule through its host: the new
     /// value and the others as they stand.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_game_rule_listener_reads_the_whole_rule_set() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mods: mod_api::Mods = vec![ModEntry::new(
@@ -567,8 +714,144 @@ mod tests {
         );
     }
 
+    /// `level_set_game_rule` writes what `/gamerule` accepts, refuses what it refuses, and
+    /// `level_set_clock_time` moves the level's clock as `/time set` does.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
+    fn a_mod_sets_game_rules_and_the_clock() {
+        use mod_api::WorldEpoch;
+        with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            assert!(level.set_game_rule(game, "keep_inventory", GameRuleValue::Bool(true)));
+            assert_eq!(
+                game.ui.rules.get("keep_inventory"),
+                Some(gamerules::Value::Bool(true))
+            );
+            assert!(game.level_set_game_rule(
+                level,
+                "minecraft:random_tick_speed",
+                gamerules::Value::Int(9)
+            ));
+            assert_eq!(
+                game.ui.rules.get("random_tick_speed"),
+                Some(gamerules::Value::Int(9))
+            );
+            assert!(game.level_set_game_rule(level, "random_tick_speed", gamerules::Value::Int(9)));
+            assert!(!game.level_set_game_rule(level, "missing:rule", gamerules::Value::Bool(true)));
+            assert!(!game.level_set_game_rule(level, "keep_inventory", gamerules::Value::Int(1)));
+            assert!(!game.level_set_game_rule(
+                level,
+                "random_tick_speed",
+                gamerules::Value::Int(-1)
+            ));
+            assert_eq!(
+                game.ui.rules.get("random_tick_speed"),
+                Some(gamerules::Value::Int(9))
+            );
+
+            assert!(game.level_set_clock_time(level, 13_000));
+            assert_eq!(game.level_clock_time(level), Some(13_000));
+            assert!(game.level_set_clock_time(level, 13_000));
+            assert!(!game.level_set_clock_time(level, -1));
+            assert_eq!(game.level_clock_time(level), Some(13_000));
+            let stale =
+                mod_api::LevelRef::new(WorldEpoch::new(level.epoch().get() + 1), level.dimension());
+            assert!(!game.level_set_clock_time(stale, 1));
+            assert!(!game.level_set_game_rule(
+                stale,
+                "keep_inventory",
+                gamerules::Value::Bool(false)
+            ));
+        });
+    }
+
+    /// What a mod's `game_rule_changed` and `time_skip` listeners were told.
+    #[derive(Default)]
+    struct Told {
+        rules: Mutex<Vec<(String, bool)>>,
+        skips: Mutex<Vec<(String, i64, i64, String)>>,
+    }
+    struct Teller(Arc<Told>, bool);
+    #[mod_api::__subscriptions]
+    impl Hooks for Teller {
+        fn game_rule_changed(&self, _: &mut dyn ServerHost, event: &mut GameRuleChangedEvent<'_>) {
+            self.0
+                .rules
+                .lock()
+                .unwrap()
+                .push((event.rule.to_owned(), event.actor.is_some()));
+        }
+        fn time_skip(
+            &self,
+            _: &mut dyn ServerHost,
+            event: &mut mod_api::TimeSkipEvent<'_>,
+        ) -> mod_api::Flow {
+            self.0.skips.lock().unwrap().push((
+                event.dimension.to_owned(),
+                event.from,
+                event.to,
+                event.cause.to_owned(),
+            ));
+            if self.1 {
+                mod_api::Flow::Cancel
+            } else {
+                mod_api::Flow::Continue
+            }
+        }
+    }
+
+    /// A rule a mod sets reaches `game_rule_changed` once, with no actor; the same value again
+    /// reaches nothing.
+    #[test]
+    #[ignore = "daily"]
+    fn a_mod_set_game_rule_has_no_actor() {
+        let told = Arc::new(Told::default());
+        let mods: mod_api::Mods = vec![ModEntry::new(
+            "teller",
+            Box::new(Teller(told.clone(), false)),
+        )]
+        .into();
+        with_mods(mods, || {
+            with_game(|game| {
+                let level = game.level(game.dim.id()).unwrap();
+                assert!(level.set_game_rule(game, "keep_inventory", GameRuleValue::Bool(true)));
+                assert!(level.set_game_rule(game, "keep_inventory", GameRuleValue::Bool(true)));
+            });
+        });
+        assert_eq!(
+            *told.rules.lock().unwrap(),
+            [("minecraft:keep_inventory".to_owned(), false)]
+        );
+    }
+
+    /// A `time_skip` listener that cancels keeps the old time: the call says `false`, the
+    /// listener heard the jump with cause `mod`, and the clock has not moved.
+    #[test]
+    #[ignore = "daily"]
+    fn a_canceled_time_skip_keeps_the_clock() {
+        let told = Arc::new(Told::default());
+        let mods: mod_api::Mods = vec![ModEntry::new(
+            "teller",
+            Box::new(Teller(told.clone(), true)),
+        )]
+        .into();
+        with_mods(mods, || {
+            with_game(|game| {
+                let level = game.level(game.dim.id()).unwrap();
+                let start = game.level_clock_time(level).unwrap();
+                assert_ne!(start, 13_000);
+                assert!(!game.level_set_clock_time(level, 13_000));
+                assert_eq!(game.level_clock_time(level), Some(start));
+                assert_eq!(
+                    *told.skips.lock().unwrap(),
+                    [(game.dim.id().to_owned(), start, 13_000, "mod".to_owned())]
+                );
+            });
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn rule_reads_distinguish_unknown_stale_and_unavailable_and_snapshot_values() {
         use super::super::execution_role::ExecutionRole;
         use mod_api::{LevelReadError, WorldEpoch};
@@ -629,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn weather_read_resolves_levels_and_refuses_stale_or_unavailable_handles() {
         use super::super::execution_role::ExecutionRole;
         use mod_api::{LevelRef, WorldEpoch};

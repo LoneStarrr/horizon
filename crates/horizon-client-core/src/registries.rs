@@ -3,10 +3,38 @@
 use std::collections::BTreeMap;
 
 /// Registry contents and source state used to validate and complete arguments.
+/// A selector token a mod registered: the word after `@` and the base selection it parses to,
+/// before its `[...]` options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorToken {
+    pub name: String,
+    /// The completion's tooltip, a translation key.
+    pub tooltip: String,
+    /// Only players are candidates (`type=minecraft:player`).
+    pub players_only: bool,
+    /// At most this many results (`usize::MAX`: no limit).
+    pub limit: usize,
+    /// A `sort=` value: `nearest`, `furthest`, `random` or `arbitrary`.
+    pub sort: &'static str,
+}
+/// Who a completion is for, when a mod's own argument type completes the text:
+/// the player typing, whose command permission level is [`Registries::permission`].
+/// The mod's provider decides what to offer; the game does not filter its answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandSender {
+    /// The player's UUID.
+    pub uuid: u128,
+    /// Their account name.
+    pub name: String,
+}
 #[derive(Clone, Debug, Default)]
 pub struct Registries {
     /// Permission level of the command source.
     pub permission: u8,
+    /// The player a completion is for, while a mod's argument type completes the
+    /// text; `None` for the console and for a client completing its own commands
+    /// before its profile is known.
+    pub sender: Option<CommandSender>,
     pub items: Vec<String>,
     pub item_tags: Vec<String>,
     /// Block id -> (property, allowed values).
@@ -73,6 +101,8 @@ pub struct Registries {
     /// Every registry's element and tag ids (`minecraft:item` -> ...), as
     /// the server's registry access and reloadable registries hold them.
     pub by_registry: BTreeMap<String, RegistryIds>,
+    /// The selector tokens mods registered (`@allies`), in registration order.
+    pub selector_tokens: Vec<SelectorToken>,
     /// Blocks whose default state has a block entity.
     pub block_entities: std::collections::BTreeSet<String>,
     /// Block tag -> member blocks.

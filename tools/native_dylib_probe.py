@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dev-only exact-build Rust dylib probe. Build SDK with prebuilt_game.py first.
 
-Uses SDK metadata only: never rebuilds mod_api, mod_points or the game.
+Uses SDK metadata only: never rebuilds mod_api or the game.
 All compiler commands and native dependency inspection are retained in --output.
 """
 import argparse
@@ -67,7 +67,7 @@ def pe_symbols(path):
 
 def windows_allocator(images, game, evidence):
     """Windows binds each import to the named DLL (no ELF interposition): exactly one image may export the Rust
-    allocator, and every image calling it must import it from that one (#2394)."""
+    allocator, and every image calling it must import it from that one (arismoko/horizon#2394)."""
     rows = {}
     for image in images:
         exported, imported = pe_symbols(image)
@@ -176,7 +176,7 @@ def main():
     report = subprocess.run([str(counting_exe)], env=runtime_env(counting), capture_output=True, text=True)
     (counting / "report.txt").write_text(report.stdout + report.stderr)
     print(f"counting allocator (exit {report.returncode}):\n{report.stdout}{report.stderr}")
-    # On Windows this records #2394's cause: a `#[global_allocator]` in a dylib beside std's DLL splits from it.
+    # On Windows this records arismoko/horizon#2394's cause: a `#[global_allocator]` in a dylib beside std's DLL splits from it.
     # The shipped route's checks below decide the result.
     if report.returncode != 0 or ("ONE ALLOCATOR" not in report.stdout and not windows):
         failures.append("cross-image allocations do not all go through the game's counting allocator (allocator/report.txt)")
@@ -193,11 +193,11 @@ def main():
     template = (sdk / sdk_tools.TEMPLATE).read_text()
     (shipped / "main.rs").write_text(template.replace("/* MOD_ENTRIES */", '        "probe" => mod_0::hooks,\n').replace(
         "/* BUILT_MODS */",
-        '    horizon_mod_package::runtime::BuiltMod { id: "probe", version: "0.1.0", side: horizon_mod_package::Side::Both },\n'))
+        '    mod_api::__private::native::BuiltMod { id: "probe", version: "0.1.0", side: mod_api::Side::Both },\n'))
     shipped_exe = shipped / ("horizon-client.exe" if windows else "horizon-client")
     subprocess.run([*route, "--crate-type", "bin", "--crate-name", "horizon_native_game",
                     *(flag for arg in identity["link_args"] for flag in ("-C", f"link-arg={arg}")),
-                    *extern("horizon_client"), *extern("horizon_mod_host"), *extern("mod_api"), *extern("mod_points"), *extern("horizon_mod_package"),
+                    *extern("horizon_client"), *extern("horizon_mod_host"), *extern("mod_api"), *extern("horizon_mod_package"),
                     "--extern", f"mod_0={shipped / 'libmod_0.rlib'}", "-o", str(shipped_exe), str(shipped / "main.rs")], check=True)
     if windows:
         # std's DLL always exports the allocator shim; the game exports one only if it has its own allocator.
@@ -225,10 +225,10 @@ def main():
               "-L", f"dependency={sdk / 'host'}", "-L", f"native={sdk / 'native'}", "-L", f"dependency={output}"]
     for crate, source in [("probe_shared", "shared.rs"), ("probe_a", "mod.rs"), ("probe_b", "mod.rs")]:
         extra = [] if crate == "probe_shared" else ["--extern", f"probe_shared={output / (prefix + 'probe_shared' + extension)}"]
-        run([*common, "--crate-type=dylib", "--crate-name", crate, *extern("horizon_client"), *extern("mod_api"), *extern("mod_points"),
+        run([*common, "--crate-type=dylib", "--crate-name", crate, *extern("horizon_client"), *extern("mod_api"),
              *extra, str(FIXTURES / source), "-o", str(output / (prefix + crate + extension))])
     executable = output / ("probe.exe" if windows else "probe")
-    run([*common, "--crate-name=probe", *extern("horizon_client"), *extern("mod_api"), *extern("mod_points"),
+    run([*common, "--crate-name=probe", *extern("horizon_client"), *extern("mod_api"),
          *extern("libloading"), "--extern", f"probe_shared={output / (prefix + 'probe_shared' + extension)}",
          str(FIXTURES / "main.rs"), "-o", str(executable)])
     env = runtime_env(output)

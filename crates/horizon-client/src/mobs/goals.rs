@@ -14,7 +14,7 @@ pub const JUMP: u8 = 4;
 pub const TARGET: u8 = 8;
 
 /// The facts of a target one mob may take, as far as [`Mob::valid_target`]
-/// reads them (#1175): another mob — what a tick's snapshot carries, or the
+/// reads them (arismoko/horizon#1175): another mob — what a tick's snapshot carries, or the
 /// game's own state — or a player. One rule set; both the write handle and a
 /// goal tick's view fill these from where they stand.
 pub enum TargetFacts {
@@ -64,6 +64,14 @@ pub trait Goal: std::fmt::Debug + Send + Sync {
         false
     }
     fn tick(&mut self, _m: &mut Mob, _cx: &mut Cx) {}
+    /// `RandomStrollGoal.trigger`: the goal's next `canUse` skips the
+    /// interval's draw (only a stroll has one).
+    fn trigger(&mut self) {}
+    /// `GuardianAttackGoal.stop` triggers the guardian's `randomStrollGoal`
+    /// when it stops; the selector is what holds the goals then, so it asks.
+    fn strolls_on_stop(&self) -> bool {
+        false
+    }
     fn box_clone(&self) -> Box<dyn Goal>;
     /// The goal's name for debugging (`Goal.toString`).
     fn name(&self) -> &'static str {
@@ -151,6 +159,16 @@ impl GoalSelector {
         if self.goals[i].running {
             self.goals[i].running = false;
             self.goals[i].goal.stop(m, cx);
+            if self.goals[i].goal.strolls_on_stop() {
+                self.trigger_stroll();
+            }
+        }
+    }
+    /// `RandomStrollGoal.trigger` of the mob's stroll goals: the guardian's
+    /// attack goal asks for one when its beam ends, and its hurt too.
+    pub fn trigger_stroll(&mut self) {
+        for g in &mut self.goals {
+            g.goal.trigger();
         }
     }
     /// GoalSelector.tick
@@ -717,7 +735,7 @@ impl Mob {
         if let Some(v) = self.ai.seen_cache.iter().find(|(k, _)| *k == who) {
             return v.1;
         }
-        let Some(t) = w.target_info(who) else {
+        let Some(t) = w.target_info(who).filter(|_| !super::ravager::blind(self)) else {
             return false;
         };
         let eye = Vec3::new(self.position.x, self.eye_y(), self.position.z);
@@ -850,9 +868,9 @@ impl Mob {
             }
         }
     }
-    /// The setter's own refusal (#1175), one rule both the write handle and
+    /// The setter's own refusal (arismoko/horizon#1175), one rule both the write handle and
     /// a goal tick's `set_target` ask: a brain-backed species' target is its
-    /// brain's to write (`getTarget` overrides it, #934). The read path does
+    /// brain's to write (`getTarget` overrides it, arismoko/horizon#934). The read path does
     /// not ask this — it reads a brain's own target back.
     pub fn refuses_set_target(&self) -> bool {
         super::ai::brain_target(self).is_some()
@@ -867,7 +885,7 @@ impl Mob {
         change
     }
     /// `Mob.asValidTarget` and the modeled `canAttack` overrides over the
-    /// target's facts (#1175): one rule set both the write handle and a goal
+    /// target's facts (arismoko/horizon#1175): one rule set both the write handle and a goal
     /// tick's view ask — the facts of the target, not where they were read.
     /// The warden's own override (`Warden.canTargetEntity`) reads the
     /// scoreboard and the world border, so the write handle answers it around
@@ -1060,7 +1078,7 @@ impl Goal for ClimbOnTopOfPowderSnow {
 #[derive(Clone, Debug)]
 pub struct Panic {
     pub speed: f64,
-    /// Only the damage of `#panic_environmental_causes` (an armadillo).
+    /// Only the damage of `#panic_environmental_causes` (a wolf).
     pub environmental: bool,
     /// `TurtlePanicGoal`: always look for water this far away, not only
     /// when on fire.
@@ -1082,6 +1100,10 @@ impl Panic {
         self
     }
 }
+#[path = "animal_panic.rs"]
+mod animal_panic;
+pub use animal_panic::{AnimalPanic, water_pos};
+
 pub fn should_panic(m: &Mob) -> bool {
     m.last_damage
         .is_some_and(|(d, t)| d.causes_panic() && i64::from(m.age) - t <= 40)
@@ -1103,33 +1125,11 @@ impl Goal for Panic {
         if !wanted {
             return false;
         }
-        let range = self.water_range.or((m.fire_ticks > 0).then_some(5));
-        if let Some(range) = range {
-            let (bx, by, bz) = (
-                m.position.x.floor() as i32,
-                m.position.y.floor() as i32,
-                m.position.z.floor() as i32,
-            );
-            if cx.w.data.state(cx.w.world.block(bx, by, bz)).top == 0.0 {
-                // findBlocksInBoxByManhattanDistance(pos, range, 1) for water.
-                let mut best: Option<([i32; 3], i32)> = None;
-                for dy in -1i32..=1 {
-                    for dx in -range..=range {
-                        for dz in -range..=range {
-                            let d = dx.abs() + dy.abs() + dz.abs();
-                            if cx.w.fluid(bx + dx, by + dy, bz + dz) == crate::blocks::Fluid::Water
-                                && best.is_none_or(|b| d < b.1)
-                            {
-                                best = Some(([bx + dx, by + dy, bz + dz], d));
-                            }
-                        }
-                    }
-                }
-                if let Some((p, _)) = best {
-                    self.pos = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
-                    return true;
-                }
-            }
+        if let Some(range) = self.water_range.or((m.fire_ticks > 0).then_some(5))
+            && let Some(p) = water_pos(m, cx.w, range)
+        {
+            self.pos = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
+            return true;
         }
         match m.default_random_pos(cx.w, 5, 4) {
             Some(p) => {
@@ -1150,183 +1150,9 @@ impl Goal for Panic {
         m.ai.panicking = false;
     }
 }
-/// RandomStrollGoal / WaterAvoidingRandomStrollGoal.
-#[derive(Clone, Debug)]
-pub struct Stroll {
-    pub speed: f64,
-    pub interval: i32,
-    pub check_no_action: bool,
-    /// WaterAvoidingRandomStrollGoal probability of a plain stroll.
-    pub water_avoiding: Option<f32>,
-    /// RandomSwimmingGoal: BehaviorUtils.getRandomSwimmablePos.
-    pub swim: bool,
-    /// WaterAvoidingRandomFlyingGoal: a hover spot, else an air or water pos.
-    pub flying: bool,
-    /// `Parrot.ParrotWanderGoal`: to a tree, else as `flying`.
-    pub parrot: bool,
-    pub force: bool,
-    wanted: [f64; 3],
-    /// A subclass's `getPosition` in place of the default pick
-    /// (`GolemRandomStrollInVillageGoal`, `MoveBackToVillageGoal`).
-    position: Option<fn(&mut Mob, &mut Cx) -> Option<[f64; 3]>>,
-    /// A subclass's own `canUse` test, run before the interval's draw.
-    gate: Option<fn(&Mob, &MobWorld) -> bool>,
-    label: Option<&'static str>,
-}
-impl Stroll {
-    /// `RandomStrollGoal.<init>` (interval 120, checks the no-action time).
-    pub fn new(speed: f64) -> Self {
-        Self {
-            speed,
-            interval: 120,
-            check_no_action: true,
-            water_avoiding: None,
-            swim: false,
-            flying: false,
-            parrot: false,
-            force: false,
-            wanted: [0.0; 3],
-            position: None,
-            gate: None,
-            label: None,
-        }
-    }
-    /// The stroll's spot comes from `f` (an overridden `getPosition`).
-    pub fn position(mut self, f: fn(&mut Mob, &mut Cx) -> Option<[f64; 3]>) -> Self {
-        self.position = Some(f);
-        self
-    }
-    /// The stroll may only start while `f` holds (an overridden `canUse`).
-    pub fn gate(mut self, f: fn(&Mob, &MobWorld) -> bool) -> Self {
-        self.gate = Some(f);
-        self
-    }
-    /// The goal's class name, for debugging.
-    pub fn named(mut self, label: &'static str) -> Self {
-        self.label = Some(label);
-        self
-    }
-    pub fn avoiding_water(speed: f64) -> Self {
-        Self {
-            water_avoiding: Some(0.001),
-            ..Self::new(speed)
-        }
-    }
-    pub fn interval(mut self, i: i32) -> Self {
-        self.interval = i;
-        self
-    }
-    /// WaterAvoidingRandomFlyingGoal (a nearby air position).
-    pub fn flying(speed: f64) -> Self {
-        Self {
-            flying: true,
-            ..Self::new(speed)
-        }
-    }
-    /// `Parrot.ParrotWanderGoal(speed)`, a WaterAvoidingRandomFlyingGoal.
-    pub fn parrot(speed: f64) -> Self {
-        Self {
-            water_avoiding: Some(0.001),
-            parrot: true,
-            ..Self::new(speed)
-        }
-    }
-    /// RandomSwimmingGoal(speed, interval)
-    pub fn swimming(speed: f64, interval: i32) -> Self {
-        Self {
-            swim: true,
-            ..Self::new(speed).interval(interval)
-        }
-    }
-}
-impl Goal for Stroll {
-    goal_clone!();
-    fn name(&self) -> &'static str {
-        if let Some(label) = self.label {
-            label
-        } else if self.parrot {
-            "ParrotWander"
-        } else if self.water_avoiding.is_some() {
-            "Stroll"
-        } else if self.swim {
-            "RandomSwimming"
-        } else {
-            "RandomStroll"
-        }
-    }
-    fn flags(&self) -> u8 {
-        MOVE
-    }
-    /// RandomStrollGoal.canUse.
-    fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        if super::riders::mob_controlled(m, cx.w) {
-            return false;
-        }
-        if self.gate.is_some_and(|gate| !gate(m, cx.w)) {
-            return false;
-        }
-        if !self.force {
-            if self.check_no_action && m.ai.no_action_time >= 100 {
-                return false;
-            }
-            if m.random.next_int_bound(reduced(self.interval)).unwrap_or(1) != 0 {
-                return false;
-            }
-        }
-        let pos = match self.water_avoiding {
-            _ if self.position.is_some() => self.position.and_then(|pick| pick(m, cx)),
-            Some(_) if self.parrot => super::parrot::wander_pos(m, cx.w),
-            Some(prob) => {
-                if m.fluids.in_water {
-                    m.land_random_pos(cx.w, 15, 7)
-                        .or_else(|| m.default_random_pos(cx.w, 10, 7))
-                } else if m.random.next_float() >= prob {
-                    m.land_random_pos(cx.w, 10, 7)
-                } else {
-                    m.default_random_pos(cx.w, 10, 7)
-                }
-            }
-            None if self.swim => {
-                let mut p = m.default_random_pos(cx.w, 10, 7);
-                let mut count = 0;
-                while let Some(q) = p {
-                    let s = cx.w.world.block(
-                        q[0].floor() as i32,
-                        q[1].floor() as i32,
-                        q[2].floor() as i32,
-                    );
-                    if cx
-                        .w
-                        .data
-                        .pathfindable(s, super::data::PathComputationType::Water)
-                        || count >= 10
-                    {
-                        break;
-                    }
-                    count += 1;
-                    p = m.default_random_pos(cx.w, 10, 7);
-                }
-                p
-            }
-            None if self.flying => m.flying_stroll_pos(cx.w),
-            None => m.default_random_pos(cx.w, 10, 7),
-        };
-        let Some(p) = pos else { return false };
-        self.wanted = p;
-        self.force = false;
-        true
-    }
-    /// RandomStrollGoal.canContinueToUse.
-    fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        !m.ai.nav.is_done() && !super::riders::mob_controlled(m, cx.w)
-    }
-    fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
-        m.nav_move_to(cx.w, self.wanted, self.speed);
-    }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.nav_stop();
-    }
-}
+#[path = "goals/stroll.rs"]
+mod stroll;
+pub use stroll::Stroll;
 /// LookAtPlayerGoal (player targets only).
 #[derive(Clone, Debug)]
 pub struct LookAtPlayer {
@@ -1335,8 +1161,8 @@ pub struct LookAtPlayer {
     pub only_horizontal: bool,
     /// `LookAtPlayerGoal(Mob.class, ...)`: the nearest mob, not the player.
     pub mobs: bool,
-    /// `LookAtPlayerGoal(Strider.class, ...)`: only mobs of this species.
-    pub only: Option<Species>,
+    /// `LookAtPlayerGoal(<species class>, ...)`: only these species, subclasses too.
+    pub only: &'static [Species],
     /// InteractGoal: LOOK and MOVE.
     pub interact: bool,
     look_at: Option<Who>,
@@ -1349,7 +1175,7 @@ impl LookAtPlayer {
             probability: 0.02,
             only_horizontal: false,
             mobs: false,
-            only: None,
+            only: &[],
             interact: false,
             look_at: None,
             look_time: 0,
@@ -1363,9 +1189,9 @@ impl LookAtPlayer {
         }
     }
     /// `LookAtPlayerGoal(this, <species class>, range)`.
-    pub fn species(species: Species, range: f32) -> Self {
+    pub fn species(list: &'static [Species], range: f32) -> Self {
         Self {
-            only: Some(species),
+            only: list,
             ..Self::mobs(range)
         }
     }
@@ -1413,8 +1239,8 @@ impl Goal for LookAtPlayer {
         self.look_at = None;
         let range = f64::from(self.range);
         if !self.mobs {
-            // level.getNearestPlayer(forNonCombat().range(lookDistance)).
-            if m.can_see_player(cx.w, range) {
+            // `EntitySelector.notRiding(mob)`: never the player riding it.
+            if !super::riders::player_rides(m, cx.w) && m.can_see_player(cx.w, range) {
                 self.look_at = Some(Who::Player);
             }
             return self.look_at.is_some();
@@ -1426,7 +1252,7 @@ impl Goal for LookAtPlayer {
         let candidates: Vec<(u32, Vec3)> =
             cx.w.others_near(area)
                 .filter(|s| s.id != id && s.alive && s.bounds.intersects(area))
-                .filter(|s| only.is_none_or(|o| s.species == o))
+                .filter(|s| only.is_empty() || only.contains(&s.species))
                 .map(|s| (s.id, s.position))
                 .collect();
         let mut best: Option<(u32, f64)> = None;
@@ -1671,11 +1497,11 @@ impl Goal for MeleeAttack {
                 _ => self.interval,
             };
             self.until_attack = adjusted(true, interval);
-            m.swing();
+            m.swing_for_attack(false);
             super::ai::do_hurt_target(m, who, cx);
+            // `Fox.this.playSound(FOX_BITE, 1.0F, 1.0F)`: `Entity.playSound`, skipped when silent.
             if let Some(sound) = self.bite {
-                let at = [m.position.x, m.position.y, m.position.z];
-                cx.events.push(MobEvent::Sound(sound, at, 1.0, 1.0));
+                m.sound(sound, cx.events);
             }
         }
         if self.zombie {
@@ -1922,21 +1748,30 @@ impl Goal for NearestTarget {
                 let pos = Vec3::new(m.position.x, m.eye_y(), m.position.z);
                 let id = m.id;
                 let attacker = m.species();
-                let candidates: Vec<(u32, Vec3)> =
-                    cx.w.nearby(pos, range, move |s| {
-                        s.id != id
-                            && !s.playing_dead
-                            && !illager_spares(attacker, s)
-                            && match prey {
-                                Prey::Species(list) => list.contains(&s.species),
-                                Prey::Filter(f) => f(s),
-                                Prey::Player => false,
-                            }
-                    })
-                    .map(|s| (s.id, s.position))
-                    .collect();
+                let accepts = move |s: &Seen| {
+                    s.id != id
+                        && !s.playing_dead
+                        && !illager_spares(attacker, s)
+                        && match prey {
+                            Prey::Species(list) => list.contains(&s.species),
+                            Prey::Filter(f) => f(s),
+                            Prey::Player => false,
+                        }
+                };
+                let candidates: Vec<(u32, Vec3)> = match prey {
+                    Prey::Species(list) => {
+                        cx.w.nearby_species(pos, range, list, accepts)
+                            .map(|s| (s.id, s.position))
+                            .collect()
+                    }
+                    _ => {
+                        cx.w.nearby(pos, range, accepts)
+                            .map(|s| (s.id, s.position))
+                            .collect()
+                    }
+                };
                 for (cid, cpos) in candidates {
-                    if m.distance_sqr(cpos) > range * range {
+                    if m.distance_sqr(cpos) > cx.w.reach_sqr(cid, m, range) {
                         continue;
                     }
                     if self.beyond_sqr.is_some_and(|d| m.distance_sqr(cpos) <= d) {
@@ -2131,10 +1966,13 @@ impl Goal for HurtByTarget {
                 return;
             }
             for other in ids {
-                cx.events.push(MobEvent::SetTarget {
+                // A target-change hook may have switched the selected player:
+                // the alert carries the one this mob now targets.
+                cx.events.push(cx.w.route_player_event(MobEvent::SetTarget {
                     mob: other,
                     target: by,
-                });
+                    player: None,
+                }));
             }
         }
         if cub {
@@ -2437,8 +2275,8 @@ impl Goal for Breed {
         if tamable && !m.extra.tame {
             return false;
         }
-        // AbstractHorse.canMate is false and Mule keeps it: mules never breed.
-        if species == Species::Mule {
+        // Mule keeps AbstractHorse.canMate; CamelHusk.canMate and canFallInLove are false.
+        if matches!(species, Species::Mule | Species::CamelHusk) {
             return false;
         }
         // TurtleBreedGoal.canUse: not while carrying an egg.
@@ -2976,7 +2814,7 @@ impl Goal for BreathAir {
         );
         m.move_relative(0.02, input);
         let mut ev = Vec::new();
-        m.do_move(cx.w, cx.level, &mut ev);
+        m.do_move(cx.w, cx.level, &mut ev, &mut Default::default()); // the fresh gate, armed by `do_move`
         cx.events.extend(ev);
     }
 }
@@ -3194,7 +3032,7 @@ mod breeding_variant_tests {
     use std::sync::Arc;
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn chicken_breeding_coin_precedes_same_tick_egg_with_or_without_listener() {
         #[derive(Debug, Clone)]
         struct SeedAtBreed(Breed);
@@ -3210,7 +3048,9 @@ mod breeding_variant_tests {
                 true
             }
             fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-                m.random = horizon_core::random::LegacyRandom::new(1);
+                m.random = horizon_core::random::EntityRandom::own(
+                    horizon_core::random::LegacyRandom::new(1),
+                );
                 self.0.tick(m, cx);
             }
         }
@@ -3218,7 +3058,7 @@ mod breeding_variant_tests {
             let kind = Arc::new(types.types["minecraft:chicken"].clone());
             let mut mate = Mob::new(2, kind.clone(), Vec3::new(1.0, 64.0, 0.0), 0.0);
             mate.extra.in_love = 600;
-            let partner = [mate.seen(None)];
+            let partner = [mate.seen(None, &crate::items::Items::empty())];
             for asks_baby_spawn in [false, true] {
                 let w = MobWorld {
                     goal_host: None,
@@ -3265,7 +3105,7 @@ mod breeding_variant_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn variant_and_experience_are_drawn_in_order_before_later_goal_work() {
         assert!(with_test_world(&[], |world, types| {
             for id in [
@@ -3277,8 +3117,8 @@ mod breeding_variant_tests {
                 "minecraft:wolf",
             ] {
                 let kind = Arc::new(types.types[id].clone());
-                let partner =
-                    [Mob::new(2, kind.clone(), Vec3::new(1.0, 64.0, 0.0), 0.0).seen(None)];
+                let partner = [Mob::new(2, kind.clone(), Vec3::new(1.0, 64.0, 0.0), 0.0)
+                    .seen(None, &crate::items::Items::empty())];
                 for (ask_mods, mob_drops) in
                     [(false, true), (false, false), (true, true), (true, false)]
                 {
@@ -3290,7 +3130,9 @@ mod breeding_variant_tests {
                         ..world.clone()
                     };
                     let mut parent = Mob::new(1, kind.clone(), Vec3::new(0.0, 64.0, 0.0), 0.0);
-                    parent.random = horizon_core::random::LegacyRandom::new(0);
+                    parent.random = horizon_core::random::EntityRandom::own(
+                        horizon_core::random::LegacyRandom::new(0),
+                    );
                     let mut goal = Breed {
                         speed: 1.0,
                         partner: Some(2),
@@ -3427,6 +3269,7 @@ mod eat_block_tests {
     /// goal still runs (`EntityEvent` 10) and still shears the coat, and the
     /// grass stays.
     #[test]
+    #[ignore = "daily"]
     fn the_eat_goal_turns_grass_to_dirt_only_with_mob_griefing() {
         let Some(on) = sheep_events(true, false) else {
             return;
@@ -3471,6 +3314,7 @@ mod eat_block_tests {
     /// NeoForge's `canEntityGrief`: with the rule off, a mod's yes for this
     /// sheep lets it eat the grass (and only through `MobWorld::can_grief`).
     #[test]
+    #[ignore = "daily"]
     fn a_mods_grief_answer_overrides_the_rule_for_its_mob() {
         let Some(off) = sheep_events_hooked(false, false, Some(&GriefFor1)) else {
             return;
@@ -3489,6 +3333,7 @@ mod eat_block_tests {
     /// disappears with the rule on and stays with it off, while the goal eats
     /// either way.
     #[test]
+    #[ignore = "daily"]
     fn the_eat_goal_breaks_short_grass_only_with_mob_griefing() {
         let Some(on) = sheep_events(true, true) else {
             return;
@@ -3593,7 +3438,7 @@ mod remove_all_tests {
     /// lock it held, and moves the locks behind the removed one, so the next
     /// tick still finds the survivor that kept its place.
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn remove_all_stops_the_running_goal_and_moves_the_locks() {
         let ran = with_built_test_world_rules(
             &[],
@@ -3712,6 +3557,7 @@ mod avoid_entity_targeting_tests {
     /// 20 block range, but the wall is between them, so the goal must not pick
     /// them (it did before: only the distance was checked).
     #[test]
+    #[ignore = "daily"]
     fn a_rabbit_does_not_flee_a_player_behind_a_wall() {
         if let Some((in_range, picked)) = target(2, true) {
             assert!(in_range, "the player is inside the plain distance range");
@@ -3722,6 +3568,7 @@ mod avoid_entity_targeting_tests {
     /// `LivingEntity.canAttack`: in Peaceful no player is a target at all, so
     /// the goal does not pick them even in plain sight.
     #[test]
+    #[ignore = "daily"]
     fn a_rabbit_does_not_flee_in_peaceful() {
         if let Some((in_range, picked)) = target(0, false) {
             assert!(in_range, "the player is inside the plain distance range");
@@ -3732,6 +3579,7 @@ mod avoid_entity_targeting_tests {
     /// The control: the same world on normal difficulty with nothing in the way
     /// still picks the player.
     #[test]
+    #[ignore = "daily"]
     fn a_rabbit_flees_a_player_it_can_see() {
         if let Some((in_range, picked)) = target(2, false) {
             assert!(in_range, "the player is inside the plain distance range");
@@ -3741,6 +3589,7 @@ mod avoid_entity_targeting_tests {
 
     /// Upstream's visibility regression, also through the selected-guest path.
     #[test]
+    #[ignore = "daily"]
     fn an_invisible_player_tempts_only_within_two_blocks() {
         let mut outcomes = Vec::new();
         if !with_test_world(&[], |w, types| {
@@ -3793,6 +3642,7 @@ mod avoid_entity_targeting_tests {
     /// which never picks a spectator: a spectator holding wheat does not tempt
     /// an animal.
     #[test]
+    #[ignore = "daily"]
     fn a_spectator_does_not_tempt_an_animal() {
         let mut outcomes = Vec::new();
         if !with_test_world(&[], |w, types| {
@@ -3829,7 +3679,57 @@ mod avoid_entity_targeting_tests {
             "a survival player tempts; a spectator does not"
         );
     }
+
+    /// `LookAtPlayerGoal`'s player targeting runs over `EntitySelector.notRiding(mob)`:
+    /// a pig does not look at the player riding it, while the same player standing
+    /// a block off is its look target.
+    #[test]
+    #[ignore = "daily"]
+    fn a_mob_does_not_look_at_the_player_riding_it() {
+        let mut out = Vec::new();
+        let ran = with_test_world(&[], |w, types| {
+            for riding in [false, true] {
+                let mut m = Mob::new(
+                    1,
+                    Arc::new(types.types["minecraft:pig"].clone()),
+                    Vec3::new(0.5, 64.0, 0.5),
+                    0.0,
+                );
+                let mut player = test_player(Vec3::new(0.5, 64.0, 1.5));
+                player.passenger = riding;
+                player.riding_vehicle = riding.then_some(m.id);
+                let world = crate::mobs::MobWorld {
+                    player: Some(player),
+                    ..w.clone()
+                };
+                m.ai.goals.add(1, LookAtPlayer::new(6.0).probability(1.0));
+                let mut level = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut level.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                out.push(goals.is_running("LookAtPlayer"));
+                m.ai.goals = goals;
+            }
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            out,
+            vec![true, false],
+            "a player beside the pig is looked at; the one riding it is not"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "panic_tests.rs"]
+mod panic_tests;
 
 #[cfg(test)]
 mod peaceful_targets_tests {
@@ -3840,81 +3740,95 @@ mod peaceful_targets_tests {
     /// hurt wolf neither takes its attacker (a player) as target nor picks one
     /// by sight, while at Normal it does.
     #[test]
+    #[ignore = "daily"]
     fn peaceful_mobs_never_target_the_player() {
-        with_test_world(&[], |w, types| {
-            let mut w = w.clone();
-            w.player = Some(test_player(Vec3::new(2.5, 64.0, 0.5)));
-            let kind = Arc::new(types.types["minecraft:wolf"].clone());
-            let mut wolf = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
-            wolf.ai.last_hurt_by = Some(Who::Player);
-            wolf.ai.last_hurt_by_time = 5;
-            let mut test_level = crate::health::TestLevel::new(0);
-            let level = &mut test_level.level();
-            let mut events = Vec::new();
-            let mut cx = Cx {
-                w: &w,
-                level,
-                events: &mut events,
-            };
-            assert!(
-                HurtByTarget::default().can_use(&mut wolf, &mut cx),
-                "normal"
-            );
-            assert!(wolf.can_target_player(&w, 16.0, false), "normal");
+        assert!(
+            with_test_world(&[], |w, types| {
+                let mut w = w.clone();
+                w.player = Some(test_player(Vec3::new(2.5, 64.0, 0.5)));
+                let kind = Arc::new(types.types["minecraft:wolf"].clone());
+                let mut wolf = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                wolf.ai.last_hurt_by = Some(Who::Player);
+                wolf.ai.last_hurt_by_time = 5;
+                let mut test_level = crate::health::TestLevel::new(0);
+                let level = &mut test_level.level();
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &w,
+                    level,
+                    events: &mut events,
+                };
+                assert!(
+                    HurtByTarget::default().can_use(&mut wolf, &mut cx),
+                    "normal"
+                );
+                assert!(wolf.can_target_player(&w, 16.0, false), "normal");
 
-            let mut peaceful = w.clone();
-            peaceful.difficulty = crate::mobs::spawning::LocalDifficulty::new(0, 18000, 0, 0.0);
-            let mut cx = Cx {
-                w: &peaceful,
-                level,
-                events: &mut events,
-            };
-            assert!(
-                !HurtByTarget::default().can_use(&mut wolf, &mut cx),
-                "peaceful"
-            );
-            assert!(!wolf.can_target_player(&peaceful, 16.0, false), "peaceful");
-            assert!(!wolf.can_keep_target_player(&peaceful, 16.0), "peaceful");
-        });
+                let mut peaceful = w.clone();
+                peaceful.difficulty = crate::mobs::spawning::LocalDifficulty::new(0, 18000, 0, 0.0);
+                let mut cx = Cx {
+                    w: &peaceful,
+                    level,
+                    events: &mut events,
+                };
+                assert!(
+                    !HurtByTarget::default().can_use(&mut wolf, &mut cx),
+                    "peaceful"
+                );
+                assert!(!wolf.can_target_player(&peaceful, 16.0, false), "peaceful");
+                assert!(!wolf.can_keep_target_player(&peaceful, 16.0), "peaceful");
+            }),
+            "vanilla data is missing"
+        );
     }
 
     /// `Mob.canAttack` refuses a Ghast, and `HurtByTargetGoal.canUse` ends
     /// with `canAttack(lastHurtByMob)`: a ghast's fireball is not retaliated.
     #[test]
+    #[ignore = "daily"]
     fn a_hurt_mob_does_not_retaliate_against_a_ghast() {
         let mut seen = None;
-        with_test_world(&[], |_, types| {
-            let mob = |id: u32, name: &str, at: Vec3| {
-                Mob::new(id, Arc::new(types.types[name].clone()), at, 0.0)
-            };
-            let ghast = mob(2, "minecraft:ghast", Vec3::new(2.5, 64.0, 0.5));
-            let zombie = mob(3, "minecraft:zombie", Vec3::new(3.5, 64.0, 0.5));
-            seen = Some([ghast.seen(None), zombie.seen(None)]);
-        });
+        assert!(
+            with_test_world(&[], |_, types| {
+                let mob = |id: u32, name: &str, at: Vec3| {
+                    Mob::new(id, Arc::new(types.types[name].clone()), at, 0.0)
+                };
+                let ghast = mob(2, "minecraft:ghast", Vec3::new(2.5, 64.0, 0.5));
+                let zombie = mob(3, "minecraft:zombie", Vec3::new(3.5, 64.0, 0.5));
+                seen = Some([
+                    ghast.seen(None, &crate::items::Items::empty()),
+                    zombie.seen(None, &crate::items::Items::empty()),
+                ]);
+            }),
+            "vanilla data is missing"
+        );
         let Some(seen) = seen else { return };
-        with_test_world(&seen, |w, types| {
-            let kind = Arc::new(types.types["minecraft:cow"].clone());
-            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
-            let mut lr = crate::health::TestLevel::new(0);
-            let mut events = Vec::new();
-            let mut cx = Cx {
-                w,
-                level: &mut lr.level(),
-                events: &mut events,
-            };
-            m.ai.last_hurt_by = Some(Who::Mob(2));
-            m.ai.last_hurt_by_time = 5;
-            assert!(
-                !HurtByTarget::default().can_use(&mut m, &mut cx),
-                "a ghast is not a valid attacker to retaliate against"
-            );
-            m.ai.last_hurt_by = Some(Who::Mob(3));
-            m.ai.last_hurt_by_time = 6;
-            assert!(
-                HurtByTarget::default().can_use(&mut m, &mut cx),
-                "a zombie attacker is retaliated against"
-            );
-        });
+        assert!(
+            with_test_world(&seen, |w, types| {
+                let kind = Arc::new(types.types["minecraft:cow"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                m.ai.last_hurt_by = Some(Who::Mob(2));
+                m.ai.last_hurt_by_time = 5;
+                assert!(
+                    !HurtByTarget::default().can_use(&mut m, &mut cx),
+                    "a ghast is not a valid attacker to retaliate against"
+                );
+                m.ai.last_hurt_by = Some(Who::Mob(3));
+                m.ai.last_hurt_by_time = 6;
+                assert!(
+                    HurtByTarget::default().can_use(&mut m, &mut cx),
+                    "a zombie attacker is retaliated against"
+                );
+            }),
+            "vanilla data is missing"
+        );
     }
 }
 #[cfg(test)]
@@ -3991,62 +3905,70 @@ mod visibility_hook_tests {
     /// NeoForge's `LivingVisibilityEvent` scales the range a targeting check
     /// sees the player from, and `getVisibilityPercent` clamps it to 10.
     #[test]
+    #[ignore = "daily"]
     fn a_mods_visibility_scales_the_targeting_range() {
-        with_test_world(&[], |w, types| {
-            let mut w = w.clone();
-            let kind = Arc::new(types.types["minecraft:zombie"].clone());
-            let mut near = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
-            let mut far = Mob::new(2, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
-            w.player = Some(test_player(Vec3::new(10.5, 64.0, 0.5)));
-            assert!(near.can_see_player_through_walls(&w, 16.0));
-            w.mob_hooks = Some(&Scale);
-            assert!(
-                !near.can_see_player_through_walls(&w, 16.0),
-                "16 x 0.25 = 4 blocks"
-            );
-            // x100 clamps to 10: 160 blocks.
-            w.player = Some(test_player(Vec3::new(150.5, 64.0, 0.5)));
-            assert!(far.can_see_player_through_walls(&w, 16.0));
-            w.player = Some(test_player(Vec3::new(170.5, 64.0, 0.5)));
-            assert!(!far.can_see_player_through_walls(&w, 16.0));
-        });
+        assert!(
+            with_test_world(&[], |w, types| {
+                let mut w = w.clone();
+                let kind = Arc::new(types.types["minecraft:zombie"].clone());
+                let mut near = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                let mut far = Mob::new(2, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                w.player = Some(test_player(Vec3::new(10.5, 64.0, 0.5)));
+                assert!(near.can_see_player_through_walls(&w, 16.0));
+                w.mob_hooks = Some(&Scale);
+                assert!(
+                    !near.can_see_player_through_walls(&w, 16.0),
+                    "16 x 0.25 = 4 blocks"
+                );
+                // x100 clamps to 10: 160 blocks.
+                w.player = Some(test_player(Vec3::new(150.5, 64.0, 0.5)));
+                assert!(far.can_see_player_through_walls(&w, 16.0));
+                w.player = Some(test_player(Vec3::new(170.5, 64.0, 0.5)));
+                assert!(!far.can_see_player_through_walls(&w, 16.0));
+            }),
+            "vanilla data is missing"
+        );
     }
 
     /// A worn head's `mob_visibility` halves the range only for the types
     /// vanilla names: a zombie head fools a zombie, not a husk, and a
     /// skeleton skull a skeleton, not a stray.
     #[test]
+    #[ignore = "daily"]
     fn a_worn_head_hides_the_player_only_from_its_own_type() {
-        with_test_world(&[], |w, types| {
-            let mut w = w.clone();
-            let mob = |id, name: &str| {
-                let kind = Arc::new(types.types[name].clone());
-                Mob::new(id, kind, Vec3::new(0.5, 64.0, 0.5), 0.0)
-            };
-            let wearing = |head: &str| {
-                let mut p = test_player(Vec3::new(10.5, 64.0, 0.5));
-                p.head = Some(head.into());
-                p
-            };
-            // 16 blocks, halved to 8: the player 10 blocks away is unseen.
-            for (looking, head, hidden) in [
-                ("minecraft:zombie", "minecraft:zombie_head", true),
-                ("minecraft:husk", "minecraft:zombie_head", false),
-                ("minecraft:skeleton", "minecraft:skeleton_skull", true),
-                ("minecraft:stray", "minecraft:skeleton_skull", false),
-                ("minecraft:creeper", "minecraft:creeper_head", true),
-                ("minecraft:piglin_brute", "minecraft:piglin_head", true),
-                ("minecraft:zombie", "minecraft:skeleton_skull", false),
-            ] {
-                w.player = Some(wearing(head));
-                let mut m = mob(1, looking);
-                assert_eq!(
-                    m.can_see_player_through_walls(&w, 16.0),
-                    !hidden,
-                    "{looking} looking at {head}"
-                );
-            }
-        });
+        assert!(
+            with_test_world(&[], |w, types| {
+                let mut w = w.clone();
+                let mob = |id, name: &str| {
+                    let kind = Arc::new(types.types[name].clone());
+                    Mob::new(id, kind, Vec3::new(0.5, 64.0, 0.5), 0.0)
+                };
+                let wearing = |head: &str| {
+                    let mut p = test_player(Vec3::new(10.5, 64.0, 0.5));
+                    p.head = Some(head.into());
+                    p
+                };
+                // 16 blocks, halved to 8: the player 10 blocks away is unseen.
+                for (looking, head, hidden) in [
+                    ("minecraft:zombie", "minecraft:zombie_head", true),
+                    ("minecraft:husk", "minecraft:zombie_head", false),
+                    ("minecraft:skeleton", "minecraft:skeleton_skull", true),
+                    ("minecraft:stray", "minecraft:skeleton_skull", false),
+                    ("minecraft:creeper", "minecraft:creeper_head", true),
+                    ("minecraft:piglin_brute", "minecraft:piglin_head", true),
+                    ("minecraft:zombie", "minecraft:skeleton_skull", false),
+                ] {
+                    w.player = Some(wearing(head));
+                    let mut m = mob(1, looking);
+                    assert_eq!(
+                        m.can_see_player_through_walls(&w, 16.0),
+                        !hidden,
+                        "{looking} looking at {head}"
+                    );
+                }
+            }),
+            "vanilla data is missing"
+        );
     }
 }
 
@@ -4086,7 +4008,7 @@ mod target_change_hook_tests {
     }
 
     #[test]
-    #[ignore = "requires prepared entity resources in .local/horizon-client"]
+    #[ignore = "daily"]
     fn nearest_target_goal_respects_cancellation() {
         assert!(
             with_test_world(&[], |world, types| {
@@ -4124,112 +4046,7 @@ mod target_change_hook_tests {
 }
 
 #[cfg(test)]
-mod breed_xp_tests {
-    use super::*;
-
-    /// Two llamas in love, two blocks apart on a flat grass shelf, ticked by
-    /// the AI until the first breeds: its own events, with the `mob_drops`
-    /// game rule at `drops`. `None` without the vanilla data.
-    fn llama_events(drops: bool) -> Option<Vec<MobEvent>> {
-        // The partner's `Seen` needs its kind, so two loads.
-        let mut kind = None;
-        crate::mobs::world::with_built_test_world_rules(&[], true, drops, shelf, |_, types| {
-            kind = Some(Arc::new(types.types["minecraft:llama"].clone()));
-        });
-        let kind = kind?;
-        let mut partner = Mob::new(2, kind.clone(), Vec3::new(2.5, 64.0, 0.5), 0.0);
-        // AbstractHorse.canParent: only tame llamas breed.
-        partner.extra.tame = true;
-        partner.extra.in_love = 600;
-        let seen = [partner.seen(None)];
-        let mut out = None;
-        crate::mobs::world::with_built_test_world_rules(&seen, true, drops, shelf, |w, _| {
-            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
-            m.extra.in_love = 600;
-            m.extra.tame = true;
-            let mut test_level = crate::health::TestLevel::new(0);
-            let level = &mut test_level.level();
-            let mut events = Vec::new();
-            for _ in 0..600 {
-                crate::mobs::ai::tick(&mut m, w, level, &mut events);
-                if events
-                    .iter()
-                    .any(|e| matches!(e, MobEvent::Breed { parent: 1, .. }))
-                {
-                    break;
-                }
-            }
-            out = Some(events);
-        });
-        out
-    }
-
-    /// A flat grass shelf two llamas can stand on.
-    fn shelf(world: &mut crate::world::World, registry: &horizon_world::registry::BlockRegistry) {
-        let grass = registry.default_state("minecraft:grass_block").unwrap();
-        for cx in -3..3 {
-            for cz in -3..3 {
-                world
-                    .chunks
-                    .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
-            }
-        }
-        for x in -8..=8 {
-            for z in -8..=8 {
-                world.set(x, 63, z, grass).unwrap();
-            }
-        }
-    }
-
-    /// `finalizeSpawnChildFromBreeding` makes the experience draw only inside
-    /// the `mob_drops` check, from the breeding parent's own random: the
-    /// breed goal carries one 1-7 orb with the rule on, no orb with it off,
-    /// and the pair breeds either way.
-    #[test]
-    fn the_breed_xp_follows_the_mob_drops_rule() {
-        let Some(on) = llama_events(true) else {
-            return;
-        };
-        let Some(off) = llama_events(false) else {
-            return;
-        };
-        let orb = |events: &[MobEvent]| {
-            events.iter().find_map(|e| match e {
-                MobEvent::Breed {
-                    experience: crate::mobs::BreedExperience::Drawn(amount),
-                    ..
-                } => *amount,
-                _ => None,
-            })
-        };
-        assert!(
-            orb(&on).is_some_and(|a| (1..=7).contains(&a)),
-            "mob_drops on: one orb of 1-7, got {:?}",
-            orb(&on)
-        );
-        assert!(orb(&off).is_none(), "mob_drops off: no experience draw");
-        assert!(
-            off.iter().any(|e| matches!(
-                e,
-                MobEvent::Breed {
-                    experience: crate::mobs::BreedExperience::Drawn(None),
-                    ..
-                }
-            )),
-            "mob_drops off: the already-decided reward is empty, not deferred"
-        );
-        assert!(
-            on.iter()
-                .any(|e| matches!(e, MobEvent::Breed { parent: 1, .. })),
-            "mob_drops on: the pair breeds"
-        );
-        assert!(
-            off.iter()
-                .any(|e| matches!(e, MobEvent::Breed { parent: 1, .. })),
-            "mob_drops off: the pair still breeds"
-        );
-    }
-}
+mod breed_xp_tests;
 
 #[cfg(test)]
 #[path = "breed_partner_range_tests.rs"]
@@ -4372,6 +4189,7 @@ mod melee_continue_tests {
     /// `MeleeAttackGoal.canContinueToUse`'s follow branch refuses a target
     /// outside the mob's home (`isWithinHome(target.blockPosition())`).
     #[test]
+    #[ignore = "daily"]
     fn a_chase_stops_outside_the_mobs_home() {
         let mut outcomes = None;
         let ran = with_test_world(&[], |w, types| {
@@ -4401,6 +4219,7 @@ mod melee_continue_tests {
 
     /// The same branch refuses a spectator (`!(player.isSpectator() || player.isCreative())`).
     #[test]
+    #[ignore = "daily"]
     fn a_chase_stops_when_the_target_is_a_spectator() {
         let mut outcomes = None;
         let ran = with_test_world(&[], |w, types| {
@@ -4462,6 +4281,7 @@ mod hurt_by_anger_tests {
     /// `HurtByTargetGoal.canUse` refuses a player when the `universal_anger`
     /// game rule is on: the anger target goals handle that hit instead.
     #[test]
+    #[ignore = "daily"]
     fn universal_anger_leaves_the_players_hit_to_the_anger_goals() {
         let mut outcomes = None;
         if !with_test_world(&[], |w, types| {
@@ -4523,6 +4343,7 @@ mod breed_continue_tests {
     /// `BreedGoal.canContinueToUse` refuses a partner that is panicking. The
     /// goal starts with a calm partner and must stop when the partner panics.
     #[test]
+    #[ignore = "daily"]
     fn a_breed_goal_stops_when_the_partner_panics() {
         let mut kind = None;
         if !with_test_world(&[], |_, types| {
@@ -4537,7 +4358,7 @@ mod breed_continue_tests {
         m.extra.in_love = 600;
         m.ai.goals.add(1, Breed::new(1.0));
         let mut started = None;
-        let calm = [partner.seen(None)];
+        let calm = [partner.seen(None, &crate::items::Items::empty())];
         if !with_test_world(&calm, |w, _| {
             let mut damage = crate::health::TestLevel::new(0);
             let mut events = Vec::new();
@@ -4554,7 +4375,7 @@ mod breed_continue_tests {
             return;
         }
         partner.ai.panicking = true;
-        let panicking = [partner.seen(None)];
+        let panicking = [partner.seen(None, &crate::items::Items::empty())];
         let mut stopped = None;
         if !with_test_world(&panicking, |w, _| {
             let mut damage = crate::health::TestLevel::new(0);

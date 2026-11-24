@@ -33,11 +33,13 @@ impl Game<'_> {
         p: &horizon_client::projectiles::Projectile,
     ) -> bool {
         self.combat.piercing_hit = p.arrow.as_ref().is_some_and(|a| a.pierce > 0);
-        self.mob_hits_player(
+        let hurt = self.mob_hits_player(
             amount,
             [p.previous.x, p.previous.y, p.previous.z],
             "minecraft:arrow",
-        )
+        );
+        self.combat.arrow_hurt_player |= hurt;
+        hurt
     }
     /// The stack in an inventory slot, the off hand at `OFFHAND_SLOT`.
     pub(super) fn stack_in(&self, slot: usize) -> Option<&ItemStack> {
@@ -55,7 +57,7 @@ impl Game<'_> {
         }
     }
     /// The stack's `blocks_attacks`: its own component, else its item's, as the stack's item
-    /// parts allow (`minecraft:shield_block`): a stack they grant the ability to blocks with the
+    /// parts allow (`shield_block`): a stack they grant the ability to blocks with the
     /// component's defaults when it has none, and one they deny it blocks with nothing.
     pub(super) fn blocks_attacks(
         &self,
@@ -82,10 +84,27 @@ impl Game<'_> {
         if self.blocks_attacks(stack).is_none() {
             return false;
         }
+        // `Item.use` reads `consumable` before `blocks_attacks`: a stack
+        // carrying both starts being eaten (or refuses to be), never raised.
+        if self.consumable(stack).is_some() {
+            return false;
+        }
         if self.shield_cooldown == 0 {
             self.start_using_item();
         }
         true
+    }
+    /// `ServerLevel.broadcastDamageEvent`: the hurt one's own client plays its
+    /// hurt sound from `ClientboundDamageEventPacket`.
+    fn broadcast_hurt_damage(&mut self, source: HurtSource<'_>) {
+        let Some(id) = self.health_resources.damage.id(source.damage_type) else {
+            return;
+        };
+        if let Some(p) = self.player.as_mut() {
+            p.events.push(horizon_client::motion::MotionEvent::Health(
+                horizon_client::health::HealthEvent::DamageBroadcast { source: id },
+            ));
+        }
     }
     /// `LivingEntity.getItemBlockingWith` and the inputs of `applyItemBlocking`
     /// for an attack from `from` (`DamageSource.getSourcePosition`).
@@ -143,7 +162,10 @@ impl Game<'_> {
                     factor,
                 },
             },
-            bypassed: component.bypassed_by.as_deref().is_some_and(matches),
+            bypassed: component
+                .bypassed_by
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|spec| matches(spec))),
             pierce,
             angle,
         })
@@ -171,6 +193,48 @@ impl Game<'_> {
             .player
             .as_ref()
             .map(|p| [p.position.x, p.position.y, p.position.z]);
+        // `BlocksAttacks.hurtBlockingItem` runs inside `applyItemBlocking`, so
+        // the wear (its Unbreaking draws included) comes before `hurtServer`
+        // reads BLOCKS_ATTACKS off the used stack again, and before the block
+        // sound's pitch draw.
+        if outcome.blocking_item_used {
+            // BlocksAttacks.hurtBlockingItem: the hit counts the blocking item
+            // as used, before the blocked-damage gate (vanilla awards it on the
+            // server even when the item blocks none of the damage).
+            if self.remote.is_none() {
+                self.award_stat("used", &stack.item, 1);
+            }
+            // ItemDamageFunction.apply (or what a native mod set, kept only for a hit
+            // the event left blocked), then hurtAndBreak.
+            let item_damage = outcome.shield_damage;
+            if item_damage > 0 && !self.creative {
+                let (updated, broken) = self.damage_stack(&stack, item_damage, true);
+                if self.stack_in(slot) == Some(&stack) {
+                    *self.stack_in_mut(slot) = updated;
+                    if let Some(broken) = broken {
+                        self.using = None;
+                        // ItemStack.hurtAndBreak: onEquippedItemBroken for the hand it was used from.
+                        let hand = if slot == OFFHAND_SLOT {
+                            horizon_core::equipment_slot::EquipmentSlot::OffHand
+                        } else {
+                            horizon_core::equipment_slot::EquipmentSlot::MainHand
+                        };
+                        self.player_equipment_broke(hand, &broken);
+                        self.award_stat("broken", &broken.item, 1);
+                    }
+                }
+            }
+        }
+        // `ItemStack.getComponents` is empty for an emptied stack: the hit that
+        // emptied it finds no BLOCKS_ATTACKS there, so `onBlocked` does not run
+        // and `hurtServer`'s else branch broadcasts instead. Only a hit that
+        // was blocked owes that here; the others broadcast already.
+        if self.stack_in(slot).is_none() {
+            if outcome.sound {
+                self.broadcast_hurt_damage(source);
+            }
+            return;
+        }
         if outcome.sound
             && let Some(sound) = &component.block_sound
         {
@@ -180,30 +244,6 @@ impl Game<'_> {
         // BlocksAttacks.hurtBlockingItem counts use even when nothing is blocked.
         if !outcome.blocking_item_used {
             return;
-        }
-        if self.remote.is_none() {
-            self.award_stat("used", &stack.item, 1);
-        }
-        // ItemDamageFunction.apply (or what a native mod set, kept only for a hit
-        // the event left blocked), then hurtAndBreak.
-        let item_damage = outcome.shield_damage;
-        if item_damage > 0 && !self.creative {
-            let (updated, broken) = self.damage_stack(&stack, item_damage, true);
-            if self.stack_in(slot) == Some(&stack) {
-                *self.stack_in_mut(slot) = updated;
-                if let Some(broken) = broken {
-                    self.using = None;
-                    // ItemStack.hurtAndBreak: onEquippedItemBroken for the hand it was used from.
-                    let hand = if slot == OFFHAND_SLOT {
-                        horizon_core::equipment_slot::EquipmentSlot::OffHand
-                    } else {
-                        horizon_core::equipment_slot::EquipmentSlot::MainHand
-                    };
-                    self.player_equipment_broke(hand, &broken);
-                    self.award_stat("broken", &broken.item, 1);
-                    return;
-                }
-            }
         }
         // LivingEntity.blockUsingItem: only once something was stopped.
         if outcome.blocked <= 0.0 || projectile {
@@ -351,7 +391,7 @@ mod durability_tests {
     use horizon_core::geometry::Vec3;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn shield_break_clears_the_active_use() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
@@ -388,7 +428,7 @@ mod durability_tests {
     /// The wear a raised shield takes from a blocked hit (8 points here), through the part of the
     /// shield: halved to 4, canceled to none, and as vanilla (8) for the part-less item next to it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; process-wide parts, run this test alone"]
+    #[ignore = "daily"]
     fn a_damage_item_part_changes_the_wear_of_a_blocking_shield() {
         use crate::game::damage_item_tests::{Rule, with_wear_part};
         with_wear_part("minecraft:shield", Rule::Halve, |game, wear| {
@@ -437,7 +477,7 @@ mod blocked_hit_use_tests {
     /// `BlocksAttacks.hurtBlockingItem`: a hit taken while using a shield
     /// counts it as used, even when the shield blocks none of the damage.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    #[ignore = "daily"]
     fn a_blocked_hit_counts_the_shield_as_used() {
         let mut game_resources = None;
         let mut game = server_game(&mut game_resources);
@@ -492,3 +532,7 @@ mod blocked_hit_use_tests {
 #[cfg(test)]
 #[path = "tests/shield_ram_tests.rs"]
 mod ram_tests;
+
+#[cfg(test)]
+#[path = "tests/shield_use_tests.rs"]
+mod use_tests;

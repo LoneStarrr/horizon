@@ -39,15 +39,19 @@ impl Fixture {
         let catalog = root.join(if modules {
             "module-catalog".to_owned()
         } else {
-            format!("target/horizon-mod/prebuilt/{}", "a".repeat(40))
+            format!(".horizon/cache/{}/build-data", "a".repeat(40))
         });
         fs::create_dir_all(&catalog).unwrap();
-        fs::write(catalog.join("internals.json"), serde_json::json!([{
+        if !modules {
+            fs::write(catalog.parent().unwrap().join("build"), "a".repeat(40)).unwrap();
+        }
+        let build = serde_json::json!({"commit": "a".repeat(40)});
+        fs::write(catalog.join("internals.json"), serde_json::json!({"schema": 1, "build": build, "internals": [{
             "path": METHOD, "kind": "method", "signature": "impl PortedGame { fn tick(&mut self) -> u32 }", "hash": HASH,
-        }]).to_string()).unwrap();
+        }]}).to_string()).unwrap();
         fs::write(
             catalog.join("points.json"),
-            serde_json::json!({"points": [{"target": METHOD}], "sites": []}).to_string(),
+            serde_json::json!({"schema": 1, "build": build, "points": [{"target": METHOD}], "sites": []}).to_string(),
         )
         .unwrap();
         let launcher = root.join("launcher-stub");
@@ -61,6 +65,7 @@ impl Fixture {
             .args(args)
             .current_dir(&self.root)
             .env("HORIZON_LAUNCHER", &self.launcher)
+            .env("HORIZON_SDK_BASE", self.root.join("no-sdk"))
             .output()
             .unwrap();
         assert!(
@@ -74,7 +79,7 @@ impl Fixture {
         Manifest::parse(&fs::read_to_string(self.root.join("horizon-mod.toml")).unwrap()).unwrap()
     }
     fn catalog_hash(&self) -> String {
-        let entries: Vec<ListedInternal> = serde_json::from_str(
+        let entries: Vec<ListedInternal> = horizon_mod_package::internals::parse(
             &fs::read_to_string(self.root.join("module-catalog/internals.json")).unwrap(),
         )
         .unwrap();
@@ -88,6 +93,7 @@ impl Drop for Fixture {
 }
 
 #[test]
+#[ignore = "daily"]
 fn internals_add_uses_launcher_module_catalog_hash() {
     let fixture = Fixture::new(true);
     fixture.run(&["internals", "add", METHOD, "--kind", "method"]);
@@ -99,40 +105,22 @@ fn internals_add_uses_launcher_module_catalog_hash() {
 }
 
 #[test]
-fn inject_add_head_uses_launcher_module_catalog_hash() {
-    let fixture = Fixture::new(true);
-    fixture.run(&[
-        "inject", "add", METHOD, "--kind", "head", "--with", "listen",
-    ]);
-    let declared = fixture.manifest();
-    assert_eq!(declared.inject.len(), 1);
-    assert_eq!(declared.inject[0].at, METHOD);
-    assert_eq!(declared.inject[0].hash, Some(fixture.catalog_hash()));
-    assert!(fixture.root.join("launcher-called").is_file());
-}
-
-#[test]
+#[ignore = "daily"]
 fn module_free_add_commands_keep_prebuilt_output_and_never_run_launcher() {
-    for args in [
-        vec!["internals", "add", METHOD, "--kind", "method"],
-        vec![
-            "inject", "add", METHOD, "--kind", "head", "--with", "listen",
-        ],
-    ] {
-        let modules = Fixture::new(true);
-        let prebuilt = Fixture::new(false);
-        let expected = modules.run(&args);
-        let actual = prebuilt.run(&args);
-        assert_eq!(actual.stdout, expected.stdout);
-        assert_eq!(actual.stderr, expected.stderr);
-        assert!(!prebuilt.root.join("launcher-called").exists());
-        let mut declared: toml::Value =
-            toml::from_str(&fs::read_to_string(modules.root.join("horizon-mod.toml")).unwrap())
-                .unwrap();
-        declared["native"].as_table_mut().unwrap().remove("module");
-        let prebuilt_text: toml::Value =
-            toml::from_str(&fs::read_to_string(prebuilt.root.join("horizon-mod.toml")).unwrap())
-                .unwrap();
-        assert_eq!(declared, prebuilt_text);
-    }
+    let args = ["internals", "add", METHOD, "--kind", "method"];
+    let modules = Fixture::new(true);
+    let prebuilt = Fixture::new(false);
+    let expected = modules.run(&args);
+    let actual = prebuilt.run(&args);
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+    assert!(!prebuilt.root.join("launcher-called").exists());
+    let mut declared: toml::Value =
+        toml::from_str(&fs::read_to_string(modules.root.join("horizon-mod.toml")).unwrap())
+            .unwrap();
+    declared["native"].as_table_mut().unwrap().remove("module");
+    let prebuilt_text: toml::Value =
+        toml::from_str(&fs::read_to_string(prebuilt.root.join("horizon-mod.toml")).unwrap())
+            .unwrap();
+    assert_eq!(declared, prebuilt_text);
 }

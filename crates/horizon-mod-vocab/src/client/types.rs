@@ -76,6 +76,26 @@ pub struct KeyMapping {
     pub label: Text,
 }
 
+/// Why `ClientHost::set_mapping_down` or `ClientHost::click_mapping` refused a mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum MappingError {
+    /// No player is in a world.
+    NoWorld,
+    /// No vanilla mapping has this name.
+    Unknown {
+        /// The name asked for.
+        key: String,
+    },
+    /// A vanilla mapping a player does not play with: one outside the movement, gameplay and
+    /// inventory categories (`key.screenshot`, `key.fullscreen`, `key.chat`...).
+    NotGameplay {
+        /// The name asked for.
+        key: String,
+    },
+}
+
 /// The metadata of a server play packet observed by `Hooks::client_packet`.
 ///
 /// Fields beyond the type id are exposed only for custom payloads. This is
@@ -635,6 +655,39 @@ pub enum SoundState {
     Stopped,
 }
 
+/// A file-backed standalone model baked on every resource load.
+// exhaustive: mods build every form with a struct literal and the game matches them without a wildcard
+#[derive(Clone, Debug, PartialEq, Eq, horizon_mod_api_macros::Wire)]
+pub enum StandaloneModelForm {
+    /// Bake one dependency with the blockstate baker's negative XYZ quarter-turns.
+    Rotated {
+        /// Namespaced identifier used to resolve the resulting `ModelRef`.
+        id: String,
+        /// Source model identifier, not the result identifier.
+        model: String,
+        /// Quarter-turn counts in X, Y, Z order, modulo four.
+        turns: [u8; 3],
+        /// Keep textures aligned to the resulting face's world basis.
+        uvlock: bool,
+    },
+    /// Bake all dependencies unturned and concatenate their quads into one model.
+    Combined {
+        /// Namespaced identifier used to resolve the resulting `ModelRef`.
+        id: String,
+        /// Source model identifiers, in quad concatenation order.
+        parts: Vec<String>,
+    },
+}
+
+impl StandaloneModelForm {
+    /// The resulting model's identifier.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Rotated { id, .. } | Self::Combined { id, .. } => id,
+        }
+    }
+}
+
 // no wire: dispatch result retains a static owning-mod identity; not an owned transport record.
 /// A replace hook's answer, or a collect hook's entry, with the mod that gave it: the dispatch
 /// fills in `mod_id` (the answering mod's `[mod] id`), so no mod can answer for another.
@@ -671,11 +724,33 @@ pub struct ScreenId {
     pub id: String,
 }
 
+/// The topmost screen's identity, without render or input state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+// exhaustive: the game builds it with a literal; mods only read it
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct ScreenIdentity {
+    /// The same stable identifier as [`ScreenView::id`], such as `inventory` or `dialog`.
+    pub id: String,
+    /// The same menu type as [`ScreenView::menu`], if the screen has one.
+    pub menu: Option<String>,
+}
+
+/// The sign the sign editor is on (`ScreensClientHost::sign_editor`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+// exhaustive: the game builds it with a literal; mods only read it
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct SignEditView {
+    /// The block position of the sign being edited.
+    pub pos: BlockPos,
+    /// Whether the side being edited is the sign's front (`true`) or back (`false`).
+    pub front: bool,
+}
+
 // no wire: borrowed call-scoped view; transport uses owned snapshots rather than serializing references.
-/// The open screen, for the screen hooks (`native_screen_render_post`, the
-/// mouse ones `native_screen_mouse_button_pressed_pre`, `..._released_pre` and
-/// `native_screen_mouse_scrolled_pre`, and the key ones
-/// `native_screen_key_pressed_pre` and `native_screen_char_typed_pre`): what
+/// The open screen, for the screen hooks (`screen_render_post`, the
+/// mouse ones `screen_mouse_button_pressed_pre`, `..._released_pre` and
+/// `screen_mouse_scrolled_pre`, and the key ones
+/// `screen_key_pressed_pre` and `screen_char_typed_pre`): what
 /// it is, its menu and title, where its container panel is, how many slots its
 /// menu has, and where the mouse and the frame's partial tick are.
 #[derive(Clone, Copy, Debug)]
@@ -747,7 +822,7 @@ impl ColoredLight {
     }
 }
 
-/// The minimap a native mod shows (`native_minimap`), drawn by Horizon's
+/// The minimap a native mod shows (`minimap`), drawn by Horizon's
 /// minimap: its corner, its side in GUI pixels, blocks per map pixel,
 /// turning with the player or north up, round or square.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -766,7 +841,7 @@ pub struct Minimap {
     pub round: bool,
 }
 
-/// A mod block's screen over its menu (`native_screen`): its size, where
+/// A mod block's screen over its menu (`screen`): its size, where
 /// each of the container's slots is (`Slot.x`, `Slot.y`; none hides the
 /// slot, and so do slots past the list; the server's menu does not have a
 /// hidden slot either, so clicks and shift-clicks skip it), and the player inventory's first
@@ -787,9 +862,9 @@ pub struct Screen {
     /// The inventory's left column (vanilla's is 8).
     pub inventory_x: f32,
     /// The mod draws the title and the "Inventory" label itself
-    /// (`native_screen_draw`); Horizon leaves them out.
+    /// (`screen_draw`); Horizon leaves them out.
     pub own_labels: bool,
-    /// The mod draws its own background (`native_screen_draw`), so Horizon
+    /// The mod draws its own background (`screen_draw`), so Horizon
     /// leaves out the plain panel and the slot frames.
     pub own_background: bool,
     /// The registered recipe book hosted beside this menu. Its declarations must
@@ -818,7 +893,34 @@ pub struct Stack {
     pub components: String,
 }
 
-/// What the player did on a native mod's panel (`native_panel_event`).
+/// How a mod's item panel (`panel_items`) looks (`panel_style`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum PanelStyle {
+    /// The recipe book's page arrows and a plain search box (the default).
+    #[default]
+    RecipeBook,
+    /// A recipe viewer's: square page buttons on a bar over the items and
+    /// the viewer's search box, as Horizon's Recipes panel draws them.
+    Viewer,
+    /// JEI's look on Minecraft 1.12: the items flush with the screen's right
+    /// edge under a row of square page buttons that always shows (they wrap
+    /// around), the viewer's search box at the foot of the screen with a
+    /// settings button beside it that opens the mod's page in Options > Mods,
+    /// and a whole slot lit under the pointer.
+    Classic {
+        /// The search box under the window when there is room below it (JEI's
+        /// "center search bar"), else under the items.
+        centred_search: bool,
+        /// Lay the panel out beside a window at least this wide, centred on
+        /// the screen (a recipe screen the mod draws over the container);
+        /// 0 for the container's own.
+        window_width: u16,
+    },
+}
+
+/// What the player did on a native mod's panel (`panel_event`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 #[derive(horizon_mod_api_macros::Wire)]
@@ -843,8 +945,8 @@ pub enum PanelEvent {
         stack: Stack,
     },
     /// A click on a slot of a recipe the panel shows: the recipe's index in
-    /// `native_panel_recipes`' list and the slot's in it (the results come
-    /// after the slots), and the stack it showed then.
+    /// `panel_recipes`' list and the slot's in it (the results come after
+    /// the slots), and the stack it showed then.
     SlotClicked {
         /// The recipe's index in the panel's list.
         recipe: u32,
@@ -866,7 +968,99 @@ pub enum PanelEvent {
     Tab(u32),
 }
 
-/// The zoom a native mod asks for (`native_zoom`): the factor (1 is none), eased through the
+/// How the panel lays out a recipe of `panel_recipes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// exhaustive: a closed set the game draws, matched without a wildcard
+#[derive(horizon_mod_api_macros::Wire)]
+pub enum RecipeLayout {
+    /// A crafting grid of `width` x `height` slots, an arrow and the result.
+    Grid,
+    /// One input over a flame, an arrow and the result (furnaces, smokers,
+    /// campfires).
+    Cooking,
+    /// One input, an arrow and the result (the stonecutter).
+    Single,
+    /// Template, base and addition, an arrow and the result.
+    Smithing,
+    /// A potion and an ingredient, an arrow and the result.
+    Brewing,
+}
+
+/// One result of a recipe the panel shows (`panel_recipes`): a slot cycling
+/// through `stacks`, one a second, and the chance in percent the recipe gives
+/// it (`Some(25.0)` draws "25%"); `None` gives it every time.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct RecipeResult {
+    /// The stacks the slot cycles through, at most 64.
+    pub stacks: Vec<Stack>,
+    /// The chance in percent, 0 to 100; `None` for every time.
+    pub chance: Option<f32>,
+}
+
+impl RecipeResult {
+    /// A result slot cycling through `stacks`, given every time.
+    pub fn new(stacks: Vec<Stack>) -> Self {
+        Self {
+            stacks,
+            chance: None,
+        }
+    }
+}
+
+/// A recipe the panel shows (`panel_recipes`), laid out by the game with its
+/// own slots, arrow and buttons. Each slot, and each result, cycles through
+/// its stacks, one a second; an empty slot shows nothing.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct RecipeView {
+    /// How the recipe is drawn.
+    pub layout: RecipeLayout,
+    /// The grid's size (`Grid` only), 1 to 3 each; slots past it continue in
+    /// rows under it, 27 in all.
+    pub width: u32,
+    /// The grid's height, as `width`.
+    pub height: u32,
+    /// Each slot's stacks, at most 64 each: a grid's row by row, else the
+    /// layout's inputs in order (`Smithing`: template, base, addition).
+    pub slots: Vec<Vec<Stack>>,
+    /// Up to four, left to right after the arrow.
+    pub results: Vec<RecipeResult>,
+    /// Fluids the recipe takes, `amount` in millibuckets, each in a well with
+    /// its amount under it; at most eight. A well shows the fluid's client
+    /// look (`data/<mod>/horizon/fluid/`: sprite and tint), a flat square of
+    /// vanilla's colour for water and lava, and else grey.
+    pub fluid_inputs: Vec<FluidStack>,
+    /// Fluids the recipe gives, as `fluid_inputs`.
+    pub fluid_outputs: Vec<FluidStack>,
+    /// A short line under the recipe (a cooking time), or "".
+    pub note: String,
+    /// The action button beside it (a viewer's "+"), heard as
+    /// `PanelEvent::Action`: none, enabled (`Some(true)`) or shown greyed.
+    pub action: Option<bool>,
+}
+
+impl RecipeView {
+    /// A recipe of `layout` with these slots and results, in a 1 x 1 grid,
+    /// with no fluids, note or action button: set those fields after.
+    pub fn new(layout: RecipeLayout, slots: Vec<Vec<Stack>>, results: Vec<RecipeResult>) -> Self {
+        Self {
+            layout,
+            width: 1,
+            height: 1,
+            slots,
+            results,
+            fluid_inputs: Vec::new(),
+            fluid_outputs: Vec::new(),
+            note: String::new(),
+            action: None,
+        }
+    }
+}
+
+/// The zoom a native mod asks for (`zoom`): the factor (1 is none), eased through the
 /// field of view like the spyglass when `smooth`, and the scale of mouse turning.
 #[derive(Clone, Copy, Debug, PartialEq)]
 // exhaustive: the game builds it with a literal; mods only read it

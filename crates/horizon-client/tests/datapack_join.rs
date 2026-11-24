@@ -134,6 +134,7 @@ impl Host {
             seed: 1,
             max_players: 8,
             levels: Default::default(),
+            level_seeds: Default::default(),
         };
         let load = Arc::new(
             load_context(DataLoadOrigin::ServerDataLoad)
@@ -159,6 +160,7 @@ impl Host {
             next_entity: &mut self.next_entity,
             spawn: [8.5, f64::from(MIN_Y + 5), 8.5],
             spawn_angle: [0.0; 2],
+            spawn_dimension: "minecraft:overworld",
             difficulty: 2,
             difficulty_locked: false,
             clock_rate: 1.0,
@@ -247,6 +249,7 @@ fn join(host: &mut Host, session: &Session) {
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_client_that_offers_the_registry_joins_and_reads_the_entry() {
     let _turn = begin();
     datapack_net::serve(Some(first_set(7)));
@@ -350,6 +353,7 @@ fn refused_client(brand: &str) -> (String, bool) {
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_required_registry_refuses_a_client_without_the_mod_before_any_registry_data() {
     let _turn = begin();
     datapack_net::serve(Some(first_set(7)));
@@ -365,6 +369,7 @@ fn a_required_registry_refuses_a_client_without_the_mod_before_any_registry_data
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_reload_snapshot_gives_the_client_generation_two_and_stales_old_handles() {
     let _turn = begin();
     let first = first_set(7);
@@ -433,6 +438,7 @@ fn a_reload_snapshot_gives_the_client_generation_two_and_stales_old_handles() {
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_refused_reload_disconnects_instead_of_retaining_the_old_generation() {
     let _turn = begin();
     let first = first_set(7);

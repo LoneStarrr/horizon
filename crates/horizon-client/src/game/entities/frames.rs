@@ -3,7 +3,9 @@
 //! `hurtServer` (take the item out, then break the frame) and
 //! `ItemFrameRenderer` (the frame model and the item at a 45 degree step).
 use super::{Game, Hit, InteractTarget};
-use horizon_assets::{bake::bake_model, model::CuboidModel, resolve::ModelLibrary};
+use horizon_assets::{
+    bake::bake_model, item_model::OwnerState, model::CuboidModel, resolve::ModelLibrary,
+};
 use horizon_client::{entities::ItemFrame, items::ItemStack, mesher::Vertex};
 use horizon_core::{
     geometry::{Aabb, Vec3},
@@ -110,6 +112,162 @@ pub(super) fn hanging_drop_position(center: [f64; 3], step: [i32; 3]) -> [f64; 3
         center[2] + f64::from(step[2]) * 0.15,
     ]
 }
+/// Index of a frame's item stack in `Game::item_frames`, avoiding cloning `ItemStack`
+/// while collecting visible framed items.
+#[derive(Clone, Copy)]
+struct FramedStack(usize);
+
+/// A frame's item, waiting for its model after all frame backings are emitted.
+struct FramedItem {
+    stack: FramedStack,
+    id: u32,
+    matrix: glam::Mat4,
+    light: u8,
+    cull: bool,
+    kind: &'static str,
+    /// `None` for plain static items whose resolution does not read the frame owner.
+    owner: Option<OwnerState>,
+}
+
+struct PreparedFrameQuad {
+    /// Block-centered corners pre-rotated by the frame's facing matrix.
+    corners: [glam::DVec3; 4],
+    uv: [[f32; 2]; 4],
+    normal: [i8; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedFrameCacheKey {
+    pack_generation: u64,
+    sprites_ptr: usize,
+    sprites_len: usize,
+    models: [(usize, usize); 4],
+}
+
+struct PreparedFrameCache {
+    key: PreparedFrameCacheKey,
+    /// Lazily prepared quads per `[variant: 0..4][facing: 0..6]`.
+    variants: [[Option<Vec<PreparedFrameQuad>>; 6]; 4],
+}
+
+impl PreparedFrameCache {
+    fn new(key: PreparedFrameCacheKey) -> Self {
+        Self {
+            key,
+            variants: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+        }
+    }
+
+    fn quads(
+        &mut self,
+        variant: usize,
+        facing: usize,
+        model: &FrameModel,
+        sprites: &std::collections::HashMap<String, horizon_client::hud::Rect>,
+    ) -> &[PreparedFrameQuad] {
+        self.variants[variant][facing].get_or_insert_with(|| {
+            prepare_frame_quads(model, frame_facing_rotations()[facing], sprites)
+        })
+    }
+}
+
+fn frame_facing_rotation_for(facing: usize) -> glam::DMat4 {
+    let step_y = match facing {
+        0 => -1,
+        1 => 1,
+        _ => 0,
+    };
+    let (x_rot, y_rot) = if step_y == 0 {
+        let to_y = match facing {
+            3 => 0.0,
+            4 => 90.0,
+            2 => 180.0,
+            _ => 270.0,
+        };
+        (0.0f64, 180.0f64 - to_y)
+    } else {
+        (-90.0 * f64::from(step_y), 180.0)
+    };
+    glam::DMat4::from_rotation_x(x_rot.to_radians())
+        * glam::DMat4::from_rotation_y(y_rot.to_radians())
+}
+
+fn frame_facing_rotations() -> &'static [glam::DMat4; 6] {
+    static ROTATIONS: std::sync::OnceLock<[glam::DMat4; 6]> = std::sync::OnceLock::new();
+    ROTATIONS.get_or_init(|| std::array::from_fn(frame_facing_rotation_for))
+}
+
+fn frame_item_rotations() -> &'static [glam::DMat4; 8] {
+    static ROTATIONS: std::sync::OnceLock<[glam::DMat4; 8]> = std::sync::OnceLock::new();
+    ROTATIONS.get_or_init(|| {
+        std::array::from_fn(|r| glam::DMat4::from_rotation_z((r as f64 * 45.0).to_radians()))
+    })
+}
+
+fn prepare_frame_quads(
+    model: &FrameModel,
+    rot: glam::DMat4,
+    sprites: &std::collections::HashMap<String, horizon_client::hud::Rect>,
+) -> Vec<PreparedFrameQuad> {
+    let mut out = Vec::with_capacity(model.len());
+    for (corners, uv, sprite) in model {
+        let Some(r) = sprites.get(sprite) else {
+            continue;
+        };
+        let rotated = corners.map(|c| {
+            rot.transform_point3(glam::DVec3::new(
+                f64::from(c[0]) - 0.5,
+                f64::from(c[1]) - 0.5,
+                f64::from(c[2]) - 0.5,
+            ))
+        });
+        let n = (rotated[1] - rotated[0])
+            .cross(rotated[2] - rotated[0])
+            .normalize_or_zero();
+        let normal = [
+            (n.x.clamp(-1.0, 1.0) * 127.0) as i8,
+            (n.y.clamp(-1.0, 1.0) * 127.0) as i8,
+            (n.z.clamp(-1.0, 1.0) * 127.0) as i8,
+            -127,
+        ];
+        let mapped_uv = uv.map(|[u, v]| [r.u0 + u * (r.u1 - r.u0), r.v0 + v * (r.v1 - r.v0)]);
+        out.push(PreparedFrameQuad {
+            corners: rotated,
+            uv: mapped_uv,
+            normal,
+        });
+    }
+    out
+}
+
+thread_local! {
+    static PREPARED_FRAMES: std::cell::RefCell<Option<PreparedFrameCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// `ItemFrameRenderer.extractRenderState`'s `ItemOwner` (`updateForNonLiving`
+/// with the frame entity): `ItemFrame.position` and
+/// `ItemFrame.getVisualRotationYInDegrees`.
+fn frame_owner(f: &ItemFrame) -> OwnerState {
+    super::item_draw::owner_at(center(f), visual_rotation_y_degrees(f), f.kind())
+}
+/// `ItemFrame.getVisualRotationYInDegrees`: the frame's own yaw, as an item
+/// model's owner reads it (a framed compass's needle turns with it).
+fn visual_rotation_y_degrees(f: &ItemFrame) -> f32 {
+    // `Direction.get2DDataValue` of a wall frame, and the axis direction's
+    // step for the two flat ones.
+    let s = f.step();
+    let (two_d, correction) = match (s[0], s[1], s[2]) {
+        (0, 0, 1) => (0, 0),
+        (-1, 0, 0) => (1, 0),
+        (0, 0, -1) => (2, 0),
+        (1, 0, 0) => (3, 0),
+        (0, y, _) => (-1, 90 * y),
+        _ => (0, 0),
+    };
+    crate::camera::wrap_degrees(
+        180.0 + (two_d * 90) as f32 + f32::from(f.rotation) * 45.0 + correction as f32,
+    )
+}
 impl Game<'_> {
     /// `ItemFrame.survives` (not fixed): no collision, a solid block behind
     /// (or a diode for wall frames), no overlapping hanging entity.
@@ -170,7 +328,8 @@ impl Game<'_> {
             None
         };
         let mut cancel = false;
-        self.native_hanging_break(player, kind, pos, &mut cancel);
+        let dimension = self.dim.id();
+        self.native_hanging_break(dimension, player, kind, pos, &mut cancel);
         cancel
     }
     /// `ItemFrameItem.useOn`.
@@ -206,7 +365,7 @@ impl Game<'_> {
             check_interval: 0,
             // `applyComponentsFromItemStack` sets `CUSTOM_NAME`.
             custom_name: stack.data().and_then(|d| d.custom_name.clone()),
-            random: horizon_client::random_source::entity(),
+            random: horizon_core::random::EntityRandom::own(horizon_client::random_source::entity()),
         };
         // `EntityType.createDefaultStackConfig`: the item's `custom_data`, then its
         // `entity_data` merged over the frame (`TypedEntityData.loadInto`), before
@@ -367,6 +526,12 @@ impl Game<'_> {
         if !self.before_block(d) || self.mob_hit().is_some_and(|m| m.1 < d) {
             return false;
         }
+        // BlockAttachedEntity.skipAttackInteraction: `mayInteract` refuses the
+        // hit before the frame is asked, fixed or not.
+        let at = self.item_frames[i].pos;
+        if !self.may_interact_at(BlockPos::new(at[0], at[1], at[2])) {
+            return true;
+        }
         if self.item_frames[i].fixed {
             // A fixed frame refuses the hit of a player who isn't in creative
             // (canHurtWhenFixed), so skipAttackInteraction is false and
@@ -376,7 +541,12 @@ impl Game<'_> {
             }
             return true;
         }
-        self.hit_frame(i, true, self.creative);
+        // `isInvulnerableToBase`: a refused hit goes on to onAttack, as a fixed frame's does.
+        if self.native_player_hit_invulnerable(self.item_frames[i].id, self.item_frames[i].kind()) {
+            self.attack_ticks = 0;
+            return true;
+        }
+        self.hit_frame(i, true, self.creative, false);
         true
     }
     /// `ItemFrame.hurtServer` from a projectile (`AbstractArrow.onHitEntity`,
@@ -394,26 +564,34 @@ impl Game<'_> {
         let Some(i) = self.item_frames.iter().position(|f| f.id == id) else {
             return false;
         };
-        if self.item_frames[i].fixed {
-            if !creative {
-                return false;
-            }
-            self.item_frames[i].item = None;
+        let fixed = self.item_frames[i].fixed;
+        if fixed && !creative {
+            return false;
         }
-        self.hit_frame(i, by_player, creative);
+        self.hit_frame(i, by_player, creative, fixed);
         true
     }
     /// The non-fixed part of `ItemFrame.hurtServer`: a filled frame gives its
     /// item up (`shouldDamageDropItem`), an empty one breaks
     /// (`BlockAttachedEntity.hurtServer`). `by_player`: the damage source's
     /// entity is the acting player, `creative` when they have infinite
-    /// materials (no drops).
-    fn hit_frame(&mut self, i: usize, by_player: bool, creative: bool) {
-        let with_frame = self.item_frames[i].item.is_none();
+    /// materials (no drops). `whole`: the frame breaks even with an item in it
+    /// (a fixed frame hurt by a creative player keeps its item until the
+    /// break hook lets the whole frame go).
+    fn hit_frame(&mut self, mut i: usize, by_player: bool, creative: bool, whole: bool) {
+        let with_frame = whole || self.item_frames[i].item.is_none();
         let entity_id = self.item_frames[i].id;
         if with_frame {
             let (kind, pos) = (self.item_frames[i].kind(), self.item_frames[i].pos);
             if self.hanging_break_cancelled(kind, pos, by_player) {
+                return;
+            }
+            // The hook had `&mut self`: find the frame again by id.
+            let Some(now) = self.item_frames.iter().position(|f| f.id == entity_id) else {
+                return;
+            };
+            i = now;
+            if !whole && self.item_frames[i].item.is_some() {
                 return;
             }
         }
@@ -441,8 +619,8 @@ impl Game<'_> {
             self.frame_output_changed(f.pos);
         }
         self.drop_frame_items(&mut f, with_frame, by_player, creative);
-        if !with_frame {
-            self.item_frames[i].random = f.random.clone();
+        if !with_frame && let Some(now) = self.item_frames.iter().position(|g| g.id == entity_id) {
+            self.item_frames[now].random = f.random.clone();
         }
         // BLOCK_CHANGE by the attacker after the drops: ItemFrame.hurtServer
         // for the item, ItemFrame.dropItem(level, causedBy) for the frame.
@@ -547,8 +725,9 @@ impl Game<'_> {
     }
     /// `ServerExplosion.hurtEntities` for item frames: a frame within the blast
     /// is killed and dropped with its item (`BlockAttachedEntity.hurtServer`).
-    /// A fixed frame is not hurt by an explosion, and `blast_spares_decorations`
-    /// keeps every frame without `mobGriefing`.
+    /// A fixed frame resists an explosion unless the blast was caused by a
+    /// creative player (`ItemFrame.canHurtWhenFixed`), and
+    /// `blast_spares_decorations` keeps every frame without `mobGriefing`.
     pub(super) fn explosion_breaks_frames(
         &mut self,
         blast: [f64; 3],
@@ -558,6 +737,11 @@ impl Game<'_> {
         if self.blast_spares_decorations(interaction) {
             return;
         }
+        // DamageSource.isCreativePlayer: a creative player's blast can hurt
+        // a fixed frame; another player's, a mob's or an ownerless one cannot.
+        let creative = self
+            .blast_attacker()
+            .is_some_and(|(id, _)| self.creative_damage_source_id(id as i32));
         let mut i = 0;
         while i < self.item_frames.len() {
             let c = center(&self.item_frames[i]);
@@ -565,10 +749,24 @@ impl Game<'_> {
                 ((c[0] - blast[0]).powi(2) + (c[1] - blast[1]).powi(2) + (c[2] - blast[2]).powi(2))
                     .sqrt()
                     / diameter;
-            if dist > 1.0
-                || self.item_frames[i].fixed
-                || !self.break_frame_by(i, self.explosion_kill_credit())
-            {
+            if dist > 1.0 || !self.combat.visits(self.item_frames[i].id) {
+                i += 1;
+                continue;
+            }
+            let gone = if self.item_frames[i].fixed {
+                if !creative {
+                    i += 1;
+                    continue;
+                }
+                // A fixed frame breaks whole and drops neither itself nor its
+                // item, as on the projectile path (`projectile_hurts_frame`).
+                let before = self.item_frames.len();
+                self.hit_frame(i, true, true, true);
+                self.item_frames.len() < before
+            } else {
+                self.break_frame_by(i, self.explosion_kill_credit())
+            };
+            if !gone {
                 i += 1;
             }
         }
@@ -582,10 +780,15 @@ impl Game<'_> {
         index: usize,
         source: Option<super::commands::Target>,
     ) -> bool {
+        let frame_id = self.item_frames[index].id;
         let (kind, pos) = (self.item_frames[index].kind(), self.item_frames[index].pos);
         if self.hanging_break_cancelled(kind, pos, false) {
             return false;
         }
+        // The hook had `&mut self`: find the frame again by id.
+        let Some(index) = self.item_frames.iter().position(|g| g.id == frame_id) else {
+            return false;
+        };
         let mut f = self.item_frames.remove(index);
         self.entity_killed_event_by(center(&f), source);
         self.audio
@@ -636,15 +839,49 @@ impl Game<'_> {
     }
     /// ItemFrameRenderer: the frame model, then the item half size on its face.
     pub(super) fn frame_geometry(&mut self, camera: glam::DVec3, out: &mut Vec<Vertex>) {
+        if self.item_frames.is_empty() {
+            return;
+        }
         let sprites = &self.gui.atlas.sprites;
+        let cache_key = PreparedFrameCacheKey {
+            pack_generation: self.pack.item_renderer.generation(),
+            sprites_ptr: std::ptr::from_ref(sprites) as usize,
+            sprites_len: sprites.len(),
+            models: [
+                (self.frame_model.as_ptr() as usize, self.frame_model.len()),
+                (
+                    self.glow_frame_model.as_ptr() as usize,
+                    self.glow_frame_model.len(),
+                ),
+                (
+                    self.map_frame_model.as_ptr() as usize,
+                    self.map_frame_model.len(),
+                ),
+                (
+                    self.glow_map_frame_model.as_ptr() as usize,
+                    self.glow_map_frame_model.len(),
+                ),
+            ],
+        };
+        let mut frame_cache = PREPARED_FRAMES
+            .with(|cell| cell.borrow_mut().take())
+            .filter(|c| c.key == cache_key)
+            .unwrap_or_else(|| PreparedFrameCache::new(cache_key));
+        let facing_rotations = frame_facing_rotations();
+        let item_rotations = frame_item_rotations();
+        let can_use_static = self.pack.item_renderer.cit.is_none();
         // Each with its frame's type: a pack tells a glow frame and what it holds apart by its
         // `entityId` (`glow_item_frame` in entity.properties), the item drawn within its frame.
         let mut maps: Vec<(i32, glam::Mat4, u32, bool, &'static str)> = Vec::new();
-        let mut items: Vec<(ItemStack, u32, glam::Mat4, u8, bool, &'static str)> = Vec::new();
+        let mut items: Vec<FramedItem> = Vec::new();
         // ItemFrame.shouldRenderAtSqrDistance: 1024 blocks at a view scale
         // of 1.
         let range = 16.0 * 64.0 * self.view_scale();
-        for f in &self.item_frames {
+        for (frame_idx, f) in self.item_frames.iter().enumerate() {
+            // LevelExtractor: the camera entity is not drawn from its own eyes.
+            if self.hides_as_camera(f.id) {
+                continue;
+            }
             let entity_start = out.len();
             self.mark_entity(entity_start, f.kind());
             let map = f.item.as_ref().and_then(super::maps::map_id);
@@ -661,36 +898,21 @@ impl Game<'_> {
                     }
                 }
             }
-            if !self.entity_in_view(camera, (lo + hi) / 2.0, range, lo, hi) {
+            let Some(sight) = self.entity_sight(camera, (lo + hi) / 2.0, range, lo, hi) else {
                 continue;
-            }
-            let culling = self.entity_cull_decision(f, 1.0);
+            };
+            let culling = self.sighted_decision(sight, || self.entity_cull_decision(f, 1.0));
             if culling.hides_entity() {
                 continue;
             }
             let entity_start = out.len();
             self.mark_motion(entity_start, Self::MOTION_OBJECT | u64::from(f.id));
-            let s = f.step();
-            // Pose: to the block centre, then X/Y rotation by facing.
-            let (x_rot, y_rot) = if s[1] == 0 {
-                let to_y = match f.facing {
-                    3 => 0.0,
-                    4 => 90.0,
-                    2 => 180.0,
-                    _ => 270.0,
-                };
-                (0.0f64, 180.0f64 - to_y)
-            } else {
-                (-90.0 * f64::from(s[1]), 180.0)
-            };
-            let pose = glam::DMat4::from_translation(
-                glam::DVec3::new(
-                    f64::from(f.pos[0]) + 0.5,
-                    f64::from(f.pos[1]) + 0.5,
-                    f64::from(f.pos[2]) + 0.5,
-                ) - camera,
-            ) * glam::DMat4::from_rotation_x(x_rot.to_radians())
-                * glam::DMat4::from_rotation_y(y_rot.to_radians());
+            let facing_idx = usize::from(f.facing.min(5));
+            let origin = glam::DVec3::new(
+                f64::from(f.pos[0]) + 0.5,
+                f64::from(f.pos[1]) + 0.5,
+                f64::from(f.pos[2]) + 0.5,
+            ) - camera;
             let light = self.world.light(f.pos[0], f.pos[1], f.pos[2]);
             let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
             // ItemFrameRenderer.getBlockLightLevel: a glow frame's model is at least 5 bright.
@@ -701,62 +923,42 @@ impl Game<'_> {
             };
             let frame_packed =
                 (u32::from(frame_light >> 4) * 16) | ((u32::from(frame_light & 15) * 16) << 8);
-            let frame_start = out.len();
-            let mut quad =
-                |m: &glam::DMat4, corners: [[f64; 3]; 4], uv: [[f32; 2]; 4], light: u32| {
-                    // The frame model is drawn with the entity shader, lit by its face normal.
-                    let at = corners.map(|c| m.transform_point3(glam::DVec3::from_array(c)));
-                    let n = (at[1] - at[0]).cross(at[2] - at[0]).normalize_or_zero();
-                    let normal = [0, 1, 2].map(|k| (n[k].clamp(-1.0, 1.0) * 127.0) as i8);
-                    for (p, uv) in at.into_iter().zip(uv) {
+            if !f.invisible {
+                let (variant, model) = match (f.glow, map.is_some()) {
+                    (false, false) => (0, &self.frame_model),
+                    (true, false) => (1, &self.glow_frame_model),
+                    (false, true) => (2, &self.map_frame_model),
+                    (true, true) => (3, &self.glow_map_frame_model),
+                };
+                // HDR output: a glow frame shines softly (entity.wgsl hdr_entity_mark); the item
+                // in it is only lit, as vanilla draws it.
+                let layer = if f.glow {
+                    u32::from(horizon_client::mesher::INCANDESCENT) << 16
+                } else {
+                    0
+                };
+                let quads = frame_cache.quads(variant, facing_idx, model, sprites);
+                out.reserve(quads.len() * 4);
+                for q in quads {
+                    for (corner, uv) in q.corners.into_iter().zip(q.uv) {
                         out.push(Vertex {
-                            normal: [normal[0], normal[1], normal[2], -127],
-                            pos: p.as_vec3().to_array(),
+                            normal: q.normal,
+                            pos: (origin + corner).as_vec3().to_array(),
                             uv,
-                            layer: 0,
+                            layer,
                             color: 0xFFFF_FFFF,
-                            light,
-
+                            light: frame_packed,
                             glint_uv: [0.0, 0.0],
                         });
                     }
-                };
-            let map_uv = |r: &horizon_client::hud::Rect, uv: [[f32; 2]; 4]| {
-                uv.map(|[u, v]| [r.u0 + u * (r.u1 - r.u0), r.v0 + v * (r.v1 - r.v0)])
-            };
-            if !f.invisible {
-                let model = match (f.glow, map.is_some()) {
-                    (true, true) => &self.glow_map_frame_model,
-                    (false, true) => &self.map_frame_model,
-                    (true, false) => &self.glow_frame_model,
-                    (false, false) => &self.frame_model,
-                };
-                for (corners, uv, sprite) in model {
-                    let Some(r) = sprites.get(sprite) else {
-                        continue;
-                    };
-                    quad(
-                        &pose,
-                        corners.map(|c| {
-                            [
-                                f64::from(c[0]) - 0.5,
-                                f64::from(c[1]) - 0.5,
-                                f64::from(c[2]) - 0.5,
-                            ]
-                        }),
-                        map_uv(r, *uv),
-                        frame_packed,
-                    );
                 }
             }
-            // HDR output: a glow frame shines softly (entity.wgsl fs_hdr_mark); the item in it
-            // is only lit, as vanilla draws it.
-            if f.glow {
-                for v in &mut out[frame_start..] {
-                    v.layer |= u32::from(horizon_client::mesher::INCANDESCENT) << 16;
-                }
+            self.finish_lit_entity(culling, f, out, entity_start);
+            // The frame; what it shows is an item or a map, Horizon's to light: not the layer's.
+            self.lit_entity(entity_start..out.len());
+            if culling.rays_only() {
+                continue;
             }
-            self.finish_entity_occlusion(culling, f, out, entity_start);
             let cull_contents = culling.checks_vertices();
             if let Some(stack) = &f.item {
                 let mut canceled = false;
@@ -765,6 +967,10 @@ impl Game<'_> {
                     continue;
                 }
             }
+            let Some(stack) = f.item.as_ref() else {
+                continue;
+            };
+            let pose = glam::DMat4::from_translation(origin) * facing_rotations[facing_idx];
             if let Some(id) = map {
                 // ItemFrameRenderer: the map fills the face, in 90-degree steps.
                 let depth = if f.invisible { 0.5 } else { 0.4375 };
@@ -782,49 +988,93 @@ impl Game<'_> {
                 maps.push((id, m.as_mat4(), item_light, cull_contents, f.kind()));
                 continue;
             }
-            let Some(stack) = f.item.clone() else {
-                continue;
-            };
             // `GlowItemFrame` items render full bright (15728880).
             let item_light = if f.glow { 0xFF } else { light };
             let depth = if f.invisible { 0.5 } else { 0.4375 };
+            let rot_z = if (0..8).contains(&f.rotation) {
+                item_rotations[f.rotation as usize]
+            } else {
+                glam::DMat4::from_rotation_z((f64::from(f.rotation) * 45.0).to_radians())
+            };
             let m = pose
                 * glam::DMat4::from_translation(glam::DVec3::new(0.0, 0.0, depth))
-                * glam::DMat4::from_rotation_z((f64::from(f.rotation) * 45.0).to_radians())
+                * rot_z
                 * glam::DMat4::from_scale(glam::DVec3::splat(0.5));
-            items.push((
-                stack,
-                f.id,
-                m.as_mat4(),
-                item_light,
-                cull_contents,
-                f.kind(),
-            ));
+            let use_static = can_use_static
+                && stack.count > 0
+                && stack.damage == 0
+                && stack.data().is_none()
+                && self.pack.item_renderer.is_static_item(&stack.item);
+            items.push(FramedItem {
+                stack: FramedStack(frame_idx),
+                id: f.id,
+                matrix: m.as_mat4(),
+                light: item_light,
+                cull: cull_contents,
+                kind: f.kind(),
+                // `ItemFrameRenderer.extractRenderState` hands the frame entity
+                // itself to the item model (`updateForNonLiving`), so a framed
+                // compass's needle reads the frame's position and yaw.
+                owner: (!use_static).then(|| frame_owner(f)),
+            });
         }
-        // `extractRenderState`: FIXED, seeded by the frame entity.
-        let skinning = self.skinning();
-        let lights = horizon_client::block_entity_render::diffuse_lights(self.nether_lighting());
-        for (stack, id, m, light, cull, kind) in items {
-            let entity_start = out.len();
-            self.mark_entity(entity_start, kind);
-            self.mark_motion(entity_start, Self::MOTION_FRAME_ITEM | u64::from(id));
-            let owner = super::item_draw::owner_at([0.0; 3], 0.0, "minecraft:item_frame");
-            let state = self.resolve_item(
-                &stack,
-                horizon_assets::item_model::DisplayContext::Fixed,
-                Some(&owner),
-                id as i32,
-            );
-            let light = horizon_client::block_entity_render::vertex_light(light);
-            // Posed on the GPU when every layer can be.
-            let skinned = skinning
-                .then(|| self.submit_item_skinned(&state, &[m], light, lights))
-                .flatten();
-            if skinned.is_none() {
-                self.submit_item_world(&state, m, light, out);
-            }
-            if cull {
-                self.cull_skinned(out, entity_start, skinned);
+        PREPARED_FRAMES.with(|cell| *cell.borrow_mut() = Some(frame_cache));
+        if !items.is_empty() {
+            // `extractRenderState`: FIXED, seeded by the frame entity.
+            let skinning = self.skinning();
+            let lights =
+                horizon_client::block_entity_render::diffuse_lights(self.nether_lighting());
+            let hdr_on = self.renderer.as_ref().is_some_and(|r| r.hdr_on());
+            let mut static_cache = self
+                .pack
+                .item_renderer
+                .static_cache_for(horizon_assets::item_model::DisplayContext::Fixed);
+            let mut scratch_layers: Vec<horizon_client::item_render::LayerRender> = Vec::new();
+            for item in items {
+                let frame = &self.item_frames[item.stack.0];
+                let Some(stack) = frame.item.as_ref() else {
+                    continue;
+                };
+                let entity_start = out.len();
+                self.mark_entity(entity_start, item.kind);
+                self.mark_motion(entity_start, Self::MOTION_FRAME_ITEM | u64::from(item.id));
+                let light = horizon_client::block_entity_render::vertex_light(item.light);
+                let mut dynamic_state: Option<horizon_client::item_render::ItemRenderState> = None;
+                let (state, hdr) = if item.owner.is_none()
+                    && let Some(cached) = static_cache
+                        .as_mut()
+                        .and_then(|cache| cache.get(&stack.item))
+                {
+                    (&cached.state, self.item_hdr(&stack.item, hdr_on))
+                } else {
+                    let owner = item.owner.unwrap_or_else(|| frame_owner(frame));
+                    let resolved = self.resolve_item_uncached_into(
+                        stack,
+                        horizon_assets::item_model::DisplayContext::Fixed,
+                        Some(&owner),
+                        item.id as i32,
+                        horizon_client::cit::Hand::Main,
+                        std::mem::take(&mut scratch_layers),
+                    );
+                    let hdr = (resolved.hdr_tier, resolved.hdr_light);
+                    let state_ref = dynamic_state.insert(resolved);
+                    (&*state_ref, hdr)
+                };
+                // Posed on the GPU when every layer can be.
+                let skinned = skinning
+                    .then(|| {
+                        self.submit_item_skinned_hdr(state, hdr, &[item.matrix], light, lights)
+                    })
+                    .flatten();
+                if skinned.is_none() {
+                    self.submit_item_world_hdr(state, hdr, item.matrix, light, out);
+                }
+                if item.cull {
+                    self.cull_skinned(out, entity_start, skinned);
+                }
+                if let Some(owned) = dynamic_state {
+                    scratch_layers = owned.layers;
+                }
             }
         }
         // Maps: keyed by their map id, which several frames can show, so they stay unmarked.
@@ -877,6 +1127,195 @@ mod source_tests {
         assert_eq!(model.len(), 1);
         assert_eq!(model[0].2, "example:block/frame");
     }
+
+    #[test]
+    fn prepared_frame_quads_match_uncached_transform_across_all_facings() {
+        use horizon_client::hud::Rect;
+        use horizon_client::mesher::Vertex;
+        let model: super::FrameModel = vec![
+            (
+                [
+                    [0.125, 0.125, 0.9375],
+                    [0.875, 0.125, 0.9375],
+                    [0.875, 0.875, 0.9375],
+                    [0.125, 0.875, 0.9375],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                "block/oak_planks".into(),
+            ),
+            (
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 1.0, 1.0],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                "block/missing_in_atlas".into(),
+            ),
+        ];
+        let mut sprites = std::collections::HashMap::new();
+        sprites.insert(
+            "block/oak_planks".into(),
+            Rect {
+                u0: 0.125,
+                v0: 0.25,
+                u1: 0.375,
+                v1: 0.5,
+                w: 16,
+                h: 16,
+            },
+        );
+        let camera = glam::DVec3::new(128.25, 63.5, -256.75);
+        let pos = [140i32, 68, -240];
+        let origin = glam::DVec3::new(
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]) + 0.5,
+            f64::from(pos[2]) + 0.5,
+        ) - camera;
+        let steps = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        for facing in 0u8..6 {
+            let s = steps[usize::from(facing)];
+            let (x_rot, y_rot) = if s[1] == 0 {
+                let to_y = match facing {
+                    3 => 0.0,
+                    4 => 90.0,
+                    2 => 180.0,
+                    _ => 270.0,
+                };
+                (0.0f64, 180.0f64 - to_y)
+            } else {
+                (-90.0 * f64::from(s[1]), 180.0)
+            };
+            let pose = glam::DMat4::from_translation(origin)
+                * glam::DMat4::from_rotation_x(x_rot.to_radians())
+                * glam::DMat4::from_rotation_y(y_rot.to_radians());
+            let mut expected = Vec::new();
+            for (corners, uv, sprite) in &model {
+                let Some(r) = sprites.get(sprite) else {
+                    continue;
+                };
+                let at = corners.map(|c| {
+                    pose.transform_point3(glam::DVec3::new(
+                        f64::from(c[0]) - 0.5,
+                        f64::from(c[1]) - 0.5,
+                        f64::from(c[2]) - 0.5,
+                    ))
+                });
+                let n = (at[1] - at[0]).cross(at[2] - at[0]).normalize_or_zero();
+                let normal = [0, 1, 2].map(|k| (n[k].clamp(-1.0, 1.0) * 127.0) as i8);
+                let mapped_uv =
+                    uv.map(|[u, v]| [r.u0 + u * (r.u1 - r.u0), r.v0 + v * (r.v1 - r.v0)]);
+                for (p, uv) in at.into_iter().zip(mapped_uv) {
+                    expected.push(Vertex {
+                        normal: [normal[0], normal[1], normal[2], -127],
+                        pos: p.as_vec3().to_array(),
+                        uv,
+                        layer: 0,
+                        color: 0xFFFF_FFFF,
+                        light: 0x00F0_00F0,
+                        glint_uv: [0.0, 0.0],
+                    });
+                }
+            }
+
+            let prepared = super::prepare_frame_quads(
+                &model,
+                super::frame_facing_rotations()[usize::from(facing)],
+                &sprites,
+            );
+            let mut actual = Vec::new();
+            for q in &prepared {
+                for (corner, uv) in q.corners.into_iter().zip(q.uv) {
+                    actual.push(Vertex {
+                        normal: q.normal,
+                        pos: (origin + corner).as_vec3().to_array(),
+                        uv,
+                        layer: 0,
+                        color: 0xFFFF_FFFF,
+                        light: 0x00F0_00F0,
+                        glint_uv: [0.0, 0.0],
+                    });
+                }
+            }
+            assert_eq!(actual.len(), expected.len(), "facing {facing}");
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(a.pos, e.pos, "facing {facing} vert {i} pos");
+                assert_eq!(a.uv, e.uv, "facing {facing} vert {i} uv");
+                assert_eq!(a.normal, e.normal, "facing {facing} vert {i} normal");
+                assert_eq!(a.layer, e.layer, "facing {facing} vert {i} layer");
+                assert_eq!(a.color, e.color, "facing {facing} vert {i} color");
+                assert_eq!(a.light, e.light, "facing {facing} vert {i} light");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_frame_cache_invalidates_on_pack_reload_generation() {
+        use horizon_client::hud::Rect;
+        let model: super::FrameModel = vec![(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+            ],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            "block/frame".into(),
+        )];
+        let mut sprites_v1 = std::collections::HashMap::new();
+        sprites_v1.insert(
+            "block/frame".into(),
+            Rect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.5,
+                v1: 0.5,
+                w: 16,
+                h: 16,
+            },
+        );
+        let key_v1 = super::PreparedFrameCacheKey {
+            pack_generation: 1,
+            sprites_ptr: std::ptr::from_ref(&sprites_v1) as usize,
+            sprites_len: sprites_v1.len(),
+            models: [(model.as_ptr() as usize, model.len()); 4],
+        };
+        let mut cache = super::PreparedFrameCache::new(key_v1);
+        assert_eq!(cache.quads(0, 3, &model, &sprites_v1)[0].uv[2], [0.5, 0.5]);
+
+        let mut sprites_v2 = std::collections::HashMap::new();
+        sprites_v2.insert(
+            "block/frame".into(),
+            Rect {
+                u0: 0.5,
+                v0: 0.5,
+                u1: 1.0,
+                v1: 1.0,
+                w: 16,
+                h: 16,
+            },
+        );
+        let key_v2 = super::PreparedFrameCacheKey {
+            pack_generation: 2,
+            sprites_ptr: std::ptr::from_ref(&sprites_v2) as usize,
+            sprites_len: sprites_v2.len(),
+            models: [(model.as_ptr() as usize, model.len()); 4],
+        };
+        assert_ne!(cache.key, key_v2);
+        let mut reloaded = super::PreparedFrameCache::new(key_v2);
+        assert_eq!(
+            reloaded.quads(0, 3, &model, &sprites_v2)[0].uv[2],
+            [1.0, 1.0]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -899,7 +1338,9 @@ mod map_limit_tests {
             invisible: false,
             check_interval: 0,
             custom_name: None,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
         }
     }
     /// A map whose `count` frame markers all count toward the limit.
@@ -930,7 +1371,7 @@ mod map_limit_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    #[ignore = "daily"]
     fn a_map_tracking_more_than_256_markers_stays_in_the_hand() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.item_frames.extend([frame(1), frame(2)]);
@@ -976,7 +1417,9 @@ mod game_event_tests {
             invisible: false,
             check_interval: 0,
             custom_name: None,
-            random: horizon_core::random::LegacyRandom::new(0),
+            random: horizon_core::random::EntityRandom::own(
+                horizon_core::random::LegacyRandom::new(0),
+            ),
         }
     }
     fn at(id: u32) -> Option<InteractTarget> {
@@ -996,7 +1439,7 @@ mod game_event_tests {
     /// `ItemFrame.interact`: putting an item in and turning it each post
     /// `GameEvent.BLOCK_CHANGE` from the player, at the frame's position.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn putting_and_rotating_a_frame_item_posts_block_change() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -1021,7 +1464,7 @@ mod game_event_tests {
     /// `ItemFrame.hurtServer`: the item coming out posts `BLOCK_CHANGE` from
     /// the player hitting the frame.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn taking_a_frame_item_out_posts_block_change_from_the_player() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -1063,7 +1506,7 @@ mod game_event_tests {
     /// `ItemFrame.dropItem` from `BlockAttachedEntity.tick`, when a frame
     /// loses the block it hangs on: the event has no source.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_frame_that_falls_posts_block_change_without_source() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -1079,4 +1522,47 @@ mod game_event_tests {
         assert!(game.item_frames.is_empty(), "nothing holds the frame");
         assert_eq!(posted(), [("minecraft:block_change", center, None)]);
     }
+
+    /// `ItemFrame.canHurtWhenFixed`: a creative player's blast breaks a fixed,
+    /// filled frame whole and drops nothing (`dropItem` skips a fixed frame);
+    /// a survival player's or an ownerless blast leaves it with its item.
+    #[test]
+    #[ignore = "daily"]
+    fn only_a_creative_players_blast_breaks_a_fixed_frame() {
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        let feet = Vec3::new(0.5, 70.0, -1.0);
+        game.player =
+            Some(horizon_client::motion::PlayerMotion::new(game.motion, feet).expect("a player"));
+        game.player.as_mut().expect("a player").entity_id = 1;
+        let me = game.own_entity_id() as u32;
+        assert_eq!(me, 1, "the blast's owner is this player");
+        // (creative, the blast's owner is the player, the frame breaks)
+        for (creative, owned, breaks) in [(true, true, true), (false, true, false), (true, false, false)] {
+            game.creative = creative;
+            game.dropped.clear();
+            game.item_frames.clear();
+            let mut f = frame(1, [0, 64, 1], Some(ItemStack::new("minecraft:stick", 1)));
+            f.fixed = true;
+            game.item_frames.extend(vec![f]);
+            game.combat = Default::default();
+            game.combat.blast_owner = owned.then(|| (me, horizon_client::text::Text::literal("Steve")));
+            game.combat.blast_owner_player = owned;
+            game.explosion_breaks_frames(
+                [0.5, 64.5, 1.0],
+                2.0,
+                super::super::explosion::BlockInteraction::Keep,
+            );
+            let case = format!("creative={creative} owned={owned}");
+            assert_eq!(game.item_frames.is_empty(), breaks, "{case}");
+            if !breaks {
+                assert!(game.item_frames[0].item.is_some(), "{case}: the item stays");
+            }
+            assert!(game.dropped.is_empty(), "{case}: a fixed frame drops nothing");
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "tests/lodestone_compass_tests.rs"]
+mod lodestone_compass_tests;

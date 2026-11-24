@@ -4,7 +4,7 @@ use sha2::{Digest, Sha512};
 /// The most a `mod.wasm` may weigh.
 pub const MAX_WASM: u64 = 64 << 20;
 
-/// A wasm mod's `[wasm]` section, written by `cargo horizon-mod build --wasm` (or Portizon),
+/// A wasm mod's `[wasm]` section, written by `cargo horizon-mod build --wasm` (or a mod converter),
 /// never by hand: what its one `mod.wasm` is and what it was built and linked against.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(try_from = "Fields")]
@@ -116,13 +116,14 @@ impl Wasm {
         &self.linked
     }
 
-    /// The converter that made it from a Java mod (`portizon@<commit>`), when it has no
+    /// The converter that made it from a Java mod (`<converter>@<commit>`), when it has no
     /// Rust source of its own.
     pub fn built_with(&self) -> Option<&str> {
         self.built_with.as_deref()
     }
 
-    /// Checks `bytes` are this section's `mod.wasm`.
+    /// Checks `bytes` are this section's `mod.wasm`. The bytes are hashed on every call; a module
+    /// is validated once per process, since the game reads a package several times as it starts.
     pub fn check(&self, bytes: &[u8]) -> Result<(), WasmError> {
         if bytes.len() as u64 > MAX_WASM {
             return Err(WasmError::TooLarge);
@@ -133,92 +134,114 @@ impl Wasm {
         if sha512_of(bytes) != self.sha512 {
             return Err(WasmError::Hash);
         }
-        wasmparser::Validator::new()
-            .validate_all(bytes)
-            .map_err(|_| WasmError::InvalidMember)?;
-        let mut shared = false;
-        let mut exports = [false; 3];
-        for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-            match payload.map_err(|_| WasmError::InvalidMember)? {
-                wasmparser::Payload::Version {
-                    encoding: wasmparser::Encoding::Component,
-                    ..
-                } => return Err(WasmError::InvalidMember),
-                wasmparser::Payload::CustomSection(section) if section.name() == "dylink.0" => {
-                    if shared {
-                        return Err(WasmError::InvalidMember);
-                    }
-                    let wasmparser::KnownCustom::Dylink0(subsections) = section.as_known() else {
-                        return Err(WasmError::InvalidMember);
-                    };
-                    let mut memory_info = false;
-                    for subsection in subsections {
-                        if let wasmparser::Dylink0Subsection::MemInfo(_) =
-                            subsection.map_err(|_| WasmError::InvalidMember)?
-                        {
-                            if memory_info {
-                                return Err(WasmError::InvalidMember);
-                            }
-                            memory_info = true;
-                        }
-                    }
-                    if !memory_info {
-                        return Err(WasmError::InvalidMember);
-                    }
-                    shared = true;
-                }
-                wasmparser::Payload::ImportSection(section) => {
-                    for import in section.into_imports() {
-                        let import = import.map_err(|_| WasmError::InvalidMember)?;
-                        let allowed = matches!(
-                            (import.module, import.name, import.ty),
-                            ("env", "memory", wasmparser::TypeRef::Memory(_))
-                                | (
-                                    "env",
-                                    "__indirect_function_table",
-                                    wasmparser::TypeRef::Table(_)
-                                )
-                                | (
-                                    "env",
-                                    "__stack_pointer" | "__memory_base" | "__table_base",
-                                    wasmparser::TypeRef::Global(_),
-                                )
-                                | ("env", _, wasmparser::TypeRef::Func(_))
-                                | ("GOT.mem" | "GOT.func", _, wasmparser::TypeRef::Global(_))
-                                | (
-                                    "horizon",
-                                    "host" | "host_reply",
-                                    wasmparser::TypeRef::Func(_)
-                                )
-                        );
-                        if !allowed {
-                            return Err(WasmError::InvalidMember);
-                        }
-                    }
-                }
-                wasmparser::Payload::ExportSection(section) => {
-                    for export in section {
-                        let export = export.map_err(|_| WasmError::InvalidMember)?;
-                        if export.kind == wasmparser::ExternalKind::Func {
-                            for (index, name) in ["horizon_layout", "horizon_in", "horizon_hook"]
-                                .iter()
-                                .enumerate()
-                            {
-                                if export.name == *name {
-                                    exports[index] = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+        let validated = || VALIDATED.lock().unwrap_or_else(|e| e.into_inner());
+        if validated().contains(&self.sha512) {
+            return Ok(());
         }
-        if !shared || !exports.into_iter().all(|found| found) {
-            return Err(WasmError::InvalidMember);
-        }
+        valid_member(bytes)?;
+        validated().insert(self.sha512.clone());
         Ok(())
     }
+}
+
+/// The SHA-512s of the modules [`Wasm::check`] has found valid members in this process: whether
+/// a module is one depends on its bytes alone.
+static VALIDATED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether `bytes` are a valid shared group member with the guest entry points.
+fn valid_member(bytes: &[u8]) -> Result<(), WasmError> {
+    wasmparser::Validator::new()
+        .validate_all(bytes)
+        .map_err(|_| WasmError::InvalidMember)?;
+    let mut shared = false;
+    let mut exports = [false; 3];
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|_| WasmError::InvalidMember)? {
+            wasmparser::Payload::Version {
+                encoding: wasmparser::Encoding::Component,
+                ..
+            } => return Err(WasmError::InvalidMember),
+            wasmparser::Payload::CustomSection(section) if section.name() == "dylink.0" => {
+                if shared {
+                    return Err(WasmError::InvalidMember);
+                }
+                let wasmparser::KnownCustom::Dylink0(subsections) = section.as_known() else {
+                    return Err(WasmError::InvalidMember);
+                };
+                let mut memory_info = false;
+                for subsection in subsections {
+                    if let wasmparser::Dylink0Subsection::MemInfo(_) =
+                        subsection.map_err(|_| WasmError::InvalidMember)?
+                    {
+                        if memory_info {
+                            return Err(WasmError::InvalidMember);
+                        }
+                        memory_info = true;
+                    }
+                }
+                if !memory_info {
+                    return Err(WasmError::InvalidMember);
+                }
+                shared = true;
+            }
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.map_err(|_| WasmError::InvalidMember)?;
+                    // Each API call's own import, which the game links by name:
+                    // `Owner::method#signature`.
+                    let call = import.module == "horizon"
+                        && import.name.contains("::")
+                        && import.name.contains('#')
+                        && matches!(import.ty, wasmparser::TypeRef::Func(_));
+                    let allowed = matches!(
+                        (import.module, import.name, import.ty),
+                        ("env", "memory", wasmparser::TypeRef::Memory(_))
+                            | (
+                                "env",
+                                "__indirect_function_table",
+                                wasmparser::TypeRef::Table(_)
+                            )
+                            | (
+                                "env",
+                                "__stack_pointer" | "__memory_base" | "__table_base",
+                                wasmparser::TypeRef::Global(_),
+                            )
+                            | ("env", _, wasmparser::TypeRef::Func(_))
+                            | ("GOT.mem" | "GOT.func", _, wasmparser::TypeRef::Global(_))
+                            | (
+                                "horizon",
+                                "host" | "host_reply",
+                                wasmparser::TypeRef::Func(_)
+                            )
+                    );
+                    if !allowed && !call {
+                        return Err(WasmError::InvalidMember);
+                    }
+                }
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export.map_err(|_| WasmError::InvalidMember)?;
+                    if export.kind == wasmparser::ExternalKind::Func {
+                        for (index, name) in ["horizon_layout", "horizon_in", "horizon_hook"]
+                            .iter()
+                            .enumerate()
+                        {
+                            if export.name == *name {
+                                exports[index] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !shared || !exports.into_iter().all(|found| found) {
+        return Err(WasmError::InvalidMember);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -256,6 +279,12 @@ mod tests {
         let imports = r#"(import "horizon" "host" (func)) (import "env" "memory" (memory 1))"#;
         let good = module(imports, exports, dylink);
         assert_eq!(section(&good).check(&good), Ok(()));
+        let call = module(
+            r#"(import "horizon" "Host::level#00000000000000ff" (func)) (import "env" "memory" (memory 1))"#,
+            exports,
+            dylink,
+        );
+        assert_eq!(section(&call).check(&call), Ok(()));
         for bad in [
             module(imports, exports, ""),
             module(imports, exports, r#"(@custom "dylink.0" "\01\01\00")"#),

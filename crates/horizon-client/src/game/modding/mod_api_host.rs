@@ -97,8 +97,15 @@ impl Game<'_> {
         }
     }
 
+    /// A local `Hud.setOverlayMessage`, not a server action or packet.
+    pub(in crate::game) fn show_action_bar(&mut self, line: horizon_client::text::Text) {
+        if self.native_window() && self.lan_acting.is_none() {
+            self.titles.set_overlay(line, false);
+        }
+    }
+
     pub(super) fn native_authoritative(&self) -> bool {
-        self.serving.is_some() || self.options.dedicated.is_some()
+        self.is_logical_server()
     }
 
     /// Access a holder's attachment map, to lend to a mod: a server's, whose
@@ -153,12 +160,19 @@ impl Game<'_> {
     ) -> Result<(), mod_api::AttachmentError> {
         use mod_api::AttachmentError;
         let id = std::num::NonZeroU32::new(id).ok_or(AttachmentError::MissingHolder)?;
+        if matches!(
+            self.with_resident_slot(&self.dim.key(), id, |slot| slot.is_bound()),
+            super::entity_residency::SlotAccess::Done(true)
+        ) {
+            return Ok(());
+        }
         if !matches!(
             self.server_resident_entity(id.get()),
             horizon_client::join_seq::residency::table::EntityLookup::Found {
                 value: super::commands::Target::Mob(_)
                     | super::commands::Target::Painting(_)
-                    | super::commands::Target::DragonPart(_),
+                    | super::commands::Target::DragonPart(_)
+                    | super::commands::Target::General(_),
                 ..
             }
         ) {
@@ -365,7 +379,15 @@ impl mod_api::LevelHost for super::GameLevel<'_> {
         let [x, y, z] = fields.position;
         let key = (x, y, z);
         if self.world.block_entities.generation(&key) != Some(fields.generation) {
-            return None;
+            // The block entity of the break whose `block_drops` event is running: the removal
+            // took it out of the world, a read-only view of it is held until the event ends.
+            return Some(
+                self.world
+                    .block_entities
+                    .broken(&key, fields.generation)?
+                    .data
+                    .clone(),
+            );
         }
         let entity = self.world.block_entities.get(&key)?;
         let name = &self.facts.get(self.world.block(x, y, z)).name;
@@ -387,6 +409,9 @@ impl mod_api::LevelHost for super::GameLevel<'_> {
     }
     fn state_block(&self, state: mod_api::BlockState) -> Option<&str> {
         self.native_state_block(state.try_into_engine(&()).ok()?)
+    }
+    fn state_property(&self, state: mod_api::BlockState, key: &str) -> Option<&str> {
+        self.native_state_property(state.try_into_engine(&()).ok()?, key)
     }
     fn state_string(&self, state: mod_api::BlockState) -> Option<String> {
         self.registry
@@ -533,6 +558,13 @@ impl mod_api::LevelHost for super::native_hooks::HitLevel<'_> {
             .state(state.try_into_engine(&()).ok()?)
             .map(|s| &*s.name)
     }
+    fn state_property(&self, state: mod_api::BlockState, key: &str) -> Option<&str> {
+        super::native_hooks::state_property(
+            self.0.registry(),
+            state.try_into_engine(&()).ok()?,
+            key,
+        )
+    }
     fn state_string(&self, state: mod_api::BlockState) -> Option<String> {
         self.0
             .registry()
@@ -574,14 +606,18 @@ impl mod_api::AttachmentHost for super::native_hooks::HitLevel<'_> {
 }
 
 impl mod_api::LevelRandomHost for super::native_hooks::HitLevel<'_> {
+    fn swept_entity(&self) -> Option<mod_api::SweptEntity> {
+        self.1.copied()
+    }
+
     fn attachments(&mut self) -> &mut dyn mod_api::AttachmentStore {
         self
     }
     fn random(&mut self) -> Option<mod_api::LegacyRandom> {
-        Some(self.0.random().clone())
+        Some(mod_api::LegacyRandom::clone(self.0.random()))
     }
     fn set_random(&mut self, random: mod_api::LegacyRandom) -> bool {
-        *self.0.random() = random;
+        **self.0.random() = random;
         true
     }
 }
@@ -605,6 +641,9 @@ impl<'a: 'b, 'b, L: std::ops::Deref<Target = super::GameLevel<'a>>> mod_api::Lev
     }
     fn state_block(&self, state: mod_api::BlockState) -> Option<&str> {
         mod_api::LevelHost::state_block(&*self.level, state)
+    }
+    fn state_property(&self, state: mod_api::BlockState, key: &str) -> Option<&str> {
+        mod_api::LevelHost::state_property(&*self.level, state, key)
     }
     fn state_string(&self, state: mod_api::BlockState) -> Option<String> {
         mod_api::LevelHost::state_string(&*self.level, state)
@@ -797,7 +836,7 @@ mod attachment_membership_tests {
         );
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn attachment_off_walk_membership_matches_old_walk() {
         with_game(|game| {
             game.reset_entity_residency();
@@ -870,7 +909,7 @@ mod attachment_membership_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn attachment_guest_hook_membership_matches_old_walk() {
         crate::game::native_guest_turn_tests::with_guests(|game| {
             for id in [12, 13] {
@@ -901,7 +940,7 @@ mod attachment_membership_tests {
         });
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn attachment_membership_matches_old_walk() {
         with_game(|game| {
             game.reset_entity_residency();

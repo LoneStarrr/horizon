@@ -70,6 +70,9 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
             .add_empty_chunk(ChunkPos::new(x, 0))
             .unwrap();
     }
+    for x in 0..3 {
+        game.load_ticking_neighbourhood(x, 0);
+    }
     game.player = Some(PlayerMotion::new(game.motion, Vec3::new(24.5, 201.0, 12.5)).unwrap());
     let net = NetConfig {
         announce: false,
@@ -95,6 +98,7 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
             max_players: 2,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         },
     )
     .unwrap();
@@ -159,7 +163,7 @@ fn vectors(game: &mut Game<'_>, uuid: &str) -> ([f64; 3], f32) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_fence_leash_pulls_a_pig_as_vanilla_does() {
     let mut resources = None;
     let mut game = game(&mut resources);

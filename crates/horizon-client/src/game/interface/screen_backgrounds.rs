@@ -53,6 +53,20 @@ impl Game<'_> {
         self.native_dimension_transition_screen_draw(screen, reason, progress, batch);
         true
     }
+    /// The cause of the currently selected mod screen's client load.
+    pub(super) fn dimension_transition_cause(
+        &self,
+        screen: &str,
+    ) -> Option<mod_api::DimensionTransitionCause> {
+        let load = &self.remote.as_ref()?.level_load;
+        let selected =
+            horizon_client_render::dimension_transition::screen(load.transition_screen()?)?;
+        if selected == screen {
+            load.transition_cause()
+        } else {
+            None
+        }
+    }
     /// `LevelLoadingScreen.extractBackground`.
     pub(super) fn draw_level_loading_background(
         &self,
@@ -105,7 +119,7 @@ impl Game<'_> {
         self.native_menu_background(&mut radius);
         radius.filter(|r| r.is_finite() && (1.0..=64.0).contains(r))
     }
-    /// `Screen.renderTransparentBackground`: draws the translucent dark background
+    /// `Screen.extractTransparentBackground`: draws the translucent dark background
     /// behind an in-game screen (inventory, containers, creative, books, signs, editors),
     /// giving native mods a chance to suppress it (`Flow::Cancel`) or apply menu blur / tiled background.
     pub(super) fn render_transparent_background(&self, screen: &str, batch: &mut HudBatch) {
@@ -130,7 +144,12 @@ impl Game<'_> {
         partial: f32,
     ) -> Option<horizon_client::gfx::BorderDraw> {
         use horizon_client::border_render::{self, BorderRenderer};
-        let distance = f64::from(self.streaming.radius * 16);
+        // The wall and its fade span the effective render distance, never the
+        // streaming radius's margin nor the far-terrain LOD distance: the
+        // wall's texture coordinates are f32, and at LOD depths one ulp of the
+        // v coordinate is wider than a whole texture tile.
+        let radius = self.effective_render_distance();
+        let distance = f64::from(radius * 16);
         border_render::extract(
             &self.border,
             partial,
@@ -145,9 +164,8 @@ impl Game<'_> {
             self.border_renderer.invalidate();
             self.border_section = Some(section);
         }
-        // Camera.depthFar, as the renderer's far plane.
-        let depth_far =
-            horizon_client::camera::depth_far(self.terrain_distance(), self.settings.cloud_range);
+        // `Camera.depthFar`, from the same radius, caps the wall's height.
+        let depth_far = horizon_client::camera::depth_far(radius, self.settings.cloud_range);
         if !self
             .border_renderer
             .prepare(&self.border_state, camera, distance, depth_far)
@@ -167,20 +185,15 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    /// `ScreenEvent.Render.Foreground` (only when the screen `drawn`) and
-    /// `Render.Post` for the open screen, once a frame, after it has drawn
-    /// itself and its tooltips, so a native mod draws over it here. Never
-    /// `Playing`: the prompts, books and sign editors drawn over gameplay keep
-    /// it, draw after this point and so over what a mod drew.
-    pub(super) fn draw_screen_with_post_hook(&self, batch: &mut HudBatch, drawn: bool) {
+    /// `ScreenEvent.Render.Post`, after the screen's drawing and tooltips,
+    /// including when Pre cancelled. Gameplay overlays keep their exclusions.
+    pub(super) fn draw_screen_with_post_hook(&self, batch: &mut HudBatch) {
         if let Some(view) = self.screen_render_view(batch) {
-            self.screen_render_end(batch, &view, drawn);
+            self.screen_render_end(batch, &view);
         }
     }
-    /// `ScreenEvent.Render.Pre` then `Render.Background` for the open screen,
-    /// once a frame, before it draws itself: whether it is drawn (a cancelled
-    /// `Render.Pre` skips it and its Background). The Win and Options screens
-    /// call this on their own path. Client only: what a mod draws is its own.
+    /// `ScreenEvent.Render.Pre` for the open screen: whether it draws.
+    /// Background and Foreground are reported by the screen while drawing.
     pub(super) fn draw_screen_with_pre_hook(&self, batch: &mut HudBatch) -> bool {
         match self.screen_render_view(batch) {
             Some(view) => self.screen_render_begin(batch, &view),
@@ -189,9 +202,9 @@ impl Game<'_> {
     }
     /// `draw_screen_with_post_hook` for the title's own screen, once a frame,
     /// after it has drawn and before the toasts.
-    pub(super) fn draw_title_screen_with_post_hook(&self, batch: &mut HudBatch, drawn: bool) {
+    pub(super) fn draw_title_screen_with_post_hook(&self, batch: &mut HudBatch) {
         if let Some(view) = self.title_screen_render_view(batch) {
-            self.screen_render_end(batch, &view, drawn);
+            self.screen_render_end(batch, &view);
         }
     }
     /// `draw_screen_with_pre_hook` for the title's own screens.
@@ -226,13 +239,41 @@ impl Game<'_> {
         &self,
         batch: &HudBatch,
     ) -> Option<mod_api::ScreenView<'_>> {
-        if self.screen != Screen::Playing
-            || self.screen_over_playing()
-            || self.remote_loading()
-            || !self.screen_render_listened()
-        {
+        if !self.screen_render_listened() || !self.title_screen_render_uncovered() {
             return None;
         }
         self.title_screen_view(batch)
+    }
+
+    pub(super) fn title_screen_render_uncovered(&self) -> bool {
+        self.screen == Screen::Playing && !self.screen_over_playing() && !self.remote_loading()
+    }
+}
+
+impl Game<'_> {
+    /// Dispatch at the boundary reported by the screen that owns the drawing.
+    /// No view or layout is built unless this particular phase has a listener.
+    pub(super) fn draw_screen_phase(
+        &self,
+        batch: &mut HudBatch,
+        phase: horizon_client::screen_draw::RenderPhase,
+    ) {
+        use horizon_client::screen_draw::RenderPhase;
+        let hook = match phase {
+            RenderPhase::Background => mod_api::HookId::ScreenRenderBackground,
+            RenderPhase::Foreground => mod_api::HookId::ScreenRenderForeground,
+        };
+        if !mod_api::__private::listened(hook) {
+            return;
+        }
+        let view = self
+            .screen_render_view(batch)
+            .or_else(|| self.title_screen_render_view(batch));
+        if let Some(view) = view {
+            match phase {
+                RenderPhase::Background => self.native_screen_render_background(batch, &view),
+                RenderPhase::Foreground => self.native_screen_render_foreground(batch, &view),
+            }
+        }
     }
 }

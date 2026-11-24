@@ -43,6 +43,9 @@ impl Game<'_> {
         velocity: [f64; 3],
         falling: mod_api::Falling,
     ) -> bool {
+        if self.entity_ids_exhausted() {
+            return false;
+        }
         if (self.serving.is_none() && self.options.dedicated.is_none())
             || dimension != self.dim.id()
             || self.pack.assets.registry.state(state).is_none()
@@ -115,7 +118,7 @@ mod tests {
     };
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn falling_tick_preserves_its_owner_on_success_and_collision_error() {
         bound_falling_case(false, |game, _| {
             assert!(game.spawn_remote_projectile(
@@ -170,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn falling_client_tick_commits_state_without_detaching_its_owner() {
         bound_falling_case(true, |game, _| {
             game.remote_projectile_data(
@@ -194,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn falling_parked_swap_preserves_state_and_owner_until_discard() {
         bound_falling_case(false, |game, index| {
             let home = game.dim;
@@ -219,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn falling_lifecycle_commands_unload_park_and_remote() {
         use super::super::{
             commands::Target,

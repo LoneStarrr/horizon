@@ -1,5 +1,5 @@
 //! The game's own animations sample exactly as they did before the sampling moved into `mod_api`
-//! (#2607): every exported vanilla definition, every channel, at a grid of times and scales,
+//! (arismoko/horizon#2607): every exported vanilla definition, every channel, at a grid of times and scales,
 //! bit for bit against the pre-move sampler kept here as the oracle.
 use super::*;
 
@@ -38,7 +38,7 @@ fn oracle(k: &[Keyframe], seconds: f32, scale: f32) -> [f32; 3] {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn every_vanilla_animation_samples_as_before_the_move() {
     let root = std::path::PathBuf::from(
         std::env::var_os("HORIZON_TEST_RESOURCES").expect("set HORIZON_TEST_RESOURCES"),

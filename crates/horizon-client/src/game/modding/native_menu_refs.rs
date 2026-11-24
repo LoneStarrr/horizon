@@ -122,7 +122,7 @@ impl Game<'_> {
         )
     }
 
-    fn native_client_menu_name(&self, menu: MenuRef) -> Option<&str> {
+    pub(super) fn native_client_menu_name(&self, menu: MenuRef) -> Option<&str> {
         let remote = self.remote.as_ref().filter(|remote| remote.logged_in)?;
         let epoch = self.native_lifecycle.epoch()?;
         (menu.fields().player.fields().entity.epoch() == epoch
@@ -159,13 +159,11 @@ impl Game<'_> {
             (open.window == menu.fields().window && open.hidden.is_empty()).then_some(guest)
         } else {
             let play = host.play.get(&guest.conn);
+            let menus = host.menus.get(&guest.conn);
             if menu.fields().window != 0
+                || menus.is_some_and(|m| m.crafting.table.is_some() || m.station.is_some())
                 || play.is_some_and(|p| {
-                    p.merchant.is_some()
-                        || p.crafting.table.is_some()
-                        || p.station.is_some()
-                        || p.lectern.is_some()
-                        || p.mount_window.is_some()
+                    p.merchant.is_some() || p.lectern.is_some() || p.mount_window.is_some()
                 })
             {
                 return None;
@@ -231,6 +229,7 @@ impl Game<'_> {
     pub(super) fn menu_slot_count(&self, menu: MenuRef) -> Option<usize> {
         if self.remote.is_some() {
             let name = self.native_client_menu_name(menu)?;
+            Self::inventory_screen_slot(name, 0)?;
             return Some(
                 (0..)
                     .map_while(|slot| Self::inventory_screen_slot(name, slot))
@@ -288,7 +287,11 @@ impl Game<'_> {
                 slot: n,
             },
             SlotBacking::Ender(n) => MenuSlotBacking::Ender(n),
-            SlotBacking::Native(n) => MenuSlotBacking::Native(n),
+            // Only a slot a mod backed (`player_back_mod_menu_slots`) reads as a place.
+            SlotBacking::Native(n) => match self.native_menu_place(guest.conn, open.window, n) {
+                Some(place) => MenuSlotBacking::Place(place),
+                None => MenuSlotBacking::Native(n),
+            },
         })
     }
 
@@ -314,6 +317,8 @@ impl Game<'_> {
             MenuSlotBacking::CraftResult => guest.craft_result.clone(),
             MenuSlotBacking::Ender(n) => guest.ender_items.get(n)?.clone(),
             MenuSlotBacking::Native(n) => guest.native_menu.get(n)?.clone(),
+            // The place's mirror, refreshed after each click and each tick.
+            MenuSlotBacking::Place(_) => guest.native_menu.get(slot)?.clone(),
             _ => unreachable!("MenuSlotBacking: unhandled variant"),
         })
     }
@@ -494,7 +499,7 @@ mod tests {
     };
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn inventory_boxes_follow_menu_indices_and_the_input_layout() {
         super::super::native_entity_refs::tests::with_client_game(|game| {
             game.screen = super::super::Screen::Inventory;
@@ -650,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_server_closes_a_guests_menu_and_sets_their_selected_slot() {
         with_game(|game| {
             let config = HubConfig {
@@ -666,6 +671,7 @@ mod tests {
                 max_players: 10,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             let mut net = NetConfig::lan(0, "test".into(), 10);
             net.listen = false;
@@ -733,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn a_stack_is_thrown_from_the_eyes_as_player_drop_does() {
         use horizon_client::motion::PlayerMotion;
         use horizon_core::geometry::Vec3;
@@ -759,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn menus_read_storage_and_invalidate_on_replacement_wrap_and_reconnect() {
         with_game(|game| {
             let config = HubConfig {
@@ -775,6 +781,7 @@ mod tests {
                 max_players: 10,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             let mut net = NetConfig::lan(0, "test".into(), 10);
             net.listen = false;
@@ -864,7 +871,7 @@ mod tests {
             assert_eq!(newer.slot_count(game), None);
             let inventory = game.player_container_menu(player).unwrap();
             let host = game.lan.as_mut().unwrap();
-            *host.play.entry(1).or_default().crafting.table = Some((
+            *host.menus.entry(1).or_default().crafting.table = Some((
                 7,
                 0,
                 Box::new(horizon_client::menu::Menu::new(
@@ -876,6 +883,7 @@ mod tests {
             assert_eq!(inventory.slot_count(game), None);
             let host = game.lan.as_mut().unwrap();
             host.play.clear();
+            host.menus.clear();
             host.hub.guests.replace(0, guest());
             assert_eq!(inventory.slot_count(game), None);
 

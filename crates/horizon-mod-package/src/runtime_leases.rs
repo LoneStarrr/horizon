@@ -33,6 +33,21 @@ impl From<fs::TryLockError> for Error {
     }
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("another process is using this folder"),
+            Self::UnsupportedFilesystem => {
+                f.write_str("this filesystem does not support runtime leases")
+            }
+            Self::Unsafe(path) => write!(f, "{} is an unexpected file or link", path.display()),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 pub fn linked(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -360,6 +375,82 @@ pub fn open_directory(path: &Path) -> Result<Dir, Error> {
     Ok(Dir::from_std_file(retained(directory.into_std_file())?))
 }
 
+/// Writes the completion marker a game opens in the folder it is started from: an empty regular
+/// file, made without following a link and without truncating whatever the path already is.
+pub fn write_completion(directory: &Path) -> io::Result<()> {
+    let marker = directory.join(".installed");
+    match fs::symlink_metadata(&marker) {
+        Ok(meta) if meta.is_file() && !linked(&meta) && meta.len() == 0 => return Ok(()),
+        Ok(meta) if linked(&meta) => {
+            if meta.is_dir() {
+                fs::remove_dir(&marker)?;
+            } else {
+                fs::remove_file(&marker)?;
+            }
+        }
+        Ok(meta) if meta.is_file() => fs::remove_file(&marker)?,
+        // A finished installation's marker is a file: a directory there is not ours to delete.
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "{} is not a regular file",
+                marker.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // `create_new` never truncates a path another process made in the meantime.
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(&marker) {
+                Ok(meta) if meta.is_file() && !linked(&meta) && meta.len() == 0 => Ok(()),
+                _ => Err(io::Error::other(format!(
+                    "{} is not an empty regular file",
+                    marker.display()
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Registers and holds the units a game started from `executable` leases by itself: what the
+/// launcher's launch and the dedicated server's supervisor both need where the game takes no
+/// holder. The claims must live as long as the game.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub fn lease_units(
+    executable: &Path,
+    selection: &crate::selection::LaunchArguments,
+    data: &Path,
+    directory: &Path,
+) -> Result<Vec<Claim>, Error> {
+    let units = crate::holder::lease_paths(executable, selection, data, directory)?;
+    let registry = Registry::with_release(data, Release::Unlock)?;
+    units
+        .into_iter()
+        .map(|(path, _)| {
+            let directory = open_directory(&path)?;
+            registry.lock(&directory, LockMode::Shared)
+        })
+        .collect()
+}
+
+/// Platforms without the desktop runtime holder take no unit leases.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn lease_units(
+    _executable: &Path,
+    _selection: &crate::selection::LaunchArguments,
+    _data: &Path,
+    _directory: &Path,
+) -> Result<Vec<Claim>, Error> {
+    Ok(Vec::new())
+}
+
 /// Fresh retained metadata and leases must never become later stdio replacement targets.
 pub(crate) fn retained(file: fs::File) -> io::Result<fs::File> {
     #[cfg(unix)]
@@ -392,13 +483,17 @@ pub(crate) fn isolated_test() -> bool {
         return false;
     }
     let test = std::thread::current().name().unwrap().to_owned();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--include-ignored", "--exact", &test, "--nocapture"])
+        .env("RUNTIME_LEASE_TEST_ISOLATED", "1")
+        .output()
+        .unwrap();
+    // The child must run this one test: a success that ran nothing (an ignored or filtered name) checks nothing.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test, "--nocapture"])
-            .env("RUNTIME_LEASE_TEST_ISOLATED", "1")
-            .status()
-            .unwrap()
-            .success()
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+        "the isolated rerun of {test} did not pass exactly one test:\n{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     true
 }

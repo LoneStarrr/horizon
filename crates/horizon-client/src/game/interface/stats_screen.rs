@@ -2,7 +2,6 @@
 //! the player's statistics, with the Done button.
 use super::{Game, Screen};
 use horizon_client::{hud::HudBatch, items::ItemStack, text::Text, ui};
-use std::fmt::Write as _;
 use winit::keyboard::KeyCode;
 
 /// `Stats.CUSTOM` in registration order with its formatter.
@@ -94,6 +93,7 @@ enum Format {
     Time,
 }
 fn two(v: f64) -> String {
+    // `DecimalFormat("########0.00")`: HALF_EVEN on the exact binary value, as `{:.2}` does.
     format!("{v:.2}")
 }
 /// `StatFormatter`.
@@ -140,9 +140,7 @@ fn format(f: Format, v: i32) -> String {
                 format!("{} min", two(min))
             } else {
                 // Java's double + " s".
-                let mut t = String::new();
-                let _ = write!(t, "{s:?}");
-                format!("{t} s")
+                format!("{} s", horizon_core::java_number::double_to_string(s))
             }
         }
     }
@@ -162,12 +160,7 @@ const COLUMNS: [(&str, &str); 6] = [
 fn item_rows(stats: &super::stats::Stats, block_item: impl Fn(&str) -> String) -> Vec<String> {
     let mut items: Vec<String> = Vec::new();
     for (ty, _) in COLUMNS {
-        for (k, v) in stats
-            .values
-            .get(&format!("minecraft:{ty}"))
-            .into_iter()
-            .flatten()
-        {
+        for (k, v) in stats.type_map(&format!("minecraft:{ty}")).iter() {
             let item = if ty == "mined" {
                 block_item(k)
             } else {
@@ -201,6 +194,23 @@ fn sort_rows(rows: &mut [String], order: i32, key: impl Fn(&str) -> (i32, usize)
     if order < 0 {
         rows.reverse();
     }
+}
+/// The rows for `present` mob ids in `registry` order; ids the registry lacks
+/// (a modded type) follow in their first-seen order.
+fn mobs_in_registry_order(registry: &[String], present: Vec<String>) -> Vec<String> {
+    let set: std::collections::HashSet<&str> = present.iter().map(String::as_str).collect();
+    let mut rows: Vec<String> = registry
+        .iter()
+        .filter(|id| set.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let known: std::collections::HashSet<&str> = registry.iter().map(String::as_str).collect();
+    for id in present {
+        if !known.contains(id.as_str()) && !rows.contains(&id) {
+            rows.push(id);
+        }
+    }
+    rows
 }
 #[derive(Default)]
 pub(super) struct StatsUi {
@@ -352,18 +362,26 @@ impl Game<'_> {
             Some(self.res.facts().get(state).name.to_string())
         })
     }
+    /// `MobsStatisticsList.<init>`: `BuiltInRegistries.ENTITY_TYPE` in registry
+    /// (network id) order, the types killed or killing the player.
     fn stat_mobs(&self) -> Vec<String> {
-        let mut mobs: Vec<String> = Vec::new();
-        for ty in ["killed", "killed_by"] {
-            if let Some(m) = self.stats.values.get(&format!("minecraft:{ty}")) {
-                for (k, v) in m {
-                    if *v > 0 && !mobs.contains(k) {
-                        mobs.push(k.clone());
-                    }
-                }
-            }
-        }
-        mobs
+        let counted = |ty: &str| {
+            self.stats
+                .type_map(&format!("minecraft:{ty}"))
+                .iter()
+                .filter(|(_, v)| **v > 0)
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>()
+        };
+        let present: Vec<String> = ["killed", "killed_by"]
+            .into_iter()
+            .flat_map(counted)
+            .collect();
+        let registry = super::remote::builtin_registries(&self.options.resources);
+        let order = registry
+            .as_deref()
+            .and_then(|b| b.get("minecraft:entity_type"));
+        mobs_in_registry_order(order.map_or(&[], |ids| &ids.names), present)
     }
     /// `MobRow`: the mob's name, its kills and killed-by lines, and their
     /// colours (grey when none).
@@ -411,6 +429,7 @@ impl Game<'_> {
         ui::menu_background(batch, atlas, 0.0, 0.0, w, h, true);
         let (top, bottom) = (TAB_H, h - FOOTER);
         ui::separators(batch, atlas, top, bottom, true);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         // The tab bar.
         let mut tab_tip = false;
         let (x0, tw) = tabs(w);
@@ -538,7 +557,12 @@ impl Game<'_> {
             1 => {
                 let items = self.stat_items();
                 if items.is_empty() {
-                    return self.draw_stats_footer(batch, w, h);
+                    self.draw_stats_footer(batch, w, h);
+                    self.draw_screen_phase(
+                        batch,
+                        horizon_client::screen_draw::RenderPhase::Foreground,
+                    );
+                    return;
                 }
                 // ItemStatisticsList, a ContainerObjectSelectionList: the
                 // header's sort buttons and each row's item.
@@ -666,6 +690,7 @@ impl Game<'_> {
             self.stats_ui.scroll.amount,
         );
         self.draw_stats_footer(batch, w, h);
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Foreground);
         if let Some((stack, x, y)) = tip {
             self.draw_stack_tooltip(batch, &stack, x, y);
         }
@@ -797,6 +822,39 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use winit::keyboard::KeyCode::{Digit0, Digit1, Digit2, Digit3, Numpad8, Tab};
+
+    /// Registry (network id) order, not alphabetical: a killed-by-only mob
+    /// earlier in the registry precedes a killed-only one later; unknown ids
+    /// follow.
+    #[test]
+    fn mob_rows_follow_registry_order() {
+        let reg: Vec<String> = [
+            "minecraft:enderman",
+            "minecraft:ender_dragon",
+            "minecraft:zombie",
+        ]
+        .map(String::from)
+        .to_vec();
+        let present = [
+            "minecraft:zombie",
+            "minecraft:mod_b",
+            "minecraft:ender_dragon",
+            "minecraft:enderman",
+            "minecraft:mod_a",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            mobs_in_registry_order(&reg, present),
+            [
+                "minecraft:enderman",
+                "minecraft:ender_dragon",
+                "minecraft:zombie",
+                "minecraft:mod_b",
+                "minecraft:mod_a"
+            ]
+        );
+    }
 
     /// `ItemStatisticsList`: a mined block's row is its item (`Block.asItem`),
     /// air dropped, and a `BlockItem`'s Mined column reads its block's count.
@@ -932,5 +990,13 @@ mod tests {
         assert!(ui.key(Tab, true, false, [true, true, true]));
         assert_eq!(ui.tab, 1);
         assert_eq!(ui.scroll.amount, 0.0);
+    }
+
+    /// `StatFormatter`'s seconds are Java's `double + " s"`; its decimals are
+    /// `DecimalFormat` on the binary value, so `1.005 km` (just below the midpoint) is `"1.00 km"`.
+    #[test]
+    fn stat_formatter_matches_java_number_text() {
+        assert_eq!(format(Format::Distance, 100_500), "1.00 km");
+        assert_eq!(format(Format::Time, 20), "1.0 s");
     }
 }

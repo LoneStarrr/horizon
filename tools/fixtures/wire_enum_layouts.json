@@ -185,7 +185,8 @@
     {
       "name": "DataMapError",
       "path": "crate::world::data_maps::DataMapError",
-      "hash": "38e6144ff0918aa9",
+      "hash": "3c338ccd2a00316e",
+      "contract_change": "arismoko/horizon#4199 appends DataMapError::InvalidKey; ordinals 0, 1, 2 remain unchanged; the frozen hash was 38e6144ff0918aa9",
       "canonical_path": "crate::world::data_maps::DataMapError"
     },
     {
@@ -294,8 +295,10 @@
     {
       "name": "ExplosionInteraction",
       "path": "crate::world::types::ExplosionInteraction",
-      "hash": "649673fec35bab1f",
-      "canonical_path": "crate::world::types::ExplosionInteraction"
+      "hash": "1ede2797636bb977",
+      "canonical_path": "crate::world::types::ExplosionInteraction",
+      "baseline_hash": "649673fec35bab1f",
+      "contract_change": "#3929 takes vanilla's five ExplosionInteraction values in vanilla's order: None 0, Block 1, Mob 2, Tnt 3 (was 2), Trigger 4. Hash independently mixed from the five literal variant names using the original FNV layout algorithm."
     },
     {
       "name": "FakeEffect",
@@ -336,8 +339,9 @@
     {
       "name": "GameRuleError",
       "path": "crate::world::types::GameRuleError",
-      "hash": "e76f57d2c9f945cb",
-      "canonical_path": "crate::world::types::GameRuleError"
+      "hash": "b0678faa207c25fa",
+      "canonical_path": "crate::world::types::GameRuleError",
+      "contract_change": "arismoko/horizon#3316 appends GameRuleError::InvalidRange; ordinals 0, 1, 2 remain unchanged; the frozen hash was e76f57d2c9f945cb"
     },
     {
       "name": "Hand",
@@ -477,6 +481,12 @@
       "path": "crate::entity::types::MinecartKind",
       "hash": "3ee6a888c41a4aa0",
       "canonical_path": "crate::entity::types::MinecartKind"
+    },
+    {
+      "name": "MoveCause",
+      "path": "crate::entity::types::MoveCause",
+      "hash": "00bec45d5d6aef41",
+      "canonical_path": "crate::entity::types::MoveCause"
     },
     {
       "name": "MobCategory",
@@ -631,6 +641,12 @@
       "canonical_path": "crate::world::types::RaidStatus"
     },
     {
+      "name": "RailShape",
+      "path": "crate::block::rail_shape::RailShape",
+      "hash": "d5b1c18674ac3799",
+      "canonical_path": "crate::block::rail_shape::RailShape"
+    },
+    {
       "name": "Rarity",
       "path": "crate::content::content_declarations::Rarity",
       "hash": "52de7b6c1b10c3e0",
@@ -693,8 +709,10 @@
     {
       "name": "Shape",
       "path": "crate::item::crafting::Shape",
-      "hash": "a157d010a4183033",
-      "canonical_path": "crate::item::crafting::Shape"
+      "hash": "004a43af941b0c62",
+      "canonical_path": "crate::item::crafting::Shape",
+      "baseline_hash": "a157d010a4183033",
+      "contract_change": "#3737 adds CustomDisplay at ordinal 3; ordinals 0, 1, 2 remain unchanged. Hash independently mixed from the four literal variant names using the original FNV layout algorithm."
     },
     {
       "name": "ShapeEntityKind",
@@ -705,7 +723,7 @@
     {
       "name": "Side",
       "path": "crate::content::package_side::Side",
-      "hash": "dd28eeec22f3e455",
+      "hash": "a58ce85f7e9e9c30",
       "canonical_path": "crate::content::package_side::Side"
     },
     {

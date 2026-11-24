@@ -175,10 +175,19 @@ def violations(files: dict[str, str], allowed: dict[str, dict]) -> list[str]:
                 predicates = [source[attributes.start() + cfg.start(1):attributes.start() + cfg.end(1)]
                               for cfg in re.finditer(r'#\[\s*cfg\s*\(([^\]]*)\)\s*\]',
                                                      code[attributes.start():attributes.end()])] if attributes else []
-                guarded = any(re.sub(r'\s+', '', predicate) in {
+                # Rust ANDs stacked #[cfg] attributes. A conjunction such as
+                # `not(test) && feature("testing")` still holds in an ordinary
+                # build with that feature, so it is reachable in production.
+                # Only a single, direct test/testing-only cfg may gate
+                # test-support state: any additional predicate is refused
+                # rather than being judged on its own with any(), which used to
+                # let the approved half of a stack admit the whole item.
+                approved = {
                     'test', 'feature="testing"', 'any(test,feature="testing")',
                     'any(feature="testing",test)',
-                } for predicate in predicates)
+                }
+                normalized = [re.sub(r'\s+', '', predicate) for predicate in predicates]
+                guarded = len(normalized) == 1 and normalized[0] in approved
                 if not guarded:
                     errors.append(f'{path}:{line}: test-support state requires a direct test/testing-only cfg')
     for key in sorted({key for key in allowed if not key.startswith('@generated/')} - seen):
@@ -194,8 +203,8 @@ def inventory_document(allowed: dict[str, dict]) -> str:
 Part of #2587. The vocabulary is **not stateless**, and this first change does **not** claim it is
 free of unsafe. Its crate-level `deny(unsafe_code)` remains in force. The unchanged
 `src/__private/points.rs` contains the sole temporary unsafe exception (local lint expectations)
-and the open injection-dispatch registry. #2697 moves only the final seal into
-`horizon-engine-slots`; point activity stays in this registry. The #2587 follow-up then moves raw-pointer
+and the open injection-dispatch registry. #2697 moves the final seal into
+`horizon-engine-slots`; #3523 also moves generated point records and activity there, behind a set-once dispatch socket. The #2587 follow-up then moves raw-pointer
 conversion and ownership behind the points boundary and installs `forbid(unsafe_code)`.
 
 Crash detail buffers, profiling, borrowed resource scopes, static-string storage, retained fluids,

@@ -395,6 +395,38 @@ impl WorldgenOverrides {
         let base = DimensionFacts::base_for_type(&id);
         Some(DimensionFacts::patched(base, &id, &json))
     }
+    /// The `sea_level` of the noise settings these packs give the vanilla level `level`: those its
+    /// pack stem names (inline, or a pack's own file), else the preset's (`minecraft:overworld`,
+    /// `nether`, `end`) when a pack replaces them. `None` when nothing the packs give changes it,
+    /// for a generator that is not the noise one, and for settings the packs do not carry.
+    pub fn level_sea_level(&self, level: &str) -> Option<i32> {
+        let stem = self.entries.get(DIMENSIONS).and_then(|d| d.get(level));
+        let settings = match stem {
+            Some(stem) => {
+                let generator = &serde_json::from_str::<Value>(stem).ok()?["generator"];
+                if generator["type"].as_str() != Some("minecraft:noise") {
+                    return None;
+                }
+                generator["settings"].clone()
+            }
+            None => Value::String(
+                match level {
+                    "minecraft:the_nether" => "minecraft:nether",
+                    "minecraft:the_end" => "minecraft:end",
+                    _ => "minecraft:overworld",
+                }
+                .to_owned(),
+            ),
+        };
+        let settings = match settings {
+            Value::String(id) => {
+                serde_json::from_str(self.entries.get("settings")?.get(&id)?).ok()?
+            }
+            inline @ Value::Object(_) => inline,
+            _ => return None,
+        };
+        i32::try_from(settings["sea_level"].as_i64()?).ok()
+    }
     /// The entries packs give `bundle`.
     pub fn entries(&self, bundle: &str) -> impl Iterator<Item = (&str, &str)> {
         self.entries
@@ -711,6 +743,35 @@ mod tests {
         let (_, stem) = o.entries(DIMENSIONS).next().unwrap();
         assert!(!stem.contains("molten_peaks") && stem.contains("minecraft:plains"));
     }
+
+    #[test]
+    fn a_levels_sea_level_comes_from_the_noise_settings_the_packs_give_it() {
+        let mut o = WorldgenOverrides::default();
+        assert_eq!(o.level_sea_level("minecraft:the_nether"), None);
+        o.set("settings", "minecraft:nether", r#"{"sea_level":10}"#.into());
+        assert_eq!(o.level_sea_level("minecraft:the_nether"), Some(10));
+        assert_eq!(o.level_sea_level("minecraft:overworld"), None);
+        o.set("settings", "test:high", r#"{"sea_level":120}"#.into());
+        let stem = |settings: &str| {
+            format!(r#"{{"generator":{{"type":"minecraft:noise","settings":{settings}}}}}"#)
+        };
+        o.set(DIMENSIONS, "minecraft:overworld", stem(r#""test:high""#));
+        assert_eq!(o.level_sea_level("minecraft:overworld"), Some(120));
+        o.set(
+            DIMENSIONS,
+            "minecraft:the_end",
+            stem(r#"{"sea_level":-16}"#),
+        );
+        assert_eq!(o.level_sea_level("minecraft:the_end"), Some(-16));
+        o.set(DIMENSIONS, "minecraft:the_nether", stem(r#""test:absent""#));
+        assert_eq!(o.level_sea_level("minecraft:the_nether"), None);
+        o.set(
+            DIMENSIONS,
+            "minecraft:the_nether",
+            r#"{"generator":{"type":"minecraft:flat"}}"#.into(),
+        );
+        assert_eq!(o.level_sea_level("minecraft:the_nether"), None);
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +835,53 @@ mod level_facts_tests {
         // the rest stays the Nether's, not the Overworld's
         assert!(facts.fast_lava && facts.respawn_anchor_works);
         assert_eq!(facts.coordinate_scale, 8.0);
+    }
+
+    #[test]
+    fn a_packs_cloud_attributes_reach_level_facts() {
+        use serde_json::json;
+
+        let mut overrides = WorldgenOverrides::default();
+        assert!(overrides.level_facts("minecraft:overworld").is_none());
+        assert_eq!(
+            overrides.add_file("file/p", "data/test/dimension/pocket.json", || {
+                Some(r#"{"type":"test:pocket"}"#.into())
+            }),
+            PackFile::Read
+        );
+
+        for (attributes, expected) in [
+            (
+                json!({
+                    "minecraft:visual/cloud_height": 72.5,
+                    "minecraft:visual/cloud_color": "#00ffffff",
+                }),
+                (72.5, 0.0),
+            ),
+            (json!({"minecraft:visual/cloud_color": -1}), (192.33, 1.0)),
+            (
+                json!({
+                    "minecraft:visual/cloud_height": {"modifier": "add", "argument": 4},
+                    "minecraft:visual/cloud_color": [1.0, 1.0, 1.0, 0.5],
+                }),
+                (192.33_f32 + 4.0, 0.5),
+            ),
+            (json!({"visual/cloud_height": 80}), (80.0, 0.8)),
+        ] {
+            let fixture = json!({"min_y": -64, "height": 384, "attributes": attributes});
+            assert_eq!(
+                overrides.add_file("file/p", "data/test/dimension_type/pocket.json", || {
+                    Some(fixture.to_string())
+                }),
+                PackFile::Read
+            );
+            let facts = overrides.level_facts("test:pocket").unwrap().unwrap();
+            assert_eq!(
+                (facts.cloud_height, facts.cloud_color_alpha),
+                expected,
+                "{fixture}"
+            );
+        }
     }
 
     #[test]

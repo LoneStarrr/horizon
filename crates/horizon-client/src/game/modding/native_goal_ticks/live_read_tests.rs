@@ -14,7 +14,7 @@ impl mobs::LiveMobs for OneMob<'_> {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn scoped_host_reads_live_other_mob_before_stale_snapshot() {
     with_game(|game| {
         let kind = game
@@ -27,8 +27,8 @@ fn scoped_host_reads_live_other_mob_before_stale_snapshot() {
         let mut other = Mob::new(9002, kind.clone(), Vec3::ZERO, 0.0);
         let stale = Mob::new(9003, kind, Vec3::ZERO, 0.0);
         let snapshot = [
-            crate::game::creatures::seen(&other, game.level.player_uuid),
-            crate::game::creatures::seen(&stale, game.level.player_uuid),
+            crate::game::creatures::seen(&other, game.level.player_uuid, game.items()),
+            crate::game::creatures::seen(&stale, game.level.player_uuid, game.items()),
         ];
         other.yaw = 37.0;
         other.head_pitch = -12.0;
@@ -53,7 +53,7 @@ fn scoped_host_reads_live_other_mob_before_stale_snapshot() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn scoped_host_resolves_other_real_players_from_the_game() {
     use horizon_client::lan::{Joined, PlayerSender, guest::Guest};
     use horizon_protocol::packets::configuration::ClientInformation;

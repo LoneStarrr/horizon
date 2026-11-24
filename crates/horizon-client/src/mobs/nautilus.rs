@@ -7,13 +7,14 @@ use super::{
     Mob, MobEvent, MobWorld, Species, Who,
     anim::{Poses, State},
     control::{LookKind, MoveKind, Operation},
-    goals::{Breed, Cx, Goal, LOOK, LookAtPlayer, MOVE, Panic, Stroll, Tempt, goal_clone},
+    goals::{AnimalPanic, Breed, Cx, Goal, LOOK, MOVE, Stroll, Tempt, goal_clone},
     keyframes::Animation,
     nav::NavKind,
 };
 use crate::blocks::Fluid;
 use crate::health::DamageLevel;
 use horizon_core::{geometry::Vec3, random::RandomSource};
+use horizon_world::move_gate::MoveGate;
 use std::collections::HashMap;
 
 // Nautilus state: `tame`/`owner`, the saddle, `head` the body armour,
@@ -58,22 +59,20 @@ pub fn register(m: &mut Mob) {
         g.add(1, t);
         g.add(2, Charge::new(0.5));
         g.add(3, Stroll::swimming(1.0, 1));
-        g.add(3, LookAtPlayer::new(6.0));
     } else {
-        g.add(0, Panic::new(1.6));
+        g.add(0, AnimalPanic::new(1.6));
         g.add(1, Breed::new(0.4));
         let mut t = Tempt::new(1.3, tempt, false);
         t.stop_distance = stop;
         g.add(2, t);
         g.add(3, Charge::new(0.6));
         g.add(4, Stroll::swimming(1.0, 1));
-        g.add(4, LookAtPlayer::new(6.0));
     }
 }
 /// `finalizeSpawn`: `NautilusAi.initMemories` (2400 to 3600 ticks before it
 /// first looks for prey) and the zombie's variant by biome.
-pub fn finalize(m: &mut Mob, warm_ocean: bool) {
-    m.extra.counter = 2400 + m.random.next_int_bound(1201).unwrap_or(0);
+pub fn finalize(m: &mut Mob, warm_ocean: bool, r: &mut impl RandomSource) {
+    m.extra.counter = 2400 + r.next_int_bound(1201).unwrap_or(0);
     m.extra.nautilus_attack_cooldown_ttl = Some(i64::MAX);
     if zombie(m) {
         m.extra.variant = u8::from(warm_ocean);
@@ -180,7 +179,7 @@ pub fn travel(
     }
     let speed = m.ai.speed;
     m.move_relative(speed, input);
-    m.do_move(w, level, events);
+    m.do_move(w, level, events, &mut MoveGate::new());
     m.velocity = Vec3::new(m.velocity.x * 0.9, m.velocity.y * 0.9, m.velocity.z * 0.9);
     true
 }
@@ -293,7 +292,7 @@ fn check_restriction(m: &mut Mob) {
 pub fn ai_step(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut horizon_core::random::LegacyRandom,
+    level_random: &mut horizon_core::random::LevelRandom,
     events: &mut Vec<MobEvent>,
 ) {
     // customServerAiStep: the home is kept before the rest of the step.
@@ -424,7 +423,7 @@ pub fn aggravated(m: &Mob) -> bool {
 fn find_target(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut horizon_core::random::LegacyRandom,
+    level_random: &mut horizon_core::random::LevelRandom,
 ) -> Option<Who> {
     if m.extra.in_love > 0 || !m.fluids.in_water || m.is_baby() || m.extra.tame {
         return None;
@@ -611,12 +610,12 @@ impl Goal for Charge {
     }
 }
 /// The body texture: the baby's, the adult's, or the zombie's variant.
-pub fn texture(m: &Mob) -> String {
+pub fn texture(m: &Mob) -> &'static str {
     match (zombie(m), m.is_baby(), m.extra.variant) {
-        (true, _, 1) => "entity/nautilus/zombie_nautilus_coral".into(),
-        (true, _, _) => "entity/nautilus/zombie_nautilus".into(),
-        (false, true, _) => "entity/nautilus/nautilus_baby".into(),
-        (false, false, _) => "entity/nautilus/nautilus".into(),
+        (true, _, 1) => "entity/nautilus/zombie_nautilus_coral",
+        (true, _, _) => "entity/nautilus/zombie_nautilus",
+        (false, true, _) => "entity/nautilus/nautilus_baby",
+        (false, false, _) => "entity/nautilus/nautilus",
     }
 }
 /// The body model: `ZombieNautilusRenderer` picks the coral model for the
@@ -630,16 +629,18 @@ pub fn model(m: &Mob) -> &'static str {
     }
 }
 /// The `NAUTILUS_BODY` equipment texture of a nautilus armour item.
-pub fn armor_texture(item: &str) -> Option<String> {
+pub fn armor_texture(item: &str) -> Option<std::borrow::Cow<'static, str>> {
     let material = item
         .strip_prefix("minecraft:")?
         .strip_suffix("_nautilus_armor")?;
-    let material = if material == "golden" {
-        "gold"
-    } else {
-        material
-    };
-    Some(format!("entity/equipment/nautilus_body/{material}"))
+    Some(match material {
+        "copper" => std::borrow::Cow::Borrowed("entity/equipment/nautilus_body/copper"),
+        "iron" => std::borrow::Cow::Borrowed("entity/equipment/nautilus_body/iron"),
+        "golden" => std::borrow::Cow::Borrowed("entity/equipment/nautilus_body/gold"),
+        "diamond" => std::borrow::Cow::Borrowed("entity/equipment/nautilus_body/diamond"),
+        "netherite" => std::borrow::Cow::Borrowed("entity/equipment/nautilus_body/netherite"),
+        other => std::borrow::Cow::Owned(format!("entity/equipment/nautilus_body/{other}")),
+    })
 }
 /// `NautilusModel.setupAnim` (and `ZombieNautilusCoralModel`'s corals,
 /// hidden under armour).
@@ -755,9 +756,30 @@ mod tests {
         }
     }
 
+    /// `NautilusAi` and `ZombieNautilusAi` have no `LookAtPlayerGoal`: the
+    /// idle activity's walk from a look target never runs (no sensor writes
+    /// `LOOK_TARGET`), so a nautilus never turns to stare at a player.
+    #[test]
+    fn neither_brain_looks_at_a_player() {
+        for (id, species) in [
+            ("minecraft:nautilus", Species::Nautilus),
+            ("minecraft:zombie_nautilus", Species::ZombieNautilus),
+        ] {
+            let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+            kind.id = id.into();
+            kind.species = species;
+            let mut m = Mob::new(1, Arc::new(kind), Vec3::ZERO, 0.0);
+            register(&mut m);
+            // The stroll is there, so the list is the brain's own.
+            assert!(m.ai.goals.has("RandomSwimming"), "{id} strolls");
+            assert!(!m.ai.goals.has("LookAtPlayer"), "{id} looks at players");
+        }
+    }
+
     /// `ChargeAttack.dealKnockBack` is `causeExtraKnockback`: `LivingEntity.knockback`
     /// on the target, away from (sin(yaw), -cos(yaw)), not a raw push of its motion.
     #[test]
+    #[ignore = "daily"]
     fn a_charge_knocks_its_target_back_along_its_facing() {
         let mut events = Vec::new();
         let ran = with_test_world(&[], |w, types| {
@@ -897,7 +919,8 @@ mod hostile_target_tests {
             |_, _| {},
             |_, types| {
                 let kind = Arc::new(types.types["minecraft:pufferfish"].clone());
-                fish = Some(Mob::new(2, kind, fish_at, 0.0).seen(None));
+                fish =
+                    Some(Mob::new(2, kind, fish_at, 0.0).seen(None, &crate::items::Items::empty()));
             },
         );
         let fish = fish?;
@@ -907,7 +930,7 @@ mod hostile_target_tests {
                 .map(|seed| {
                     let mut m = Mob::new(1, kind.clone(), Vec3::new(0.5, 62.0, 0.5), 270.0);
                     m.fluids.in_water = true;
-                    let mut level = horizon_core::random::LegacyRandom::new(seed);
+                    let mut level = crate::mobs::world::level_random(seed);
                     find_target(&mut m, w, &mut level)
                 })
                 .collect();
@@ -917,6 +940,7 @@ mod hostile_target_tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_nautilus_only_targets_a_pufferfish_it_sees() {
         let near = Vec3::new(6.5, 62.0, 0.5);
         // 16 out on x and 3 on z: inside the sensor's box, past range(16).
@@ -1046,7 +1070,7 @@ mod cooldown_memory_tests {
     }
 
     #[test]
-    #[ignore = "needs actual prepared mob data; must execute, not skip"]
+    #[ignore = "daily"]
     fn actual_mob_ticks_retain_noai_lifetime_and_apply_active_memory_boundaries() {
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("actual prepared resources"),

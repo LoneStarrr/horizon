@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.test_ci_concurrency import yaml, ROOT
 from tests.test_ignored_test_completion import IgnoredTests, target, summary
+from tests.symlinks import symlink_or_skip
 from tools.ci import ignored_tests
 
 
@@ -65,7 +65,7 @@ class Visibility(unittest.TestCase):
                 path = Path("crates/example/src/lib.rs")
                 path.parent.mkdir(parents=True)
                 path.write_text('panic!("checked-in reason");\n')
-                Path("crates/link.rs").symlink_to("/tmp/private.rs")
+                symlink_or_skip(Path("crates/link.rs"), "/tmp/private.rs")
                 subprocess.run(["git", "add", str(path), "crates/link.rs"], check=True)
                 subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture"], check=True)
                 path.write_text("PRIVATE_WORKTREE")
@@ -128,53 +128,3 @@ class Visibility(unittest.TestCase):
         self.assertLess(len(log.getvalue()), 7500)
         self.assertNotIn("private unexpected payload", log.getvalue())
 
-    def test_data_end_memory_telemetry_is_bounded_best_effort(self):
-        steps = yaml.safe_load((ROOT / '.github/workflows/dyna-ci.yml').read_text())["jobs"]["ignored-tests-shards"]["steps"]
-        step = next(s for s in steps if s.get("name") == "Record data-leg end and compiler cache")
-        self.assertEqual(step["if"], "always()")
-        script = step["run"]
-        self.assertIn("/sys/fs/cgroup/$metric", script)
-        self.assertIn("memory.peak memory.max memory.swap.peak memory.swap.max", script)
-        self.assertNotIn("cargo", script)
-        with tempfile.TemporaryDirectory() as folder:
-            Path(folder, "memory.peak").write_text("123456\n")
-            Path(folder, "memory.max").write_text("max\n")
-            Path(folder, "memory.swap.max").write_text("PRIVATE_PAYLOAD\n")
-            # Exercise the actual shell under errexit; absent/invalid files cannot fail it.
-            script = script.replace("/sys/fs/cgroup/", folder + "/")
-            script = script.replace("sccache --show-stats", "false")
-            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("memory_peak_bytes=123456", result.stdout)
-        self.assertIn("memory_max_bytes=max", result.stdout)
-        self.assertIn("memory_swap_peak_bytes=unavailable", result.stdout)
-        self.assertIn("memory_swap_max_bytes=unavailable", result.stdout)
-        self.assertIn("whole_job_cgroup_including_compilation_tests_file_cache", result.stdout)
-        self.assertNotIn("PRIVATE_PAYLOAD", result.stdout)
-        self.assertEqual(result.stderr, "")
-
-    def test_formatting_failure_does_not_skip_later_builds_but_is_propagated(self):
-        steps = yaml.safe_load((ROOT / '.github/workflows/dyna-ci.yml').read_text())["jobs"]["lint"]["steps"]
-        fmt = next(s for s in steps if s.get("id") == "formatting")
-        native = next(s for s in steps if s.get("id") == "native-lint")
-        final = next(s for s in steps if s.get("name") == "Propagate formatting failure")
-        self.assertTrue(fmt["continue-on-error"])
-        self.assertNotIn("clippy", fmt["run"])
-        self.assertIn("clippy", native["run"])
-        self.assertNotIn("continue-on-error", native)
-        for name in ("Lint native targets", "Lint the server build without sound or controllers", "The machine sample builds against this API", "The mod API builds for wasm32"):
-            step = next(s for s in steps if s.get("name") == name)
-            self.assertLess(steps.index(fmt), steps.index(step))
-            self.assertLess(steps.index(step), steps.index(final))
-            self.assertNotIn("formatting", step.get("if", ""))
-        self.assertIn("always()", final["if"])
-        self.assertIn("steps.formatting.outcome == 'failure'", final["if"])
-        self.assertIn("exit 1", final["run"])
-        # Actions treats continue-on-error failure as a successful conclusion for
-        # subsequent default success() steps, but retains the original outcome.
-        for format_outcome in ("success", "failure"):
-            conclusion = "success" if fmt["continue-on-error"] else format_outcome
-            later_builds_run = conclusion == "success"
-            final_runs = format_outcome == "failure"  # parsed always()/outcome predicate above
-            self.assertTrue(later_builds_run)
-            self.assertEqual(final_runs, format_outcome == "failure")

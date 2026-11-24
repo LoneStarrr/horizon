@@ -2,6 +2,7 @@
 //! `.hmod` files on disk, listed in an index the way the registry lists them.
 use super::*;
 use crate::browser::horizon::tests::{sample, scratch};
+use crate::browser::GAME;
 
 const MANIFEST: &str = "id = \"ruby\"\nname = \"Ruby\"\napi = \"0.2\"\nside = \"both\"\n\
                         capabilities = [\"registries\"]\n";
@@ -21,7 +22,7 @@ fn ruby(dir: &Path, version: &str, blocks: &[&str], items: &[&str]) -> PathBuf {
         .collect();
     let files: Vec<(&str, &[u8])> = names.iter().map(|(n, b)| (n.as_str(), *b)).collect();
     let manifest = format!("{MANIFEST}version = \"{version}\"\n");
-    let bytes = horizon_mod_package::Package::write_files(&manifest, &files).unwrap();
+    let bytes = horizon_platform::mod_package::Package::write_files(&manifest, &files).unwrap();
     let path = dir.join(format!("ruby-{version}.hmod"));
     fs::write(&path, bytes).unwrap();
     path
@@ -37,8 +38,8 @@ fn index_of(versions: &[(&str, &str, &Path)]) -> Index {
             native_binaries: Vec::new(),
             version: (*version).into(),
             api: "0.2".into(),
-            side: Some(horizon_mod_package::Side::Both),
-            capabilities: vec![horizon_mod_package::Capability::Registries],
+            side: Some(mod_vocab::Side::Both),
+            capabilities: vec![horizon_platform::mod_package::Capability::Registries].into(),
             game: (*game).into(),
             requires: Vec::new(),
             file: index::File {
@@ -267,12 +268,13 @@ fn wasm_update_waits_for_the_player() {
     ];
     let manifest = format!(
         "{MANIFEST}version = \"1.1.0\"\n[wasm]\nsha512 = \"{}\"\ntoolchain = \"1.99.1\"\nbuilt_with = \"test\"\n",
-        horizon_mod_package::manifest::sha512_of(module)
+        horizon_platform::mod_package::manifest::sha512_of(module)
     );
     let new = dir.join("ruby-1.1.0.hmod");
     fs::write(
         &new,
-        horizon_mod_package::Package::write_files(&manifest, &[("mod.wasm", module)]).unwrap(),
+        horizon_platform::mod_package::Package::write_files(&manifest, &[("mod.wasm", module)])
+            .unwrap(),
     )
     .unwrap();
     let first = index_of(&[("1.0.0", GAME, &old)]);

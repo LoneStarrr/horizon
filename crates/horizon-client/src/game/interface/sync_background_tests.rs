@@ -26,7 +26,7 @@ mod background {
     }
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cancelled_background_keeps_custom_geometry_and_one_blur_request() {
     mod_platform::testing::with_mods(
         vec![ModEntry::new("background", background::hooks())].into(),
@@ -59,6 +59,32 @@ fn cancelled_background_keeps_custom_geometry_and_one_blur_request() {
     );
 }
 
+/// `DrawContext::blur_behind`: what was drawn before the call is the blurred background, and the
+/// frame asks for the menu blur at the player's radius.
+#[test]
+#[ignore = "daily"]
+fn blur_behind_marks_the_drawn_vertices_and_asks_for_the_menu_blur() {
+    with_client_game(|game| {
+        let mut batch = horizon_client::hud::HudBatch::scratch([800, 600]);
+        batch.fill(&game.gui.atlas, 0.0, 0.0, 10.0, 10.0, 0xff00_00ff);
+        game.settings.menu_blur = 5;
+        assert_eq!(
+            game.menu_blur(),
+            None,
+            "no screen blurs the world behind it"
+        );
+        game.native_blur_behind(&mut batch);
+        batch.fill(&game.gui.atlas, 20.0, 20.0, 10.0, 10.0, 0xffff_ffff);
+        assert_eq!(
+            batch.blur_at, 6,
+            "the first quad is behind the blur, the second sharp"
+        );
+        assert_eq!(game.menu_blur(), Some(5.0));
+        game.settings.menu_blur = 0;
+        assert_eq!(game.menu_blur(), None, "a radius of 0 blurs nothing");
+    });
+}
+
 mod claims {
     use super::*;
     #[derive(Default)]
@@ -80,7 +106,7 @@ mod claims {
     }
 }
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn cancelled_landing_restores_farmland_before_its_crop_is_notified() {
     let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     mod_platform::testing::with_mods(

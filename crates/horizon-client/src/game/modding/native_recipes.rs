@@ -163,7 +163,8 @@ impl Game<'_> {
                 let at = |i: usize| (i / w) * size + i % w;
                 let mut grid: [Option<ItemStack>; 9] = Default::default();
                 for (i, stack) in slots.iter().enumerate() {
-                    #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
+                    #[allow(clippy::needless_borrows_for_generic_args)]
+                    // TODO(arismoko/horizon#2273)
                     {
                         grid[at(i)] = stack.as_ref().map(&read_stack).transpose()?;
                     }
@@ -171,14 +172,20 @@ impl Game<'_> {
                 let grid = &grid[..size * size];
                 let scale = |id: i32| self.maps.data.get(&id).map(|m| m.scale);
                 let recipes = self.recipes();
-                let Some((id, output)) = recipes
-                    .find_with(&self.loop_context, grid, size, &scale)
-                    .filter(|(_, output)| output.count > 0)
-                else {
+                let matched =
+                    recipes.find_with_dimensions(&self.loop_context, grid, size, w, h, &scale);
+                let Some((id, output)) = matched.filter(|(_, output)| output.count > 0) else {
                     return Ok(None);
                 };
-                let mut placed =
-                    recipes.remainders(id, grid, size, &|s| self.crafting_remainder(s));
+                let mut placed = if matches!(
+                    recipes.recipe(id),
+                    Some(horizon_client::crafting::Recipe::Mod(_))
+                ) {
+                    recipes
+                        .mod_remainders_rect(id, grid, size, w, h, &|s| self.crafting_remainder(s))
+                } else {
+                    recipes.remainders(id, grid, size, &|s| self.crafting_remainder(s))
+                };
                 let remainders = (0..w * h)
                     .map(|i| placed[at(i)].take().try_into_api().map_err(|_| InvalidItem))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -232,11 +239,11 @@ impl Game<'_> {
                 else {
                     return Err(InvalidInput);
                 };
-                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(arismoko/horizon#2273)
                 let template = template.as_ref().map(&read_stack).transpose()?;
-                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(arismoko/horizon#2273)
                 let base = base.as_ref().map(&read_stack).transpose()?;
-                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(#2273)
+                #[allow(clippy::needless_borrows_for_generic_args)] // TODO(arismoko/horizon#2273)
                 let addition = addition.as_ref().map(&read_stack).transpose()?;
                 let stations = self.stations();
                 let Some((id, output)) = stations.recipes.smithing_recipe(
@@ -336,6 +343,15 @@ impl Game<'_> {
             self.recipe_tables.known = (Some(version), known.into());
         }
         self.recipe_tables.known.1.clone()
+    }
+
+    /// `RecipesClientHost::recipe_book_ids`: the display ids the recipe book
+    /// gives `recipe_id`, as `transfer_recipe` looks them up.
+    pub(in crate::game) fn recipe_book_ids(&mut self, recipe_id: &str) -> Arc<[i32]> {
+        if self.player.is_none() || self.res.rest.get().is_none() {
+            return Arc::from([]);
+        }
+        self.viewer_book_ids(recipe_id)
     }
 
     fn make_mod_recipes(&mut self) -> Recipes {
@@ -508,6 +524,36 @@ impl Game<'_> {
     }
 }
 
+/// The window's own recipes outside `types` and the server's of them, in
+/// `recipe_sources::sources`' shape. The server sends its ids whole
+/// (`encode_content`), but the tables find a vanilla recipe by its bare name
+/// (`Recipes::placement`, `meta`): kept whole, `minecraft:stick` had no
+/// placement, so the book dropped every synced vanilla recipe and a viewer's
+/// "+" found no book id for it.
+fn synced_sources(
+    own: Vec<(String, serde_json::Value)>,
+    received: Vec<(String, serde_json::Value)>,
+    types: &[String],
+) -> Vec<(String, serde_json::Value)> {
+    let of = |v: &serde_json::Value| horizon_client::crafting::mod_kinds::file_has_type(v, types);
+    // The book numbers what the tables keep (`RecipeIndex::from_recipes` on the server):
+    // a window's own recipe no reader here takes leaves both, so the numbers agree.
+    let readable = horizon_client::crafting::mod_kinds::readable;
+    let mut all: Vec<_> = own
+        .into_iter()
+        .filter(|(_, v)| !of(v) && readable(v))
+        .collect();
+    all.extend(
+        received
+            .into_iter()
+            .map(|(id, v)| match id.strip_prefix("minecraft:") {
+                Some(name) => (name.to_owned(), v),
+                None => (id, v),
+            }),
+    );
+    all
+}
+
 impl Game<'_> {
     /// The server's recipes a client was sent, over its own; None on a
     /// server and until a server sends any.
@@ -576,22 +622,36 @@ impl Game<'_> {
             }
             return;
         }
+        // The window's own recipes as it loaded them (`load_world_rest`): the content mods'
+        // files live in the data changes over the root, not in the root.
         let root = &self.options.resources;
-        let overlay = horizon_world::loot::PackOverlay::NONE;
-        let built = horizon_items::recipe_sources::sources(root, &overlay).and_then(|own| {
-            let of = |v: &serde_json::Value| types.iter().any(|t| v["type"].as_str() == Some(t));
-            let mut all: Vec<_> = own.into_iter().filter(|(_, v)| !of(v)).collect();
-            all.extend(received);
+        let files = super::world_rest::content_files(&self.pack.data_changes);
+        let built = (|| -> horizon_items::Result<_> {
+            let inventory = horizon_mod_package::enabled::EnabledMods::read(root)?;
+            let conditions = horizon_world::conditions::LoadConditions::new(inventory.server_ids());
+            let overlay = horizon_world::loot::PackOverlay {
+                conditions: &conditions,
+                files: &files,
+            };
+            let own = horizon_items::recipe_sources::sources(root, &overlay)?;
+            let all = synced_sources(own, received, &types);
             let index = horizon_client::recipe_book::RecipeIndex::load_from_sources(&all);
-            horizon_client::crafting::Recipes::from_sources(
+            // As `ResolvedSources::load`: the ingredient hooks' fluid ingredients read these tags.
+            let context = self
+                .res
+                .core
+                .item_data
+                .context()
+                .with_fluid_tags(horizon_items::items::fluid_tag_list(root, &overlay)?);
+            let recipes = horizon_client::crafting::Recipes::from_sources(
                 root,
                 self.items(),
                 &overlay,
                 all,
-                self.res.core.item_data.context(),
-            )
-            .map(|recipes| (recipes, index))
-        });
+                &context,
+            )?;
+            Ok((recipes, index))
+        })();
         match built {
             Ok((recipes, index)) => {
                 self.recipe_tables.synced = Some(recipes);
@@ -609,7 +669,7 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::native_entity_refs::tests::with_game;
+    use super::super::native_entity_refs::tests::{with_game, with_game_at};
     use mod_api::{ItemStack, RecipeInput, RecipeLookupError};
 
     fn stack(item: &str) -> Option<ItemStack> {
@@ -622,8 +682,206 @@ mod tests {
     /// `level.recipe_for` against vanilla's own recipes: a shaped recipe that hands back buckets, the
     /// same shaped recipe from a smaller grid and from a corner of a larger one, a special
     /// recipe, and grids that make nothing.
+    /// The server's recipes come with whole ids (`encode_content`); the
+    /// synced set names a vanilla one bare, as the window's own files do,
+    /// and keeps a data pack's whole. The window's own recipes of a synced
+    /// type give way to the server's.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn synced_sources_name_vanilla_recipes_as_the_tables_find_them() {
+        let shaped = serde_json::json!({"type": "minecraft:crafting_shaped"});
+        let smelting = serde_json::json!({"type": "minecraft:smelting"});
+        let own = vec![
+            ("stick".to_owned(), shaped.clone()),
+            ("iron_ingot".to_owned(), smelting.clone()),
+        ];
+        let received = vec![
+            ("minecraft:stick".to_owned(), shaped.clone()),
+            ("braid:sticks_from_logs".to_owned(), shaped.clone()),
+        ];
+        let types = ["minecraft:crafting".to_owned()];
+        let names: Vec<_> = super::synced_sources(own, received, &types)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["iron_ingot", "stick", "braid:sticks_from_logs"]);
+    }
+
+    /// A window's own recipe of a type nothing here reads — a carried mod's own —
+    /// leaves the synced set with it, so the book's display numbers are the ones the
+    /// tables keep. A type the server did not ask for stays.
+    #[test]
+    fn synced_sources_drop_a_recipe_nothing_reads() {
+        let own = vec![
+            (
+                "iron_ingot".to_owned(),
+                serde_json::json!({"type": "minecraft:smelting"}),
+            ),
+            (
+                "oritech:amethystbud".to_owned(),
+                serde_json::json!({"type": "oritech:assembler"}),
+            ),
+        ];
+        let types = ["minecraft:crafting".to_owned()];
+        let names: Vec<_> = super::synced_sources(own, Vec::new(), &types)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["iron_ingot"]);
+    }
+
+    /// With the server's crafting recipes synced, the book still holds the
+    /// vanilla ones under their own display ids (a viewer's "+" reads them,
+    /// `recipe_book_ids`), and a recipe only the server has gets one too.
+    #[test]
+    #[ignore = "daily"]
+    fn synced_vanilla_recipes_keep_their_book_ids() {
+        fn book_ids(game: &mut crate::game::Game<'_>, id: &str) -> Vec<i32> {
+            (game.recipe_book_entries().into_iter())
+                .filter(|e| e.id == id && e.display_id >= 0)
+                .map(|e| e.display_id)
+                .collect()
+        }
+        with_game(|game| {
+            let ids = [
+                "minecraft:stick",
+                "minecraft:chest",
+                "minecraft:iron_ingot_from_smelting_raw_iron",
+            ];
+            let own = ids.map(|id| book_ids(game, id));
+            assert!(own.iter().all(|ids| !ids.is_empty()), "{own:?}");
+            let types = ["minecraft:crafting", "minecraft:smelting"].map(str::to_owned);
+            let mut sources = horizon_items::recipe_sources::sources(
+                &game.options.resources,
+                &horizon_world::loot::PackOverlay::NONE,
+            )
+            .unwrap();
+            let pack = serde_json::json!({
+                "type": "minecraft:crafting_shaped",
+                "pattern": ["#", "#"],
+                "key": {"#": "#minecraft:logs"},
+                "result": {"id": "minecraft:stick", "count": 16},
+            });
+            sources.push(("zzz:sticks_from_logs".to_owned(), pack));
+            for part in horizon_client::lan::recipes::encode_content(&types, &sources, false) {
+                game.remote_recipe_content(&part);
+            }
+            assert!(game.synced_recipes().is_some());
+            assert_eq!(ids.map(|id| book_ids(game, id)), own);
+            assert_eq!(book_ids(game, "zzz:sticks_from_logs").len(), 1);
+        });
+    }
+
+    /// A content mod that ships files under `minecraft` (tags, as most do)
+    /// doesn't make vanilla's namespace one of the root's content namespaces:
+    /// listed, `recipe_sources::sources` read every vanilla recipe twice, as
+    /// `stick` and `minecraft:stick`, and the book held two entries of each,
+    /// numbered `n` and `n + 1`, so a viewer's "+" sent the neighbour's id. A
+    /// vanilla recipe has exactly one book id, the server's, synced or not.
+    #[test]
+    #[ignore = "daily"]
+    fn a_synced_vanilla_recipe_has_one_book_id_the_servers() {
+        use std::path::{Path, PathBuf};
+        fn book_ids(game: &mut crate::game::Game<'_>, id: &str) -> Vec<i32> {
+            (game.recipe_book_entries().into_iter())
+                .filter(|e| e.id == id && e.display_id >= 0)
+                .map(|e| e.display_id)
+                .collect()
+        }
+        let base = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let scratch =
+            std::env::temp_dir().join(format!("horizon-one-book-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let dir = scratch.join("tagger");
+        for (name, text) in [
+            (
+                "horizon-mod.toml",
+                "id = \"tagger\"\nname = \"tagger\"\nversion = \"1.0\"\napi = \"0.2\"\ncapabilities = [\"registries\"]\n",
+            ),
+            (
+                "data/minecraft/tags/item/tagger_extra.json",
+                r#"{"values": ["minecraft:stick"]}"#,
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let package = horizon_mod_package::Package::read(&dir).unwrap();
+        let tagger = horizon_client::mod_content::ContentMod {
+            id: package.manifest.id.clone(),
+            content: horizon_mod_package::content::Content::read(&dir, &package.manifest).unwrap(),
+            jars: Vec::new(),
+        };
+        let root = scratch.join("root");
+        let inventory = horizon_mod_package::enabled::EnabledMods::new([(
+            "tagger".to_owned(),
+            mod_api::Side::Both,
+        )]);
+        horizon_client::mod_content::build(&base, Path::new(""), &[tagger], &root, &inventory)
+            .unwrap();
+        assert_eq!(horizon_client::mod_content::namespaces(&root), ["tagger"]);
+        with_game_at(root, |game| {
+            let ids = [
+                "minecraft:stick",
+                "minecraft:stick_from_bamboo_item",
+                "minecraft:chest",
+                "minecraft:iron_ingot_from_smelting_raw_iron",
+            ];
+            // The integrated server numbers the book's displays by its index.
+            let server = ids.map(|id| {
+                let index = &game.stations().recipe_index;
+                vec![index.first_display(id).unwrap()]
+            });
+            assert_eq!(ids.map(|id| book_ids(game, id)), server);
+            let types = ["minecraft:crafting", "minecraft:smelting"].map(str::to_owned);
+            let sources = horizon_items::recipe_sources::sources(
+                &game.options.resources,
+                &horizon_world::loot::PackOverlay::NONE,
+            )
+            .unwrap();
+            for part in horizon_client::lan::recipes::encode_content(&types, &sources, false) {
+                game.remote_recipe_content(&part);
+            }
+            assert!(game.synced_recipes().is_some());
+            assert_eq!(ids.map(|id| book_ids(game, id)), server);
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A content mod's recipes come from the window's data changes, not the prepared root.
+    /// A server that sends only its smelting recipes leaves the window's own crafting
+    /// recipes in place, the content mod's among them.
+    #[test]
+    #[ignore = "daily"]
+    fn a_sync_of_other_types_keeps_the_content_mods_recipes() {
+        use horizon_assets::resource_source::{Resource, ResourceSource};
+        with_game(|game| {
+            let recipe = serde_json::json!({
+                "type": "minecraft:crafting_shaped",
+                "pattern": ["#"],
+                "key": {"#": "minecraft:dirt"},
+                "result": {"id": "minecraft:diamond"},
+            });
+            game.pack.data_changes = ResourceSource::indexed(std::collections::BTreeMap::from([(
+                "data/testpack/recipe/dirt_diamond.json".to_owned(),
+                Resource::bytes(recipe.to_string().into_bytes()),
+            )]));
+            let types = ["minecraft:smelting".to_owned()];
+            let sources = horizon_items::recipe_sources::sources(
+                &game.options.resources,
+                &horizon_world::loot::PackOverlay::NONE,
+            )
+            .unwrap();
+            for part in horizon_client::lan::recipes::encode_content(&types, &sources, false) {
+                game.remote_recipe_content(&part);
+            }
+            assert!(game.synced_recipes().is_some());
+            assert!(game.recipes().recipe("testpack:dirt_diamond").is_some());
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn recipe_for_matches_the_grid_and_returns_what_each_slot_keeps() {
         with_game(|game| {
             let level = game.level(game.dim.id()).unwrap();
@@ -699,7 +957,7 @@ mod tests {
     /// Vanilla expected outputs, ordered smithing, and a data-pack recipe parsed by the
     /// production recipe loader. These assertions do not derive expectations from matcher output.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn recipe_for_dispatches_cooking_and_stonecutting_and_pack_recipes() {
         mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {
@@ -801,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn recipe_for_preserves_smithing_order_and_damage() {
         mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {
@@ -853,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn recipe_for_refuses_mod_owned_types_instead_of_empty_matches() {
         mod_platform::testing::with_mods(Vec::new().into(), || {
             with_game(|game| {

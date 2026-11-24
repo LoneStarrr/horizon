@@ -22,15 +22,25 @@ pub trait Hooks {
     /// item are asked, on both sides, as the client's menu predicts the slot.
     /// `host` is read-only: read `entity` through it (its position, its
     /// equipment) to answer from its state when asked. The stack is converted
-    /// once and lent to each slot and entity a menu click, a dispense or a
-    /// pickup asks about; a wasm mod is given a copy of it on each call. An `entity` that is no live entity of that side any
-    /// more is refused without asking.
+    /// once and lent to each slot and entity a native menu click, dispense or pickup
+    /// asks about. Each decision prepares one owned copy per participating wasm guest
+    /// instance and lends it by token to every candidate. Mutable access invalidates
+    /// the source revision; replacing or removing it changes its identity. Stale
+    /// preparation and stale apply preconditions refuse without asking again. Pickup
+    /// scope is one mob's attempt. Missing prepared exports refuse at load or part
+    /// registration. A stale or missing target refuses wherever a part is asked;
+    /// the no-listener data path performs no conversion or entity lookup.
+    /// Target type, position, health, maximum health, alive/living status and physical
+    /// equipment are retained outside traversal; other Host reads can allocate.
     #[hook(
         side = "both",
+        version = 2,
         contract = "listen",
         scope = "item",
         key = "stack",
+        prepared = "stack",
         host = "read",
+        target = "horizon_client::game::native_hooks::can_equip::NativeHookHost<'_>::native_can_equip",
         cancellable = false,
         neoforge = "IItemExtension.canEquip"
     )]

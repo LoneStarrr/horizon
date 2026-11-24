@@ -1,103 +1,44 @@
 //! Vanilla's friends machinery without its screens: authlib's
 //! `MinecraftServicesFriendsService` (`getFriends`, `updateFriends`,
 //! `updateAttributes`, `updatePresence`), `RemoteFriendListUpdateHandler`'s worker and
-//! state, `PlayerSocialManager`'s flags, and `PresenceHandler`'s posting.
+//! state, `PlayerSocialManager`'s flags and block list (`UserApiService`'s
+//! `getBlocklist`), and `PresenceHandler`'s posting.
 //!
 //! `title::poll_account` starts this the way `Minecraft`'s constructor does: the
 //! account's `friendsPreferences` (`UserFlag.FRIENDS_ENABLED`,
-//! `UserFlag.ACCEPT_FRIEND_INVITES`) decide whether the worker reads the lists. No
-//! screen shows them yet; the overlay and the Online options are later parts.
+//! `UserFlag.ACCEPT_FRIEND_INVITES`) decide whether the worker reads the lists, and
+//! `startOnlineMode`'s block-list refresh runs once at the same point. No screen shows
+//! them yet; the overlay and the Online options are later parts.
 //!
 //! The requests keep authlib's cache rules: `If-None-Match` with the last `ETag`, a 304
 //! or an empty answer keeps the cached lists, `Retry-After` sets the poll interval, and
 //! `getFriendData` waits out a ten-second cooldown between reads. The presence statuses
 //! are `PresenceHandler.getPresenceStatus`'s, supplied by the client each tick.
+mod blocklist;
 mod list_updates;
 mod model;
+mod presence;
+mod service;
 
 use list_updates::{Handler, spawn_updater};
 pub use list_updates::{State, set_foreground};
-use model::presence_of;
 pub use model::{
     Friend, FriendData, Presence, PresenceStatus, ResultCode, parse_friends, parse_presence,
 };
 
-use crate::auth::{self, AuthSession};
+use presence::PresenceHandler;
+pub use presence::{
+    SharePresence, latest_presence, send_offline_presence, set_presence_status, set_share_presence,
+    tick, try_update_presence,
+};
+use service::{Service, send_json, session, url};
+
 use serde_json::{Value, json};
 use std::{
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
+    collections::HashSet,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-
-/// `Options.sharePresence` (`PresenceSharing`): how much of the player the service sees.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharePresence {
-    None,
-    Limited,
-    All,
-}
-
-impl SharePresence {
-    /// `options.txt`'s `sharePresence` (0 none, 1 limited, 2 all; `Options` defaults to
-    /// all).
-    pub fn of(setting: u8) -> Self {
-        match setting {
-            0 => Self::None,
-            1 => Self::Limited,
-            _ => Self::All,
-        }
-    }
-}
-
-/// `MinecraftServicesFriendsService`: the HTTP client and its caches.
-#[derive(Default)]
-struct Service {
-    friends_etag: Option<String>,
-    presence_etag: Option<String>,
-    friends_cache: FriendData,
-    presence_cache: Vec<Presence>,
-    /// `getFriendsPollInterval`/`getPresencePollInterval`: the service's `Retry-After`.
-    friends_poll: Option<Duration>,
-    presence_poll: Option<Duration>,
-    /// `requestCooldown`: ten seconds between `getFriendData` requests.
-    cooldown: Option<Instant>,
-    /// `requestPending`: one list request at a time.
-    pending: bool,
-}
-
-impl Service {
-    /// `canMakeRequest`.
-    fn can_make_request(&self) -> bool {
-        self.cooldown.is_none_or(|at| Instant::now() > at)
-    }
-}
-
-/// `PresenceHandler`.
-struct PresenceHandler {
-    latest: Vec<Presence>,
-    last_post: Instant,
-    /// `updatePresence`: post at the next tick.
-    update: bool,
-    /// `PresenceHandler.getPresenceStatus`'s answer, from the client's state.
-    playing: PresenceStatus,
-}
-
-impl Default for PresenceHandler {
-    fn default() -> Self {
-        Self {
-            latest: Vec::new(),
-            // `lastPresencePost = Instant.now()`: the first post waits an interval.
-            last_post: Instant::now(),
-            // Its constructor sets `updatePresence = true`.
-            update: true,
-            playing: PresenceStatus::Online,
-        }
-    }
-}
 
 /// `PlayerSocialManager`'s flags.
 #[derive(Default)]
@@ -139,7 +80,9 @@ fn lock() -> std::sync::MutexGuard<'static, Inner> {
 
 /// `Minecraft`'s constructor: make the social manager, whose `friendListEnabled` comes
 /// from the account's `friendsPreferences`, and start the updater when it is on.
-/// Called once; later calls leave the running manager alone.
+/// `PlayerSocialManager.startOnlineMode` also starts the block-list refresh here
+/// (`Minecraft.java:2899`, once the user properties have arrived). Called once;
+/// later calls leave the running manager alone.
 pub fn init(friends_enabled: bool, allow_requests: bool) {
     {
         let mut inner = lock();
@@ -152,6 +95,7 @@ pub fn init(friends_enabled: bool, allow_requests: bool) {
         inner.handler.enabled = friends_enabled;
     }
     spawn_updater();
+    blocklist::refresh();
 }
 
 /// `PlayerSocialManager.setFriendListEnabled`: the Online options switch.
@@ -197,86 +141,6 @@ pub fn outgoing_requests() -> Vec<Friend> {
 /// `PlayerSocialManager.getFriendListState`.
 pub fn friend_list_state() -> State {
     lock().handler.state
-}
-
-/// `PresenceHandler.getLatestPresence`.
-pub fn latest_presence() -> Vec<Presence> {
-    lock().presence.latest.clone()
-}
-
-/// `Options.sharePresence`: what presence the handler posts.
-pub fn set_share_presence(share: SharePresence) {
-    lock().share = share;
-}
-
-/// `PresenceHandler.getPresenceStatus`, supplied by the client from its world state.
-pub fn set_presence_status(status: PresenceStatus) {
-    lock().presence.playing = status;
-}
-
-/// `Minecraft.runTick`: `PresenceHandler.tick`, once per client tick.
-pub fn tick() {
-    let due = {
-        let inner = lock();
-        if !inner.manager.friend_list_enabled || inner.handler.latest.friends.is_empty() {
-            return;
-        }
-        let interval = inner
-            .service
-            .presence_poll
-            .unwrap_or(Duration::from_secs(60));
-        let since = inner.presence.last_post.elapsed();
-        (inner.presence.update && since >= interval) || since >= interval * 5
-    };
-    if due {
-        update_presence();
-    }
-}
-
-/// `PresenceHandler.updatePresence`.
-fn update_presence() {
-    let status = {
-        let mut inner = lock();
-        inner.presence.update = false;
-        inner.presence.last_post = Instant::now();
-        match inner.share {
-            SharePresence::None => PresenceStatus::Offline,
-            SharePresence::Limited => PresenceStatus::Online,
-            SharePresence::All => inner.presence.playing,
-        }
-    };
-    let _ = thread::Builder::new()
-        .name("Friends presence".into())
-        .spawn(move || {
-            if let Some(presence) = post_presence(status) {
-                lock().presence.latest = presence;
-            }
-        });
-}
-
-/// `PresenceHandler.tryUpdatePresence`: the world was entered (or the overlay opened).
-pub fn try_update_presence() {
-    lock().presence.update = true;
-}
-
-/// `PresenceHandler.sendOfflinePresence`: the game is closing.
-pub fn send_offline_presence() {
-    static SENT: AtomicBool = AtomicBool::new(false);
-    {
-        let inner = lock();
-        if !inner.manager.friend_list_enabled || inner.handler.latest.friends.is_empty() {
-            return;
-        }
-    }
-    // `Minecraft.close` happens once; a second quit path must not post twice.
-    if SENT.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let _ = thread::Builder::new()
-        .name("Friends offline".into())
-        .spawn(|| {
-            let _ = post_presence(PresenceStatus::Offline);
-        });
 }
 
 /// `FriendsService.sendFriendRequest(name)`.
@@ -353,60 +217,6 @@ fn friend_action(body: Value) -> ResultCode {
     code
 }
 
-/// `MinecraftServicesFriendsService.presence`: post one status, cache the answer.
-/// `None` means the answer said nothing new (304, an empty body or a failure); the
-/// handler keeps its last presence then.
-fn post_presence(status: PresenceStatus) -> Option<Vec<Presence>> {
-    let session = session()?;
-    let url = url("updatePresence")?;
-    let body = json!({"status": status.wire()}).to_string();
-    let etag = lock().service.presence_etag.clone();
-    let answer = send_json(&session, "POST", &url, &body, etag.as_deref()).ok()?;
-    let mut inner = lock();
-    if let Some(retry) = answer.retry_after {
-        inner.service.presence_poll = Some(retry);
-    }
-    if let Some(etag) = answer.etag {
-        inner.service.presence_etag = Some(etag);
-    }
-    if answer.status == 304 || answer.body.is_empty() {
-        return None;
-    }
-    // `PresenceResponse`: a missing `presence` field is an empty list, replacing the
-    // cached one; malformed JSON keeps the cache, as authlib's exception path does.
-    if let Ok(value) = serde_json::from_str::<Value>(&answer.body) {
-        let presence = presence_of(&value);
-        inner.service.presence_cache = presence.clone();
-        return Some(presence);
-    }
-    None
-}
-
-/// `MinecraftServicesFriendsService.getFriendData`'s request.
-fn fetch_friends(session: &AuthSession, etag: Option<&str>) -> Result<Answer, Failure> {
-    let url = url("getFriends").ok_or(Failure {
-        code: ResultCode::ServiceNotAvailable,
-    })?;
-    send_json(session, "GET", &url, "", etag)
-}
-
-/// One HTTP answer: its status, cache headers and body.
-struct Answer {
-    status: u16,
-    etag: Option<String>,
-    retry_after: Option<Duration>,
-    body: String,
-}
-
-struct Failure {
-    code: ResultCode,
-}
-
-/// The discovery document's `player` service endpoint.
-fn session() -> Option<Arc<AuthSession>> {
-    auth::current().filter(|s| !s.expired())
-}
-
 fn uuid(id: u128) -> String {
     let hex = format!("{id:032x}");
     format!(
@@ -419,109 +229,22 @@ fn uuid(id: u128) -> String {
     )
 }
 
-fn url(name: &str) -> Option<String> {
-    let doc = auth::discovery().ok()?;
-    auth::endpoint(&doc, "player", name)
+/// `PlayerSocialManager.startOnlineMode` (`UserApiService.refreshBlockList`):
+/// one block-list fetch, run again only once the service's cooldown has passed.
+pub fn refresh_block_list() {
+    blocklist::refresh();
 }
 
-/// authlib's `MinecraftClient`: the bearer token, `If-None-Match` when a cache has an
-/// `ETag`, and `Retry-After` back to the caller.
-fn send_json(
-    session: &AuthSession,
-    method: &str,
-    url: &str,
-    body: &str,
-    etag: Option<&str>,
-) -> Result<Answer, Failure> {
-    let bearer = format!("Bearer {}", session.access_token());
-    let agent = auth::agent();
-    let mut request = match method {
-        "GET" => agent.get(url),
-        "POST" => agent.post(url),
-        "PUT" => agent.put(url),
-        _ => {
-            return Err(Failure {
-                code: ResultCode::Error,
-            });
-        }
-    };
-    request = request.set("Authorization", &bearer);
-    if let Some(etag) = etag {
-        request = request.set("If-None-Match", etag);
-    }
-    let response = if method == "GET" {
-        request.call()
-    } else {
-        request
-            .set("Content-Type", "application/json; charset=utf-8")
-            .send_string(body)
-    }
-    .map_err(http_error)?;
-    let status = response.status();
-    let etag = response.header("ETag").map(str::to_owned);
-    let retry_after = response.header("Retry-After").and_then(parse_retry_after);
-    if status == 304 {
-        return Ok(Answer {
-            status,
-            etag,
-            retry_after,
-            body: String::new(),
-        });
-    }
-    let body = response.into_string().map_err(|_| Failure {
-        code: ResultCode::Error,
-    })?;
-    Ok(Answer {
-        status,
-        etag,
-        retry_after,
-        body,
-    })
+/// `PlayerSocialManager.isBlocked` (`UserApiService.isBlockedPlayer`): whether
+/// the account has blocked this player outside the game. Never the NIL UUID;
+/// nobody until the fetch lands, and a due refresh starts off-thread where
+/// vanilla would fetch on the calling thread.
+pub fn is_blocked_player(id: u128) -> bool {
+    blocklist::is_blocked_player(id)
 }
 
-/// authlib's `MinecraftClient.parseRetryAfter`: whole seconds above zero.
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-}
-
-/// `MinecraftServicesFriendsService.handleHttpError`.
-fn http_error(error: ureq::Error) -> Failure {
-    let code = match error {
-        ureq::Error::Status(status, _) => match status {
-            429 => ResultCode::TooManyRequests,
-            500.. => ResultCode::ServiceNotAvailable,
-            403 => ResultCode::Forbidden,
-            400 => ResultCode::UnknownProfile,
-            401 => ResultCode::Unauthorized,
-            _ => ResultCode::Error,
-        },
-        ureq::Error::Transport(_) => ResultCode::ConnectionIssue,
-    };
-    Failure { code }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_share_presence_option_maps_to_its_levels() {
-        assert_eq!(SharePresence::of(0), SharePresence::None);
-        assert_eq!(SharePresence::of(1), SharePresence::Limited);
-        assert_eq!(SharePresence::of(2), SharePresence::All);
-        assert_eq!(SharePresence::of(9), SharePresence::All);
-    }
-
-    #[test]
-    fn retry_after_reads_whole_positive_seconds() {
-        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
-        assert_eq!(parse_retry_after(" 5 "), Some(Duration::from_secs(5)));
-        assert_eq!(parse_retry_after("0"), None);
-        assert_eq!(parse_retry_after("later"), None);
-    }
+/// The account's blocked players (`UserApiService`'s set), empty while the
+/// fetch has not landed.
+pub fn blocked_players() -> HashSet<u128> {
+    blocklist::blocked_players()
 }

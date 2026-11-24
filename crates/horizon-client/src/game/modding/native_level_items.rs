@@ -9,6 +9,12 @@ use super::{Game, spill};
 use horizon_items::items::ItemStack;
 use mod_api::{EntityRef, LevelRef};
 
+/// The most experience one `level_award_experience` call awards: about 400 orbs
+/// of the largest size. Vanilla's `ExperienceOrb.award` has no cap, but only
+/// trusted code calls it; a mod's call can't be interrupted, and `u32::MAX`
+/// points are 1.7 million orbs, each scanning the others for a merge.
+pub(super) const MAX_AWARD: u32 = 1_000_000;
+
 impl Game<'_> {
     /// Whether vanilla could make an item entity of `stack`: not empty
     /// (`ItemStack.isEmpty`) and of an item the registry has.
@@ -28,9 +34,8 @@ impl Game<'_> {
         motion: Option<[f64; 3]>,
         pickup_delay: u32,
     ) -> Option<EntityRef> {
-        // `spawn_item` takes the next id.
-        let id = self.next_entity + 1;
-        self.add_item_entity(stack, at, motion, pickup_delay);
+        // Found by its id: the hooks the spawn runs may add entities after it.
+        let (id, _) = self.add_item_entity(stack, at, motion, pickup_delay)?;
         self.dropped
             .iter()
             .rev()
@@ -42,16 +47,16 @@ impl Game<'_> {
     /// `pos` (three draws from the level random, made for an empty stack and
     /// with `block_drops` off too), with its own random motion and the
     /// default pickup delay of 10 ticks. None, with nothing spawned, for an
-    /// empty stack or an unknown item, with the `block_drops` rule off, on a
-    /// client, for a stale handle, a level not in place, or an item a mod
-    /// kept out (`native_entity_join_level`).
+    /// empty stack or an unknown item, with the `block_drops` rule off, on a client,
+    /// for a stale handle, a level not in place, once the entity ids run out (the level random is
+    /// not drawn from), or an item a mod kept out (`native_entity_join_level`).
     pub(super) fn level_pop_resource(
         &mut self,
         level: LevelRef,
         pos: [i32; 3],
         stack: ItemStack,
     ) -> Option<EntityRef> {
-        if !self.level_in_place(level) {
+        if !self.level_in_place(level) || self.entity_ids_exhausted() {
             return None;
         }
         let at = spill::pop_position(&mut self.world.random, pos);
@@ -113,6 +118,9 @@ impl Game<'_> {
         motion: Option<[f64; 3]>,
         pickup_delay: u32,
     ) -> Option<EntityRef> {
+        if self.entity_ids_exhausted() {
+            return None;
+        }
         let finite = [x, y, z]
             .into_iter()
             .chain(motion.into_iter().flatten())
@@ -131,7 +139,8 @@ impl Game<'_> {
     /// they award). True once the orbs are awarded, even if a mod keeps a new
     /// one out (`native_entity_join_level`). False, with no orbs, for 0, a
     /// value that isn't finite, on a client, for a stale handle or a level
-    /// not in place.
+    /// not in place. One call awards at most `MAX_AWARD` points: more is cut
+    /// to that, so the host call stays bounded (an orb is at most 2477).
     pub(super) fn level_award_experience(
         &mut self,
         level: LevelRef,
@@ -143,7 +152,7 @@ impl Game<'_> {
         if amount == 0 || ![x, y, z].iter().all(|v| v.is_finite()) || !self.level_in_place(level) {
             return false;
         }
-        self.spawn_orbs([x, y, z], amount);
+        self.spawn_orbs([x, y, z], amount.min(MAX_AWARD));
         true
     }
 }
@@ -151,144 +160,138 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use mod_api::ServerHost;
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn a_level_pops_spawns_and_awards_as_vanilla() {
-        use super::super::{
-            Audio, Game, Options, Progress, Settings, execution_role::ExecutionRole,
-            load_resources, spill,
-        };
-        use horizon_client::gamerules::Value as RuleValue;
-        use horizon_client::items::ItemStack;
-        use horizon_core::random::RandomSource;
-        use mod_api::{Authority, LevelRef, WorldEpoch};
 
-        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            ExecutionRole::IntegratedServer,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = ExecutionRole::IntegratedServer;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.to_path_buf(),
-            )),
-            None,
-        )
-        .unwrap();
-        game.native_lifecycle
-            .begin_open(Authority::IntegratedServer);
-        let level = game.level(game.dim.id()).unwrap();
-        let stone = || ItemStack::new("minecraft:stone", 3);
-
-        // Block.popResource: three level-random offsets, then the entity.
-        let mut random = game.world.random.clone();
-        let at = spill::pop_position(&mut random, [4, 64, -2]);
-        let popped = game
-            .level_pop_resource(level, [4, 64, -2], stone())
-            .unwrap();
-        assert_eq!(game.entity_kind(popped).as_deref(), Some("minecraft:item"));
-        assert_eq!(game.entity_position(popped), Some(at));
-        let item = game.dropped.last().unwrap();
-        assert_eq!((item.pickup_delay, item.stack.count), (10, 3));
-        assert_eq!(item.velocity.y, 0.2);
-        // The offsets are drawn even when nothing drops.
-        assert!(
-            game.level_pop_resource(level, [0; 3], ItemStack::new("minecraft:air", 1))
-                .is_none()
-        );
-        game.ui.rules.set("block_drops", RuleValue::Bool(false));
-        assert!(
-            game.level_pop_resource(level, [4, 64, -2], stone())
-                .is_none()
-        );
-        let _ = spill::pop_position(&mut random, [0; 3]);
-        let _ = spill::pop_position(&mut random, [0; 3]);
-        assert_eq!(random.next_long(), game.world.random.next_long());
-
-        // new ItemEntity(level, x, y, z, stack, delta...): the pickup delay
-        // is the caller's, as ItemEntity.setPickupDelay at construction.
-        let spawned = game
-            .level_spawn_item_with_motion(level, 1.5, 70.0, 2.5, stone(), [0.0, 0.3, 0.0], 40)
-            .unwrap();
-        assert_eq!(game.entity_position(spawned), Some([1.5, 70.0, 2.5]));
-        let item = game.dropped.last().unwrap();
-        assert_eq!((item.pickup_delay, item.velocity.y), (40, 0.3));
-        assert!(
-            game.level_spawn_item(level, 1.5, 70.0, 2.5, stone(), 32767)
-                .is_some()
-        );
-        assert_eq!(game.dropped.last().unwrap().pickup_delay, 32767);
-        assert!(
-            game.level_spawn_item(level, f64::NAN, 70.0, 2.5, stone(), 0)
-                .is_none()
-        );
-        for empty in [
-            ItemStack::new("minecraft:stone", 0),
-            ItemStack::new("minecraft:nothing", 1),
-        ] {
-            assert!(
-                game.level_spawn_item(level, 0.0, 0.0, 0.0, empty, 0)
-                    .is_none()
-            );
+    /// The orbs `spawn_orbs_toward` creates for `value` points, before merging.
+    fn orbs_for(mut value: u32) -> u32 {
+        let mut orbs = 0;
+        while value > 0 {
+            value -= horizon_client::entities::ExperienceOrb::split(value);
+            orbs += 1;
         }
-
-        // An item a hook spawns while the tick has the list out joins after
-        // the others, which keep their numbers.
-        use horizon_client::join_seq::Joined;
-        let joins = |game: &Game| -> Vec<(u32, u64)> {
-            game.dropped
-                .iter()
-                .map(|d| (d.id, d.join_seq().get()))
-                .collect()
-        };
-        let before = joins(&game);
-        let out = game.dropped.lift();
-        let hooked = game
-            .level_spawn_item(level, 1.5, 70.0, 2.5, stone(), 0)
-            .unwrap();
-        assert_eq!(joins(&game).len(), 1);
-        game.put_back_dropped(out);
-        let after = joins(&game);
-        assert_eq!(after[..before.len()], before[..]);
-        assert_eq!(after[before.len()].0, hooked.id());
-        assert!(after[before.len()].1 > before.iter().map(|j| j.1).max().unwrap());
-        assert!(game.entity_kind(hooked).is_some());
-
-        // ExperienceOrb.award: 100 is 73, 17, 7 and 3, far apart from other orbs.
-        assert!(game.level_award_experience(level, 100.5, 70.0, 0.5, 100));
-        let values: Vec<u32> = game.orbs.iter().map(|o| o.points()).collect();
-        assert_eq!(values, [73, 17, 7, 3]);
-        assert!(!game.level_award_experience(level, 100.5, 70.0, 0.5, 0));
-
-        let stale = LevelRef::new(WorldEpoch::new(0), game.dim.key());
-        assert!(
-            game.level_spawn_item(stale, 0.0, 0.0, 0.0, stone(), 0)
-                .is_none()
-        );
-        assert!(game.level_pop_resource(stale, [0; 3], stone()).is_none());
-        assert!(!game.level_award_experience(stale, 0.0, 0.0, 0.0, 5));
+        orbs
     }
 
     #[test]
-    #[ignore = "needs prepared resources and an isolated process for native mods"]
+    fn one_award_is_cut_to_a_bounded_number_of_orbs() {
+        assert!(orbs_for(u32::MAX) > 1_000_000, "uncapped it is millions");
+        assert!(orbs_for(super::MAX_AWARD) <= 410);
+    }
+    #[test]
+    #[ignore = "daily"]
+    fn a_level_pops_spawns_and_awards_as_vanilla() {
+        use super::super::{Game, spill};
+        use horizon_client::gamerules::Value as RuleValue;
+        use horizon_client::items::ItemStack;
+        use horizon_core::random::RandomSource;
+        use mod_api::{LevelRef, WorldEpoch};
+
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            let stone = || ItemStack::new("minecraft:stone", 3);
+
+            // Block.popResource: three level-random offsets, then the entity.
+            let mut random = game.world.random.clone();
+            let at = spill::pop_position(&mut random, [4, 64, -2]);
+            let popped = game
+                .level_pop_resource(level, [4, 64, -2], stone())
+                .unwrap();
+            assert_eq!(
+                game.entity_kind(popped)
+                    .map(|kind| kind.id(game))
+                    .as_deref(),
+                Some("minecraft:item")
+            );
+            assert_eq!(game.entity_position(popped), Some(at));
+            let item = game.dropped.last().unwrap();
+            assert_eq!((item.pickup_delay, item.stack.count), (10, 3));
+            assert_eq!(item.velocity.y, 0.2);
+            // The offsets are drawn even when nothing drops.
+            assert!(
+                game.level_pop_resource(level, [0; 3], ItemStack::new("minecraft:air", 1))
+                    .is_none()
+            );
+            game.ui.rules.set("block_drops", RuleValue::Bool(false));
+            assert!(
+                game.level_pop_resource(level, [4, 64, -2], stone())
+                    .is_none()
+            );
+            let _ = spill::pop_position(&mut random, [0; 3]);
+            let _ = spill::pop_position(&mut random, [0; 3]);
+            assert_eq!(random.next_long(), game.world.random.next_long());
+
+            // new ItemEntity(level, x, y, z, stack, delta...): the pickup delay
+            // is the caller's, as ItemEntity.setPickupDelay at construction.
+            let spawned = game
+                .level_spawn_item_with_motion(level, 1.5, 70.0, 2.5, stone(), [0.0, 0.3, 0.0], 40)
+                .unwrap();
+            assert_eq!(game.entity_position(spawned), Some([1.5, 70.0, 2.5]));
+            let item = game.dropped.last().unwrap();
+            assert_eq!((item.pickup_delay, item.velocity.y), (40, 0.3));
+            assert!(
+                game.level_spawn_item(level, 1.5, 70.0, 2.5, stone(), 32767)
+                    .is_some()
+            );
+            assert_eq!(game.dropped.last().unwrap().pickup_delay, 32767);
+            assert!(
+                game.level_spawn_item(level, f64::NAN, 70.0, 2.5, stone(), 0)
+                    .is_none()
+            );
+            for empty in [
+                ItemStack::new("minecraft:stone", 0),
+                ItemStack::new("minecraft:nothing", 1),
+            ] {
+                assert!(
+                    game.level_spawn_item(level, 0.0, 0.0, 0.0, empty, 0)
+                        .is_none()
+                );
+            }
+
+            // An item a hook spawns while the tick has the list out joins after
+            // the others, which keep their numbers.
+            use horizon_client::join_seq::Joined;
+            let joins = |game: &Game| -> Vec<(u32, u64)> {
+                game.dropped
+                    .iter()
+                    .map(|d| (d.id, d.join_seq().get()))
+                    .collect()
+            };
+            let before = joins(game);
+            let out = game.dropped.lift();
+            let hooked = game
+                .level_spawn_item(level, 1.5, 70.0, 2.5, stone(), 0)
+                .unwrap();
+            assert_eq!(joins(game).len(), 1);
+            game.put_back_dropped(out);
+            let after = joins(game);
+            assert_eq!(after[..before.len()], before[..]);
+            assert_eq!(after[before.len()].0, hooked.id());
+            assert!(after[before.len()].1 > before.iter().map(|j| j.1).max().unwrap());
+            assert!(game.entity_kind(hooked).is_some());
+
+            // ExperienceOrb.award: 100 is 73, 17, 7 and 3, far apart from other orbs.
+            assert!(game.level_award_experience(level, 100.5, 70.0, 0.5, 100));
+            let values: Vec<u32> = game.orbs.iter().map(|o| o.points()).collect();
+            assert_eq!(values, [73, 17, 7, 3]);
+            assert!(!game.level_award_experience(level, 100.5, 70.0, 0.5, 0));
+            // A huge amount is cut to `MAX_AWARD`: a bounded number of orbs.
+            game.orbs.clear();
+            assert!(game.level_award_experience(level, 100.5, 70.0, 0.5, u32::MAX));
+            assert!(game.orbs.len() <= 410);
+            let total: u64 = game.orbs.iter().map(|o| u64::from(o.points()) * u64::from(o.count)).sum();
+            assert_eq!(total, u64::from(super::MAX_AWARD));
+
+            let stale = LevelRef::new(WorldEpoch::new(0), game.dim.key());
+            assert!(
+                game.level_spawn_item(stale, 0.0, 0.0, 0.0, stone(), 0)
+                    .is_none()
+            );
+            assert!(game.level_pop_resource(stale, [0; 3], stone()).is_none());
+            assert!(!game.level_award_experience(stale, 0.0, 0.0, 0.0, 5));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn an_orb_awarded_in_a_merge_hook_is_merged_by_a_later_scan() {
         use horizon_client::entities::ExperienceOrb;
         use horizon_core::geometry::Vec3;
@@ -322,6 +325,7 @@ mod tests {
                         fall_distance: 0.0,
                         rotation: [0.0, 0.0],
                         join: Default::default(),
+                        section_order: 0,
                         id,
                         position: p,
                         previous: p,
@@ -330,6 +334,7 @@ mod tests {
                         age: 0,
                         on_ground: true,
                         count: 1,
+                        fire_ticks: 0,
                         ticks,
                         health: 5,
                         air: 300,

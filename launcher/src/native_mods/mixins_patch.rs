@@ -1,4 +1,4 @@
-//! The horizon-mixins tool for `[[native.mixin]]` builds (`horizon_mod_package::mixins_tool`):
+//! The horizon-mixins tool for `[[native.mixin]]` builds (`horizon_platform::mod_package::mixins_tool`):
 //! once per pin and patch the launcher downloads the prebuilt tool from its release, and where
 //! that release has none for this computer it downloads the tool's source at the pin, applies the
 //! carried patch only to the exact text it was written against, and builds it.
@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use horizon_mod_package::mixins_tool::{self, PATCH, PATCH_NAME};
+use horizon_platform::mod_package::mixins_tool::{self, PATCH, PATCH_NAME};
 use sha2::{Digest, Sha256};
 
 use super::{root, run, Step, MIXINS_REV};
@@ -127,10 +127,12 @@ fn install(
 /// The tool built from its pinned source with the carried patch, into `dir`.
 fn build(rust: &Toolchain, dir: &Path) -> Result<(), String> {
     let partial = dir.join(".source");
-    let top = super::unpack_archive(
+    // Built only during a native build: a stop ends its source download too.
+    let top = super::unpack_archive_until(
         &format!("{}/{MIXINS_REV}", horizon_addresses::HORIZON_MIXINS_SOURCE),
         &partial,
         256 << 20,
+        &super::check_cancelled,
     )?;
     mixins_tool::apply(&top, PATCH).map_err(|why| {
         format!("E_MIXINS_PATCH: {PATCH_NAME} does not apply to horizon-mixins {MIXINS_REV}: {why}")

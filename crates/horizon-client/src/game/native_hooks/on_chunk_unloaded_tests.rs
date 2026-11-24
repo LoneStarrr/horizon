@@ -1,5 +1,5 @@
 #![cfg(test)]
-//! `on_chunk_unloaded` through a real game (#3145): a chunk with two mod block entities and a
+//! `on_chunk_unloaded` through a real game (arismoko/horizon#3145): a chunk with two mod block entities and a
 //! vanilla chest leaves the world when its `/forceload` ticket goes, through the game's own
 //! streaming, save and unload; the chunk comes back from its saved data; then the world closes.
 use crate::game::native_entity_refs::tests::{run_fresh_cases, with_game_at};
@@ -102,7 +102,7 @@ fn pump_until(game: &mut crate::game::Game<'_>, resident: bool) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn each_mod_block_entity_of_an_unloading_chunk_is_told_once() {
     if run_fresh_cases(
         "game::native_hooks::on_chunk_unloaded_tests::each_mod_block_entity_of_an_unloading_chunk_is_told_once",
@@ -189,7 +189,7 @@ fn each_mod_block_entity_of_an_unloading_chunk_is_told_once() {
 /// A client's copies: a column the server forgets tells its mod block entities, while
 /// the client level going (a respawn, a dimension change, leaving) tells none.
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_client_tells_a_forgotten_column_but_not_its_level_going() {
     use crate::game::execution_role::ExecutionRole;
     use horizon_client::{chunk::Chunk, containers::ModBlockEntity};

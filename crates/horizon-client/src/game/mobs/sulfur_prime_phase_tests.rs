@@ -52,6 +52,7 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
     game.block_ticks
         .add_empty_chunk(ChunkPos::new(0, 0))
         .unwrap();
+    game.load_ticking_neighbourhood(0, 0);
     assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
     game
 }
@@ -89,7 +90,7 @@ fn cube_on(game: &mut Game<'_>, under: &str) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_cube_loaded_with_a_tnt_body_on_power_primes_on_its_second_tick() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -103,7 +104,7 @@ fn a_cube_loaded_with_a_tnt_body_on_power_primes_on_its_second_tick() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_warmed_cube_primes_on_the_first_powered_tick() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -121,7 +122,7 @@ fn a_warmed_cube_primes_on_the_first_powered_tick() {
 // cubes whose body was adopted when the tick started.
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn control_an_adopted_cube_without_power_stays_unprimed() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -133,7 +134,7 @@ fn control_an_adopted_cube_without_power_stays_unprimed() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn control_a_primed_cube_on_power_is_not_primed_again() {
     let mut resources = None;
     let mut game = game(&mut resources);
@@ -163,7 +164,7 @@ fn replace_body(game: &mut Game<'_>, with: &str) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_tnt_body_taken_off_this_tick_still_primes_with_its_cached_fuse() {
     let mut resources = None;
     let mut game = game(&mut resources);

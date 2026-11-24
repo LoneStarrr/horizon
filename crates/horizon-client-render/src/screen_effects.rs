@@ -47,9 +47,6 @@ pub struct ScreenQuad {
     pub blend: Blend,
     /// How the sprite is sampled: [`SAMPLE_BLUR`] and [`SAMPLE_CLAMP`].
     pub sampling: u32,
-    /// A tint of the whole view (the underwater overlay), not something in front of it: in HDR
-    /// output the world shines through it (`Renderer::draw_overlay`).
-    pub world_tint: bool,
 }
 /// What `block_screen_effect_draw` draws with: quads in camera space (`+x` right, `+y` up, the
 /// camera at the origin looking down `-z`), under `GameRenderer.render3dHud`'s projection.
@@ -93,7 +90,6 @@ impl CameraQuads {
             }),
             blend: Blend::Alpha,
             sampling,
-            world_tint: false,
         });
         true
     }
@@ -229,7 +225,6 @@ impl ScreenEffects {
             }),
             blend: Blend::Alpha,
             sampling,
-            world_tint: false,
         };
         let full = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
         // ScreenEffectRenderer.submitBlockSprite: u1/v1 at (-1, -1), colour 0xFF191919.
@@ -252,16 +247,13 @@ impl ScreenEffects {
         {
             let (u, v) = (-yaw / 64.0, pitch / 64.0);
             let uv = [[u + 4.0, v + 4.0], [u, v + 4.0], [u, v], [u + 4.0, v]];
-            out.push(ScreenQuad {
-                world_tint: true,
-                ..hand_quad(
-                    full,
-                    uv,
-                    rect,
-                    [brightness, brightness, brightness, 0.1],
-                    texture_sampling("misc/underwater"),
-                )
-            });
+            out.push(hand_quad(
+                full,
+                uv,
+                rect,
+                [brightness, brightness, brightness, 0.1],
+                texture_sampling("misc/underwater"),
+            ));
         }
         out.extend_from_slice(input.custom[2]);
         if input.on_fire
@@ -300,7 +292,6 @@ impl ScreenEffects {
             }),
             blend,
             sampling,
-            world_tint: false,
         };
         for d in input.gui_overlays {
             match d {
@@ -474,9 +465,6 @@ mod tests {
         });
         let sampling: Vec<_> = quads.iter().map(|q| q.sampling).collect();
         assert_eq!(sampling, [0, SAMPLE_CLAMP, SAMPLE_BLUR]);
-        // Only the underwater overlay tints the world; the block in the way covers it.
-        let tints: Vec<_> = quads.iter().map(|q| q.world_tint).collect();
-        assert_eq!(tints, [false, true, false]);
     }
     /// A camera-space corner under a 90 degree square projection is at `(x, y)` with `w` its
     /// depth, whatever the depth, so a deeper corner of the same quad draws nearer the centre.

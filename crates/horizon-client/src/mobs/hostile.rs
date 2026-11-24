@@ -9,6 +9,10 @@ use super::{
 };
 use horizon_core::random::RandomSource;
 
+#[cfg(test)]
+#[path = "monster_no_action_tests.rs"]
+mod monster_no_action_tests;
+
 pub fn register(m: &mut Mob) {
     use Species as S;
     match m.species() {
@@ -247,6 +251,15 @@ pub fn mob_brightness(m: &Mob, w: &MobWorld) -> f32 {
         m.position.z.floor() as i32,
     )
 }
+/// The same with the override a mob can give it: `Blaze` and `Vex` report a
+/// constant 1.0 whatever the light.
+pub fn magic_value(m: &Mob, w: &MobWorld) -> f32 {
+    if matches!(m.species(), Species::Blaze | Species::Vex) {
+        1.0
+    } else {
+        mob_brightness(m, w)
+    }
+}
 fn dark_enough(m: &Mob, w: &MobWorld) -> bool {
     mob_brightness(m, w) < 0.5
 }
@@ -443,6 +456,17 @@ pub fn creeper_tick(m: &mut Mob, events: &mut Vec<MobEvent>) {
     }
 }
 
+/// Endermite.aiStep: `counter` is the life; an endermite not required to
+/// persist is discarded at 2400.
+pub(super) fn endermite_lifetime(m: &mut Mob) {
+    if !m.persistent {
+        m.extra.counter += 1;
+    }
+    if m.extra.counter >= 2400 {
+        m.removed = true;
+    }
+}
+
 #[cfg(test)]
 mod spider_vehicle_tests {
     use super::*;
@@ -453,6 +477,7 @@ mod spider_vehicle_tests {
     /// `SpiderAttackGoal.canUse` is `super.canUse() && !isVehicle()`: a spider
     /// with a player (or a mob) on its back does not start the attack goal.
     #[test]
+    #[ignore = "daily"]
     fn a_spider_carrying_a_player_does_not_start_its_attack() {
         let mut outcomes = None;
         if !with_test_world(&[], |w, types| {

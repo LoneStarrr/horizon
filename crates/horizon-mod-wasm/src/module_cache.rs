@@ -1,15 +1,22 @@
 //! Persistent, account-trusted Wasmtime artifacts. Only the game supplies this root.
 use sha2::{Digest, Sha256};
+#[cfg(not(windows))]
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use std::io;
+#[cfg(not(windows))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use wasmtime::{Engine, Module};
 
+#[cfg(windows)]
+#[path = "module_cache_windows.rs"]
+mod windows;
+
 /// The budget for current-engine entries: 1 GiB holds 30 copies of the largest measured
 /// `.cwasm` (34,039,320 bytes, from a 12.5 MB wasm module) plus headroom. 30 modules is
-/// an allowance, not a measured pack; see #2896.
+/// an allowance, not a measured pack; see arismoko/horizon#2896.
 const LIMIT: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,45 +32,81 @@ pub(crate) const CACHE_DIR: &str = ".horizon-cache/wasm";
 
 pub(crate) struct ModuleCache {
     pub(super) root: PathBuf,
+    #[cfg(windows)]
+    folder: Option<windows::Folder>,
     pub(super) disabled: Option<String>,
     warned: AtomicBool,
+    pub(crate) budget: crate::compile_budget::CompileBudget,
     #[cfg(test)]
     compiles: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompileTimeout(pub(crate) crate::compile_budget::CompileBudget);
+impl std::fmt::Display for CompileTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compilation time limit exceeded: {}", self.0)
+    }
+}
+impl std::error::Error for CompileTimeout {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompileUnavailable {
+    pub(crate) budget: crate::compile_budget::CompileBudget,
+    pub(crate) why: String,
+}
+impl std::fmt::Display for CompileUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot enforce compilation budget {}: {}; restore a private writable .horizon-cache/wasm directory and a working compiler executable",
+            self.budget, self.why
+        )
+    }
+}
+impl std::error::Error for CompileUnavailable {}
+
 impl ModuleCache {
     /// Hits are mapped by `Module::deserialize_open_file`, as in `deserialize_file`.
-    /// Unix checks folder ownership and write permissions without following a symlink.
-    /// Each opened entry must be regular, owned by this user, not group/other writable,
-    /// and have exactly one link. Windows caching is disabled until owner, DACL and
-    /// inheritance trust can be established for folders and opened entries (#2901).
+    /// Unix checks ownership and mode bits. Windows checks owners, DACLs and local
+    /// ACL-enforcing volumes. Both check each opened entry and refuse linked files.
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self::new_for_platform(root, cfg!(windows))
+        Self::new_with_limit(root, LIMIT)
     }
 
-    fn new_for_platform(root: PathBuf, windows: bool) -> Self {
-        Self::new_with_limit(root, windows, LIMIT)
-    }
-
-    pub(crate) fn new_with_limit(root: PathBuf, windows: bool, limit: u64) -> Self {
-        Self::prepare(root, windows, Some(limit))
+    fn new_with_limit(root: PathBuf, limit: u64) -> Self {
+        Self::prepare(root, Some(limit))
     }
 
     /// Child preparation must preserve live parent inputs and cache entries.
+    #[cfg(unix)]
     pub(super) fn for_child(root: PathBuf) -> Self {
-        Self::prepare(root, cfg!(windows), None)
+        Self::prepare(root, None)
     }
 
-    fn prepare(root: PathBuf, windows: bool, limit: Option<u64>) -> Self {
-        let disabled = if windows {
-            Err(io::Error::other(
-                "Windows owner/DACL/inheritance trust is not verified; compiling wasm",
-            ))
-        } else {
-            prepare_folder(&root)
+    fn prepare(root: PathBuf, limit: Option<u64>) -> Self {
+        #[cfg(windows)]
+        let prepared = windows::prepare_folder(&root);
+        #[cfg(not(windows))]
+        let prepared = prepare_folder(&root);
+        let disabled = prepared
+            .as_ref()
+            .err()
+            .map(|why| format!("folder {}: {why}", root.display()));
+        #[cfg(windows)]
+        if let (Ok(folder), Some(limit)) = (&prepared, limit) {
+            let current = match crate::runtime::engine() {
+                Ok(engine) => Some(Self::engine_part(&engine)),
+                Err(why) => {
+                    log::debug!("wasm cache artifact cleanup skipped: {why}");
+                    None
+                }
+            };
+            if let Err(why) = folder.cleanup(current.as_deref(), limit) {
+                log::debug!("wasm cache directory enumeration {}: {why}", root.display());
+            }
         }
-        .err()
-        .map(|why| format!("folder {}: {why}", root.display()));
+        #[cfg(not(windows))]
         if let Some(limit) = limit.filter(|_| disabled.is_none()) {
             remove_stale_temporaries(&root);
             match crate::runtime::engine() {
@@ -80,6 +123,9 @@ impl ModuleCache {
         }
         Self {
             root,
+            #[cfg(windows)]
+            folder: prepared.ok(),
+            budget: crate::compile_budget::CompileBudget::default(),
             #[cfg(test)]
             compiles: AtomicU64::new(0),
             warned: AtomicBool::new(disabled.is_some()),
@@ -98,6 +144,11 @@ impl ModuleCache {
         digest.0.update((setting.len() as u64).to_le_bytes());
         digest.0.update(setting.as_bytes());
         digest.0.update([u8::from(enabled)]);
+        for (setting, enabled) in crate::runtime::THREADS {
+            digest.0.update((setting.len() as u64).to_le_bytes());
+            digest.0.update(setting.as_bytes());
+            digest.0.update([u8::from(enabled)]);
+        }
         // Runtime stack bounds need not affect Wasmtime's compiled-code hash,
         // but a policy change still starts a new Horizon cache generation.
         digest
@@ -121,7 +172,7 @@ impl ModuleCache {
         } else {
             Some((
                 production_command as fn(&Path, &str) -> std::process::Command,
-                crate::compile_child::TIMEOUT,
+                self.budget.limit,
             ))
         };
         #[cfg(not(unix))]
@@ -147,14 +198,26 @@ impl ModuleCache {
             std::time::Duration,
         )>,
     ) -> wasmtime::Result<(Module, Source)> {
-        if self.disabled.is_some() {
+        if let Some(why) = &self.disabled {
+            #[cfg(unix)]
+            if let Some((_, timeout)) = child.as_ref() {
+                return Err(CompileUnavailable {
+                    budget: crate::compile_budget::CompileBudget {
+                        limit: *timeout,
+                        ..self.budget
+                    },
+                    why: why.clone(),
+                }
+                .into());
+            }
+            #[cfg(not(unix))]
+            let _ = why;
             return Module::new(engine, bytes).map(|module| (module, Source::Compiled));
         }
         let path = self.entry_path(&Self::key(engine, bytes));
         if let Some(module) = self.load_cached(engine, &path) {
             return Ok((module, Source::Cached));
         }
-        // Windows caching is disabled before this point (#2901).
         #[cfg(not(unix))]
         let _ = child;
         #[cfg(unix)]
@@ -168,9 +231,27 @@ impl ModuleCache {
                     }
                     "no valid cache entry".to_owned()
                 }
+                Err(why)
+                    if why
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::TimedOut) =>
+                {
+                    return Err(CompileTimeout(crate::compile_budget::CompileBudget {
+                        limit: timeout,
+                        ..self.budget
+                    })
+                    .into());
+                }
                 Err(why) => why.to_string(),
             };
-            log::warn!("wasm compiler child failed: {why}; compiling wasm in process");
+            return Err(CompileUnavailable {
+                budget: crate::compile_budget::CompileBudget {
+                    limit: timeout,
+                    ..self.budget
+                },
+                why,
+            }
+            .into());
         }
         #[cfg(test)]
         self.compiles.fetch_add(1, Ordering::Relaxed);
@@ -186,17 +267,18 @@ impl ModuleCache {
     }
 
     fn load_cached(&self, engine: &Engine, path: &Path) -> Option<Module> {
-        match trusted_entry(path) {
+        #[cfg(windows)]
+        let entry = self.folder.as_ref()?.trusted_entry(path.file_name()?);
+        #[cfg(not(windows))]
+        let entry = trusted_entry(path);
+        match entry {
             Ok(file) => {
-                // SAFETY: the account is the trust boundary. Unix folder and entry are owned
-                // by this user and not group/other writable. We verify the opened handle,
-                // not the path: a directory swap can only present another user's file
-                // (refused), or this account's trusted file. Artifacts are produced by
-                // Module::serialize for this engine; Wasmtime checks header/compatibility.
-                // A mapped entry must remain unchanged for the Module lifetime. Writers
-                // only temp-and-rename (including corrupt-entry recovery), giving a new
-                // inode and preserving every live mapping; they never rewrite in place.
-                // Unix also rejects hard links; Windows never reaches this path.
+                // SAFETY: the opened regular file has one link and grants write access
+                // only to trusted principals (the user and, on Windows, SYSTEM and
+                // Administrators). Windows anchors opens to the audited folder and
+                // excludes concurrent writers. This is the handle we checked. Cache
+                // writers publish new files by rename, preserving live mappings.
+                // Wasmtime checks format and engine compatibility.
                 match unsafe { Module::deserialize_open_file(engine, file) } {
                     Ok(module) => return Some(module),
                     Err(why) => self.warn_once(path, &why),
@@ -218,25 +300,29 @@ impl ModuleCache {
     }
 
     pub(super) fn write(&self, path: &Path, module: &Module) -> wasmtime::Result<()> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         let bytes = module.serialize()?;
+        #[cfg(windows)]
+        self.folder
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?
+            .write(
+                path.file_name()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+                &bytes,
+            )?;
+        #[cfg(not(windows))]
+        self.write_path(path, &bytes)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn write_path(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let (temporary, mut file) = loop {
-            let temporary = self.root.join(format!(
-                ".{}-{}.tmp",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&temporary) {
+            let temporary = self.root.join(temporary_name());
+            match create_temporary(&temporary) {
                 Ok(file) => break (temporary, file),
                 Err(why) if why.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(why) => return Err(why.into()),
+                Err(why) => return Err(why),
             }
         };
         let result = (|| {
@@ -245,8 +331,8 @@ impl ModuleCache {
                 use std::os::unix::fs::PermissionsExt;
                 file.set_permissions(fs::Permissions::from_mode(0o600))?;
             }
-            file.write_all(&bytes)?;
-            #[cfg(test)]
+            file.write_all(bytes)?;
+            #[cfg(all(test, unix))]
             if std::env::var("HORIZON_COMPILER_MODE").as_deref() == Ok("midwrite") {
                 assert!(!path.exists());
                 // Let the parent kill a writer with an uncommitted artifact on disk.
@@ -262,9 +348,17 @@ impl ModuleCache {
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
-        Ok(())
+        result
     }
+}
+
+fn temporary_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A `Hasher` that feeds every write into one sha256, so `Hash` impls can join the key.
@@ -281,8 +375,10 @@ impl Hasher for KeyDigest {
 
 /// Temporary files a crashed write left behind. Only ones older than an hour are removed, so a
 /// second game writing into the same folder right now keeps its file.
+const STALE_TEMPORARY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[cfg(not(windows))]
 fn remove_stale_temporaries(root: &Path) {
-    const STALE: std::time::Duration = std::time::Duration::from_secs(3600);
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -297,7 +393,7 @@ fn remove_stale_temporaries(root: &Path) {
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > STALE);
+            .is_some_and(|age| age > STALE_TEMPORARY);
         if old {
             let _ = fs::remove_file(entry.path());
         }
@@ -305,6 +401,7 @@ fn remove_stale_temporaries(root: &Path) {
 }
 
 /// Names carry both digests so obsolete artifacts need never be opened.
+#[cfg(not(windows))]
 fn remove_obsolete_entries(root: &Path, current_engine: &str) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -325,8 +422,7 @@ fn remove_obsolete_entries(root: &Path, current_engine: &str) {
 }
 
 fn current_entry(path: &Path, current_engine: &str) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "cwasm")
+    is_cache_artifact(path)
         && path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -341,7 +437,18 @@ fn current_entry(path: &Path, current_engine: &str) -> bool {
             })
 }
 
+fn is_cache_artifact(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        if cfg!(windows) {
+            extension.eq_ignore_ascii_case("cwasm")
+        } else {
+            extension == "cwasm"
+        }
+    })
+}
+
 /// Only runs in the constructor, before this launch can write any entries.
+#[cfg(not(windows))]
 fn enforce_size_limit(root: &Path, current_engine: &str, limit: u64) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -380,6 +487,19 @@ fn enforce_size_limit(root: &Path, current_engine: &str, limit: u64) {
     }
 }
 
+#[cfg(not(windows))]
+fn create_temporary(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(not(windows))]
 fn prepare_folder(root: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -421,21 +541,10 @@ fn prepare_folder(root: &Path) -> io::Result<()> {
         return Err(io::Error::other("not a directory"));
     }
     check_permissions(&metadata)?;
-    #[cfg(windows)]
-    {
-        let canonical = root.canonicalize()?;
-        let under_profile = ["LOCALAPPDATA", "USERPROFILE"]
-            .iter()
-            .filter_map(std::env::var_os)
-            .filter_map(|path| PathBuf::from(path).canonicalize().ok())
-            .any(|profile| canonical.starts_with(profile));
-        if !under_profile {
-            return Err(io::Error::other("outside the user's profile"));
-        }
-    }
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn trusted_entry(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -445,14 +554,6 @@ fn trusted_entry(path: &Path) -> io::Result<File> {
         options.custom_flags(
             (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
         );
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT; FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
-        options
-            .custom_flags(0x00200000)
-            .access_mode(0x00120089 | 0x001200a0);
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -470,6 +571,7 @@ fn trusted_entry(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(not(windows))]
 fn check_permissions(metadata: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -480,14 +582,7 @@ fn check_permissions(metadata: &fs::Metadata) -> io::Result<()> {
             ));
         }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err(io::Error::other("reparse point"));
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = metadata;
         return Err(io::Error::other(
@@ -498,13 +593,9 @@ fn check_permissions(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 #[path = "module_cache_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "module_cache_gate_tests.rs"]
-mod gate_tests;
 
 #[cfg(unix)]
 pub(crate) fn production_command(input: &Path, key: &str) -> std::process::Command {

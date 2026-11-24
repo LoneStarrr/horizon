@@ -1,4 +1,4 @@
-//! The section geometry design's acceptance cases (docs/modding/src/concepts/section-geometry.md)
+//! The section geometry design's acceptance cases (docs/design/mod-api/section-geometry.md)
 //! that the mesher alone decides.
 use super::mod_geometry::{
     Batch, Budget, MAX_IN_FLIGHT_BYTES, MAX_QUADS, MAX_SECTION_BYTES, QUAD_BYTES, Renderer,
@@ -248,6 +248,7 @@ impl World {
             shader_pack_lighting: false,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
             assets: &self.assets,
             render: &self.render,
             tables,
@@ -261,6 +262,7 @@ impl World {
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
             hidden_states: &[],
+            part_tables: Default::default(),
         }
     }
 

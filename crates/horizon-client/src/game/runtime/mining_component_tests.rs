@@ -4,7 +4,7 @@ use horizon_core::{geometry::Vec3, position::ChunkPos};
 use std::sync::Arc;
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn mining_uses_admitted_stack_tools_and_actual_eye_immersion() {
     let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let settings = Settings::default();
@@ -191,7 +191,7 @@ fn with_survival_game(f: impl FnOnce(&mut Game<'_>)) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_custom_durable_stick_wears_while_mining() {
     with_survival_game(|game| {
         let registry = game.pack.assets.registry;
@@ -237,7 +237,7 @@ fn a_custom_durable_stick_wears_while_mining() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn efficiency_applies_to_a_same_item_swap() {
     with_survival_game(|game| {
         let registry = game.pack.assets.registry;
@@ -271,6 +271,43 @@ fn efficiency_applies_to_a_same_item_swap() {
                 (base + 10.0) / hardness / 30.0,
                 "{block} with efficiency 3"
             );
+        }
+    });
+}
+
+#[test]
+#[ignore = "daily"]
+fn a_stacks_attribute_modifiers_replace_its_items_attack_damage() {
+    with_survival_game(|game| {
+        // Player.attack reads getAttributeValue(ATTACK_DAMAGE): the base 1
+        // plus what detectEquipmentUpdates gave the player for the held stack
+        // (ItemStack.forEachModifier, the stack's ATTRIBUTE_MODIFIERS). An
+        // iron pickaxe's own modifier is +3 (ToolMaterial.IRON's 2 plus the
+        // pickaxe's 1); the stack's +20 replaces it, so the hit is 21 (#14641).
+        for (stack, damage) in [
+            ("minecraft:iron_pickaxe", 4.0),
+            (
+                "minecraft:iron_pickaxe[attribute_modifiers=[{type:\"minecraft:attack_damage\",id:\"minecraft:base_attack_damage\",amount:20.0,operation:\"add_value\",slot:\"mainhand\"}]]",
+                21.0,
+            ),
+            // Identifier.CODEC reads bare names as `minecraft:`'s: the same
+            // modifier, so the attribute the host applies it to is found.
+            (
+                "minecraft:iron_pickaxe[attribute_modifiers=[{type:\"attack_damage\",id:\"base_attack_damage\",amount:20.0,operation:\"add_value\",slot:\"mainhand\"}]]",
+                21.0,
+            ),
+            // In the off hand slot group, it does not apply to the main hand.
+            (
+                "minecraft:iron_pickaxe[attribute_modifiers=[{type:\"minecraft:attack_damage\",id:\"minecraft:base_attack_damage\",amount:20.0,operation:\"add_value\",slot:\"offhand\"}]]",
+                1.0,
+            ),
+            ("minecraft:iron_pickaxe[!attribute_modifiers]", 1.0),
+        ] {
+            assert!(game.run_command(&format!(
+                "item replace entity @s weapon.mainhand with {stack}"
+            )));
+            game.tick_hand();
+            assert_eq!(game.attack_damage(), damage, "{stack}");
         }
     });
 }

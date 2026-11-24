@@ -8,7 +8,21 @@ use horizon_client::{
     Result,
     attack_strength::HeldStack,
     first_person::{Hand, HandWorld, Hit, SwingAnimation, UseResult, swing_duration},
+    input_queue::{ClickQueue, QueueLimits},
+    interaction_input::{Button, click_queue},
     items::ItemStack,
+};
+
+/// The local player's empty attack and use click queues, bounded as a server's client's are
+/// (`CLICK_QUEUES`).
+pub(super) const ATTACK_CLICKS: ClickQueue = click_queue(Button::Attack);
+pub(super) const USE_CLICKS: ClickQueue = click_queue(Button::Use);
+/// The bounds of `Game::hotbar_presses`: each selection from the queue takes 64 number keys, oldest
+/// first, and 1024 wait at most. A player presses a few a tick.
+pub(super) const HOTBAR_PRESSES: QueueLimits = QueueLimits {
+    name: "number keys",
+    max_len: 1024,
+    per_tick: 64,
 };
 use horizon_core::geometry::{Aabb, Vec3};
 
@@ -129,6 +143,13 @@ impl Game<'_> {
             .unwrap_or(otherwise)
     }
 
+    /// `Player.entityInteractionRange`/`blockInteractionRange` for the tick's picks:
+    /// the attribute carries creative's and a server's modifiers.
+    pub(super) fn update_interaction_ranges(&mut self) {
+        self.entity_reach = self.interaction_range("minecraft:entity_interaction_range", 3.0, 5.0);
+        self.block_reach = self.interaction_range("minecraft:block_interaction_range", 4.5, 5.0);
+    }
+
     /// A stack's `minecraft:attack_range` component, falling back to the spear's
     /// default reach (`spear::REACH`) for spear items unless explicitly removed.
     fn attack_range_component(&self, stack: &ItemStack) -> Option<serde_json::Value> {
@@ -235,8 +256,8 @@ impl Game<'_> {
             error: None,
         });
         self.clicks.destroying = destroying;
-        self.attack_clicks = 0;
-        self.use_clicks = 0;
+        self.attack_clicks.clear();
+        self.use_clicks.clear();
         self.request_remote_mining_stop();
         self.mining = None;
     }
@@ -304,8 +325,26 @@ impl Game<'_> {
     /// spear's 4.5 blocks), with the item the keys select (attribute
     /// swapping a spear's reach onto a mace).
     pub(super) fn pick_tick_targets(&mut self) {
-        self.tick_hit.set(Some(self.pick()));
+        let hit = self.pick();
+        self.tick_hit.set(Some(hit));
         self.tick_mob = None;
+        // GameRenderer.pick: the entity ray runs to the block hit (out to the larger range), and
+        // filterHitResult turns an entity past the entity range into a miss. An entity between
+        // the crosshair and a block in reach but out of reach itself hides that block: the
+        // click neither uses nor mines it.
+        if hit.is_some() && self.block_reach > self.entity_reach {
+            let reach = self.entity_reach;
+            self.entity_reach = self.block_reach;
+            let far = [true, false]
+                .into_iter()
+                .filter_map(|attacking| self.crosshair_entity(attacking))
+                .map(|p| p.distance)
+                .reduce(f64::min);
+            self.entity_reach = reach;
+            if far.is_some_and(|d| d > reach) {
+                self.tick_hit.set(Some(None));
+            }
+        }
         let mob = match self.active_attack_range() {
             Some(range) => self.attack_range_pick(&range),
             None => None,
@@ -315,7 +354,7 @@ impl Game<'_> {
     }
     /// `handleKeybinds`' number keys (`keyHotbarSlots[i].consumeClick`).
     pub(super) fn select_queued_hotbar(&mut self) {
-        for slot in std::mem::take(&mut self.hotbar_presses) {
+        for slot in self.hotbar_presses.take_tick() {
             self.selected = slot;
         }
     }
@@ -390,9 +429,10 @@ impl Game<'_> {
     /// The attack and use part of `Minecraft.tick` for the local player:
     /// attack clicks since the last tick and the held attack button.
     pub(super) fn tick_local_hand(&mut self) -> Result<()> {
-        let attack_clicks = std::mem::take(&mut self.attack_clicks);
-        let use_clicks = std::mem::take(&mut self.use_clicks);
         if self.screen == Screen::Playing && self.title.is_none() && self.sleeping.is_none() {
+            // Up to each queue's bound; the rest act on the next ticks.
+            let attack_clicks = self.attack_clicks.take_tick();
+            let use_clicks = self.use_clicks.take_tick();
             let mut clicks = std::mem::take(&mut self.clicks);
             // keyAttack.isDown(); playing implies the grabbed mouse here
             // (scripts under --control hold buttons without grabbing it).
@@ -446,6 +486,8 @@ impl Game<'_> {
             // Minecraft.tick: a screen keeps the attack from starting, and
             // opening it released the keys (`KeyMapping.releaseAll`).
             self.clicks.miss_time = 10000;
+            self.attack_clicks.clear();
+            self.use_clicks.clear();
             self.hotbar_presses.clear();
         }
         let d = &self.clicks.destroying;
@@ -551,10 +593,34 @@ impl Game<'_> {
         // The scan also includes a capped source below eyes exactly on a cell boundary.
         inside(y) || (eye[1] == f64::from(y) && inside(y - 1))
     }
-    /// A key for the main-hand stack (`destroyingItem`): its item and components.
-    pub(super) fn main_hand_key(&self) -> String {
-        self.held()
-            .map_or(String::new(), |s| format!("{} {:?}", s.item, s.extra))
+    /// The main-hand stack a break begins with (`destroyingItem`).
+    pub(super) fn main_hand_key(&self) -> Option<ItemStack> {
+        self.held().cloned()
+    }
+    /// `MultiPlayerGameMode.sameDestroyTarget`'s item half for the stack
+    /// `began` a break began with: `ItemStack.isSameItemSameComponents` with
+    /// the main hand now (count and damage left out, as vanilla's kept
+    /// reference sees an in-place change), which the parts of `began`'s item
+    /// may overturn (`IItemExtension.shouldCauseBlockBreakReset`).
+    pub(super) fn same_destroying_item(&self, began: &Option<ItemStack>) -> bool {
+        let held = self.held();
+        let same = match (began, held) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.item == b.item && a.extra == b.extra,
+            _ => false,
+        };
+        let Some(began) = began else {
+            return same;
+        };
+        if !mod_api::__private::item_listens(
+            mod_api::HookId::ShouldCauseBlockBreakReset,
+            &began.item,
+        ) {
+            return same;
+        }
+        let mut reset = !same;
+        self.native_should_cause_block_break_reset(began, held, &mut reset);
+        !reset
     }
     /// Whether an attack would hit an entity rather than the block behind
     /// it: the crosshair's `EntityHitResult`.
@@ -562,17 +628,15 @@ impl Game<'_> {
         if let Some(entity) = self.targeting().entity {
             return self.targeting_entity_hit(entity).is_some();
         }
+        // An entity out of entity reach but in front of the block hides it too
+        // (`GameRenderer.pick`'s ray runs to the block hit at the larger range).
+        let far = self.block_reach.max(self.entity_reach);
         let before = |d: Option<f64>| d.is_some_and(|d| self.before_block(d));
-        before(self.painting_hit().map(|h| h.1))
-            || before(self.frame_hit().map(|h| h.1))
-            || before(self.armor_stand_hit().map(|h| h.1))
-            || before(self.cushion_hit().map(|h| h.1))
-            || before(self.boat_hit().map(|h| h.1))
-            || before(self.cart_hit().map(|h| h.1))
-            || before(self.interaction_hit().map(|h| h.1))
+        self.crosshair_entity(true).is_some()
+            // The local world's dragon (`dragon_hit`) is not among the server's entities.
             || before(self.dragon_hit().map(|h| h.1))
-            || before(self.mob_hit().map(|h| h.1))
-            || before(self.redirectable_hit().map(|h| h.1))
+            || before(self.primed_tnt_hit(far).map(|(_, d)| d))
+            || before(self.mob_hit_within(far).map(|h| h.1))
     }
     /// `LocalPlayer.isHandsBusy`: paddling a boat this player controls
     /// (`getControlledVehicle`: its first passenger, on a server's client).
@@ -647,7 +711,8 @@ impl Game<'_> {
         let mut changed = [false; 2];
         for h in 0..2 {
             let replaced = self.hands_replaced[h];
-            let same = shows_held_stack(&self.visible_hands[h], &next[h], replaced);
+            let mut same = shows_held_stack(&self.visible_hands[h], &next[h], replaced);
+            self.reequip_part(h, &next[h], &mut same);
             if same {
                 self.visible_hands[h] = next[h].clone();
                 self.hands_replaced[h] = false;
@@ -667,6 +732,45 @@ impl Game<'_> {
                 self.hands_replaced[h] = false;
             }
         }
+    }
+
+    /// `IItemExtension.shouldCauseReequipAnimation` for hand `h` (0 main, 1
+    /// off), asked while the stack it shows differs from `held` by slot or
+    /// by value and `held` isn't empty: `same` (shown at once) is vanilla's
+    /// answer, and the parts of the held item may turn it either way.
+    fn reequip_part(&self, h: usize, held: &(usize, Option<ItemStack>), same: &mut bool) {
+        let Some(stack) = &held.1 else {
+            return;
+        };
+        let visible = &self.visible_hands[h];
+        if visible.0 == held.0 && visible.1.as_ref() == Some(stack) {
+            return;
+        }
+        let hand = if h == 0 { Hand::Main } else { Hand::Off };
+        let slot = if h == 0 { "mainhand" } else { "offhand" };
+        let slot_changed = h == 0 && visible.0 != held.0;
+        let mut reequip = !*same;
+        if mod_api::__private::item_listens(
+            mod_api::HookId::ShouldCauseReequipAnimation,
+            &stack.item,
+        ) {
+            self.native_should_cause_reequip_animation(
+                stack,
+                visible.1.as_ref(),
+                hand,
+                slot_changed,
+                &mut reequip,
+            );
+        }
+        self.native_should_cause_reequip_animation_in_slot(
+            stack,
+            visible.1.as_ref(),
+            hand,
+            slot,
+            slot_changed,
+            &mut reequip,
+        );
+        *same = !reequip;
     }
 
     /// A replay owns its held-item and equip animation state. Reset it when a
@@ -696,6 +800,7 @@ impl Game<'_> {
             self.boat_hit().map(|h| h.1),
             self.cart_hit().map(|h| h.1),
             self.dragon_hit().map(|h| h.1),
+            self.primed_tnt_hit(self.entity_reach).map(|(_, d)| d),
         ]);
         let active = self
             .using
@@ -753,6 +858,10 @@ impl Game<'_> {
             self.painting_hit().map(|h| h.1),
             self.frame_hit().map(|h| h.1),
             self.dragon_hit().map(|h| h.1),
+            // A nearer TNT outside the entity reach becomes a miss after
+            // `LocalPlayer.pick` filters it, hiding a block menu behind it too.
+            self.primed_tnt_hit(self.block_reach.max(self.entity_reach))
+                .map(|(_, d)| d),
         ];
         let nearest = cart
             .into_iter()
@@ -824,16 +933,18 @@ impl Game<'_> {
     /// Haste and Mining Fatigue modifiers (`ADD_MULTIPLIED_TOTAL`), clamped to
     /// the attribute's range.
     pub(super) fn main_hand_attack_speed(&self) -> f64 {
-        if let Some(player) = &self.player
-            && let Ok(speed) = player
-                .attributes
+        if let Some(speed) = self.player.as_ref().and_then(|p| {
+            p.attributes
                 .computed_value_of("minecraft:attack_speed")
-            && (self.remote.is_some()
-                || !self.applied_modifiers.is_empty()
-                || !self.potions.applied.is_empty())
+                .ok()
+        }) && (self.remote.is_some()
+            || !self.applied_modifiers.is_empty()
+            || !self.potions.applied.is_empty())
         {
-            return speed.clamp(0.0, 1024.0);
+            // The computed value is already inside the attribute's bounds.
+            return speed;
         }
+        // The base comes from the player's attribute map so `/attribute ... base set` applies.
         let base = self
             .player
             .as_ref()
@@ -848,13 +959,22 @@ impl Game<'_> {
             + self
                 .attack_item_info()
                 .map_or(0.0, |i| f64::from(i.attack_speed));
-        self.potions
+        let value = self
+            .potions
             .effects
             .modifiers()
             .into_iter()
             .filter(|m| m.0 == "minecraft:attack_speed")
-            .fold(value, |v, m| v * (1.0 + m.2))
-            .clamp(0.0, 1024.0)
+            .fold(value, |v, m| v * (1.0 + m.2));
+        self.sanitize_attack_speed(value)
+    }
+    /// `Attributes.ATTACK_SPEED`'s sanitizer, from the attribute catalog: the
+    /// attack speed a value computed outside the attribute map takes.
+    pub(in crate::game) fn sanitize_attack_speed(&self, value: f64) -> f64 {
+        self.motion
+            .attributes
+            .definition("minecraft:attack_speed")
+            .map_or(value, |definition| definition.sanitize(value))
     }
     /// The item whose attack damage and speed modifiers the player has (`attack_item`).
     pub(super) fn attack_item_info(&self) -> Option<&horizon_client::items::ItemInfo> {
@@ -916,6 +1036,7 @@ impl GameHands<'_, '_> {
     }
 }
 impl HandWorld for GameHands<'_, '_> {
+    type Held = Option<ItemStack>;
     fn hit(&mut self) -> Hit {
         if self.game.entity_targeted() {
             return Hit::Entity;
@@ -1033,8 +1154,11 @@ impl HandWorld for GameHands<'_, '_> {
         self.keep(r);
         true
     }
-    fn main_hand_key(&mut self) -> String {
+    fn main_hand_key(&mut self) -> Option<ItemStack> {
         self.game.main_hand_key()
+    }
+    fn same_destroying_item(&mut self, began: &Option<ItemStack>) -> bool {
+        self.game.same_destroying_item(began)
     }
     fn destroy_stage(&mut self, _: [i32; 3], _: Option<i32>) {}
     fn swing(&mut self, hand: Hand, animation: SwingAnimation) {

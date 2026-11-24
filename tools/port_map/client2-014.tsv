@@ -8,9 +8,9 @@ ConfirmScreen.addMessage	port	crates/horizon-client/src/confirm_screen.rs::Confi
 ConfirmScreen.addButtons	port	crates/horizon-client/src/confirm_screen.rs::Confirm::answer_at	Yes and No buttons; the answer comes from the click position
 ConfirmScreen.tick	inline	crates/horizon-client/src/confirm_screen.rs::Confirm::draw_active	the 20-tick delay is a 1000 ms timer kept by the caller; buttons are greyed while it runs
 ConnectScreen.connect	port	crates/horizon-client/src/net.rs::Session::connect	background connect on its own thread (Session::start)
-ConnectScreen.tick	port	crates/horizon-client/src/game/network/remote/mod.rs::Game::tick_remote	ticks the pending session while it opens; game.rs tick sends remote sessions here
+ConnectScreen.tick	port	crates/horizon-client/src/game/network/remote/tick.rs::Game::tick_remote_body	ticks the pending session while it opens; game.rs tick sends remote sessions here
 ConnectScreen.init	port	crates/horizon-client-render/src/level_loading.rs::draw_connecting	the status centred at (width / 2, height / 2 - 50) and Cancel at `connect_cancel`'s corner while the connection can still be cancelled; unsure whether Escape aborts the join
-ConnectScreen.extractRenderState	port	crates/horizon-client/src/game/network/remote/mod.rs::Game::remote_overlay	gap: minor: also draws the address line, vanilla draws only the status
+ConnectScreen.extractRenderState	port	crates/horizon-client/src/game/network/remote/screens.rs::Game::remote_overlay_body	gap: minor: also draws the address line, vanilla draws only the status
 CreateBuffetWorldScreen.init	port	crates/horizon-client/src/title/buffet.rs::State::new	title, the 200x15 search box, the biome list and the footer's Done and Cancel; the list is drawn each frame
 CreateBuffetWorldScreen.repositionElements	skip:ui		layout only; the list is laid out each frame in buffet.rs::list_area
 CreateBuffetWorldScreen.updateButtonValidity	inline	crates/horizon-client/src/title/buffet.rs::buttons	Done needs a selected biome, that is one the search text still shows
@@ -48,8 +48,8 @@ DirectJoinServerScreen.extractRenderState	port	crates/horizon-client/src/multipl
 DisconnectedScreen.init	port	crates/horizon-client/src/multiplayer.rs::Screen::buttons	reason text and the disconnected buttons; gap: minor: no Report to Server or open-report-folder button
 DisconnectedScreen.getNarrationMessage	port	crates/horizon-client/src/multiplayer.rs::Screen::narration	disconnect.lost and the reason, joined
 ErrorScreen.init	port	crates/horizon-client/src/title.rs::Title::buttons	Cancel button of the error mode (Mode::Error arm)
-ErrorScreen.extractRenderState	port	crates/horizon-client/src/title.rs::Title::draw	the error title and message (Mode::Error arm)
-ErrorScreen.extractBackground	port	crates/horizon-client/src/title.rs::Title::draw	gap: minor: the flat gradient is replaced by the title background
+ErrorScreen.extractRenderState	port	crates/horizon-client/src/title/draw.rs::Title::draw_with_items	the error title and message (Mode::Error arm)
+ErrorScreen.extractBackground	port	crates/horizon-client/src/title/draw.rs::Title::draw_with_items	gap: minor: the flat gradient is replaced by the title background
 FaviconTexture.forWorld	port	crates/horizon-client/src/title.rs::Title::icon	the world row's icon texture
 FaviconTexture.forServer	port	crates/horizon-client/src/multiplayer.rs::ping_all	server icon keyed by address, from the ping
 FaviconTexture.clear	inline	crates/horizon-client/src/multiplayer.rs::ping_all	icon dropped when the ping has no favicon
@@ -65,7 +65,7 @@ GenericWaitingScreen.createWaiting	skip:service		waiting screen while a report i
 GenericWaitingScreen.createCompleted	skip:service		result screen after a report (reporting)
 GenericWaitingScreen.init	skip:service		layout of the report waiting screen (reporting)
 GenericWaitingScreen.tick	skip:service		the report button's delay (reporting)
-GenericWaitingScreen.extractRenderState	port	crates/horizon-client/src/title.rs::Title::draw_with_items	Mode::Backup draws the waiting title, the message and the animated dots while the backup runs; the Created/Failed toast follows when it finishes
+GenericWaitingScreen.extractRenderState	port	crates/horizon-client/src/title/draw.rs::Title::draw_with_items	Mode::Backup draws the waiting title, the message and the animated dots while the backup runs; the Created/Failed toast follows when it finishes
 GenericWaitingScreen.shouldCloseOnEsc	skip:service		Escape on the report waiting screen (reporting)
 GenericWaitingScreen.getNarrationMessage	port	crates/horizon-client/src/title.rs::Title::narration	Mode::Backup: selectWorld.waitingForBackup.title and its message, joined
 InBedChatScreen.init	port	crates/horizon-client/src/game/interface/chat.rs::Game::draw_chat_screen	Leave Bed button over the chat; its click is in chat_click
@@ -82,16 +82,16 @@ ManageServerScreen.init	port	crates/horizon-client/src/multiplayer.rs::Screen::b
 ManageServerScreen.resize	skip:ui		layout only; Screen::Edit keeps its fields
 ManageServerScreen.onAdd	port	crates/horizon-client/src/multiplayer.rs::Screen::click	Done saves the name (default if empty) and the address
 ManageServerScreen.extractRenderState	port	crates/horizon-client/src/multiplayer.rs::Screen::draw	labels and fields (Screen::Edit arm)
-MenuScreens.create	port	crates/horizon-client/src/game/network/remote/mod.rs::Game::remote_open_screen	server-opened menus; gap: minor: the screen is built from the packet title
+MenuScreens.create	port	crates/horizon-client/src/game/network/remote/menus.rs::Game::remote_open_screen_body	server-opened menus; gap: minor: the screen is built from the packet title
 MenuScreens.register	skip:data		registry of menu types; Horizon reads them from tables
 MenuScreens.selfTest	skip:debug		startup check that every menu has a screen
-MenuScreens.ScreenConstructor.fromPacket	port	crates/horizon-client/src/game/network/remote/mod.rs::Game::remote_open_screen	builds the screen from the open-screen packet and sets the container menu
-NoticeWithLinkScreen.init	missing		minor: no symlink warning when a world or pack folder is a symlink
-NoticeWithLinkScreen.getNarrationMessage	missing		the symlink warning screen does not exist (see init), so nothing narrates it
+MenuScreens.ScreenConstructor.fromPacket	port	crates/horizon-client/src/game/network/remote/menus.rs::Game::remote_open_screen_body	builds the screen from the open-screen packet and sets the container menu
+NoticeWithLinkScreen.init	port	crates/horizon-client/src/title.rs::Title::play	opening a world whose folder holds links sets Mode::Error with Alert::Symlink (symlink_warning.title.world)
+NoticeWithLinkScreen.getNarrationMessage	inline	crates/horizon-client/src/title.rs::Title::narration	the world_error screen narrates the symlink title and message
 OutOfMemoryScreen.init	missing		minor: unsure: no out-of-memory screen; Horizon does not handle allocation failures this way
 PauseScreen.added	skip:service		friend list listener on the pause screen (social)
 PauseScreen.init	port	crates/horizon-client/src/game/interface/screens.rs::pause_buttons	button layout; the title is drawn in draw_pause_menu
-PauseScreen.createPauseMenu	port	crates/horizon-client/src/game/interface/screens.rs::pause_buttons	gap: minor: no Mods button; the report bugs, feedback, friends and player reporting icons are all live (icon_active, screens.rs:144-151)
+PauseScreen.createPauseMenu	port	crates/horizon-client/src/game/interface/screens.rs::pause_buttons	gap: minor: no Mods button; report bugs and feedback stay live, friends follows the list, and player reporting is inactive when the integrated server has seen no player besides this one and then shows NO_PLAYERS_TO_REPORT_TOOLTIP (icon_active, screens.rs)
 PauseScreen.getCustomAdditions	port	crates/horizon-client/src/game/interface/screens.rs::Game::pause_screen_additions	the pause_screen_additions tag: one dialog, else minecraft:custom_options, else the server links row
 PauseScreen.addCustomDialogButtons	port	crates/horizon-client/src/game/interface/screens.rs::Game::pause_click	one full-width button in row 3 (id 14), labelled by computeExternalTitle; the server links fallback opens the links screen (id 11)
 PauseScreen.extractRenderState	port	crates/horizon-client/src/game/interface/screens.rs::Game::draw_pause_menu	gap: minor: no draft-report badge; the now-playing song on the pause menu is drawn by music.rs::Game::draw_music_toast, not here
@@ -145,8 +145,8 @@ TitleScreen.createNormalMenuOptions	port	crates/horizon-client/src/title.rs::Tit
 TitleScreen.getMultiplayerDisabledReason	port	crates/horizon-client/src/title.rs::Title::buttons	the decision is the button's enabled flag from Title.allows_multiplayer (AccountStatus::allows_multiplayer: servers-allowed, a multiplayer ban, a forced name change); the reason component vanilla shows for it is not built
 TitleScreen.createDemoMenuOptions	skip:other		demo build only (isDemo); Horizon has no demo mode
 TitleScreen.checkDemoWorldPresence	skip:other		demo world only
-TitleScreen.extractRenderState	port	crates/horizon-client/src/title.rs::Title::draw	version line and buttons
+TitleScreen.extractRenderState	port	crates/horizon-client/src/title/draw.rs::Title::draw_with_items	version line and buttons
 TitleScreen.mouseClicked	port	crates/horizon-client/src/title.rs::Title::click	gap: minor: no Realms notification popup to click
 TitleScreen.confirmDemo	skip:other		demo world reset only
-DirectJoinServerScreen.updateSelectButtonStatus	port	crates/horizon-client/src/multiplayer.rs::Screen::buttons	the Join Server button is active only while servers::parse_address accepts the typed address (Screen::Direct)
+DirectJoinServerScreen.updateSelectButtonStatus	port	crates/horizon-client/src/multiplayer.rs::Screen::buttons	the Join Server button is active only while servers::is_valid_address accepts the typed address (Screen::Direct)
 DirectJoinServerScreen.setInitialFocus	skip:ui		the address field is drawn focused (focused_at); it is the Direct screen's only text field

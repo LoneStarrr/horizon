@@ -9,7 +9,7 @@
 use super::{
     DamageLevel, Mob, MobEvent, MobWorld, Species, Who,
     goals::{
-        Breed, Cx, Float, Goal, LOOK, LookAtPlayer, MOVE, Panic, RandomLookAround, Stroll, Tempt,
+        AnimalPanic, Breed, Cx, Goal, LOOK, LookAtPlayer, MOVE, RandomLookAround, Stroll, Tempt,
         goal_clone,
     },
     sync,
@@ -17,8 +17,9 @@ use super::{
 use crate::blocks::Fluid;
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{LevelRandom, RandomSource},
 };
+use horizon_world::move_gate::MoveGate;
 use mod_api::SoundSource;
 use std::fmt::Debug;
 
@@ -120,10 +121,12 @@ pub fn register(m: &mut Mob) {
         prefers_shallow: true,
     };
     let g = &mut m.ai.goals;
-    g.add(0, Float);
+    // `Frog` registers no goals (its `FrogAi` brain only walks and swims) and
+    // has no `FloatGoal`; `Frog.travelInWater` adds neither lift nor gravity,
+    // so a frog in water keeps its depth instead of rising to the surface.
     // `FrogAi.initCoreActivity`: `AnimalPanic(2.0)` — the panic speed
     // multiplier is 2.0, not the 1.25 its temptation uses.
-    g.add(1, Panic::new(2.0));
+    g.add(1, AnimalPanic::new(2.0));
     // `FrogAi.initIdleActivity`: `AnimalMakeLove` first, then `FollowTemptation(1.25)`.
     g.add(2, Breed::new(1.0));
     g.add(3, Unless(is_pregnant, Tempt::new(1.25, food, false)));
@@ -184,7 +187,7 @@ pub fn travel(
         return false;
     }
     m.move_relative(m.ai.speed, input);
-    m.do_move(w, level, events);
+    m.do_move(w, level, events, &mut MoveGate::new());
     m.velocity = m.velocity.scale(0.9);
     true
 }
@@ -698,7 +701,7 @@ pub(crate) fn set_jump_cooldown(m: &mut Mob, ticks: Option<i64>) {
 }
 /// `TIME_BETWEEN_LONG_JUMPS.sample` from the level's random, divided as the
 /// caller asks.
-fn sample_cooldown(m: &mut Mob, lr: &mut LegacyRandom, div: i32) {
+fn sample_cooldown(m: &mut Mob, lr: &mut LevelRandom, div: i32) {
     let (lo, hi) = if m.species() == Species::Goat {
         GOAT_TIME_BETWEEN_LONG_JUMPS
     } else {
@@ -791,7 +794,7 @@ pub(super) struct LongJump {
 impl LongJump {
     /// `WeightedRandom.getRandomItem` with the level's random over the
     /// candidates, removed once drawn.
-    fn draw(&mut self, lr: &mut LegacyRandom) -> Option<Candidate> {
+    fn draw(&mut self, lr: &mut LevelRandom) -> Option<Candidate> {
         let total: i32 = self.candidates.iter().map(|c| c.1).sum();
         if total == 0 {
             return None;
@@ -805,7 +808,7 @@ impl LongJump {
     }
     /// `LongJumpToPreferredBlock.getJumpCandidate`: while it wants them, the
     /// first drawn spot over a preferred block, else the first one passed over.
-    fn candidate(&mut self, w: &MobWorld, lr: &mut LegacyRandom) -> Option<Candidate> {
+    fn candidate(&mut self, w: &MobWorld, lr: &mut LevelRandom) -> Option<Candidate> {
         if !self.wanting_preferred {
             return self.draw(lr);
         }
@@ -822,7 +825,7 @@ impl LongJump {
     }
     /// `LongJumpToRandomPos.pickCandidate`: the first acceptable spot it can
     /// reach in an arc but not by an 8 block path.
-    fn pick(&mut self, m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom) {
+    fn pick(&mut self, m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom) {
         while !self.candidates.is_empty() {
             let Some((target, _)) = self.candidate(w, lr) else {
                 continue;
@@ -1061,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared entity resources in .local/horizon-client"]
+    #[ignore = "daily"]
     fn tongue_acquisition_honors_brain_hooks_and_edible_redirects() {
         use crate::mobs::{MobHooks, PlayerView, TargetChange};
         use std::cell::Cell;
@@ -1108,7 +1111,8 @@ mod tests {
                 (5, "zombie", 1),
             ] {
                 let kind = std::sync::Arc::new(types.types[&format!("minecraft:{name}")].clone());
-                let mut seen = Mob::new(id, kind, Vec3::new(1.5, 64.0, 0.5), 0.0).seen(None);
+                let mut seen = Mob::new(id, kind, Vec3::new(1.5, 64.0, 0.5), 0.0)
+                    .seen(None, &crate::items::Items::empty());
                 seen.size = size;
                 others.push(seen);
             }
@@ -1202,6 +1206,7 @@ mod tests {
     /// turtle's 0.1), then the whole motion is scaled by 0.9. Out of water
     /// this path does not run.
     #[test]
+    #[ignore = "daily"]
     fn water_travel_uses_get_speed_and_scales_by_nine_tenths() {
         let ran = crate::mobs::world::with_test_world(&[], |w, _| {
             let mut m = frog();
@@ -1235,7 +1240,7 @@ mod tests {
             assert!((m.velocity.z - 0.3375).abs() < 1.0e-9, "{}", m.velocity.z);
         });
         // Without a test world the closure does not run; there is nothing else to check.
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 
     /// `Frog.updateWalkAnimation`: target `min(distance * 25, 1)`, 0 while
@@ -1286,7 +1291,7 @@ mod tests {
             ..LongJump::default()
         };
         let mut r = LegacyRandom::new(7);
-        let mut lr = r.clone();
+        let mut lr = LevelRandom::for_level(r.clone());
         let pick = r.next_int_bound(14).unwrap();
         let want = if pick < 1 {
             0
@@ -1341,7 +1346,7 @@ mod tests {
     fn the_long_jump_cooldown_counts_down_and_is_erased() {
         let mut m = frog();
         let own = m.random.state();
-        sample_cooldown(&mut m, &mut LegacyRandom::new(3), 2);
+        sample_cooldown(&mut m, &mut crate::mobs::world::level_random(3), 2);
         let t = jump_cooldown(&m).unwrap();
         assert!((50..=70).contains(&t));
         assert_eq!(m.random.state(), own);
@@ -1360,6 +1365,7 @@ mod tests {
     /// long jump run at 1.25 and 1.0; 1.25 here would make a fleeing frog 60%
     /// slower than vanilla's.
     #[test]
+    #[ignore = "daily"]
     fn a_hurt_frog_panics_at_vanillas_two_times_speed() {
         let ran = crate::mobs::world::with_built_test_world(
             &[],
@@ -1398,14 +1404,22 @@ mod tests {
                     events: &mut events,
                 };
                 let mut goals = std::mem::take(&mut m.ai.goals);
-                goals.tick(&mut m, &mut cx);
+                // `AnimalPanic` looks for a spot every tick until
+                // `LandRandomPos` finds one; the walk target carries the
+                // speed multiplier.
+                for _ in 0..20 {
+                    goals.tick(&mut m, &mut cx);
+                    if m.ai.nav.speed_modifier == 2.0 {
+                        break;
+                    }
+                }
                 assert!(goals.is_running("Panic"), "the hurt frog should flee");
                 m.ai.goals = goals;
                 assert!(m.ai.panicking);
                 assert_eq!(m.ai.nav.speed_modifier, 2.0);
             },
         );
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 
     /// `Frog` keeps its pregnancy as the `IS_PREGNANT` brain memory, and
@@ -1451,6 +1465,7 @@ mod tests {
     /// `block_place` is posted from the frog at the new block, then the lay
     /// sound, and the pregnancy is erased.
     #[test]
+    #[ignore = "daily"]
     fn laying_frogspawn_posts_block_place_from_the_frog() {
         let ran = crate::mobs::world::with_built_test_world(
             &[],
@@ -1497,6 +1512,6 @@ mod tests {
                 assert!(!is_pregnant(&m), "laying erases the pregnancy");
             },
         );
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
     }
 }

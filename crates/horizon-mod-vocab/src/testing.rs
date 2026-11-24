@@ -78,6 +78,84 @@ pub fn with_dispatch<R>(mods: Mods, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Run a closure while saving this thread's Parts snapshot and restoring it on exit or unwind.
+///
+/// Nested scopes and panic unwinding restore the preceding snapshot; other threads are unaffected.
+// hidden: API-owned test setup uses this vocabulary fixture, not mod authoring code.
+#[doc(hidden)]
+pub fn with_parts_scope<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static crate::parts::Installed>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::parts::TEST_PARTS.set(self.0);
+        }
+    }
+    let _restore = Restore(crate::parts::TEST_PARTS.get());
+    f()
+}
+
+/// Rebuild a fixture's Parts snapshot from a fresh registration epoch on this thread.
+///
+/// On success the replacement stays installed. An error or unwinding restores the previous snapshot.
+/// Production registries remain frozen; only game fixtures that need a complete key table
+/// after their initial synthetic registration should use this.
+// hidden: only the shared game fixtures in horizon-mod-api rebuild their Parts epoch; not API.
+#[doc(hidden)]
+pub fn rebuild_parts<R, E>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+    struct Restore {
+        previous: Option<&'static crate::parts::Installed>,
+        committed: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if !self.committed {
+                crate::parts::TEST_PARTS.set(self.previous);
+            }
+        }
+    }
+    let mut restore = Restore {
+        previous: crate::parts::TEST_PARTS.replace(None),
+        committed: false,
+    };
+    let result = f();
+    restore.committed = result.is_ok();
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn rebuilding_fixture_parts_commits_success_and_restores_on_error_or_unwind() {
+    use crate::parts::{custom_stat_declarations, install_input, installation::InstalledInput};
+    let install = |id: &str| {
+        install_input(InstalledInput {
+            custom_stats: vec![id.into()],
+            ..Default::default()
+        });
+    };
+    install("fixture:old");
+    let result: Result<(), ()> = rebuild_parts(|| {
+        assert!(custom_stat_declarations().is_empty());
+        install("fixture:new");
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(custom_stat_declarations(), ["fixture:new"]);
+    let result: Result<(), &str> = rebuild_parts(|| {
+        install("fixture:failed");
+        Err("fixture refused")
+    });
+    assert_eq!(result, Err("fixture refused"));
+    assert_eq!(custom_stat_declarations(), ["fixture:new"]);
+    let panic = std::panic::catch_unwind(|| {
+        let _: Result<(), ()> = rebuild_parts(|| {
+            install("fixture:panicked");
+            panic!("fixture refused");
+        });
+    });
+    assert!(panic.is_err());
+    assert_eq!(custom_stat_declarations(), ["fixture:new"]);
+}
+
 /// Capture this thread's test installation for work sent to another thread.
 ///
 /// Production installations are process-wide. Tests isolate them per thread; a worker
@@ -138,13 +216,19 @@ pub struct FakeHost {
     pub commands: FakeCommands,
     /// The message service.
     pub messages: FakeMessages,
-    /// The transaction journal over the players and the level.
-    pub journal: FakeJournal<(FakePlayers, FakeLevel)>,
+    /// The transaction journal over the players, the level and the holders' attachments.
+    pub journal: FakeJournal<(
+        FakePlayers,
+        FakeLevel,
+        horizon_mod_runtime::attachments::Attachments,
+    )>,
     /// The sounds played in the level, in order. Like the game's, they are sent as they are
     /// played: an aborted transaction does not take them back.
     pub sounds: Vec<FakeSound>,
     /// The game events sent in the level, in order, kept as the sounds are.
     pub game_events: Vec<FakeGameEvent>,
+    /// The holders' attachments: a lone map answers for any holder.
+    pub attachments: horizon_mod_runtime::attachments::Attachments,
 }
 
 impl FakeHost {
@@ -152,11 +236,75 @@ impl FakeHost {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Freeze the current load's entity-type table after declaring the fake world's entities.
+    /// Includes requested mod keys, the player type and every kind in this host's level.
+    /// Repeated setup may use already resolved kinds, but cannot extend the frozen table.
+    pub fn resolve_entity_types(&mut self) -> Result<(), Vec<String>> {
+        if crate::parts::installed().is_none() {
+            crate::parts::install_input(
+                crate::__private::parts_installation::InstalledInput::default(),
+            );
+        }
+        let mut ids: Vec<_> = crate::parts::requested_keys()
+            .entity_types
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        ids.push("minecraft:player");
+        ids.extend(
+            self.level
+                .entities
+                .values()
+                .map(|entity| entity.kind.as_str()),
+        );
+        if crate::parts::installed()
+            .is_some_and(|installed| installed.resolved_entity_types.get().is_some())
+        {
+            let errors: Vec<_> = ids
+                .into_iter()
+                .filter(|id| crate::content::registry_keys::resolved_entity_type_key(id).is_none())
+                .map(|id| {
+                    format!("fake entity kind {id} was not declared before entity-type resolution")
+                })
+                .collect();
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors)
+            };
+        }
+        crate::content::registry_keys::resolve_entity_types(ids)
+    }
     /// Player `uuid` online as entity `entity` in the level, joined if missing.
     pub fn join(&mut self, uuid: u128, entity: u32) -> &mut FakePlayer {
         self.players.join(uuid, entity, self.level.level())
     }
 
+    /// A queued bucket sound and game event, as the game plays them at the outermost commit.
+    fn play_fluid_effects(&mut self, queued: level::QueuedFluidEffects) {
+        if let Some(sound) = self.registries.fluid_sound(queued.fluid, queued.pickup) {
+            self.sounds.push(FakeSound {
+                sound: sound.to_owned(),
+                at: queued.at,
+                source: crate::SoundSource::Blocks,
+                volume: 1.0,
+                pitch: 1.0,
+            });
+        }
+        self.game_events.push(FakeGameEvent {
+            event: match queued.pickup {
+                true => "minecraft:fluid_pickup",
+                false => "minecraft:fluid_place",
+            }
+            .to_owned(),
+            at: queued.at,
+            context: crate::GameEventContext {
+                source_entity: queued.player.map(PlayerRef::entity),
+                affected_state: None,
+            },
+        });
+    }
     fn max_stack(&self, resource: &crate::ItemResource) -> u32 {
         match resource.value_id(self, "minecraft:max_stack_size") {
             Some(Tag::Int(size)) if (1..=99).contains(&size) => size as u32,
@@ -251,6 +399,7 @@ crate::impl_host_areas!(
         entities,
         items,
         levels,
+        mod_state,
         players,
         tags
     )
@@ -261,15 +410,43 @@ impl ServerHost for FakeHost {
         Some(BackendMutRef::of(self))
     }
 }
+impl crate::host::mod_state::ModStateHost for FakeHost {
+    fn attachments(&mut self) -> &mut dyn mod_api::AttachmentStore {
+        &mut self.attachments
+    }
+}
 impl crate::prelude::ModStateServerHost for FakeHost {
     fn transaction_open(&mut self) -> TransactionSeal {
-        self.journal
-            .open((self.players.clone(), self.level.clone()))
+        self.journal.open((
+            self.players.clone(),
+            self.level.clone(),
+            self.attachments.clone(),
+        ))
     }
     fn transaction_close(&mut self, seal: &TransactionSeal, commit: bool) {
-        if let Some((players, level)) = self.journal.close(seal, commit) {
-            (self.players, self.level) = (players, level);
+        if let Some((players, level, attachments)) = self.journal.close(seal, commit) {
+            (self.players, self.level, self.attachments) = (players, level, attachments);
         }
+        // The outermost commit plays what waited for it.
+        if self.journal.depth() == 0 {
+            for queued in std::mem::take(&mut self.level.fluid_effects) {
+                self.play_fluid_effects(queued);
+            }
+        }
+    }
+    fn transaction_lifecycle(&self) -> crate::TransactionLifecycle {
+        // The fake tells the world of nothing at a close, so no close is ever seen running.
+        if self.journal.depth() == 0 {
+            crate::TransactionLifecycle::None
+        } else {
+            crate::TransactionLifecycle::Open
+        }
+    }
+    fn transaction_current(&self) -> Option<crate::Transaction> {
+        self.journal.current()
+    }
+    fn transaction_depth(&self, tx: &crate::Transaction) -> Option<u32> {
+        self.journal.depth_of(tx)
     }
 }
 impl crate::prelude::ServicesServerHost for FakeHost {
@@ -381,6 +558,10 @@ impl crate::prelude::ItemsBackend for FakeHost {
     fn entity_equipment_size(&self, _: u32) -> Option<usize> {
         None
     }
+    fn item_bundle_slots(&self, _: &ItemStack) -> Option<Vec<Option<ItemStack>>> {
+        // The fake registry models declared containers, not game bundle components.
+        None
+    }
     fn item_container_slots(&self, stack: &ItemStack) -> Option<Vec<Option<ItemStack>>> {
         self.registries.container_slots(stack)
     }
@@ -411,11 +592,13 @@ impl crate::prelude::FluidsEnergyBackend for FakeHost {
     }
 }
 impl crate::prelude::EntitiesBackend for FakeHost {
-    fn entity_kind(&self, entity: EntityRef) -> Option<String> {
-        if self.players.by_entity(entity.id()).is_some() {
-            return Some("minecraft:player".to_owned());
-        }
-        Some(self.level.entity_at(entity.id())?.kind.clone())
+    fn entity_kind(&self, entity: EntityRef) -> Option<crate::EntityTypeKey> {
+        let kind = if self.players.by_entity(entity.id()).is_some() {
+            "minecraft:player"
+        } else {
+            &self.level.entity_at(entity.id())?.kind
+        };
+        crate::content::registry_keys::resolved_entity_type_key(kind)
     }
     fn entity_level(&self, entity: EntityRef) -> Option<LevelRef> {
         if let Some((_, player)) = self.players.by_entity(entity.id()) {
@@ -425,6 +608,11 @@ impl crate::prelude::EntitiesBackend for FakeHost {
     }
 }
 impl crate::prelude::KeysBackend for FakeHost {
+    fn entity_type_key_id(&self, key: crate::EntityTypeKey) -> String {
+        crate::content::registry_keys::entity_type_key_id(key)
+            .expect("fake entity type key belongs to its load")
+    }
+
     fn item_key_id(&self, key: crate::ItemKey) -> String {
         crate::content::registry_keys::item_id(key)
             .expect("fake item key belongs to its load")
@@ -445,6 +633,13 @@ impl crate::prelude::PlayersBackend for FakeHost {
     fn player_dimension(&self, player: PlayerRef) -> Option<crate::Identifier> {
         let level = self.player_level(player)?;
         crate::Identifier::parse(level.dimension_id()).ok()
+    }
+    fn player_has_infinite_materials(&self, player: PlayerRef) -> Option<bool> {
+        Some(self.players.get(player.uuid())?.infinite_materials)
+    }
+    fn player_inventory(&self, player: PlayerRef) -> Option<Vec<ItemStack>> {
+        let slots = &self.players.get(player.uuid())?.slots;
+        Some(slots.range(0..36).map(|(_, stack)| stack.clone()).collect())
     }
 }
 crate::impl_backend_areas!(
@@ -582,6 +777,27 @@ impl crate::prelude::ItemsBackendMut for FakeHost {
             .place(place)
             .map_or(0, |(player, slot)| player.extract(slot, resource, amount)))
     }
+    fn game_edit(
+        &mut self,
+        place: &ItemPlace,
+        resource: &crate::ItemResource,
+        _: &Transaction,
+    ) -> Result<bool, crate::StackWriteError> {
+        let Some((player, slot)) = self.players.place(place) else {
+            return Ok(false);
+        };
+        let Some(held) = player.slots.get_mut(&slot) else {
+            return Ok(false);
+        };
+        if held.item() != resource.item() {
+            return Ok(false);
+        }
+        let Some(updated) = resource.to_stack(held.count()) else {
+            return Ok(false);
+        };
+        *held = updated;
+        Ok(true)
+    }
 }
 impl crate::prelude::FluidsEnergyBackendMut for FakeHost {
     fn fluid_tank_insert(
@@ -618,6 +834,57 @@ impl crate::prelude::FluidsEnergyBackendMut for FakeHost {
         standing
             .and_then(|standing| standing.energy.as_mut())
             .map_or(0, |energy| energy.extract(amount))
+    }
+    /// The source block at `pos` ([`FakeLevel::set_block`]), a bucket of it; the fake plays no
+    /// sound or game event for it.
+    fn level_pickup_fluid(
+        &mut self,
+        level: LevelRef,
+        pos: [i32; 3],
+        _: Option<PlayerRef>,
+        tx: &Transaction,
+    ) -> Option<FluidStack> {
+        if !self.journal.holds(tx) {
+            return None;
+        }
+        let fluid = self.level.take_source(level, pos)?;
+        Some(FluidStack::new(fluid, 1000))
+    }
+    /// A source of `fluid` where nothing is; the fake plays no sound or game event for it.
+    fn level_place_fluid(
+        &mut self,
+        level: LevelRef,
+        pos: [i32; 3],
+        fluid: crate::FluidKey,
+        _: Option<PlayerRef>,
+        _: bool,
+        tx: &Transaction,
+    ) -> bool {
+        self.journal.holds(tx) && self.level.put_source(level, pos, fluid)
+    }
+    /// Queued with the level for the outermost commit, which plays it as the game does.
+    fn level_play_fluid_effects(
+        &mut self,
+        level: LevelRef,
+        pos: [i32; 3],
+        fluid: crate::FluidKey,
+        pickup: bool,
+        player: Option<PlayerRef>,
+        tx: &Transaction,
+    ) -> bool {
+        let Some(id) = crate::content::registry_keys::fluid_id(fluid) else {
+            return false;
+        };
+        if !self.journal.holds(tx) || level != self.level.level() {
+            return false;
+        }
+        self.level.fluid_effects.push(level::QueuedFluidEffects {
+            at: pos.map(|c| f64::from(c) + 0.5),
+            fluid: id,
+            pickup,
+            player,
+        });
+        true
     }
 }
 impl crate::prelude::EntitiesBackendMut for FakeHost {

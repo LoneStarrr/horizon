@@ -7,12 +7,10 @@ use horizon_client::{
     Result, block_entity_item, block_entity_nbt, containers::BlockEntity, item_data,
     items::ItemStack, save,
 };
-use {
-    horizon_core::nbt::{Compound, JavaString, Tag},
-    horizon_world::{
-        level::{Behaviours, classes::Class},
-        registry::BlockStateId,
-    },
+use horizon_core::nbt::{Compound, JavaString, Tag};
+use horizon_world::{
+    level::{Behaviours, classes::Class, flags},
+    registry::BlockStateId,
 };
 
 /// The component patch of `stack`.
@@ -57,6 +55,9 @@ fn clone_item<'a>(name: &str, block_item: &'a str) -> &'a str {
         // GrowingPlantBodyBlock: new ItemStack(getHeadBlock()), the block that
         // carries the item.
         "minecraft:kelp_plant" => "minecraft:kelp",
+        // TallSeagrassBlock.getCloneItemStack: new ItemStack(Blocks.SEAGRASS),
+        // for both halves of a plant whose own item is air.
+        "minecraft:tall_seagrass" => "minecraft:seagrass",
         "minecraft:twisting_vines_plant" => "minecraft:twisting_vines",
         "minecraft:weeping_vines_plant" => "minecraft:weeping_vines",
         // CandleCakeBlock: new ItemStack(Blocks.CAKE), for every colour and
@@ -91,15 +92,28 @@ impl Game<'_> {
         })
     }
 
-    /// The block entity at `key` as vanilla saves it, with its custom name.
+    /// The block entity at `key` as vanilla saves it.
     fn saved_block_entity(&self, key: (i32, i32, i32)) -> Option<Tag> {
-        let entity = self.world.block_entities.get(&key)?;
         let block = &self
             .res
             .facts()
             .get(self.world.block(key.0, key.1, key.2))
             .name;
-        let mut tag = save::encode_block_entity(key, entity, block);
+        let Some(entity) = self.world.block_entities.get(&key) else {
+            let pos = [key.0, key.1, key.2];
+            let tag = match block.as_ref() {
+                "minecraft:comparator" => self.comparator_data(pos),
+                "minecraft:decorated_pot" => self.pot_data(pos),
+                _ => None,
+            }?;
+            return block_entity_nbt::canonical(&tag);
+        };
+        let mut tag = save::block_entity_data(key, entity, block, self.world.block_lock(key));
+        save::write_stored_block_entity_components(
+            &mut tag,
+            entity,
+            self.world.block_entity_source(key),
+        );
         if let (Some(name), Tag::Compound(map)) = (self.world.block_names.get(&key), &mut tag) {
             map.insert("CustomName".into(), name.clone());
         }
@@ -304,7 +318,8 @@ impl Game<'_> {
         let props: Vec<(&str, &str)> = props.iter().map(|(k, v)| (&**k, &**v)).collect();
         match self.with_props(state, &props) {
             Some(new) if !props.is_empty() && new != state => {
-                self.level_set(pos, new)?;
+                // `level.setBlock(pos, modifiedState, 2)`: no neighbour pass.
+                self.level_set_with_flags(pos, new, flags::UPDATE_CLIENTS)?;
                 Ok(new)
             }
             _ => Ok(state),
@@ -335,12 +350,20 @@ impl Game<'_> {
         game_master: bool,
     ) {
         let key = (pos[0], pos[1], pos[2]);
-        self.pending.banner.remove(&pos);
         let Some(saved) = self.saved_block_entity(key) else {
             return;
         };
+        self.pending.banner.remove(&pos);
         let placed = block_entity_item::place(&saved, &components(stack), game_master);
         if placed == saved {
+            return;
+        }
+        if !self.world.block_entities.contains_key(&key) {
+            if self.set_pot_data(pos, &placed).is_none()
+                && self.load_comparator_output(pos, &placed).flatten() == Some(true)
+            {
+                self.mark_block_entity_updated(key);
+            }
             return;
         }
         let block = self.world.block(pos[0], pos[1], pos[2]);
@@ -348,6 +371,7 @@ impl Game<'_> {
         let Some((_, mut entity)) = save::decode_block_entity_for_block(&placed, name) else {
             return;
         };
+        entity.clean_stacks(&self.items().component_defaults);
         // The new crafter's state flag (CrafterBlock.newBlockEntity), which
         // its saved data has no part of.
         if let (BlockEntity::Crafter(new), Some(BlockEntity::Crafter(old))) =
@@ -356,6 +380,7 @@ impl Game<'_> {
             new.state_triggered = old.state_triggered;
         }
         self.load_block_name(key, &entity, &placed);
+        self.world.set_block_entity_metadata(key, &placed);
         self.world.block_entities.insert(key, entity);
         self.update_spawner_display(key);
     }
@@ -435,6 +460,7 @@ mod tests {
             ("minecraft:cave_vines_plant", "minecraft:glow_berries"),
             ("minecraft:big_dripleaf_stem", "minecraft:big_dripleaf"),
             ("minecraft:kelp_plant", "minecraft:kelp"),
+            ("minecraft:tall_seagrass", "minecraft:seagrass"),
             ("minecraft:twisting_vines_plant", "minecraft:twisting_vines"),
             ("minecraft:weeping_vines_plant", "minecraft:weeping_vines"),
             ("minecraft:candle_cake", "minecraft:cake"),
@@ -458,7 +484,7 @@ mod tests {
     /// (`BlockItem.updateCustomBlockEntityTag`) loads it into the new block
     /// entity, and `/give` takes the declared type and refuses an unknown one.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mod_block_entity_rides_its_item_through_the_game() {
         use super::super::native_entity_refs::tests::{run_fresh_cases, with_game_at};
         use super::components;
@@ -596,7 +622,7 @@ mod tests {
     /// a block with an item picks another, and one that declares nothing keeps
     /// picking its own item, or nothing when it has none.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_content_blocks_pick_item_is_what_pick_block_takes() {
         use super::super::native_entity_refs::tests::{run_fresh_cases, with_game_at};
         use horizon_client::chunk::Chunk;
@@ -677,7 +703,7 @@ mod plain_name_overlay_tests {
     /// BaseContainerBlockEntity's removed external name must not be restored
     /// from the original saved source by the chunk writer.
     #[test]
-    #[ignore = "requires real prepared resources and scratch homes/cwd; must execute"]
+    #[ignore = "daily"]
     fn removed_actual_plain_name_stays_absent_in_saved_and_reloaded_model() {
         with_game(|game| {
             game.build_registries();
@@ -853,7 +879,7 @@ mod styled_name_model_tests {
     }
 
     #[test]
-    #[ignore = "requires real prepared resources and scratch homes/cwd; must execute"]
+    #[ignore = "daily"]
     fn actual_container_names_load_place_mutate_and_save_without_raw() {
         with_game(|game| {
             game.build_registries();
@@ -973,3 +999,7 @@ mod styled_name_model_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "tests/item_block_state_tests.rs"]
+mod item_block_state_tests;

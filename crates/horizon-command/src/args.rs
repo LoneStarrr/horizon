@@ -2,6 +2,7 @@
 //! the vanilla error messages and completion suggestions.
 use super::{CmdResult, CommandError, Context, Reader, SuggestionsBuilder};
 use horizon_client_core::text::Text;
+use horizon_core::nbt::Tag;
 use std::{fmt, sync::Arc};
 
 pub use horizon_client_core::registries::{
@@ -17,15 +18,21 @@ pub enum CustomArgumentKind {
     Word,
     /// The rest of the line, spaces included.
     Greedy,
+    /// One token: every character up to the next space or the end of the line, at least one.
+    Token,
 }
 
 /// One completion a registered custom argument offers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomSuggestion {
-    /// The text that replaces the typed prefix.
+    /// The text that replaces the typed prefix, or the part of it `replace_start` sends the
+    /// replacement from.
     pub text: String,
     /// An optional explanation shown beside the completion.
     pub tooltip: Option<String>,
+    /// The byte offset into the prefix where the replacement starts; `None` replaces the whole
+    /// prefix. A mod uses it to complete one token inside a greedy text argument.
+    pub replace_start: Option<usize>,
 }
 
 /// A mod's registered argument type, as the dispatcher parses and completes it.
@@ -37,7 +44,7 @@ pub struct CustomArgument {
     id: Arc<str>,
     kind: CustomArgumentKind,
     parse: Arc<dyn Fn(&str) -> Result<String, Text> + Send + Sync>,
-    suggest: Arc<dyn Fn(&str) -> Vec<CustomSuggestion> + Send + Sync>,
+    suggest: Arc<dyn Fn(&Registries, &str) -> Vec<CustomSuggestion> + Send + Sync>,
 }
 
 impl fmt::Debug for CustomArgument {
@@ -51,12 +58,13 @@ impl fmt::Debug for CustomArgument {
 
 impl CustomArgument {
     /// A custom argument type `id` (such as `mymod:machine`) that reads a [`CustomArgumentKind`],
-    /// validates it with `parse` and completes it with `suggest`.
+    /// validates it with `parse` and completes it with `suggest`, which also sees the registries
+    /// the request is for (the sender and their permission).
     pub fn new(
         id: impl Into<Arc<str>>,
         kind: CustomArgumentKind,
         parse: impl Fn(&str) -> Result<String, Text> + Send + Sync + 'static,
-        suggest: impl Fn(&str) -> Vec<CustomSuggestion> + Send + Sync + 'static,
+        suggest: impl Fn(&Registries, &str) -> Vec<CustomSuggestion> + Send + Sync + 'static,
     ) -> Self {
         Self {
             id: id.into(),
@@ -134,6 +142,11 @@ pub enum ArgType {
     Resource(Resource),
     /// A plain identifier; suggestions come from the named list.
     Id(&'static str),
+    /// Vanilla's free identifier (`minecraft:resource_location`): a `namespace:path` of
+    /// identifier characters, canonical with the `minecraft` namespace when it is left out, with
+    /// no registry to check and no list of its own to suggest: the node asks the server, which
+    /// answers from the mods' own suggestions.
+    Identifier,
     /// ResourceArgument over a registry (the element must exist).
     Res(&'static str),
     /// ResourceKeyArgument (checked when the command runs).
@@ -208,13 +221,15 @@ pub enum ArgType {
     SlotSource,
     /// ResourceOrIdArgument over a registry: an id or an inline SNBT value.
     ResourceOrId(&'static str),
+    /// A received loot table argument: the server owns the registry and codec lookup.
+    ServerLootTable,
     /// ResourceSelectorArgument: a `*`/`?` pattern over a registry's ids.
     ResourceSelector(&'static str),
     /// A registered argument type: the mod's parser and suggestions.
     Custom(CustomArgument),
 }
 
-/// FilenameUtils.wildcardMatch (case-sensitive) of `*` and `?` patterns.
+/// Apache Commons IO's case-sensitive wildcard match of `*` and `?` patterns.
 pub fn wildcard_match(text: &str, pattern: &str) -> bool {
     // Keep the backtracking cursors as UTF-8 byte offsets.  The old port
     // materialised both strings as `Vec<char>` for indexing, which made every
@@ -416,8 +431,10 @@ pub struct Selector {
     pub player_name: Option<String>,
     /// The entity UUID when the argument was one.
     pub uuid: Option<u128>,
-    /// 'p', 'a', 'r', 's', 'e', 'n'.
+    /// 'p', 'a', 'r', 's', 'e', 'n'; 'e' for a mod's token.
     pub kind: char,
+    /// The mod's selector token (`allies` for `@allies`), whose type filters the candidates.
+    pub token: Option<String>,
     pub limit: usize,
     pub sort: Sort,
     pub include_entities: bool,
@@ -691,7 +708,7 @@ pub fn read_float_bounds(reader: &mut Reader) -> CmdResult<(Option<f32>, Option<
         "parsing.float.invalid",
     )
 }
-/// Integer.parseInt over number characters.
+/// Java integer parsing over number characters.
 pub fn java_parse_int(s: &str) -> Option<i32> {
     let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
     if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
@@ -699,7 +716,7 @@ pub fn java_parse_int(s: &str) -> Option<i32> {
     }
     s.parse().ok()
 }
-/// Double.parseDouble over the characters StringReader reads as a number.
+/// Java double parsing over the characters Brigadier's reader reads as a number.
 pub fn java_parse_double(s: &str) -> Option<f64> {
     let t = s.trim_matches(|c: char| c <= ' ');
     let body = t.strip_prefix(['-', '+']).unwrap_or(t);
@@ -974,7 +991,7 @@ fn parse_nbt_path(reader: &mut Reader) -> CmdResult<()> {
             '[' => {
                 reader.skip();
                 if !reader.can_read() {
-                    // StringReader.peek past the end (StringIndexOutOfBoundsException).
+                    // Brigadier's reader peek past the end (StringIndexOutOfBoundsException).
                     let len = reader.string.encode_utf16().count();
                     let message = format!("Index {len} out of bounds for length {len}");
                     return Err(CommandError::tr_at(
@@ -1047,36 +1064,191 @@ fn particle_fields(id: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
-/// The particle type's codec over the options (MapCodec field errors, newest first).
-fn particle_options(id: &str, t: &horizon_core::nbt::Tag) -> Result<(), String> {
-    use super::codec::{get, no_key, not_map, snbt};
+/// The particle type's codec over the options (`RecordCodecBuilder` decodes
+/// the fields last to first, and every field's error joins with `; `).
+fn particle_options(id: &str, t: &horizon_core::nbt::Tag, reg: &Registries) -> Result<(), String> {
+    use super::codec::{get, no_key, not_map};
     let horizon_core::nbt::Tag::Compound(map) = t else {
         return Err(not_map(t));
     };
-    let missing: Vec<String> = particle_fields(id)
-        .iter()
-        .rev()
-        .filter(|f| get(map, f).is_none())
-        .map(|f| no_key(f, t))
-        .collect();
-    if !missing.is_empty() {
-        return Err(missing.join("; "));
-    }
-    if particle_fields(id) == ["block_state"]
-        && let Some(state) = get(map, "block_state")
-        && !matches!(state, horizon_core::nbt::Tag::String(_))
-    {
-        // withAlternative(BlockState.CODEC, the block id codec).
-        let first = match state {
-            horizon_core::nbt::Tag::Compound(_) => {
-                super::codec::either("Not a string".into(), no_key("id", state))
-            }
-            _ => not_map(state),
+    let checks = particle_value_checks(id);
+    let mut errors: Vec<String> = Vec::new();
+    for field in particle_fields(id).iter().rev() {
+        let Some(value) = get(map, field) else {
+            errors.push(no_key(field, t));
+            continue;
         };
-        let _ = snbt;
-        return Err(super::codec::either(first, "Not a string".into()));
+        // The option class's own codec: a value it refuses fails the argument
+        // before the particle is made.
+        if let Some((_, check)) = checks.iter().find(|(name, _)| name == field)
+            && let Err(message) = check(value, reg)
+        {
+            errors.push(message);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+/// How one option field's codec reads its value.
+type OptionCheck = fn(&Tag, &Registries) -> Result<(), String>;
+/// The option fields whose codec validates the value (declaration order).
+fn particle_value_checks(id: &str) -> &'static [(&'static str, OptionCheck)] {
+    const SCALE: (&str, OptionCheck) = ("scale", scale_option);
+    const ITEM: (&str, OptionCheck) = ("item", item_stack_option);
+    const BLOCK_STATE: (&str, OptionCheck) = ("block_state", block_state_option);
+    match id.trim_start_matches("minecraft:") {
+        "block" | "block_marker" | "falling_dust" | "dust_pillar" | "block_crumble" => {
+            &[BLOCK_STATE]
+        }
+        "dust" => &[("color", rgb_color_option), SCALE],
+        "dust_color_transition" => &[
+            ("from_color", rgb_color_option),
+            ("to_color", rgb_color_option),
+            SCALE,
+        ],
+        "item" => &[ITEM],
+        _ => &[],
+    }
+}
+/// `BlockParticleOption.CODEC`: `BlockState.CODEC`, or a block id.
+fn block_state_option(t: &Tag, _reg: &Registries) -> Result<(), String> {
+    use super::codec::{either, no_key, not_map};
+    if matches!(t, Tag::String(_)) {
+        return Ok(());
+    }
+    let first = match t {
+        Tag::Compound(_) => either("Not a string".into(), no_key("id", t)),
+        _ => not_map(t),
+    };
+    Err(either(first, "Not a string".into()))
+}
+/// `Codec.FLOAT`'s value for an option (`getNumberValue().floatValue()`).
+fn float_option(t: &Tag) -> Option<f32> {
+    Some(match t {
+        Tag::Byte(v) => f32::from(*v),
+        Tag::Short(v) => f32::from(*v),
+        Tag::Int(v) => *v as f32,
+        Tag::Long(v) => *v as f32,
+        Tag::Float(v) => f32::from_bits(*v),
+        Tag::Double(v) => f64::from_bits(*v) as f32,
+        _ => return None,
+    })
+}
+/// `Codec.INT`'s value for an option (`getNumberValue().intValue()`).
+fn int_option(t: &Tag) -> Option<i32> {
+    Some(match t {
+        Tag::Byte(v) => i32::from(*v),
+        Tag::Short(v) => i32::from(*v),
+        Tag::Int(v) => *v,
+        Tag::Long(v) => *v as i32,
+        Tag::Float(v) => f32::from_bits(*v) as i32,
+        Tag::Double(v) => f64::from_bits(*v) as i32,
+        _ => return None,
+    })
+}
+/// `ScalableParticleOptionsBase.SCALE`.
+fn scale_option(t: &Tag, _reg: &Registries) -> Result<(), String> {
+    let Some(v) = float_option(t) else {
+        return Err("Not a number".into());
+    };
+    if (0.01..=4.0).contains(&v) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Value must be within range [0.01;4.0]: {}",
+            horizon_core::java_number::float_to_string(v)
+        ))
+    }
+}
+/// `ExtraCodecs.RGB_COLOR_CODEC`: an int, or `VECTOR3F` (three floats).
+fn rgb_color_option(t: &Tag, _reg: &Registries) -> Result<(), String> {
+    use super::codec::{either, is_number, not_list};
+    if is_number(t) {
+        return Ok(());
+    }
+    let Tag::List(items) = t else {
+        return Err(either("Not a number".into(), not_list(t)));
+    };
+    // Codec.FLOAT.listOf(): the elements that parse, and one error for each
+    // that does not; then Util.fixedSize(list, 3).
+    let bad = items.iter().filter(|i| !is_number(i)).count();
+    let parsed = items.len() - bad;
+    let mut message: Vec<String> = std::iter::repeat_n("Not a number".to_owned(), bad).collect();
+    if parsed != 3 {
+        message.push("Input is not a list of 3 elements".into());
+        let message = message.join("; ");
+        // fixedSize keeps the first three floats when it has them: that error
+        // carries a value, so the alternative reports it alone.
+        return Err(if parsed > 3 {
+            message
+        } else {
+            either("Not a number".into(), message)
+        });
+    }
+    if message.is_empty() {
+        Ok(())
+    } else {
+        Err(message.join("; "))
+    }
+}
+/// `Item.CODEC` (`BuiltInRegistries.ITEM.holderByNameCodec`, never air).
+fn item_option(t: &Tag, reg: &Registries) -> Result<(), String> {
+    let Tag::String(raw) = t else {
+        return Err("Not a string".into());
+    };
+    let raw = raw.to_string_lossy();
+    let Some(id) = parse_identifier(&raw) else {
+        return Err(format!("Not a valid resource location: {raw}"));
+    };
+    if !reg.ids("minecraft:item").contains(&id) {
+        return Err(format!(
+            "Unknown registry key in ResourceKey[minecraft:root / minecraft:item]: {id}"
+        ));
+    }
+    if id == "minecraft:air" {
+        return Err("Item must not be minecraft:air".into());
     }
     Ok(())
+}
+/// `ItemStackTemplate.CODEC`: `{id, count, components}` or a bare item id.
+fn item_stack_option(t: &Tag, reg: &Registries) -> Result<(), String> {
+    use super::codec::{either, get, no_key, not_map};
+    let Tag::Compound(map) = t else {
+        // Not a map, then Item.CODEC over the value itself.
+        let first = not_map(t);
+        return match item_option(t, reg) {
+            Ok(()) => Ok(()),
+            Err(second) => Err(either(first, second)),
+        };
+    };
+    // The fields decode last to first, so `count` (ExtraCodecs.intRange(1, 99))
+    // reports before `id` (Item.CODEC). Only a `count` error on its own keeps
+    // the record's partial value: then the alternative reports it alone, and
+    // every other failure joins both branches.
+    let count_error = match get(map, "count") {
+        None => None,
+        Some(count) => match int_option(count) {
+            Some(n) if (1..=99).contains(&n) => None,
+            Some(n) => Some(format!("Value must be within range [1;99]: {n}")),
+            None => Some("Not a number".to_owned()),
+        },
+    };
+    let id_error = match get(map, "id") {
+        None => Some(no_key("id", t)),
+        Some(id) => item_option(id, reg).err(),
+    };
+    match (count_error, id_error) {
+        (None, None) => Ok(()),
+        (Some(count), None) => Err(count),
+        (count, id) => {
+            let first: Vec<String> = count.into_iter().chain(id).collect();
+            let second = item_option(t, reg).expect_err("a compound is not an item id");
+            Err(either(first.join("; "), second))
+        }
+    }
 }
 /// TimeArgument units.
 fn time_unit(unit: &str) -> Option<i32> {
@@ -1120,8 +1292,8 @@ impl ArgType {
                     return Err(CommandError::tr_at(
                         "argument.float.low",
                         &[
-                            &horizon_client_core::snbt::java_float(*min),
-                            &horizon_client_core::snbt::java_float(v),
+                            &horizon_core::java_number::float_to_string(*min),
+                            &horizon_core::java_number::float_to_string(v),
                         ],
                         reader,
                     ));
@@ -1131,8 +1303,8 @@ impl ArgType {
                     return Err(CommandError::tr_at(
                         "argument.float.big",
                         &[
-                            &horizon_client_core::snbt::java_float(*max),
-                            &horizon_client_core::snbt::java_float(v),
+                            &horizon_core::java_number::float_to_string(*max),
+                            &horizon_core::java_number::float_to_string(v),
                         ],
                         reader,
                     ));
@@ -1146,8 +1318,8 @@ impl ArgType {
                     return Err(CommandError::tr_at(
                         "argument.double.low",
                         &[
-                            &horizon_client_core::snbt::java_double(*min),
-                            &horizon_client_core::snbt::java_double(v),
+                            &horizon_core::java_number::double_to_string(*min),
+                            &horizon_core::java_number::double_to_string(v),
                         ],
                         reader,
                     ));
@@ -1157,8 +1329,8 @@ impl ArgType {
                     return Err(CommandError::tr_at(
                         "argument.double.big",
                         &[
-                            &horizon_client_core::snbt::java_double(*max),
-                            &horizon_client_core::snbt::java_double(v),
+                            &horizon_core::java_number::double_to_string(*max),
+                            &horizon_core::java_number::double_to_string(v),
                         ],
                         reader,
                     ));
@@ -1167,6 +1339,9 @@ impl ArgType {
             }
             ArgType::Word => Arg::Str(reader.read_unquoted_string().to_owned()),
             ArgType::Str => Arg::Str(reader.read_string()?),
+            // ResourceLocationArgument: the longest run of identifier characters, canonicalised
+            // to `namespace:path`; an upper-case or two-colon token is `argument.id.invalid`.
+            ArgType::Identifier => Arg::Str(read_id(reader)?),
             ArgType::Greedy => {
                 let s = reader.remaining().to_owned();
                 reader.cursor = reader.string.len();
@@ -1385,7 +1560,7 @@ impl ArgType {
                         reader,
                     ));
                 }
-                // Integer.parseInt(s, begin, end, 16) per channel: a bad digit
+                // The Java hexadecimal parse (s, begin, end, 16) per channel: a bad digit
                 // escapes Brigadier as a dispatcher parse exception.
                 let width = text.len() / 3;
                 for chunk in text.as_bytes().chunks(width) {
@@ -1420,7 +1595,7 @@ impl ArgType {
                     .map(char::len_utf8)
                     .sum();
                 match (run > 0)
-                    .then(|| super::selector::java_uuid(&rest[..run]))
+                    .then(|| horizon_core::text::parse_java_uuid(&rest[..run]))
                     .flatten()
                 {
                     Some(_) => {
@@ -1486,7 +1661,7 @@ impl ArgType {
                 Arg::Str(reader.string[start..reader.cursor].to_owned())
             }
             ArgType::Component | ArgType::Style => {
-                // ParserBasedArgument.withCodec: SNBT, then the codec (errors at the start).
+                // CommandArgumentParser.withCodec: SNBT, then the codec (errors at the start).
                 let tag = super::snbt::parse_tag_argument(reader)?;
                 let (decoded, key) = if matches!(self, ArgType::Style) {
                     (
@@ -1659,7 +1834,7 @@ impl ArgType {
                 } else {
                     horizon_core::nbt::Tag::Compound(Default::default())
                 };
-                if let Err(m) = particle_options(&id, &options) {
+                if let Err(m) = particle_options(&id, &options, reg) {
                     return Err(CommandError::tr("particle.invalidOptions", &[&m]));
                 }
                 Arg::Str(reader.string[start..reader.cursor].to_owned())
@@ -1716,6 +1891,10 @@ impl ArgType {
                 super::codec::resource_or_id(reader, reg, registry)?;
                 Arg::Resource(reader.string[start..reader.cursor].to_owned())
             }
+            ArgType::ServerLootTable => {
+                super::codec::resource_or_id_syntax(reader)?;
+                Arg::Resource(reader.string[start..reader.cursor].to_owned())
+            }
             ArgType::NbtPath => {
                 parse_nbt_path(reader)?;
                 Arg::Str(reader.string[start..reader.cursor].to_owned())
@@ -1746,6 +1925,17 @@ impl ArgType {
                         let text = reader.remaining().to_owned();
                         reader.cursor = reader.string.len();
                         text
+                    }
+                    CustomArgumentKind::Token => {
+                        let token = reader.read_token().to_owned();
+                        if token.is_empty() {
+                            return Err(CommandError::tr_at(
+                                "parsing.expected",
+                                &[&"a token"],
+                                reader,
+                            ));
+                        }
+                        token
                     }
                 };
                 match (custom.parse)(&text) {
@@ -1934,13 +2124,28 @@ impl ArgType {
             }
             ArgType::Anchor => builder.suggest_matching(["eyes", "feet"]),
             ArgType::Component | ArgType::Style | ArgType::NbtTag => super::snbt::suggest(builder),
-            ArgType::Swizzle | ArgType::Message | ArgType::Nbt => {}
+            ArgType::Swizzle | ArgType::Message | ArgType::Nbt | ArgType::ServerLootTable => {}
             ArgType::Custom(custom) => {
                 let prefix = builder.remaining().to_owned();
-                for suggestion in (custom.suggest)(&prefix) {
+                for suggestion in (custom.suggest)(reg, &prefix) {
+                    // A suggestion may replace only the tail of the text argument, from its
+                    // offset: a completion for the token a greedy text is typing. One that
+                    // starts past the typed text or inside a character is left out rather than
+                    // panicking where the chat applies it (the game refuses it by name first).
+                    let start = match suggestion.replace_start {
+                        Some(offset)
+                            if offset <= prefix.len() && prefix.is_char_boundary(offset) =>
+                        {
+                            builder.start + offset
+                        }
+                        Some(_) => continue,
+                        None => builder.start,
+                    };
                     match suggestion.tooltip {
-                        Some(tooltip) => builder.suggest_tooltip(suggestion.text, tooltip),
-                        None => builder.suggest(suggestion.text),
+                        Some(tooltip) => {
+                            builder.suggest_at_tooltip(start, suggestion.text, tooltip)
+                        }
+                        None => builder.suggest_at(start, suggestion.text),
                     }
                 }
             }

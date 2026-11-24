@@ -21,7 +21,11 @@ struct Probe {
     seen: Mutex<Vec<(u128, u8)>>,
 }
 impl IPayloadHandler for Probe {
-    fn handle(&self, bytes: PayloadBytes, context: &mut dyn IPayloadContext) -> Result<(), String> {
+    fn handle(
+        &self,
+        bytes: PayloadBytes,
+        context: &mut dyn IPayloadContext,
+    ) -> Result<(), mod_api::PayloadHandleError> {
         assert_eq!(std::thread::current().name(), Some("Server thread"));
         assert_eq!(context.protocol(), PayloadProtocol::Play);
         assert_eq!(context.flow(), PayloadDirection::ToServer);
@@ -54,7 +58,7 @@ impl IPayloadHandler for Probe {
         drop(seen);
         context
             .reply(&PayloadId(CHANNEL.into()), bytes)
-            .map_err(|e| format!("reply: {e:?}"))?;
+            .map_err(|e| mod_api::PayloadHandleError::Failed(format!("reply: {e:?}")))?;
         Ok(())
     }
 }
@@ -75,7 +79,7 @@ impl Hooks for Registration {
 }
 
 #[test]
-#[ignore = "needs HORIZON_TEST_RESOURCES; starts an integrated server and two physical TCP clients"]
+#[ignore = "daily"]
 fn published_tcp_attributes_players_and_orders_actions() {
     super::tests::require_resources();
     if super::super::native_entity_refs::tests::run_fresh_cases(
@@ -206,7 +210,7 @@ fn published_tcp_attributes_players_and_orders_actions() {
     });
 }
 
-fn connect_peer(port: u16, name: &str) -> Connection {
+pub(super) fn connect_peer(port: u16, name: &str) -> Connection {
     use horizon_protocol::{
         packets::{handshake, login},
         payload_negotiation::Control,

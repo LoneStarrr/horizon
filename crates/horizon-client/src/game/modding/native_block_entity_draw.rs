@@ -234,6 +234,8 @@ pub struct BlockEntityDraw {
     /// in the vertex stream those paths and their spans already cover.
     prepared: bool,
     records: Vec<PreparedRecord>,
+    /// What is drawn shows the enchanted armour glint (`native_draw_set_glint`).
+    glint: bool,
 }
 
 struct PreparedRecord {
@@ -351,7 +353,7 @@ pub(super) fn place_turning(
 impl BlockEntityDraw {
     /// A frame drawn from `pose` (relative to the camera), lit by `light` and
     /// `lights`, adding to `vertices`; `block` is where `native_draw_item`'s
-    /// owner stands. A mob's frame (`native_mob_submit`) is made this way.
+    /// owner stands. A mob's frame (`native_render_living_pre`) is made this way.
     pub(super) fn posed(
         partial: f32,
         game_time: i64,
@@ -374,6 +376,7 @@ impl BlockEntityDraw {
             spins: Vec::new(),
             prepared: false,
             records: Vec::new(),
+            glint: false,
         }
     }
 
@@ -392,9 +395,10 @@ impl BlockEntityDraw {
         self.spins.last().is_some_and(|(_, spin)| spin.is_some())
     }
 
-    /// Record a prepared copy at the current vertex, unless this draw is CPU-only or spinning.
+    /// Record a prepared copy at the current vertex, unless this draw is CPU-only, spinning or
+    /// glinting (the glint is the CPU vertices' own).
     fn defer_model(&mut self, slot: u32, generation: u64, tint: u32) -> bool {
-        if !self.prepared || self.spinning() {
+        if !self.prepared || self.spinning() || self.glint {
             return false;
         }
         self.records.push(PreparedRecord {
@@ -528,7 +532,7 @@ impl BlockEntityDraw {
     /// With a new speed, pass `old_angle - animation * new_speed` as the
     /// phase, or it jumps. Quads drawn while it is active are lit where they
     /// turn to (`quad`). Until `still` or the next `spin`. A block entity's
-    /// frame only: a mob's (`native_mob_submit`) draws it at rest. API
+    /// frame only: a mob's (`native_render_living_pre`) draws it at rest. API
     /// @API:spinning_geometry@.
     pub fn spin(&mut self, axis: [f32; 3], pivot: [f32; 3], degrees_per_tick: f32, phase: f32) {
         let spin = Spin {
@@ -562,6 +566,18 @@ impl BlockEntityDraw {
     /// The light the helpers draw with (`native_draw_light`).
     pub(super) fn light(&self) -> u32 {
         self.light
+    }
+    /// The vertices from `start` on show the enchanted armour glint when it is on
+    /// (`native_draw_set_glint`): `ARMOR_GLINT` at their own texture coordinates, as
+    /// `armorCutoutNoCullGlint` draws over a model on its atlas.
+    fn glint_from(&mut self, start: usize) {
+        if !self.glint {
+            return;
+        }
+        for v in self.vertices.iter_mut().skip(start) {
+            v.layer = (v.layer & !0xFFFF) | horizon_client::mobs::render::ARMOR_GLINT;
+            v.glint_uv = v.uv;
+        }
     }
     /// A quad of `corners` (blocks, under the pose) with unit UVs, shaded as
     /// vanilla's block entity models are (`Lighting`'s two lights).
@@ -789,6 +805,7 @@ impl Game<'_> {
                 self.standalone_geometry.generation(),
             ),
             records: Vec::new(),
+            glint: false,
         };
         let now = self.world.game_time;
         let mut kept = self.kept_block_entities.borrow_mut();
@@ -853,6 +870,7 @@ impl Game<'_> {
             draw.kept = false;
             draw.spins.clear();
             draw.records.clear();
+            draw.glint = false;
             self.api_block_entity_submit(pos, block, id, entity, &mut draw);
             self.finish_prepared_draw(&mut draw, corner, camera);
             // The turning parts, from the start of this block's vertices.
@@ -1006,6 +1024,13 @@ impl Game<'_> {
     pub(super) fn native_draw_set_light(&self, draw: &mut BlockEntityDraw, light: u32) {
         draw.light = light;
     }
+    /// What is drawn next shows the enchanted armour glint, as an enchanted piece of armour does
+    /// (`RenderTypes.armorCutoutNoCullGlint`: `enchanted_glint_armor` scrolling over the quads'
+    /// own texture coordinates), until `native_draw_set_glint(false)`: quads, boxes, blocks,
+    /// models and model parts, not items (an item's own foil), text, terrain models or fluids.
+    pub(super) fn native_draw_set_glint(&self, draw: &mut BlockEntityDraw, glint: bool) {
+        draw.glint = glint;
+    }
     /// Draws a quad with `corners` in blocks under `draw`'s pose, in a model
     /// face's order (top left, bottom left, bottom right, top right as seen
     /// from its front), textured with the `uv` rectangle (u0, v0, u1, v1 in
@@ -1024,12 +1049,14 @@ impl Game<'_> {
             return false;
         };
         let [u0, v0, u1, v1] = uv.map(|t| t / 16.0);
+        let start = draw.vertices.len();
         draw.quad(
             corners,
             [[u0, v0], [u0, v1], [u1, v1], [u1, v0]],
             rect,
             tint,
         );
+        draw.glint_from(start);
         true
     }
 
@@ -1136,6 +1163,7 @@ impl Game<'_> {
         tint: u32,
     ) -> bool {
         let mut all = true;
+        let start = draw.vertices.len();
         for (direction, face) in Direction::ALL.into_iter().zip(faces) {
             let Some(face) = face else { continue };
             let Some(rect) = self.gui.atlas.sprites.get(face.sprite).copied() else {
@@ -1151,6 +1179,7 @@ impl Game<'_> {
                 draw.quad(quad.positions, quad.uv, rect, tint);
             }
         }
+        draw.glint_from(start);
         all
     }
 
@@ -1184,7 +1213,9 @@ impl Game<'_> {
             return false;
         };
         let pose = draw.pose();
+        let start = draw.vertices.len();
         self.block_model_vertices(id, 42, pose, draw.light, true, &mut draw.vertices);
+        draw.glint_from(start);
         true
     }
 
@@ -1230,6 +1261,7 @@ impl Game<'_> {
             &mut draw.vertices,
         );
         super::minecarts::scale_tint_alpha(&mut draw.vertices[start..], faces, tint);
+        draw.glint_from(start);
         Ok(())
     }
 
@@ -1241,7 +1273,7 @@ impl Game<'_> {
     /// `entity/zombie/zombie`) times the 0xRRGGBB `tint`. A part that isn't
     /// `visible` draws nothing, one that skips drawing (`skip_draw`) only its
     /// children. A mob's model is built in the model's own frame (+y down,
-    /// its front towards -z, its feet 24 texels down): in `native_mob_submit`,
+    /// its front towards -z, its feet 24 texels down): in `native_render_living_pre`,
     /// `draw.scale([1.0, -1.0, -1.0])` then `draw.translate([0.0, -1.501,
     /// 0.0])` first, as `LivingEntityRenderer` does. False for an unknown
     /// sprite. API @API:model_layers@.
@@ -1255,7 +1287,9 @@ impl Game<'_> {
         let Some(rect) = self.gui.atlas.sprites.get(sprite).copied() else {
             return false;
         };
+        let start = draw.vertices.len();
         draw_model_part(draw, part, rect, tint);
+        draw.glint_from(start);
         true
     }
 
@@ -1392,6 +1426,7 @@ mod tests {
             spins: Vec::new(),
             prepared: false,
             records: Vec::new(),
+            glint: false,
         }
     }
 
@@ -1434,6 +1469,57 @@ mod tests {
         place_turning(&draw.vertices, &draw.spins, 1.0, Vec3::ZERO, &mut out);
         assert!(out[..4].iter().all(|v| v.normal == [0; 4]));
         assert!(out[4..].iter().all(|v| v.normal == [0, 0, 127, 127]));
+    }
+
+    /// `set_glint` marks what is drawn while it is on with the armour glint at the vertices' own
+    /// atlas UVs, leaves what came before and after plain, and keeps a glinting model off the
+    /// prepared (GPU instance) path, whose copies carry no glint.
+    #[test]
+    fn a_glinting_quad_shows_the_armour_glint_and_stays_on_the_cpu() {
+        let glint = horizon_client::mobs::render::ARMOR_GLINT;
+        let mut draw = draw();
+        let corners = [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+        draw.quad(corners, uv, sprite(), 0xFFFFFF);
+        draw.glint = true;
+        draw.quad(corners, uv, sprite(), 0xFFFFFF);
+        draw.glint_from(4);
+        draw.glint = false;
+        draw.quad(corners, uv, sprite(), 0xFFFFFF);
+        draw.glint_from(8);
+        let (before, rest) = draw.vertices.split_at(4);
+        let (glinting, after) = rest.split_at(4);
+        assert!(
+            before
+                .iter()
+                .chain(after)
+                .all(|v| v.layer & 0xFFFF != glint)
+        );
+        assert!(
+            glinting
+                .iter()
+                .all(|v| v.layer & 0xFFFF == glint && v.glint_uv == v.uv)
+        );
+        assert!(
+            glinting.iter().any(|v| v.uv != before[0].uv),
+            "the UVs differ by corner"
+        );
+
+        draw.prepared = true;
+        assert!(
+            draw.defer_model(0, 1, u32::MAX),
+            "a plain model is prepared"
+        );
+        draw.glint = true;
+        assert!(
+            !draw.defer_model(0, 1, u32::MAX),
+            "a glinting one is drawn on the CPU"
+        );
     }
 
     #[test]
@@ -1614,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and software Vulkan"]
+    #[ignore = "daily"]
     fn prepared_model_entity_pixels() {
         use mod_api::__private::game::Fields;
         let _fixture =
@@ -1690,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_full_instance_buffer_bakes_the_tail_after_the_cut() {
         use super::super::minecarts::PreparedModelFace;
         use horizon_client::gfx::cap_prepared_instance_slots;
@@ -1800,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and software Vulkan"]
+    #[ignore = "daily"]
     fn prepared_instance_matches_cpu_pixels() {
         use glam::DVec3;
         use horizon_client::gfx::fail_next_prepared_upload;
@@ -1924,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn resolved_model_draws_and_resource_replacement_invalidates_it() {
         use super::super::host::draw::GameBlockEntityDrawContext;
         use mod_api::BlockEntityDrawContext;
@@ -2122,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and software Vulkan"]
+    #[ignore = "daily"]
     fn model_tint_alpha_agrees_on_keep_deferred_and_batch() {
         use super::super::host::draw::{GameBlockEntityDrawContext, GameWorldDrawContext};
         use horizon_client::gfx::entity_pixel_test::{self, PreparedInstanceDraw};
@@ -2290,7 +2376,7 @@ mod tests {
     /// vertices in a block-entity run, so our probe pack (one flat colour per program) paints
     /// both with `gbuffers_block`. Without a pack the batch marks no run and bakes the same.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and software Vulkan"]
+    #[ignore = "daily"]
     fn a_pack_shades_batch_and_per_copy_models_with_one_program() {
         use super::super::host::draw::{GameBlockEntityDrawContext, GameWorldDrawContext};
         use horizon_client::gfx::entity_pixel_test::{self, PACK_COLOURS};
@@ -2450,7 +2536,7 @@ mod tests {
     /// the text's styles: bold widens it and doubles its glyphs, and an outline (black too)
     /// rings each glyph with eight copies behind the text.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn text_lays_glyphs_out_under_the_pose_in_the_frames_light() {
         use super::super::host::draw::GameBlockEntityDrawContext;
         use mod_api::BlockEntityDrawContext;
@@ -2543,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn fractional_text_advance_rounds_up_for_drawing_and_measurement() {
         use super::super::host::draw::GameBlockEntityDrawContext;
         use horizon_assets::resource_source::{Resource, ResourceSource};
@@ -2572,7 +2658,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn animation_clock_survives_pause_freeze_resume_and_time_updates() {
         use horizon_protocol::packets::play;
         use std::time::Duration;
@@ -2615,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn atlas_reset_discards_queued_text_uploads() {
         super::super::native_entity_refs::tests::with_game(|game| {
             game.text_patches
@@ -2636,7 +2722,7 @@ mod tests {
     /// `BlockEntityDrawContext::cube`, its UVs cut from the sprite; an unknown sprite's face
     /// is left out and the call says so.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mod_built_cube_face_draws_in_its_sprite() {
         use super::super::host::draw::GameBlockEntityDrawContext;
         use mod_api::BlockEntityDrawContext;
@@ -2766,7 +2852,7 @@ mod tests {
     /// south face, (0, 0, 1) to (1, 1, 1) in its part's frame, sits a block east of the part's
     /// origin and then the frame's 10.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_registered_layer_bakes_and_draws_before_and_after_a_reload() {
         use horizon_core::geometry::Direction as Face;
         use mod_api::{CubeListBuilder, LayerDefinition, MeshDefinition, PartPose};
@@ -2811,6 +2897,7 @@ mod tests {
             crate::game::native_entity_refs::tests::with_client_game(|game| {
                 crate::game::mods::register_layer_definitions(
                     crate::game::execution_role::ExecutionRole::Client,
+                    std::path::Path::new("."),
                 );
                 assert_eq!(drawn(game), face);
                 assert!(game.bake_layer("golem_mod:other#main").is_none());

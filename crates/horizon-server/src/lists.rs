@@ -66,7 +66,8 @@ fn edit_locked(
             } else {
                 ops.add(OpEntry {
                     user,
-                    level: 4,
+                    // PlayerList.op: MinecraftServer.operatorUserPermissions(), the property's level.
+                    level: config.op_permission_level(dir),
                     bypasses_player_limit: false,
                 });
                 saved(&ops)?;
@@ -251,15 +252,29 @@ fn add_offline(dir: &Path, name: &str) -> Result<(), String> {
 }
 
 /// The profile a running server would store for `name`: the offline one, or in online mode the account the
-/// services know by that name.
+/// services know by that name. Asked like vanilla's bulk lookup, three times when the services don't answer
+/// (they rate-limit data-center addresses), since `init` and a stopped server's edits run only once.
 pub fn account(name: &str, online: bool) -> Result<NameAndId, String> {
-    horizon_platform::server_files::profiles::resolve(name, online).ok_or_else(|| {
-        if online {
-            format!("That player does not exist (no Minecraft account is named {name}, or the services didn't answer)")
-        } else {
-            "That player does not exist".to_owned()
-        }
-    })
+    use horizon_platform::server_files::profiles;
+    if !online {
+        return Ok(NameAndId::offline(name));
+    }
+    let nobody = || format!("That player does not exist (no Minecraft account is named {name})");
+    if !profiles::valid_player_name(name) {
+        return Err(nobody());
+    }
+    match profiles::look_up_by_name_patiently(
+        &profiles::discovery_url(),
+        &name.to_ascii_lowercase(),
+        profiles::LOOKUP_RETRY_DELAY,
+    ) {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(nobody()),
+        Err(why) => Err(format!(
+            "Couldn't look up {name}: Mojang's services {why}, after {} tries; try again in a minute",
+            profiles::LOOKUP_TRIES
+        )),
+    }
 }
 
 /// The entry already on a list under `name` (any case), so removing needs no lookup.
@@ -281,8 +296,11 @@ fn load<E: horizon_platform::server_files::user_lists::Entry>(
     mut list: horizon_platform::server_files::user_lists::UserList<E>,
 ) -> Result<horizon_platform::server_files::user_lists::UserList<E>, String> {
     // UserList::load deliberately tolerates I/O errors for the running game's vanilla behavior.
-    // A stopped command must not edit an empty replacement for a file it could not read.
-    let text = match std::fs::read_to_string(&list.file) {
+    // A stopped command must not edit an empty replacement for a file it could not read. Read under
+    // the list's lock, so a save the game is making (`whitelist add` while it runs) is waited for.
+    let read = horizon_platform::server_files::user_lists::read_locked(&list.file)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(std::io::Error::other));
+    let text = match read {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(list),
         Err(error) => return Err(format!("{}: {error}", list.file.display())),
@@ -388,7 +406,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn edits_the_lists_while_stopped() {
+        // The lock is held below without a server behind it: do not wait the full 5 s for its endpoint.
+        crate::api::ENDPOINT_WAIT.with(|w| w.set(Some(std::time::Duration::from_millis(300))));
         let dir = std::env::temp_dir().join(format!("horizon-server-lists-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -489,5 +510,47 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `PlayerList.op` writes `MinecraftServer.operatorUserPermissions()`: the level of
+    /// `op-permission-level`, from `server.toml` or, when that does not set it, `server.properties`.
+    #[test]
+    fn a_stopped_op_gets_the_op_permission_level() {
+        for (name, toml_level, file_text, expected) in [
+            ("default", None, None, 4),
+            ("toml-2", Some(2), None, 2),
+            ("toml-0", Some(0), None, 0),
+            ("toml-9", Some(9), None, 4),
+            ("file-3", None, Some("op-permission-level=3\n"), 3),
+            ("toml-wins", Some(1), Some("op-permission-level=3\n"), 1),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "horizon-server-op-level-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(config::FILE), config::TEMPLATE).unwrap();
+            config::update(&dir, "server", "online_mode", toml::Value::Boolean(false)).unwrap();
+            if let Some(text) = file_text {
+                std::fs::write(dir.join(config::PROPERTIES), text).unwrap();
+            }
+            if let Some(level) = toml_level {
+                config::update(
+                    &dir,
+                    "properties",
+                    "op-permission-level",
+                    toml::Value::Integer(level),
+                )
+                .unwrap();
+            }
+            edit_stopped(&dir, "op", &["Alex"]).unwrap();
+            let ops = std::fs::read_to_string(dir.join("ops.json")).unwrap();
+            assert!(
+                ops.contains(&format!("\"level\": {expected},")),
+                "{name}: {ops}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

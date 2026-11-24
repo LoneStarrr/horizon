@@ -9,15 +9,21 @@ license.workspace = true
 rust-version.workspace = true
 description = "Reusable client systems, control tool and parity probes"
 
+[build-dependencies]
+horizon-game-discovery = { path = "../horizon-game-discovery" }
+
 [lib]
 path = "../horizon-client/src/client_lib.rs"
 
 [dependencies]
 horizon-guest-stack = { path = "../horizon-guest-stack" }
 horizon-mod-api-macros = { path = "../horizon-mod-api-macros" }
+horizon-engine-slots = { path = "../horizon-engine-slots" }
 horizon-hooks = { path = "../horizon-hooks" }
 horizon-mod-runtime = { path = "../horizon-mod-runtime" }
 mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab" }
+# Whether a held lock file is still the one at its name (dev and inode, or volume and index).
+same-file = "1"
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
@@ -40,6 +46,8 @@ horizon-world = { path = "../horizon-world" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
+# The JDK's clock, for the LAN host's random seed (lan/mod.rs).
+horizon-java-properties = { path = "../horizon-java-properties" }
 # The control endpoint's token (control.rs), as horizon-server's and the relay's.
 getrandom = "0.3"
 # The dedicated server's anticheat, off unless server.toml's [anticheat] turns it on (docs/anticheat.md).
@@ -52,13 +60,19 @@ horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/modding/src/how-to/content-mods.md).
 # Their runtime is the `mods` feature.
-horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index"] }
+# Keep `horizon-mod-package` features aligned with `horizon-client` so alternating client and
+# client-lib builds/tests unify the same dependency set and reuse compiled artifacts.
+horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index", "junction", "runtime-process"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl", "naga-ir"] }
 winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 glam = "0.30"
 png = "0.18"
+cap-std = "3"
+cap-fs-ext = "3"
+smallvec = "1"
+shlex = "2"
 sha2 = "0.10.9"
 # Server resource packs are checked and cached by their SHA-1, as vanilla does.
 sha1 = "0.10"
@@ -83,8 +97,6 @@ crc32fast = "1"
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 # Controllers (evdev + libudev on Linux, IOKit on macOS, Windows.Gaming.Input); the `controllers` feature.
 gilrs = { version = "0.11", optional = true }
-# The DualSense's rumble, adaptive triggers and lights over HID (gilrs only reads it).
-horizon-dualsense = { path = "../horizon-dualsense", optional = true }
 # HTTPS to the Minecraft services (online-mode session join).
 ureq = { version = "2", default-features = false, features = ["tls"] }
 unicode-bidi = "0.3.18"
@@ -93,11 +105,14 @@ fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
-rustix = { version = "1", default-features = false, features = ["std", "time", "process", "fs"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "time", "process", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 # Use the registered URI handler without routing links through Explorer/cmd.
 open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
+# Resolve virtualized folders to shell-compatible physical paths (desktop.rs).
+dunce = "1.0.5"
 # DirectX 12, where Vulkan has no adapter or device, or by choice (`graphicsApi`, graphics.rs).
 # Shaders compile with FXC (d3dcompiler_47.dll, part of Windows), or on integrated GPUs with DXC
 # (dxcompiler.dll beside the game, gfx/dx12_compiler.rs).
@@ -123,6 +138,8 @@ test-publication-scope = []
 # Non-consuming residency journal observation for game fixtures only.
 test-residency-observer = []
 default = ["audio", "controllers"]
+# Dev-only: the ignored tracker-send benchmark uses the executable's allocator.
+tracker-send-bench = []
 # Sound output. Without it (and `controllers`) the program links neither libasound nor libudev on
 # Linux: the server build (`--no-default-features`, released as horizon-engine; docs/server.md).
 audio = ["horizon-client-render/audio"]
@@ -139,12 +156,15 @@ windows-segment-heap = []
 workspace = true
 
 [dev-dependencies]
-horizon-threads = { path = "../horizon-threads", features = ["test-allocation-probe"] }
+horizon-threads = { path = "../horizon-threads", features = ["test-allocation-probe", "test-game-dir"] }
 horizon-mod-wasm = { path = "../horizon-mod-wasm", features = ["listener-fixture", "test-copy-probe"] }
 tempfile = "3"
 mod_platform = { package = "horizon-mod-api", path = "../horizon-mod-api", features = ["testing"] }
+mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab", features = ["testing"] }
 # ui_theme's unit tests draw text in the design system's fonts.
 horizon-theme = { path = "../horizon-theme" }
+# dialog_screen's unit tests switch the text direction in a language only their thread sees.
+horizon-client-core = { path = "../horizon-client-core", features = ["test-language-publication"] }
 horizon-client-render = { path = "../horizon-client-render", features = ["test-support"] }
 horizon-items = { path = "../horizon-items", features = ["test-support"] }
 # Reads back the captures the server_perf tests write.
@@ -203,6 +223,10 @@ path = "../horizon-client/examples/resource_memory.rs"
 [[example]]
 name = "save_batch_bench"
 path = "../horizon-client/examples/save_batch_bench.rs"
+
+[[example]]
+name = "save_codec_bench"
+path = "../horizon-client/examples/save_codec_bench.rs"
 
 [[example]]
 name = "shared_json_startup_profile"

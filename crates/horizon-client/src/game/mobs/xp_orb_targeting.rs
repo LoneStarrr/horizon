@@ -85,10 +85,12 @@ mod tests {
     fn orb(id: u32, at: [f64; 3]) -> ExperienceOrb {
         let at = Vec3::new(at[0], at[1], at[2]);
         ExperienceOrb {
+            fire_ticks: 0,
             attachment_lifetime: Default::default(),
             fall_distance: 0.0,
             rotation: [0.0, 0.0],
             join: Default::default(),
+            section_order: 0,
             no_gravity: false,
             id,
             position: at,
@@ -109,7 +111,7 @@ mod tests {
     /// default; a mod sends one orb to a guest out of range and stops another,
     /// and an orb it leaves alone keeps the default.
     #[test]
-    #[ignore = "requires prepared game resources"]
+    #[ignore = "daily"]
     fn a_mod_chooses_whom_each_orb_follows() {
         let heard = Heard::default();
         let mods = vec![ModEntry::new("shepherd", Box::new(Shepherd(heard.clone())))].into();

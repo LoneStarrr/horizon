@@ -12,6 +12,10 @@ use horizon_core::{
     random::RandomSource,
 };
 
+#[cfg(test)]
+#[path = "cube_spawn_size_tests.rs"]
+mod cube_spawn_size_tests;
+
 // AnimState slots.
 const SQUISH: usize = 0;
 const TARGET_SQUISH: usize = 1;
@@ -51,6 +55,9 @@ pub fn register(m: &mut Mob) {
 /// magma cube's armor (size * 3), then the health back to the max.
 pub fn set_size(m: &mut Mob, size: i32) {
     use super::finalize::{Attr, set_base};
+    // MagmaCube.setSize computes ARMOR from the raw argument; only the
+    // other bases (and the stored size) use AbstractCubeMob's clamped one.
+    let raw_size = size;
     let size = size.clamp(1, 127);
     m.extra.size = size;
     set_base(m, Attr::MaxHealth, f64::from(size * size));
@@ -61,7 +68,7 @@ pub fn set_size(m: &mut Mob, size: i32) {
     );
     set_base(m, Attr::AttackDamage, f64::from(size));
     if m.species() == super::Species::MagmaCube {
-        set_base(m, Attr::Armor, f64::from(size * 3));
+        set_base(m, Attr::Armor, f64::from(raw_size * 3));
     }
     m.health = super::finalize::max_health(m);
 }
@@ -101,9 +108,14 @@ pub fn split_child(parent: &mut Mob, child: &mut Mob, index: u32) {
     child.previous_head_yaw = yaw;
 }
 
-/// AbstractCubeMob.setSpawnSize: 1, 2 or 4 (normal difficulty special multiplier 0).
-pub fn finalize(m: &mut Mob) {
-    let scale = m.random.next_int_bound(3).unwrap_or(0);
+/// AbstractCubeMob.setSpawnSize: a scale of 0 to 2, and below 2 one more when
+/// `nextFloat() < 0.5 * getSpecialMultiplier()` (the float is drawn for every
+/// scale below 2, whatever the multiplier), so sizes 1, 2 or 4.
+pub fn finalize(m: &mut Mob, special: f32, r: &mut impl RandomSource) {
+    let mut scale = r.next_int_bound(3).unwrap_or(0);
+    if scale < 2 && r.next_float() < 0.5 * special {
+        scale += 1;
+    }
     set_size(m, 1 << scale);
 }
 fn tiny(m: &Mob) -> bool {
@@ -484,46 +496,58 @@ mod golem_touch_tests {
     use std::sync::Arc;
 
     #[test]
+    #[ignore = "daily"]
     fn split_uses_parent_random_and_width_for_both_cube_types() {
-        with_test_world(&[], |_, types| {
-            for kind in ["minecraft:slime", "minecraft:magma_cube"] {
-                let ty = Arc::new(types.types[kind].clone());
-                let mut parent = Mob::new(1, ty.clone(), Vec3::new(10.0, 64.0, 20.0), 0.0);
-                set_size(&mut parent, 4);
-                parent.random = horizon_core::random::LegacyRandom::new(0);
-                assert_eq!(split_count(&mut parent), 2);
-                for (i, bits) in [(0, 13_949_265), (1, 4_035_531)] {
-                    let mut child = Mob::new(i + 2, ty.clone(), parent.position, 0.0);
-                    split_child(&mut parent, &mut child, i);
-                    let x = if i == 0 { -0.52_f32 } else { 0.52_f32 };
-                    assert_eq!(
-                        child.position,
-                        Vec3::new(10.0 + f64::from(x), 64.5, 20.0 - f64::from(0.52_f32))
+        assert!(
+            with_test_world(&[], |_, types| {
+                for kind in ["minecraft:slime", "minecraft:magma_cube"] {
+                    let ty = Arc::new(types.types[kind].clone());
+                    let mut parent = Mob::new(1, ty.clone(), Vec3::new(10.0, 64.0, 20.0), 0.0);
+                    set_size(&mut parent, 4);
+                    parent.random = horizon_core::random::EntityRandom::own(
+                        horizon_core::random::LegacyRandom::new(0),
                     );
-                    assert_eq!(child.yaw, (bits as f32 / 16_777_216.0) * 360.0);
-                    assert_eq!(child.extra.size, 2);
+                    assert_eq!(split_count(&mut parent), 2);
+                    for (i, bits) in [(0, 13_949_265), (1, 4_035_531)] {
+                        let mut child = Mob::new(i + 2, ty.clone(), parent.position, 0.0);
+                        split_child(&mut parent, &mut child, i);
+                        let x = if i == 0 { -0.52_f32 } else { 0.52_f32 };
+                        assert_eq!(
+                            child.position,
+                            Vec3::new(10.0 + f64::from(x), 64.5, 20.0 - f64::from(0.52_f32))
+                        );
+                        assert_eq!(child.yaw, (bits as f32 / 16_777_216.0) * 360.0);
+                        assert_eq!(child.extra.size, 2);
+                    }
+                    assert_eq!(parent.random.state(), 67_704_983_304_270);
                 }
-                assert_eq!(parent.random.state(), 67_704_983_304_270);
-            }
-        });
+            }),
+            "vanilla data is missing"
+        );
     }
 
     #[test]
+    #[ignore = "daily"]
     fn sulfur_split_has_fixed_count_and_draws_only_yaws() {
-        with_test_world(&[], |_, types| {
-            let ty = Arc::new(types.types["minecraft:sulfur_cube"].clone());
-            let mut parent = Mob::new(1, ty.clone(), Vec3::ZERO, 0.0);
-            super::super::sulfur_cube::set_size(&mut parent, 2, true);
-            parent.random = horizon_core::random::LegacyRandom::new(0);
-            assert_eq!(split_count(&mut parent), 2);
-            assert_eq!(parent.random.state(), 25_214_903_917);
-            let mut child = Mob::new(2, ty, parent.position, 0.0);
-            split_child(&mut parent, &mut child, 0);
-            assert_eq!(child.yaw, (12_263_604_f32 / 16_777_216.0) * 360.0);
-            assert_eq!(parent.random.state(), 205_749_139_540_596);
-            assert_eq!(child.extra.size, 1);
-            assert!(child.is_baby());
-        });
+        assert!(
+            with_test_world(&[], |_, types| {
+                let ty = Arc::new(types.types["minecraft:sulfur_cube"].clone());
+                let mut parent = Mob::new(1, ty.clone(), Vec3::ZERO, 0.0);
+                super::super::sulfur_cube::set_size(&mut parent, 2, true);
+                parent.random = horizon_core::random::EntityRandom::own(
+                    horizon_core::random::LegacyRandom::new(0),
+                );
+                assert_eq!(split_count(&mut parent), 2);
+                assert_eq!(parent.random.state(), 25_214_903_917);
+                let mut child = Mob::new(2, ty, parent.position, 0.0);
+                split_child(&mut parent, &mut child, 0);
+                assert_eq!(child.yaw, (12_263_604_f32 / 16_777_216.0) * 360.0);
+                assert_eq!(parent.random.state(), 205_749_139_540_596);
+                assert_eq!(child.extra.size, 1);
+                assert!(child.is_baby());
+            }),
+            "vanilla data is missing"
+        );
     }
 
     /// The golems a cube of this kind and size, `x` blocks east of an iron
@@ -541,7 +565,7 @@ mod golem_touch_tests {
             let mut cube = mob(1, name, Vec3::new(0.5 + x, 64.0, 0.5));
             set_size(&mut cube, size);
             cube.no_ai = no_ai;
-            out = Some((cube, golem.seen(None)));
+            out = Some((cube, golem.seen(None, &crate::items::Items::empty())));
         });
         let (mut cube, golem) = out?;
         let mut events = Vec::new();
@@ -569,6 +593,7 @@ mod golem_touch_tests {
     /// into hurts it like a touching player (#3513), for `getAttackDamage`;
     /// a tiny slime (`canDealDamage`) and a cube clear of the golem do not.
     #[test]
+    #[ignore = "daily"]
     fn a_cube_touching_an_iron_golem_hurts_it() {
         let Some(slime) = hits("minecraft:slime", 2, 1.0) else {
             return;
@@ -602,6 +627,7 @@ mod golem_touch_tests {
     /// `CubeHurtPlayer` without queueing `entity.slime.attack` in `ai_step`
     /// (the sound only follows a hit that `hurtServer` accepts).
     #[test]
+    #[ignore = "daily"]
     fn a_cube_touching_a_player_defers_its_attack_sound_to_hurt_server() {
         use horizon_core::geometry::Aabb;
         let mut events = Vec::new();
@@ -630,6 +656,7 @@ mod golem_touch_tests {
                 armor_cover: 0.0,
                 invisible: false,
                 spectator: false,
+                on_climbable: false,
                 gold_armor: false,
                 hurt_by: None,
                 last_hurt: None,
@@ -691,6 +718,7 @@ mod keep_jumping_tests {
     /// `CubeMobKeepOnJumpingGoal.canUse` is `!isPassenger()`: a cube riding
     /// a boat or another mob holds still, while one on its own keeps hopping.
     #[test]
+    #[ignore = "daily"]
     fn a_cube_that_rides_something_does_not_keep_jumping() {
         let mut starts = None;
         let ran = with_test_world(&[], |w, types| {
@@ -730,6 +758,7 @@ mod keep_jumping_tests {
     /// `AbstractCubeMob.tick` is not gated by NoAI (only `serverAiStep` is):
     /// a standing NoAI cube still records `wasOnGround`.
     #[test]
+    #[ignore = "daily"]
     fn a_no_ai_cube_updates_was_on_ground() {
         let mut result = None;
         let ran = with_test_world(&[], |w, types| {

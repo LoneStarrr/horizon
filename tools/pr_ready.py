@@ -32,10 +32,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -49,10 +51,11 @@ FLEET_SHARED = Path.home() / "code" / "horizon-parity" / "shared-local" / "parit
 if "PARITY_SHARED" not in os.environ and not (ROOT / ".local" / "minecraft").exists() and FLEET_SHARED.is_dir():
     # A fleet worktree without vanilla data still knows each harness's dependencies.
     os.environ["PARITY_SHARED"] = str(FLEET_SHARED)
-from tools import parity, process_tree, release_train  # noqa: E402
+from tools import lab, parity, process_tree, release_train  # noqa: E402
 from tools.ci import rust_changes  # noqa: E402
 
 RBUILD = Path.home() / "fleet" / "rbuild"
+LINE_LIMIT = 3000
 # What rbuild's login shell needs on each fleet machine before cargo (it adds sccache itself). The ThinkPad no
 # longer builds (2026-10-26: it keeps the AI pool and a few services; Linux work goes to playhorizon's runner).
 HOST_SETUP = {
@@ -77,6 +80,27 @@ LAUNCHER_FEATURES = """export features=""
 if [ "$(uname)" = Darwin ] && ! xcrun metal --version > /dev/null 2>&1; then features="--features gpui_platform/runtime_shaders"; fi
 in_shell() { if [ "$(uname)" = Linux ] && ! pkg-config --exists xkbcommon 2>/dev/null && command -v nix-shell > /dev/null; then
   nix-shell shell.nix --run "$1"; else bash -c "$1"; fi; }"""
+# The launcher's tests write where the launcher keeps its data: the native build log, the build lease and the native
+# build cache it trims, versions. As every run (AGENTS.md), they get a scratch home, removed afterwards, never the
+# player's own (#16877). A step that can't make one stops: the tests would use the player's data.
+LAUNCHER_TEST_HOME = (("HORIZON_LAUNCHER_HOME", "launcher"), ("HORIZON_HOME", "game"),
+                      ("HORIZON_LAUNCHER_LOCATION_FILE", "location.json"), ("XDG_DATA_HOME", "data"),
+                      ("XDG_CONFIG_HOME", "config"), ("HORIZON_LAUNCHER_TRASH", "trash"),
+                      ("HORIZON_LAUNCHER_CLIPBOARD", "clipboard"), ("HORIZON_LAUNCHER_DESKTOP", "desktop"))
+LAUNCHER_TEST_SCRATCH = ("scratch=$(mktemp -d) && trap 'rm -rf \"$scratch\"' EXIT && export "
+                         + " ".join(f'{name}="$scratch/{path}"' for name, path in LAUNCHER_TEST_HOME)
+                         + " || { echo 'pr_ready: no scratch home for the launcher tests' >&2; exit 1; }")
+
+
+def launcher_test_base():
+    """Where run_windows makes the launcher tests' scratch home: the temp folder, unless its real path has a space or a
+    letter outside ASCII. The launcher then builds in %ProgramData% instead (backend::build_dir), outside the home
+    and never removed, so the home goes in %ProgramData% itself, as the launcher's own fallback does."""
+    temp = os.path.realpath(tempfile.gettempdir())
+    if temp.isascii() and " " not in temp:
+        return temp
+    public = os.environ.get("ProgramData", "")
+    return public if os.path.isabs(public) and public.isascii() and " " not in public else r"C:\ProgramData"
 
 
 # Build-script inputs outside the crates: catalog-only edits still need to build and test their consumers.
@@ -118,8 +142,8 @@ def touched_crates(paths, packages):
         if "horizon-client-lib" in packages and path.startswith("crates/horizon-client/"):
             relative = path.removeprefix("crates/horizon-client/")
             gameplay = relative in {"Cargo.toml", "build.rs", "windows-segment-heap.manifest",
-                                    "src/lib.rs", "src/main.rs", "src/entry.rs", "src/game.rs", "tests/launch_api.rs"} \
-                or relative.startswith("src/game/")
+                                    "src/lib.rs", "src/main.rs", "src/entry.rs", "src/game.rs"} \
+                or relative.startswith(("src/game/", "tests/it/"))
             crates.add("horizon-client" if gameplay else "horizon-client-lib")
             continue
         owners = [name for name, directory in packages.items() if path.startswith(directory.rstrip("/") + "/")]
@@ -142,9 +166,16 @@ def area(path):
     return "game"
 
 
-def scope_warnings(paths):
-    """A pull request keeps to one area; its size is its own concern (#385)."""
+def reviewed(path):
+    """Whether a path's lines count towards a pull request's size: documentation and tests don't."""
+    return not is_doc(path) and not path.startswith("tests/") and not re.search(r"(^|/)tests?/|/test_\w+\.py$", path)
+
+
+def scope_warnings(paths, lines):
+    """lines: the changed lines of the reviewed paths (not documentation or tests, moved lines or inline tests)."""
     warnings = []
+    if lines > LINE_LIMIT:
+        warnings.append(f"{lines} lines of code: over {LINE_LIMIT}, split it if it can ship in parts")
     areas = sorted({area(path) for path in paths} - {None})
     if len(areas) > 1:
         warnings.append("mixes " + ", ".join(areas))
@@ -224,6 +255,194 @@ def line_counts(base, changed):
     return counts
 
 
+RAW_STRING = re.compile(r'b?r(#*)"')
+
+
+def mask_rust(text):
+    """text with comments and the insides of string and char literals blanked (newlines kept), so braces can be
+    counted. Good enough for real code, not a parser: a macro that builds unbalanced braces out of tokens can
+    still confuse it."""
+    out = list(text)
+    n, i = len(text), 0
+
+    def blank(start, end):
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        raw = RAW_STRING.match(text, i) if c in "rb" and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")) \
+            else None
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            blank(i, end)
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            end = n if end < 0 else end + 1 + len(raw.group(1))
+            blank(raw.end(), end)
+            i = end
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            blank(i + 1, j)
+            i = j + 1
+        elif c == "'":
+            if text.startswith("'\\", i):
+                end = text.find("'", i + 3)
+                end = n if end < 0 else end + 1
+                blank(i + 1, end - 1)
+                i = end
+            elif i + 2 < n and text[i + 2] == "'":
+                blank(i + 1, i + 2)
+                i += 3
+            else:
+                i += 1  # a lifetime
+        else:
+            i += 1
+    return "".join(out)
+
+
+TEST_MODULE = re.compile(r"#\s*\[\s*cfg\s*\(\s*(?:test|all\s*\(\s*test\b[^\]]*?)\)\s*\]"
+                         r"(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+
+
+def test_module_ranges(text):
+    """The (first, last) line numbers, counting from 1, of each inline `#[cfg(test)] mod name { ... }` in Rust
+    source: from the attribute to the closing brace. `#[cfg(all(test, ...))]` counts too. `mod name;` is one line
+    and is not a range."""
+    masked = mask_rust(text)
+    ranges = []
+    for match in TEST_MODULE.finditer(masked):
+        depth, j = 1, match.end()
+        while j < len(masked) and depth:
+            depth += {"{": 1, "}": -1}.get(masked[j], 0)
+            j += 1
+        if depth == 0:
+            ranges.append((masked.count("\n", 0, match.start()) + 1, masked.count("\n", 0, j - 1) + 1))
+    return ranges
+
+
+def diff_segments(diff):
+    """Parse `git diff -U0` text into runs of changed lines: [(path, "-" or "+", [(line number, text), ...])]. Line
+    numbers are the old file's for "-" and the new file's for "+"."""
+    segments, path, old_path, in_hunk, old, new, current = [], None, None, False, 0, 0, None
+    for row in diff.split("\n"):
+        if row.startswith("diff --git "):
+            in_hunk, current = False, None
+        elif not in_hunk and row.startswith("--- "):
+            old_path = row[4:].split("\t")[0].removeprefix("a/")
+        elif not in_hunk and row.startswith("+++ "):
+            path = row[4:].split("\t")[0].removeprefix("b/")
+            path = old_path if path == "/dev/null" else path
+        elif row.startswith("@@"):
+            header = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", row)
+            in_hunk, old, new, current = True, int(header.group(1)), int(header.group(2)), None
+        elif in_hunk and row[:1] in ("-", "+"):
+            side = row[0]
+            if current is None or current[1] != side:
+                current = (path, side, [])
+                segments.append(current)
+            current[2].append((old if side == "-" else new, row[1:]))
+            old, new = old + (side == "-"), new + (side == "+")
+        elif not in_hunk or row[:1] != "\\":
+            current = None
+    return segments
+
+
+def moved_lines(segments, window=3):
+    """The (segment number, position) of every changed line that was moved: a run of lines removed in one place
+    and added in another with the same text, whitespace ignored, like `git diff --color-moved`. A run counts when
+    it holds at least `window` meaningful lines (three or more characters; braces and blanks move along inside a
+    run but never make one). Each line is matched once. A start that matches more than 20 places is skipped."""
+    sides = {"-": [], "+": []}  # (stripped text, segment number, position) in diff order
+    for number, (_, side, lines) in enumerate(segments):
+        for position, (_, text) in enumerate(lines):
+            sides[side].append(("".join(text.split()), number, position))
+    removed, added = sides["-"], sides["+"]
+    seeds = {}
+    for index in range(len(added) - window + 1):
+        chunk = added[index:index + window]
+        if chunk[0][1] == chunk[-1][1]:
+            seeds.setdefault(tuple(item[0] for item in chunk), []).append(index)
+    marked = {"-": [False] * len(removed), "+": [False] * len(added)}
+
+    def run_length(i, j):
+        k = 0
+        while (i + k < len(removed) and j + k < len(added) and not marked["-"][i + k] and not marked["+"][j + k]
+               and removed[i + k][0] == added[j + k][0] and removed[i + k][1] == removed[i][1]
+               and added[j + k][1] == added[j][1]):
+            k += 1
+        return k
+
+    i = 0
+    while i <= len(removed) - window:
+        candidates = seeds.get(tuple(item[0] for item in removed[i:i + window]), [])
+        runs = [(run_length(i, j), j) for j in candidates] if len(candidates) <= 20 else []
+        length, j = max(runs, default=(0, 0))
+        if sum(len(item[0]) >= 3 for item in removed[i:i + length]) >= window:
+            for k in range(length):
+                marked["-"][i + k] = marked["+"][j + k] = True
+            i += length
+        else:
+            i += 1
+    return {(item[1], item[2]) for side in "-+" for item, flag in zip(sides[side], marked[side]) if flag}
+
+
+def skipped_lines(diff, old_source, new_source):
+    """(moved, inline tests): how many changed lines of the reviewed paths in a `git diff -U0` don't count towards
+    the size. old_source and new_source give a path's text before and after, or None if it did not exist."""
+    segments = [segment for segment in diff_segments(diff) if reviewed(segment[0])]
+    inline = set()
+    for number, (path, side, lines) in enumerate(segments):
+        text = (old_source if side == "-" else new_source)(path) if path.endswith(".rs") else None
+        ranges = test_module_ranges(text) if text and "test" in text else []
+        inline |= {(number, position) for position, (line, _) in enumerate(lines)
+                   if any(first <= line <= last for first, last in ranges)}
+    # Inline test lines are out already, so they are not offered as moves.
+    rest = [(path, side, [line for position, line in enumerate(lines) if (number, position) not in inline])
+            for number, (path, side, lines) in enumerate(segments)]
+    return len(moved_lines(rest)), len(inline)
+
+
+def skipped_in_branch(base, changed):
+    """skipped_lines for the branch: the diff since base, plus untracked files as all-added."""
+    def old_source(path):
+        try:
+            return git("show", f"{base}:{path}")
+        except subprocess.CalledProcessError:
+            return None
+
+    def new_source(path):
+        try:
+            return (ROOT / path).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            return None
+
+    diff = git("-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", base)
+    for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        text = new_source(path) if path in changed else None
+        if text:
+            lines = text.splitlines()
+            diff += f"\ndiff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n"
+            diff += "\n".join("+" + line for line in lines)
+    return skipped_lines(diff, old_source, new_source)
+
+
 def packages():
     """Workspace directories, libraries and path dependencies, including optional/build/dev dependencies."""
     try:
@@ -278,9 +497,9 @@ def tests_passed(output):
 
 
 def unittest_passed(output):
-    failed = re.search(r"^(FAILED \(.*\))$", output, re.M)
+    outcome = re.search(r"^((?:OK|FAILED) \(.*\))$", output, re.M)
     ran = re.search(r"^Ran (\d+) tests?", output, re.M)
-    return f"{ran.group(1) if ran else '?'} run, {failed.group(1)}" if failed else f"{ran.group(1)} passed" if ran else ""
+    return f"{ran.group(1) if ran else '?'} run, {outcome.group(1)}" if outcome else f"{ran.group(1)} passed" if ran else ""
 
 
 def parity_summary(output):
@@ -302,10 +521,9 @@ def parity_summary(output):
     return text
 
 
-# CI's verify job (.github/workflows/ci.yml): clippy over the whole workspace, and over the server build (the game
-# without sound or controllers).
-CI_CLIPPY = "cargo clippy --workspace --all-targets --locked -- -D warnings"
-CI_CLIPPY_SERVER = "cargo clippy -p horizon-client -p horizon-game -p horizon-mod-host --all-targets --locked --no-default-features -- -D warnings"
+# CI's lint (.github/workflows/ci.yml verify): collect warnings across the whole graph before rejecting them.
+CI_CLIPPY = "python3 tools/ci/check_warnings.py cargo clippy --keep-going --workspace --all-targets --locked"
+CI_CLIPPY_SERVER = "python3 tools/ci/check_warnings.py cargo clippy --keep-going -p horizon-client -p horizon-game -p horizon-mod-host --all-targets --locked --no-default-features"
 
 
 # CI installs the current stable each run (rustup toolchain install stable), and Rust ships one every six weeks
@@ -383,7 +601,7 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
     clippy_crates = dependent_crates(crates, dependencies)
     clippy = CI_CLIPPY
     if clippy_crates is None or "horizon-client" in clippy_crates:
-        clippy += f" && {CI_CLIPPY_SERVER}"
+        clippy = f'status=0\n{CI_CLIPPY} || status=$?\n{CI_CLIPPY_SERVER} || status=$?\nexit "$status"'
     test_skip = None if crates is None or crates else "no crate touched"
     doc_crates = sorted(libraries if crates is None else libraries.intersection(crates))
     doc_selection = "--workspace" if crates is None else " ".join(f"-p {shlex.quote(c)}" for c in doc_crates)
@@ -395,10 +613,14 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
         # docs/layers.md: a crate depends only on its own layer or a lower one, and the exceptions only shrink.
         Step("Layers", f"python3 tools/check_layers.py --base {shlex.quote(base)}", where="here"),
         Step("Addresses", f"python3 tools/check_addresses.py --base {shlex.quote(base)}", where="here"),
-        Step("File size", f"python3 tools/check_file_size.py --base {shlex.quote(base)}", where="here"),
+        # tools/hotspots/README.md: export brace lists stay at 12 names or under; longer ones only shrink.
+        Step("Export lists", "python3 tools/hotspots/check_lists.py", where="here"),
+        # tools/hotspots/check_stand_ins.py: test stand-ins keep up with the hooks and traits they mirror.
+        Step("Test stand-ins", "python3 tools/hotspots/check_stand_ins.py", where="here"),
         # Always, as in CI: some read the crates, the roadmap or the workflows.
         Step("Python tests", "python3 -m unittest discover -s tests", where="here", summary=unittest_passed),
-        Step("rustfmt", "cargo fmt --all -- --check", skip=None if rust else no_rust),
+        # CI's own scan (tools/ci/format_scan.py): cargo fmt, then the files no `mod` line reaches, by path.
+        Step("rustfmt", "python3 tools/ci/format_scan.py", skip=None if rust else no_rust),
         Step("clippy", clippy, skip=None if rust else no_rust),
         Step("holder actor", HOLDER_ACTOR,
              skip=None if crates is None or "horizon-mod-package" in crates or launcher
@@ -423,18 +645,19 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
                                  ("mod registry tests", MOD_REGISTRY, registry_skip)):
         steps.extend([
             Step(f"{name} clippy",
-                 f"CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS:-4}} cargo clippy --manifest-path {manifest}"
-                 " --all-targets --locked -- -D warnings", skip=skip),
+                 f"CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS:-4}} python3 tools/ci/check_warnings.py cargo clippy --keep-going --manifest-path {manifest}"
+                 " --all-targets --locked", skip=skip),
             Step(f"{name} tests",
                  f"CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS:-4}} cargo test --manifest-path {manifest}"
                  " --locked -- --test-threads=4", skip=skip, summary=tests_passed),
         ])
     launcher_skip = None if launcher else "launcher untouched"
     for name, command in [("launcher rustfmt", "cargo fmt --check"),
-                          ("launcher clippy", "cargo clippy --all-targets --locked $features -- -D warnings"),
+                          ("launcher clippy", "python3 ../tools/ci/check_warnings.py cargo clippy --keep-going --all-targets --locked $features"),
                           ("launcher tests", "cargo test --locked --lib --bins $features")]:
-        steps.append(Step(name, f"cd launcher && {LAUNCHER_FEATURES}\nin_shell {shlex.quote(command)}", skip=launcher_skip,
-                          summary=tests_passed if name == "launcher tests" else None))
+        home = f"\n{LAUNCHER_TEST_SCRATCH}" if name == "launcher tests" else ""
+        steps.append(Step(name, f"cd launcher && {LAUNCHER_FEATURES}{home}\nin_shell {shlex.quote(command)}",
+                          skip=launcher_skip, summary=tests_passed if name == "launcher tests" else None))
     harness = Step("Parity", summary=parity_summary)
     affected = affected_here(changed)
     local_data = (ROOT / ".local" / "minecraft").exists() and (ROOT / ".local" / "horizon-client").exists()
@@ -480,6 +703,12 @@ PARITY_HOSTS= python3 tools/parity.py --changed-files "$RUNNER_TEMP/changed" --t
     return steps
 
 
+CLIPPY_CACHE_HINT = (
+    "pr_ready: the first clippy run builds the whole workspace once (cold, can take 20+ min); later runs are warm. "
+    "Set RUSTC_WRAPPER=sccache with CARGO_INCREMENTAL=0 to reuse dependency builds across branches and checkouts."
+)
+
+
 def run_script(steps, host, verbose):
     """Runs the steps in one shell on host (here for "local"), each between markers, reading results as they come."""
     if not steps:
@@ -494,7 +723,12 @@ def run_script(steps, host, verbose):
         run_windows(steps, verbose, environment)
         return
     parts = [HOST_SETUP.get(host, ""), "set +e"]
+    first_clippy = True
     for index, step in enumerate(steps):
+        if step.name.endswith("clippy") and first_clippy:
+            first_clippy = False
+            parts.append('case "${RUSTC_WRAPPER:-}" in sccache|*/sccache|sccache.exe|*/sccache.exe) ;; '
+                         f'*) printf \'%s\\n\' {shlex.quote("@@pr_ready:hint:" + CLIPPY_CACHE_HINT)} ;; esac')
         parts.append(f"echo '@@pr_ready:begin:{index}'; started=$(date +%s)\n( {step.command}\n) 2>&1 < /dev/null\n"
                      f"status=$?; echo; echo \"@@pr_ready:end:{index}:$status:$(( $(date +%s) - started ))\"")
     script = "\n".join(parts)
@@ -503,25 +737,37 @@ def run_script(steps, host, verbose):
     else:
         command = [str(RBUILD), host, "--", "bash", "-c", script]
     current = None
-    with subprocess.Popen(command, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                          errors="replace") as process:
-        for line in process.stdout:
-            marker = re.match(r"@@pr_ready:(begin|end):(\d+)(?::(\d+):(\d+))?$", line.strip())
-            if marker and marker.group(1) == "begin":
-                current = steps[int(marker.group(2))]
-                print(f"  {current.name}...", file=sys.stderr, flush=True)
-            elif marker:
-                step = steps[int(marker.group(2))]
-                step.status = "pass" if marker.group(3) == "0" else "fail"
-                step.seconds = int(marker.group(4))
-                finish(step, verbose)
-                current = None
-            elif current is not None:
-                current.output += line
-                if verbose:
+    with process_tree.popen(command, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace") as process:
+        # The shell's group ends when the shell does, before it is reaped: a check that left a child holding the
+        # shell's output would otherwise keep this reader waiting for its end (#17707, tools/process_tree.py).
+        reaper = threading.Thread(target=lambda: (process_tree.wait(process), process_tree.ended(process)),
+                                  daemon=True)
+        reaper.start()
+        try:
+            for line in process.stdout:
+                marker = re.match(r"@@pr_ready:(begin|end):(\d+)(?::(\d+):(\d+))?$", line.strip())
+                if marker and marker.group(1) == "begin":
+                    current = steps[int(marker.group(2))]
+                    print(f"  {current.name}...", file=sys.stderr, flush=True)
+                elif marker:
+                    step = steps[int(marker.group(2))]
+                    step.status = "pass" if marker.group(3) == "0" else "fail"
+                    step.seconds = int(marker.group(4))
+                    finish(step, verbose)
+                    current = None
+                elif line.startswith("@@pr_ready:hint:"):
+                    print(line.removeprefix("@@pr_ready:hint:"), end="", file=sys.stderr, flush=True)
+                elif current is not None:
+                    current.output += line
+                    if verbose:
+                        print("    " + line, end="", file=sys.stderr)
+                elif verbose or host != "local":
                     print("    " + line, end="", file=sys.stderr)
-            elif verbose or host != "local":
-                print("    " + line, end="", file=sys.stderr)
+        except BaseException:  # its own session: Ctrl-C reaches only this process, so end the checks here
+            process_tree.kill(process)
+            raise
+        reaper.join()
     for step in steps:
         if step.status is None:
             step.status, step.detail = "fail", ("did not finish" if step.output else f"not run: {host} unreachable?")
@@ -531,6 +777,7 @@ def run_script(steps, host, verbose):
 def run_windows(steps, verbose, environment=None):
     """Run local checks directly on Windows without requiring a Unix shell. Each runs in its own job
     (tools/process_tree.py): what a check starts, a harness's game say, ends with it, or with this process."""
+    first_clippy = True
     for step in steps:
         command = shlex.split(step.command)
         cwd = ROOT
@@ -539,20 +786,23 @@ def run_windows(steps, verbose, environment=None):
         if command and command[0].startswith("CARGO_BUILD_JOBS="):  # the shell form, with no shell to read it
             command.pop(0)
             env.setdefault("CARGO_BUILD_JOBS", "4")
+        scratch = None
         if step.name == "Public tree":
             command = [sys.executable, "tools/check_public_tree.py"]
         elif step.name == "Layers":
             command = [sys.executable, "tools/check_layers.py", *command[2:]]
         elif step.name == "Addresses":
             command = [sys.executable, "tools/check_addresses.py", *command[2:]]
-        elif step.name == "File size":
-            command = [sys.executable, "tools/check_file_size.py", *command[2:]]
+        elif step.name == "Export lists":
+            command = [sys.executable, "tools/hotspots/check_lists.py"]
+        elif step.name == "Test stand-ins":
+            command = [sys.executable, "tools/hotspots/check_stand_ins.py"]
         elif step.name == "Python tests":
             command = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
         elif step.name == "rustfmt":
-            command = ["cargo", "fmt", "--all", "--", "--check"]
+            command = [sys.executable, "tools/ci/format_scan.py"]
         elif step.name == "clippy":
-            command = shlex.split(CI_CLIPPY)  # the server build's clippy runs in CI (Linux)
+            command = [sys.executable, *shlex.split(CI_CLIPPY)[1:]]  # server clippy runs in CI (Linux)
         elif step.name.startswith("tests"):
             command = shlex.split(step.command)
         elif step.name == "tokens.css up to date":
@@ -561,11 +811,14 @@ def run_windows(steps, verbose, environment=None):
             command = ["cargo", "fmt", "--check"]
             cwd = ROOT / "launcher"
         elif step.name == "launcher clippy":
-            command = ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"]
+            command = [sys.executable, "../tools/ci/check_warnings.py", "cargo", "clippy", "--keep-going",
+                       "--all-targets", "--locked"]
             cwd = ROOT / "launcher"
         elif step.name == "launcher tests":
             command = ["cargo", "test", "--locked", "--lib", "--bins"]
             cwd = ROOT / "launcher"
+            scratch = tempfile.mkdtemp(prefix="horizon-launcher-tests-", dir=launcher_test_base())
+            env.update({name: os.path.join(scratch, path) for name, path in LAUNCHER_TEST_HOME})
         elif step.name == "Parity":
             command = shlex.split(step.command)
             if command and command[0] == "PARITY_HOSTS=":
@@ -576,14 +829,19 @@ def run_windows(steps, verbose, environment=None):
         elif command and command[0] == "python3":
             command[0] = sys.executable
 
+        if step.name.endswith("clippy") and first_clippy:
+            first_clippy = False
+            if Path(env.get("RUSTC_WRAPPER", "")).name not in ("sccache", "sccache.exe"):
+                print(CLIPPY_CACHE_HINT, file=sys.stderr, flush=True)
         print(f"  {step.name}...", file=sys.stderr, flush=True)
         started = time.monotonic()
         try:
             with process_tree.popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, errors="replace") as process:
                 def release(process):
-                    # The check's exit ends what it left running, which would otherwise hold the output open.
-                    process.wait()
+                    # Signal the check's whole group before reaping its leader, which would otherwise hold the
+                    # output open through a surviving child (tools/process_tree.py).
+                    process_tree.wait(process)
                     process_tree.ended(process)
                 # A daemon: interrupted, this process exits at once, and its jobs end the checks with it.
                 reaper = threading.Thread(target=release, args=(process,), daemon=True)
@@ -597,6 +855,9 @@ def run_windows(steps, verbose, environment=None):
             step.status = "pass" if status == 0 else "fail"
         except OSError as error:
             step.status, step.detail = "fail", str(error)
+        finally:
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
         step.seconds = int(time.monotonic() - started)
         finish(step, verbose)
 
@@ -658,19 +919,25 @@ def revision_state():
             git("diff", "HEAD", "--binary") + repr(metadata))
 
 
-def block(args, base, merge_base, changed, counts, steps, label, elapsed, revision, changed_during_run=False):
+def block(args, base, merge_base, changed, counts, steps, label, elapsed, revision, changed_during_run=False,
+          skipped=(0, 0)):
     where = socket.gethostname().split(".")[0] if args.host == "local" else args.host
     head, status, _ = revision
     dirty = bool(status)
     flags = "".join(f" --{flag}" for flag in ("quick", "harnesses") if getattr(args, flag)) + \
         ("" if args.host == "local" else f" --host {args.host}") + ("" if base == "origin/main" else f" --base {base}")
     added, removed = (sum(count[i] for count in counts.values()) for i in (0, 1))
-    warnings = scope_warnings(changed)
+    moved, inline = skipped
+    counted = sum(sum(count) for path, count in counts.items() if reviewed(path)) - moved - inline
+    warnings = scope_warnings(changed, counted)
+    not_counted = " and ".join(f"{number:,} {what}" for number, what in ((moved, "moved lines"), (inline, "inline-test lines"))
+                               if number)
     lines = [f"**pr_ready** (`tools/pr_ready.py{flags}`, commit `{head}`{' dirty' if dirty else ''}, "
              f"{'changed during run; checks do not certify the ending worktree, ' if changed_during_run else ''}"
              f"host `{where}`, against {base} at {merge_base[:9]}, "
              f"{duration(elapsed)})", "", "| Check | Result |", "| --- | --- |",
              f"| Scope | {'⚠️' if warnings else '✅'} {len(changed)} files, +{added} −{removed}"
+             + (f" (not counted: {not_counted})" if not_counted else "")
              + "".join(f"; {warning}" for warning in warnings) + " |"]
     for step in steps:
         took = f" ({duration(step.seconds)})" if step.seconds else ""
@@ -678,8 +945,9 @@ def block(args, base, merge_base, changed, counts, steps, label, elapsed, revisi
         lines.append(f"| {step.name} | {MARK[step.status]}{detail}{took} |")
     content = next((step for step in steps if step.name == "content root tests"), None)
     resource_override = os.environ.get("HORIZON_TEST_RESOURCES")
+    resources = lab.RESOURCES.relative_to(lab.ROOT)
     resource_roots = [Path(resource_override)] if resource_override is not None else [
-        ROOT / ".local/horizon-client/26.3", ROOT.parent.parent / ".local/horizon-client/26.3"]
+        ROOT / resources, ROOT.parent.parent / resources]
     if args.host == "local" and not any((root / "gameplay-facts.json").is_file() for root in resource_roots):
         data_tests = "data-backed tests not run: no prepared data here"
     elif content and content.status in {"pass", "fail"}:
@@ -711,6 +979,7 @@ def main():
         parser.error(f"no merge base with {args.base} (git fetch?)")
     merge_base = git("merge-base", "HEAD", args.base).strip()
     counts = line_counts(merge_base, changed)
+    skipped = skipped_in_branch(merge_base, changed)
     crates_of, libraries, dependencies = packages() if any(workspace_rust(p) for p in changed) else ({}, set(), {})
     steps = plan(args, args.base, changed, crates_of, libraries, dependencies)
     print(f"pr_ready: {len(changed)} files changed since {args.base}; checks on {args.host}", file=sys.stderr, flush=True)
@@ -727,7 +996,7 @@ def main():
 
     label = suggested_label(changed, release_train.exporters())
     print(block(args, args.base, merge_base, sorted(changed), counts, steps, label,
-                time.monotonic() - started, revision, revision_state() != revision))
+                time.monotonic() - started, revision, revision_state() != revision, skipped))
     return 1 if any(step.status == "fail" for step in steps) else 0
 
 

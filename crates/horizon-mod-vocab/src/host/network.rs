@@ -1,6 +1,27 @@
 //! Host method declarations; access defaults and game forwarders are generated.
 #![allow(unused_variables)]
 use crate::*;
+/// The server host's methods of the `network` area, implemented by the game and reached through [`ServerHost`].
+#[horizon_mod_api_macros::host_area]
+pub trait NetworkServerHost {
+    /// Side: server.
+    /// Sends `packet` to that player's client as it is (`ServerPlayer.connection.send`), as a
+    /// Paper plugin sends a packet through ProtocolLib or PacketEvents: a team, an objective, a
+    /// score, a Tab-list entry the server doesn't keep. Only that player gets it, at once, or
+    /// after the hook for the acting player. Nothing on the server changes, so the game may
+    /// later send its own state over it. Errors: `NotConnected` for a stale, offline or fake
+    /// player and on a client, `UnknownPacket` for a name that is not a clientbound play
+    /// packet, `InvalidBody` for a body that does not decode whole (or a custom payload on an
+    /// engine `horizon:` channel), and `PayloadTooLarge` for a custom payload past
+    /// `ClientboundCustomPayloadPacket.MAX_PAYLOAD_SIZE`. A packet the client reads but
+    /// cannot apply is the mod's to get right.
+    #[access(WorldOnly)]
+    fn player_send_packet(
+        &mut self,
+        player: PlayerRef,
+        packet: ClientboundPlayPacket,
+    ) -> Result<(), SendPacketError>;
+}
 /// The client host's methods of the `network` area, implemented by the game and reached through [`crate::ClientHost`].
 #[horizon_mod_api_macros::host_area]
 pub trait NetworkClientHost {
@@ -41,4 +62,16 @@ pub trait NetworkClientHost {
     /// state required by a packet remain the mod's responsibility. API 409.
     #[access(WorldOnly)]
     fn send_packet(&mut self, packet: ServerboundPlayPacket) -> Result<(), SendPacketError>;
+    /// Side: client.
+    /// Leaves the server or the single-player world (NeoForge's
+    /// `IClientCommonPacketListenerExtension.disconnect(Component)`), at the end of this frame,
+    /// not inside the calling hook. With a reason, the disconnect screen shows it (a
+    /// single-player world is saved first); with none, it leaves as the pause menu's Disconnect
+    /// does. The request belongs to the world it was made in: one made while that world closes
+    /// is dropped, never carried into the next. A second call in the same frame replaces the
+    /// reason. The retained reason renders in the active language at draw and narration time;
+    /// literal text stays unchanged. `DisconnectError::Unavailable` when no server or world is joined.
+    #[access(WorldOnly)]
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn disconnect(&mut self, reason: Option<Text>) -> Result<(), DisconnectError>;
 }

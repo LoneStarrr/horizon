@@ -1,7 +1,14 @@
 use super::*;
 use crate::item::crafting::Shape;
+use crate::world::datapack_registry::{DatapackField, DatapackFieldKind, DatapackValue};
 use crate::world::snapshots::LootEntity;
 use crate::{Ingredient, ItemPlace, RecipeSlotDisplay, Tag, Text};
+
+/// The native thread that stands in for the guest's shadow stack: the guest reserves 256 KiB and these tests
+/// keep half of it for callers and transport plumbing. On Windows the same depth overflows a 128 KiB thread
+/// (its guard pages come out of the thread's own reservation, which Windows makes in 64 KiB steps), so it
+/// gets the next step up there. Linux CI measures the exact budget.
+const GUEST_STACK: usize = if cfg!(windows) { 160 } else { 128 } * 1024;
 
 fn round<T: Wire>(value: &T, initial: u16) {
     let mut out = Writer::new();
@@ -38,6 +45,8 @@ fn ingredient_at_limit_decodes_and_one_record_past_returns_wire_error() {
     past_limit.put(&parent.order);
     past_limit.put(&parent.custom);
     past_limit.put(&Some((Shape::Compound, vec![ingredient])));
+    past_limit.put(&parent.rule);
+    past_limit.put(&parent.display);
     assert_eq!(past_limit.error(), None);
     assert!(matches!(
         Reader::decode::<Ingredient>(past_limit.bytes()),
@@ -47,9 +56,8 @@ fn ingredient_at_limit_decodes_and_one_record_past_returns_wire_error() {
 
 #[test]
 fn structural_families_fit_the_guest_shadow_stack() {
-    // The guest reserves 256 KiB; retain half for callers and transport plumbing.
     std::thread::Builder::new()
-        .stack_size(128 * 1024)
+        .stack_size(GUEST_STACK)
         .spawn(|| {
             // A raised limit is not safe merely because the depth counter still works.
             assert_eq!(MAX_DEPTH, 32);
@@ -109,9 +117,58 @@ fn structural_families_fit_the_guest_shadow_stack() {
 }
 
 #[test]
+fn datapack_schema_families_fit_the_guest_shadow_stack() {
+    std::thread::Builder::new()
+        .stack_size(GUEST_STACK)
+        .spawn(|| {
+            let mut kind = DatapackFieldKind::Bool;
+            for _ in 0..8 {
+                kind = DatapackFieldKind::List {
+                    element: Box::new(kind),
+                    max_len: 2,
+                };
+            }
+            let mut out = Writer::new();
+            out.put(&kind);
+            assert_eq!(out.error(), None);
+            assert!(Reader::decode::<DatapackFieldKind>(out.bytes()).is_ok());
+            let mut reader = Reader::new(out.bytes());
+            reader.depth = MAX_DEPTH - 1;
+            assert!(matches!(
+                reader.take::<DatapackFieldKind>(),
+                Err(WireError::Depth)
+            ));
+
+            let field = DatapackField::required("a", kind);
+            let mut out = Writer::new();
+            out.put(&field);
+            assert_eq!(out.error(), None);
+            assert!(Reader::decode::<DatapackField>(out.bytes()).is_ok());
+
+            let mut value = DatapackValue::Bool(true);
+            for _ in 0..8 {
+                value = DatapackValue::List(vec![value]);
+            }
+            let mut out = Writer::new();
+            out.put(&value);
+            assert_eq!(out.error(), None);
+            assert!(Reader::decode::<DatapackValue>(out.bytes()).is_ok());
+            let mut reader = Reader::new(out.bytes());
+            reader.depth = MAX_DEPTH - 1;
+            assert!(matches!(
+                reader.take::<DatapackValue>(),
+                Err(WireError::Depth)
+            ));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn vanilla_trees_keep_their_depth_on_the_guest_shadow_stack() {
     std::thread::Builder::new()
-        .stack_size(128 * 1024)
+        .stack_size(GUEST_STACK)
         .spawn(|| {
             for compound in [false, true] {
                 let mut tag = Tag::Int(7);
@@ -176,7 +233,7 @@ fn vanilla_trees_keep_their_depth_on_the_guest_shadow_stack() {
 #[test]
 fn json_backed_codecs_preflight_before_serde_recursion() {
     std::thread::Builder::new()
-        .stack_size(128 * 1024)
+        .stack_size(GUEST_STACK)
         .spawn(|| {
             let quoted = serde_json::Value::String("[\\\"{".repeat(1024));
             let mut quoted_bytes = Writer::new();
@@ -274,4 +331,62 @@ fn json_backed_codecs_preflight_before_serde_recursion() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn ingredient_shape_contract_keeps_existing_tags_and_adds_custom_display_at_three() {
+    for (shape, bytes) in [
+        (Shape::Compound, [0, 0, 0, 0]),
+        (Shape::Intersection, [1, 0, 0, 0]),
+        (Shape::Difference, [2, 0, 0, 0]),
+        (Shape::CustomDisplay, [3, 0, 0, 0]),
+    ] {
+        let mut out = Writer::new();
+        out.put(&shape);
+        assert_eq!(out.bytes(), bytes);
+        assert_eq!(Reader::decode::<Shape>(&bytes).unwrap(), shape);
+    }
+}
+
+#[test]
+fn explosion_interactions_cross_in_vanillas_order() {
+    use crate::world::types::ExplosionInteraction;
+    for (interaction, bytes) in [
+        (ExplosionInteraction::None, [0, 0, 0, 0]),
+        (ExplosionInteraction::Block, [1, 0, 0, 0]),
+        (ExplosionInteraction::Mob, [2, 0, 0, 0]),
+        (ExplosionInteraction::Tnt, [3, 0, 0, 0]),
+        (ExplosionInteraction::Trigger, [4, 0, 0, 0]),
+    ] {
+        let mut out = Writer::new();
+        out.put(&interaction);
+        assert_eq!(out.bytes(), bytes);
+        assert_eq!(
+            Reader::decode::<ExplosionInteraction>(&bytes).unwrap(),
+            interaction
+        );
+    }
+}
+
+#[test]
+fn boxed_ingredient_metadata_preserves_its_value_encoding() {
+    let rule = Some(crate::item::crafting::IngredientRule::Components {
+        patch: [("minecraft:damage".into(), Tag::Int(5))].into(),
+        removed: vec!["minecraft:enchantments".into()],
+        strict: true,
+    });
+    let mut inline = Writer::new();
+    inline.put(&rule);
+    let mut boxed = Writer::new();
+    boxed.put(&rule.map(Box::new));
+    assert_eq!(inline.bytes(), boxed.bytes());
+    let display = Some(horizon_core::nbt::Compound::from([
+        ("type".into(), Tag::String("minecraft:item".into())),
+        ("item".into(), Tag::String("minecraft:diamond".into())),
+    ]));
+    let mut inline = Writer::new();
+    inline.put(&display);
+    let mut boxed = Writer::new();
+    boxed.put(&display.map(Box::new));
+    assert_eq!(inline.bytes(), boxed.bytes());
 }

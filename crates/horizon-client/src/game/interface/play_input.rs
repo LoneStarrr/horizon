@@ -1,6 +1,51 @@
 //! Key and mouse mappings in play: toggled sneak and sprint, keys after rebinding, keys held
 //! across screens, the hotbar's wheel and bumper steps, and mouse buttons while playing.
 use super::*;
+use horizon_client::{held::HeldKeys, keymapping::ToggleKeys};
+use winit::keyboard::ModifiersState;
+
+fn release_export_modifiers(
+    modifiers: &mut ModifiersState,
+    physical: &HashSet<KeyCode>,
+    keys: &HeldKeys,
+) {
+    horizon_client_input::modifiers::retain_held(modifiers, |key| {
+        physical.contains(&key) || keys.held_by(&key, Source::Agent)
+    });
+}
+
+fn mouse_hold_index(button: MouseButton) -> Option<usize> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Right => Some(1),
+        _ => None,
+    }
+}
+
+fn release_export_mapping(
+    mapping: std::result::Result<KeyCode, MouseButton>,
+    keys: &mut HeldKeys,
+    toggles: &mut ToggleKeys,
+    options: [bool; 4],
+    held_elsewhere: [bool; 4],
+) -> Option<usize> {
+    let slot = match mapping {
+        Ok(key) => {
+            if !keys.held_by(&key, Source::Keyboard) || !keys.release(&key, Source::Keyboard) {
+                return None;
+            }
+            [KeyCode::ShiftLeft, KeyCode::ControlLeft]
+                .iter()
+                .position(|&k| k == key)?
+        }
+        Err(button) => mouse_hold_index(button)? + 2,
+    };
+    if held_elsewhere[slot] {
+        return None;
+    }
+    toggles.0[slot].set_down(false, options[slot]);
+    Some(slot)
+}
 
 fn studio_replay_shortcut(key: KeyCode) -> bool {
     matches!(
@@ -36,6 +81,7 @@ impl Game<'_> {
     /// `KeyMapping.resetToggleKeys`: every toggle mapping up, and the latched sneak and sprint
     /// keys with it.
     pub(super) fn reset_toggle_keys(&mut self) {
+        self.agent_mouse_holds = [false; 2];
         for key in &mut self.toggles.0 {
             key.reset();
         }
@@ -60,6 +106,9 @@ impl Game<'_> {
     }
     pub(super) fn update_modifiers(&mut self, state: winit::keyboard::ModifiersState) {
         self.modifiers = state;
+        if let Some(title) = &mut self.title {
+            title.set_alt_down(state.alt_key());
+        }
         horizon_client_input::modifiers::reconcile(
             self.modifiers,
             &mut self.physical_keys,
@@ -127,7 +176,12 @@ impl Game<'_> {
             };
             // A controller's stick click acts as the key without setting the modifier: it is held
             // while the pad holds it (or its release waits for a tick), not when the keyboard says.
-            let pad = self.input_holds(mapping);
+            // Nor does the modifier say anything of a mod's hold (`set_mapping_down`).
+            let pad = self.input_holds(mapping)
+                || self.keys.held_by(
+                    &[KeyCode::ShiftLeft, KeyCode::ControlLeft][slot],
+                    Source::Mod,
+                );
             if !held && !pad {
                 self.toggles.0[slot].set_down(false, needs_toggle);
                 self.sync_toggle(slot);
@@ -148,7 +202,7 @@ impl Game<'_> {
                     .translate_all(*physical)
                     .contains(&Ok(key))
             }),
-            Source::Agent => false,
+            Source::Agent | Source::Mod => false,
         }
     }
     /// Apply a physical key to every mapping bound to it.
@@ -287,7 +341,11 @@ impl Game<'_> {
         if playing {
             self.toggles.screen_closed(options);
         } else {
+            self.agent_mouse_holds = [false; 2];
             self.toggles.screen_opened(options);
+            // releaseAll lets go of keyDebugModifier too: a modifier held on a mouse
+            // button whose release a sign, book or dialog then takes is not left down.
+            self.debug_keys.modifier_down = false;
         }
         self.sync_toggle(0);
         self.sync_toggle(1);
@@ -322,6 +380,11 @@ impl Game<'_> {
     /// What one whole wheel step does in play (`MouseHandler.onScroll`): a spectator's menu or
     /// flying speed, else the selected hotbar slot.
     pub(super) fn hotbar_wheel_step(&mut self, wheel: i32, vertical_steps: i32) {
+        // A replay's hotbar and spectator menu are the recording's: the wheel and a bumper turn
+        // nothing there, though a mod still heard them (`mouse_scrolling`).
+        if self.replay.playing() {
+            return;
+        }
         if self.spectator() && self.spectator_gui.is_menu_active() {
             self.spectator_scroll(-wheel);
         } else if self.spectator() {
@@ -358,6 +421,14 @@ impl Game<'_> {
         pressed: bool,
         source: Source,
     ) -> Result<()> {
+        if let Some(slot) = mouse_hold_index(button) {
+            if ![self.left, self.right][slot] {
+                self.agent_mouse_holds[slot] = false;
+            }
+            if source == Source::Agent {
+                self.agent_mouse_holds[slot] = pressed && self.sleeping.is_none();
+            }
+        }
         if !pressed && self.mouse_mapping_held_elsewhere(button, source) {
             return Ok(());
         }
@@ -374,19 +445,60 @@ impl Game<'_> {
             _ => return false,
         };
         match source {
-            Source::Keyboard | Source::Agent => self.input_holds(mapping),
-            Source::Pad => {
-                let keys = &self.settings.keys;
-                self.physical_buttons
-                    .iter()
-                    .any(|held| keys.translate_mouse_all(*held).contains(&Err(button)))
-                    || self
-                        .physical_keys
-                        .iter()
-                        .any(|held| keys.translate_all(*held).contains(&Err(button)))
+            Source::Keyboard | Source::Agent | Source::Mod => self.input_holds(mapping),
+            Source::Pad => self.physical_input_holds(Err(button)),
+        }
+    }
+
+    fn physical_input_holds(&self, mapping: std::result::Result<KeyCode, MouseButton>) -> bool {
+        let keys = &self.settings.keys;
+        self.physical_buttons
+            .iter()
+            .any(|held| keys.translate_mouse_all(*held).contains(&mapping))
+            || self
+                .physical_keys
+                .iter()
+                .any(|held| keys.translate_all(*held).contains(&mapping))
+    }
+
+    /// Apply the releases the window withheld during export without replaying UI input.
+    pub(super) fn reconcile_export_releases(
+        &mut self,
+        released: &HashSet<std::result::Result<KeyCode, MouseButton>>,
+    ) {
+        let options = [
+            self.settings.toggle_crouch,
+            self.settings.toggle_sprint,
+            self.settings.toggle_attack,
+            self.settings.toggle_use,
+        ];
+        let held_elsewhere = [
+            self.input_holds("key.sneak"),
+            self.input_holds("key.sprint"),
+            self.agent_mouse_holds[0] || self.input_holds("key.attack"),
+            self.agent_mouse_holds[1] || self.input_holds("key.use"),
+        ];
+        release_export_modifiers(&mut self.modifiers, &self.physical_keys, &self.keys);
+        self.reconcile_export_mouse_buttons([held_elsewhere[2], held_elsewhere[3]]);
+        for &mapping in released {
+            if self.physical_input_holds(mapping) {
+                continue;
+            }
+            match release_export_mapping(
+                mapping,
+                &mut self.keys,
+                &mut self.toggles,
+                options,
+                held_elsewhere,
+            ) {
+                Some(slot @ (0 | 1)) => self.sync_toggle(slot),
+                Some(2) => self.left &= self.toggles.is_down(2),
+                Some(3) => self.right &= self.toggles.is_down(3),
+                _ => {}
             }
         }
     }
+
     /// Two mappings with one default button are separate mappings all the same
     /// (`Minecraft.handleKeybinds`): whether the middle-button action a physical `input` translated
     /// to is one of those it is bound to, for this player now.
@@ -410,61 +522,10 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        if self.remote.is_some() {
-            return self.remote_mouse(button, pressed);
-        }
-        match button {
-            MouseButton::Left => {
-                // KeyMapping.click: Minecraft.tick starts the attack.
-                if pressed {
-                    self.attack_clicks += 1;
-                }
-                self.toggles
-                    .button(2, pressed, false, self.settings.toggle_attack);
-                self.left = self.toggles.is_down(2);
-            }
-            MouseButton::Right => {
-                self.toggles
-                    .button(3, pressed, false, self.settings.toggle_use);
-                self.right = self.toggles.is_down(3);
-                // handleKeybinds consumes use clicks without acting while an
-                // item is in use. Minecraft.tick runs them after the attack
-                // clicks, so a place and a break in one tick replace the block.
-                if pressed && self.using.is_none() {
-                    self.use_clicks += 1;
-                }
-            }
-            MouseButton::Middle if pressed => {
-                // handleKeybinds: the number keys select before key.pickItem.
-                self.select_queued_hotbar();
-                // Minecraft.pickBlockOrEntity -> the server's handlePickItemFromBlock:
-                // the block's clone item, with its block entity's data on Ctrl in
-                // creative, picked from the inventory (`pick_item`).
-                if let Some(entity) = self.pick_entity_hit() {
-                    // handlePickItemFromEntity: the entity's pick result.
-                    if let Some(stack) = entity.and_then(|id| self.entity_pick_result(id)) {
-                        let infinite = self.creative;
-                        horizon_client::pick_item::pick(
-                            &mut self.inventory[..36],
-                            &mut self.selected,
-                            &stack,
-                            infinite,
-                        );
-                    }
-                } else if let Some(hit) = self.pick() {
-                    let include_data = self.creative && self.has_control_down();
-                    if let Some(stack) = self.picked_stack(hit.pos, include_data) {
-                        let infinite = self.creative;
-                        horizon_client::pick_item::pick(
-                            &mut self.inventory[..36],
-                            &mut self.selected,
-                            &stack,
-                            infinite,
-                        );
-                    }
-                }
-            }
-            _ => {}
+        // MouseHandler.onButton: `KeyMapping.set`, then `KeyMapping.click` for a press.
+        self.mouse_mapping_set_down(button, pressed);
+        if pressed {
+            self.mouse_mapping_click(button);
         }
         Ok(())
     }
@@ -589,8 +650,59 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{studio_freecam_movement_key, studio_replay_shortcut};
-    use winit::keyboard::KeyCode;
+    use super::{
+        HashSet, HeldKeys, KeyCode, ModifiersState, MouseButton, Source, ToggleKeys,
+        release_export_mapping, release_export_modifiers, studio_freecam_movement_key,
+        studio_replay_shortcut,
+    };
+
+    #[test]
+    fn export_releases_clear_physical_movement_and_attack_without_ending_other_holds() {
+        let mut keys = HeldKeys::default();
+        let mut toggles = ToggleKeys::default();
+        let options = [false; 4];
+        for key in [KeyCode::KeyW, KeyCode::Space, KeyCode::KeyA] {
+            keys.press(key, Source::Keyboard);
+        }
+        keys.press(KeyCode::Space, Source::Pad);
+        keys.press(KeyCode::KeyA, Source::Agent);
+        keys.press(KeyCode::ControlLeft, Source::Agent);
+        toggles.0[2].set_down(true, false);
+        toggles.0[3].set_down(true, false);
+        // The window registered the releases in its physical sets while the gameplay
+        // keys, modifier word and raw mouse latch stayed as they were.
+        let mut modifiers = ModifiersState::SHIFT | ModifiersState::CONTROL | ModifiersState::ALT;
+        let mut raw_mouse = [true, true];
+        let physical_keys = HashSet::from([KeyCode::AltRight]);
+        let physical_buttons = HashSet::new();
+        let held_elsewhere = [false, false, false, true];
+        release_export_modifiers(&mut modifiers, &physical_keys, &keys);
+        crate::game::extras::release_raw_mouse_buttons(
+            &mut raw_mouse,
+            &physical_buttons,
+            [held_elsewhere[2], held_elsewhere[3]],
+        );
+        assert_eq!(modifiers, ModifiersState::CONTROL | ModifiersState::ALT);
+        assert_eq!(raw_mouse, [false, true]);
+
+        assert!(keys.raw(&KeyCode::KeyW) && toggles.is_down(2));
+        for mapping in [
+            Ok(KeyCode::KeyW),
+            Ok(KeyCode::Space),
+            Ok(KeyCode::KeyA),
+            Err(MouseButton::Left),
+            Err(MouseButton::Right),
+        ] {
+            release_export_mapping(mapping, &mut keys, &mut toggles, options, held_elsewhere);
+        }
+        assert!(!keys.raw(&KeyCode::KeyW));
+        assert!(!keys.held_by(&KeyCode::Space, Source::Keyboard));
+        assert!(keys.held_by(&KeyCode::Space, Source::Pad));
+        assert!(!keys.held_by(&KeyCode::KeyA, Source::Keyboard));
+        assert!(keys.held_by(&KeyCode::KeyA, Source::Agent));
+        assert!(!toggles.is_down(2));
+        assert!(toggles.is_down(3));
+    }
 
     #[test]
     fn replay_shortcuts_are_distinct_from_freecam_movement() {

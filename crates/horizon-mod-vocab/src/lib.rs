@@ -1,10 +1,7 @@
-//! Trait mods implement `Hooks` and link into the game executable.
-//! The executable passes the ordered `Mods` to `entry::main_with`.
-//! Trait mods are process-wide, like mixin module statics.
-//! Hooks use `&self + Send + Sync` for shared and reentrant calls; see `docs/modding/src/how-to/native-mods.md`.
-//! Generate the trait and dispatch with `cargo run -p xtask -- mod-api`.
+//! The API vocabulary re-exported by `horizon-mod-api`.
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
+#![deny(ambiguous_glob_reexports)]
 extern crate self as mod_api;
 
 use std::sync::{Arc, OnceLock};
@@ -26,3 +23,19 @@ mod generated {
 
 include!(concat!(env!("OUT_DIR"), "/mod_api_exports_root.rs"));
 include!(concat!(env!("OUT_DIR"), "/wire_generated.rs"));
+
+/// The mod's hooks for this crate's unit test binary, which drives no guest code. In a workspace build
+/// `horizon-mod-api` has `wasm-guest` on and declares `__horizon_mod_hooks`; MSVC's linker refuses the
+/// unresolved symbol even though nothing calls it (`horizon-mod-api`'s `tests/support/no_hooks.rs`).
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+fn __horizon_mod_hooks() -> Box<dyn ::mod_api::Hooks> {
+    struct Empty;
+    impl ::mod_api::Hooks for Empty {
+        fn subscribed(&self) -> &'static [Option<::mod_api::HookId>] {
+            &[]
+        }
+    }
+    Box::new(Empty)
+}

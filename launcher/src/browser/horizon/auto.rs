@@ -15,9 +15,9 @@
 //! `mod-browser/replaced/` until the next start: an update cut short (a crash between moving the
 //! file and saving the list) is rolled back from it then.
 use super::{install_version_guarded, Index};
-use crate::browser::{installed, Kind, SourceId, GAME};
+use crate::browser::{installed, Kind, SourceId};
 use crate::i18n::trf;
-use horizon_mod_package::index;
+use horizon_platform::mod_package::index;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -84,7 +84,7 @@ pub fn decide<'a>(index: &'a Index, entry: &installed::Entry, ctx: &Context) -> 
     let Some(p) = index.project(&entry.project) else {
         return Decision::Skip;
     };
-    let Some(target) = index.installable(p, GAME) else {
+    let Some(target) = super::installable(index, p) else {
         return Decision::Skip;
     };
     // Versions are newest first: only forward, from a version the index still lists.
@@ -102,8 +102,8 @@ pub fn decide<'a>(index: &'a Index, entry: &installed::Entry, ctx: &Context) -> 
 
 /// The blocks, items, entities, effects, menus and creative tabs a content mod adds.
 pub fn content_ids(path: &Path) -> Result<BTreeSet<String>, String> {
-    let manifest = horizon_mod_package::Package::read(path)?.manifest;
-    let c = horizon_mod_package::Content::read(path, &manifest)?;
+    let manifest = horizon_platform::mod_package::Package::read(path)?.manifest;
+    let c = horizon_platform::mod_package::Content::read(path, &manifest)?;
     let ids = c.blocks.iter().map(|b| format!("block {}", b.id));
     let ids = ids.chain(c.items.iter().map(|i| format!("item {}", i.id)));
     let ids = ids.chain(c.entity_types.iter().map(|e| format!("entity {}", e.id)));
@@ -287,6 +287,7 @@ pub(super) fn run_with(
     ctx: &Context,
     progress: &dyn Fn(&str, f32),
 ) -> Report {
+    let _game = crate::game_shader_api::for_home(home);
     let _lock = match crate::browser::lock_home(home) {
         Ok(guard) => guard,
         Err(e) => {
@@ -351,10 +352,10 @@ fn update(
         if !content {
             return Ok(());
         }
-        let new_package = horizon_mod_package::Package::read(new)?;
+        let new_package = horizon_platform::mod_package::Package::read(new)?;
         let old_wasm = old
             .as_deref()
-            .map(horizon_mod_package::Package::read)
+            .map(horizon_platform::mod_package::Package::read)
             .transpose()?
             .is_some_and(|package| package.manifest.wasm.is_some());
         if old_wasm || new_package.manifest.wasm.is_some() {

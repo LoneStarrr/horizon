@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Levels a data pack or a native mod adds, end to end in the real game (#1042).
+"""Levels a data pack or a native mod adds, end to end in the real game (arismoko/horizon#1042).
 
 The game runs headless and horizon-ctl drives it, on single player's server thread: the window is a
 client of that server, so a block is read from both sides.
@@ -13,13 +13,9 @@ client of that server, so a block is read from both sides.
   `host.commands().run_command("execute in ... run tp ...")` takes the player into a `register_dimension`
   level from inside a mod's command, then into a `register_chunk_generator` level from a server tick.
   Both save and come back.
-- density: the mod registers a density function type, `dimprobe:band` (solid for y in a band, empty
-  elsewhere). A world's data pack gives a level noise settings whose `final_density` is that type: the
-  band is stone and the air over it is air, on the server and the client, and the level saves and
-  reloads. Needs the mod game, like `mod`.
 - feature: the mod registers a feature type, `dimprobe:marker` (a column of a block over air). A world's
-  data pack gives plains a placed feature of that type (Horizon cannot add biomes), in a level with the terrain
-  of `density`: the
+  data pack gives plains a placed feature of that type (Horizon cannot add biomes), in a level whose terrain is
+  `dimprobe:band` (a density type): the
   columns stand at each chunk's corner on the surface, on the server and the client, and survive a reload.
   Needs the mod game, like `mod`.
 - tree: the mod registers a trunk placer, a foliage placer and a tree decorator (`dimprobe:spiral`,
@@ -90,7 +86,7 @@ class Session:
         self.game_dir = self.root / 'game'
         self.game_dir.mkdir()
         self.bins, self.out, self.name = bins, out, name
-        self.binary = bins / 'horizon-client'
+        self.binary = lab.binary(bins, 'horizon-client')
         self.socket = self.root / 'ctl.sock'
         self.env = lab.game_env({k: v for k, v in os.environ.items()
                                  if k not in ('HORIZON_HOME', 'HORIZON_LAUNCHER_HOME',
@@ -98,9 +94,9 @@ class Session:
         self.failures = []
 
     def run(self, *words, timeout=30):
-        return subprocess.run([str(self.bins / 'horizon-ctl'), '--socket', str(self.socket), *map(str, words)],
-                              cwd=self.game_dir, env=self.env, capture_output=True, text=True,
-                              timeout=timeout)
+        return subprocess.run([str(lab.binary(self.bins, 'horizon-ctl')), '--socket', str(self.socket),
+                               *map(str, words)],
+                              cwd=self.game_dir, env=self.env, capture_output=True, text=True, timeout=timeout)
 
     def ctl(self, *words, timeout=30):
         """A horizon-ctl command's JSON answer; a refused one raises."""
@@ -124,8 +120,8 @@ class Session:
         (package / 'horizon-mod.toml').write_text(MANIFEST)
         (package / 'Cargo.toml').write_text("[package]\nname = 'dimprobe'\nversion = '1.0.0'\n")
         (package / 'src/lib.rs').write_text('// Built into the executable.\n')
-        self.binary = folder / 'horizon-client'
-        shutil.copy2(self.bins / 'horizon-mod-dimension-game', self.binary)
+        self.binary = lab.binary(folder, 'horizon-client')
+        shutil.copy2(lab.binary(self.bins, 'horizon-mod-dimension-game'), self.binary)
 
     def quit(self):
         """Quit, saving, and wait until the game has gone."""
@@ -317,53 +313,6 @@ def replace_scenario(s):
     s.check('the level opens', s.arrived(level, 8, 8), s.where())
     block_on_both_sides(s, "the pack's generator", 0, MARKER_Y, 0, GOLD)
     block_on_both_sides(s, "the mod's dimension type", 8, -128, 8, STONE)
-
-
-def density_scenario(s):
-    level = 'test:bands'
-    band = (0, 63)
-    s.use_mod_game()
-    s.launch()
-    world = s.world()
-    s.quit()
-    path = Path(lab.RESOURCES) / 'data/minecraft/worldgen/noise_settings/overworld.json'
-    settings = json.loads(path.read_text())
-    # Only the mod's density shapes the terrain; no sea fills the air.
-    settings['noise_router']['final_density'] = {'type': 'dimprobe:band', 'min_y': band[0], 'max_y': band[1]}
-    settings['sea_level'] = -64
-    write_pack(world, 'bands', {
-        'test/worldgen/noise_settings/bands.json': settings,
-        'test/dimension_type/bands.json': overworld_type(),
-        'test/dimension/bands.json': {'type': level, 'generator': {
-            'type': 'minecraft:noise', 'settings': level,
-            'biome_source': {'type': 'minecraft:fixed', 'biome': 'minecraft:plains'}}},
-    })
-    s.launch()
-    s.command(f'execute in {level} run tp @s 8 120 8')
-    s.check('execute in reaches the level', s.arrived(level, 8, 8), s.where())
-    above, below = band[1] + 30, band[0] - 20
-    column = list(range(band[0], band[1] + 1, 4))
-    s.check('the terrain reaches the client', s.wait(lambda: s.client_block(8, band[0], 8) not in (None, 'minecraft:air')),
-            s.client_block(8, band[0], 8))
-
-    def solids():
-        return {y: b for y in column if (b := s.client_block(8, y, 8)) not in (None, 'minecraft:air')}
-
-    # Caves, ores and the surface rules still run on the mod's terrain, so the band is mostly one
-    # solid column of varied blocks, and its inside is told by what a probe finds there.
-    found = solids()
-    s.check('the band is mostly solid', len(found) * 2 > len(column), found)
-    y = next(iter(found), band[0])
-    block_on_both_sides(s, 'inside the band', 8, y, 8, found.get(y, STONE))
-    block_on_both_sides(s, 'above the band', 8, above, 8, 'minecraft:air')
-    block_on_both_sides(s, 'below the band', 8, below, 8, 'minecraft:air')
-    s.quit()
-    s.check('the level saves its own regions', any((world / 'dimensions/test/bands/region').glob('*.mca')))
-    s.launch()
-    s.check('the player comes back to the level', s.arrived(level, 8, 8), s.where())
-    block_on_both_sides(s, 'reloaded inside the band', 8, y, 8, found.get(y, STONE))
-    block_on_both_sides(s, 'reloaded above the band', 8, above, 8, 'minecraft:air')
-    s.check('the band is still mostly solid', len(solids()) * 2 > len(column), solids())
 
 
 def feature_scenario(s):
@@ -569,7 +518,7 @@ def dedicated_scenario(s):
         shutil.copy2(s.root / f'{name}.log', s.out / f'dedicated-{name}.log')
 
 
-SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'density': density_scenario, 'feature': feature_scenario, 'tree': tree_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
+SCENARIOS = {'pack': pack_scenario, 'mod': mod_scenario, 'feature': feature_scenario, 'tree': tree_scenario, 'replace': replace_scenario, 'dedicated': dedicated_scenario}
 
 
 def main():

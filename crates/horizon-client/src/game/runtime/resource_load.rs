@@ -60,8 +60,16 @@ pub(super) fn synchronous_startup(options: &Options) -> bool {
         || std::env::var_os("HORIZON_SCREEN_BUILD_FIXTURE").is_some()
         || std::env::var_os("HORIZON_DISPENSE_FIXTURE").is_some()
         || std::env::var_os("HORIZON_SCULK_FIXTURE").is_some()
+        || std::env::var_os("HORIZON_HOT_PATHS").is_some()
         || std::env::var_os("HORIZON_COMMAND_SCRIPT").is_some()
         || std::env::var_os("HORIZON_NET_REPORT").is_some()
+}
+
+/// Whether this run owns the player's device-loss marker (`gfx::safe_start`): a visible client
+/// window an ordinary launch started. Scripted, offscreen, server and split-screen guest runs
+/// sharing the folder neither write it nor take it.
+pub(super) fn owns_device_loss_marker(options: &Options) -> bool {
+    !options.offscreen && !options.split_guest && !synchronous_startup(options)
 }
 
 /// The local world a client's launch opens at once (`--world`,
@@ -161,11 +169,12 @@ pub(super) struct GameplayTables {
 pub(super) fn load_core(
     resources: &horizon_assets::resource_source::ResourceRoot,
     additional_data: &[Arc<horizon_client::datapack::DataPack>],
-    role: execution_role::ExecutionRole,
+    load_role: mods::LoadRole,
     parallel: bool,
     progress: &Progress,
     launch_world: Option<&str>,
 ) -> std::result::Result<std::result::Result<CoreTables, String>, String> {
+    let role = load_role.execution;
     let root = resources.prepared();
     let headless = !role.is_client();
     // The model library reads every file under `assets/` and needs no
@@ -198,7 +207,8 @@ pub(super) fn load_core(
         Err(e) => return Ok(Err(e.to_string())),
     };
     progress.set(1);
-    let item_data = Arc::new(mods::load_item_data(root, role).map_err(|e| e.to_string())?);
+    let item_data =
+        Arc::new(mods::load_item_data(root, role, load_role.owning).map_err(|e| e.to_string())?);
     let registry = assets.registry;
     let entity_models_for_render = entity_models.clone();
     let (render, gameplay, visibility, biomes, environment, collision) = std::thread::scope(
@@ -255,7 +265,13 @@ pub(super) fn load_core(
             });
             let biomes = Step::spawn(scope, parallel, "biomes", || {
                 let biomes = Arc::new(
-                    startup::time("core.biomes", || Biomes::load(resources))
+                    startup::time("core.biomes", || {
+                        if headless {
+                            Biomes::load_for_server(resources)
+                        } else {
+                            Biomes::load(resources)
+                        }
+                    })
                         .map_err(|e| e.to_string())?,
                 );
                 // A launch that names a world: its data preload needs only the
@@ -347,7 +363,7 @@ pub(super) fn gameplay_tables(
             let conditions = horizon_world::conditions::LoadConditions::new(inventory.server_ids());
             let mut motion =
                 MotionResources::load_with_conditions(root, assets, &facts, &conditions)?;
-            // #812: the attribute types mods declare come first, appended
+            // arismoko/horizon#812: the attribute types mods declare come first, appended
             // after every vanilla attribute in the sorted catalog order, so
             // the rows below may name a mod's own new attribute and the
             // network ids stay the same on every side running these mods.
@@ -356,10 +372,17 @@ pub(super) fn gameplay_tables(
                 motion.attributes =
                     std::sync::Arc::new(with_mod_attributes(&motion.attributes, declared)?);
             }
-            // #845: a mod's declared attribute sets
+            // arismoko/horizon#3728: then the bounds mods widen, on vanilla's attributes and
+            // the declared ones alike, before anything reads a definition.
+            let widenings = mod_api::__private::attribute_bounds_widenings();
+            if !widenings.is_empty() {
+                motion.attributes =
+                    std::sync::Arc::new(with_mod_widened_bounds(&motion.attributes, widenings)?);
+            }
+            // arismoko/horizon#845: a mod's declared attribute sets
             // (`EntityAttributeCreationEvent`) become their entity types' rows
             // in the live attribute map's catalog — the one record the mob
-            // logic and the attribute sync read (#1493) — built from the
+            // logic and the attribute sync read (arismoko/horizon#1493) — built from the
             // template's row, as the type's content row is.
             for declaration in mod_api::__private::entity_attribute_declarations() {
                 motion.attributes = std::sync::Arc::new(
@@ -375,7 +398,7 @@ pub(super) fn gameplay_tables(
                         })?,
                 );
             }
-            // #846: then the attributes mods add to existing types
+            // arismoko/horizon#846: then the attributes mods add to existing types
             // (`EntityAttributeModificationEvent`, fired after the creation
             // event), on the same catalog rows.
             let modifications = mod_api::__private::entity_attribute_modifications();
@@ -399,7 +422,7 @@ pub(super) fn gameplay_tables(
     })
 }
 
-/// The catalog with the attribute types mods declared (#812,
+/// The catalog with the attribute types mods declared (arismoko/horizon#812,
 /// `Registrar::declare_attribute`), appended after every vanilla attribute:
 /// `Catalog::with_attributes` sorts them by declaring mod id, then attribute
 /// id, and refuses a duplicate, naming it.
@@ -420,10 +443,30 @@ pub(super) fn with_mod_attributes(
                 )
                 .map_err(|error| format!("mod attribute {}: {error}", declared.id))?,
                 syncable: declared.syncable,
-                sentiment: match declared.sentiment {
-                    mod_api::Sentiment::Positive => horizon_world::attributes::Sentiment::Positive,
-                    mod_api::Sentiment::Negative => horizon_world::attributes::Sentiment::Negative,
-                    mod_api::Sentiment::Neutral => horizon_world::attributes::Sentiment::Neutral,
+                tooltip: horizon_world::attributes::Tooltip {
+                    sentiment: match declared.sentiment {
+                        mod_api::Sentiment::Positive => {
+                            horizon_world::attributes::Sentiment::Positive
+                        }
+                        mod_api::Sentiment::Negative => {
+                            horizon_world::attributes::Sentiment::Negative
+                        }
+                        mod_api::Sentiment::Neutral => {
+                            horizon_world::attributes::Sentiment::Neutral
+                        }
+                    },
+                    display: match declared.tooltip.display {
+                        mod_api::AttributeDisplay::Ranged => {
+                            horizon_world::attributes::Display::Ranged
+                        }
+                        mod_api::AttributeDisplay::Percentage => {
+                            horizon_world::attributes::Display::Percentage
+                        }
+                        mod_api::AttributeDisplay::Boolean => {
+                            horizon_world::attributes::Display::Boolean
+                        }
+                    },
+                    base_modifier: declared.tooltip.base_modifier.clone(),
                 },
             })
         })
@@ -433,8 +476,30 @@ pub(super) fn with_mod_attributes(
         .map_err(|error| format!("mod attribute declarations: {error}"))
 }
 
+/// The catalog with the attribute bounds mods widened (arismoko/horizon#3728,
+/// `Registrar::widen_attribute_bounds`): the union of every ask, whatever the
+/// load order. An unknown attribute, or a range without the attribute's
+/// default, refuses the load, naming the mod.
+pub(super) fn with_mod_widened_bounds(
+    catalog: &horizon_world::attributes::entity::Catalog,
+    widenings: &[mod_api::__private::AttributeBoundsWidening],
+) -> std::result::Result<horizon_world::attributes::entity::Catalog, String> {
+    let asks: Vec<_> = widenings
+        .iter()
+        .map(|ask| horizon_world::attributes::entity::WidenedBounds {
+            mod_id: ask.mod_id.clone(),
+            id: ask.id.clone(),
+            min: ask.min,
+            max: ask.max,
+        })
+        .collect();
+    catalog
+        .with_widened_bounds(&asks)
+        .map_err(|error| format!("mod attribute bounds: {error}"))
+}
+
 /// The catalog with the attributes mods add to existing entity types
-/// (#846, `EntityAttributeModificationEvent`), in registration order, so a
+/// (arismoko/horizon#846, `EntityAttributeModificationEvent`), in registration order, so a
 /// later addition of the same attribute wins. An unknown attribute or a type
 /// without a row refuses the load, naming the type.
 pub(super) fn with_mod_attribute_additions(
@@ -457,7 +522,7 @@ pub(super) fn with_mod_attribute_additions(
 
 /// Each mob type mods added attributes to takes its grown catalog row
 /// (`with_mod_attribute_additions`) as its attribute map and spawn fields, as
-/// a declared set's type does (#845), so a new mob of the type spawns with
+/// a declared set's type does (arismoko/horizon#845), so a new mob of the type spawns with
 /// what the live map answers. A type with no mob type (the player) builds
 /// its map from the catalog alone.
 pub(super) fn take_modified_attribute_rows(
@@ -488,10 +553,12 @@ pub(super) fn load_resources(
     settings: &Settings,
     started: Instant,
     menu: bool,
-    role: execution_role::ExecutionRole,
+    role: impl Into<mods::LoadRole>,
     progress: &Progress,
     publish: &mut dyn FnMut(UiResources, &std::path::Path),
 ) -> Result<Loaded> {
+    let load_role: mods::LoadRole = role.into();
+    let role = load_role.execution;
     let mut root = resolved.prepared().to_path_buf();
     let headless = !role.is_client();
     let (runtime_sprites, texture_atlases) = if headless {
@@ -504,11 +571,16 @@ pub(super) fn load_resources(
     };
     resolved = client_reload::stage_runtime_sprites(resolved, &runtime_sprites);
     resolved = client_reload::stage_texture_atlases(resolved, &texture_atlases);
+    // Battery Mode is a client's: a dedicated server keeps its pools whole. Fixed
+    // here, before any pool size is read or a pool starts; a later change waits
+    // for the next launch.
+    horizon_threads::sizing::set_battery(settings.horizon.battery && !headless);
     let threads = settings.horizon.worker_threads();
     // One pool of workers for every level's streaming, the client's and the
     // server thread's (horizon_threads::jobs), sized before any world opens.
     horizon_threads::jobs::configure(threads);
     horizon_client::sprites::set_texture_budget(settings.horizon.texture_budget_mib);
+    horizon_client::sprites::set_pbr_budget(settings.horizon.pbr_budget_mib);
     horizon_client::sprites::set_labpbr_maps(shader_packs::picks_material_pack(settings));
     // Stage A: the menu bundle (atlas and panorama). With a loading screen it is
     // published at once so the title screen can appear while the world bundle
@@ -556,7 +628,14 @@ pub(super) fn load_resources(
                 // it waits for the core that loaded.
                 let early = launch_world.filter(|_| root == vanilla_root);
                 startup::time("core", || {
-                    load_core(&resolved, &additional_data, role, parallel, progress, early)
+                    load_core(
+                        &resolved,
+                        &additional_data,
+                        load_role,
+                        parallel,
+                        progress,
+                        early,
+                    )
                 })
             });
             let ui = load_ui(resolved.source()).map(|ui| offer(ui, &root));
@@ -587,6 +666,9 @@ pub(super) fn load_resources(
         );
         resolved = client_reload::stage_texture_atlases(resolved, &texture_atlases);
     };
+    // Every loaded game publishes scalar registry keys, including callers that
+    // load a prepared root directly instead of building a mod content overlay.
+    crate::game::mods::register_iterated_registries(resolved.prepared())?;
     log::info!("load core tables: {:.2}s", started.elapsed().as_secs_f32());
     let CoreTables {
         item_data,
@@ -610,6 +692,18 @@ pub(super) fn load_resources(
     } = core;
     let assets = Arc::new(assets);
     let render = Arc::new(render);
+    // The namespaces of the mod block states registered now: what every level.dat saved from
+    // here on records, and what a world is checked against before it opens (`level_mods`). A
+    // launch world's data preload, which may already have started, reads no mod records; its
+    // open, which checks them, waits for these resources.
+    {
+        use horizon_client::save::level_mods;
+        let registry = assets.registry;
+        let names = (0..registry.len() as u32)
+            .filter_map(|id| registry.state(horizon_world::registry::BlockStateId(id)))
+            .map(|state| state.name.as_str());
+        level_mods::set_block_namespaces(Some(level_mods::mod_namespaces(names)));
+    }
     if let Some(folder) = launch_world {
         world_loading::preload_launch_world(
             folder,
@@ -671,6 +765,7 @@ pub(super) fn load_resources(
             threads,
         },
         rest: std::sync::OnceLock::new(),
+        block_entity_reach: std::sync::OnceLock::new(),
     };
     let resources = Arc::new(resources);
     if menu {
@@ -693,7 +788,7 @@ pub(super) fn load_resources(
             .name("world-rest-loader".into())
             .spawn(move || {
                 let _step = startup::step("rest");
-                let rest = load_world_rest(
+                let rest = world_rest::load_world_rest(
                     &resource_root,
                     &resources,
                     &assets,
@@ -724,7 +819,7 @@ pub(super) fn load_resources(
             handle,
         })
     } else {
-        let rest = load_world_rest(
+        let rest = world_rest::load_world_rest(
             &resolved,
             &resources,
             &assets,
@@ -813,7 +908,7 @@ pub(super) fn load_resources(
 /// Write the prepared folder's `horizon-data.bin` when it has none the game
 /// can use: on a thread of its own, at idle priority, once the start is done.
 /// This start has just read the folder's files (they are in the disk cache);
-/// the next starts read them from one file (#1961).
+/// the next starts read them from one file (arismoko/horizon#1961).
 pub(super) fn write_prepared_files(root: PathBuf) {
     use horizon_core::prepared_files;
     if prepared_files::open(&root).is_some() || !root.join("horizon-resources.json").is_file() {

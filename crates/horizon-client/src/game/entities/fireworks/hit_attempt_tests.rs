@@ -7,8 +7,7 @@ use horizon_client::{
     projectiles::{Hit, Projectile, ProjectileKind, ThrownType},
 };
 use mod_api::{
-    EnderPearlTeleportEvent, EntityInvulnerabilityCheckEvent, Flow, Hooks, LevelRandomHost,
-    ServerHost,
+    EnderPearlTeleportEvent, EntityInvulnerabilityCheckEvent, Flow, Hooks, LevelSide, ServerHost,
 };
 use std::sync::{
     Arc,
@@ -20,7 +19,7 @@ struct Probe(Arc<AtomicUsize>);
 impl Hooks for Probe {
     fn entity_invulnerability_check(
         &self,
-        _: &mut dyn LevelRandomHost,
+        _: LevelSide<'_>,
         _: &mut EntityInvulnerabilityCheckEvent<'_>,
     ) {
         self.0.fetch_add(1, Ordering::Relaxed);
@@ -46,7 +45,7 @@ fn fresh_player(game: &mut Game<'_>, mode: GameMode) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn remaining_hit_callers_observe_refusals_and_zero_damage() {
     let count = Arc::new(AtomicUsize::new(0));
     let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
@@ -155,6 +154,7 @@ fn remaining_hit_callers_observe_refusals_and_zero_damage() {
                 id: "remaining:zero",
                 item: "minecraft:snowball",
                 damage: 0.0,
+                slot: 0,
             };
             for mode in [GameMode::Survival, GameMode::Creative] {
                 for kind in [
@@ -232,6 +232,7 @@ fn remaining_hit_callers_observe_refusals_and_zero_damage() {
                     max_players: 20,
                     integrated: false,
                     levels: Default::default(),
+                    level_seeds: Default::default(),
                 },
             )
             .unwrap();

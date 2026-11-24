@@ -66,6 +66,7 @@ pub enum PartKind {
     Item,
     Menu,
     Fluid,
+    Entity,
 }
 
 /// A scoped hook: a Part method, called on the Parts attached to what `key` names.
@@ -82,6 +83,13 @@ pub struct Counterparts {
     pub neoforge: Vec<String>,
     pub fabric: Vec<String>,
     pub paper: Vec<String>,
+}
+
+/// Count admission for stack-list outputs. Trimming is deferred to placement.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StackCount {
+    Trim,
 }
 
 /// One hook point: a moment the game tells mods about.
@@ -106,6 +114,10 @@ pub struct Hook {
     pub owner: Option<String>,
     /// Validate a collector's edits at the per-listener ownership boundary.
     pub collect_validator: Option<String>,
+    /// A global cancel hook whose dispatch runs every listener inside `catch_unwind`: one that
+    /// unwinds is switched off for this hook for the session, and the outputs it had written roll
+    /// back to what the game requested (arismoko/horizon#2414 ruling).
+    pub isolate: bool,
     pub scope: Option<PartScope>,
     pub host: Option<HostAccess>,
     pub context: Option<PhaseContext>,
@@ -119,6 +131,10 @@ pub struct Hook {
     /// The parameters of a hook whose game target takes them as one generated `<Name>Call`
     /// (name and type, in order, without a `Ticks` parameter); empty for a flat target.
     pub call: Vec<(String, String)>,
+    /// Parameter retained in a decision-scoped guest slot instead of copied per ask.
+    pub prepared: Option<String>,
+    /// Admission policy for the mutable stack-list output; placement owns trimming.
+    pub stack_count: Option<StackCount>,
 }
 
 /// A drawing surface of the game's that drawing hooks get as a trait object (the catalog's
@@ -182,7 +198,10 @@ impl fmt::Display for CatalogError {
                 )
             }
             Self::OwnerNeedsGlobalListener(name) => {
-                write!(f, "{name}: owner needs a global listener")
+                write!(
+                    f,
+                    "{name}: owner needs a global listener or an answered replace hook"
+                )
             }
             Self::ScopeNeedsKey(name) => write!(f, "{name} needs both scope and key, or neither"),
             Self::NoHooks => f.write_str("no native hooks"),
@@ -241,6 +260,9 @@ struct HookEntry {
     context: Option<PhaseContext>,
     #[serde(default)]
     call: Vec<(String, String)>,
+    /// Only `prepared = "stack"` on `can_equip` is supported; reject at parse time.
+    prepared: Option<String>,
+    stack_count: Option<StackCount>,
     neoforge: Option<serde_json::Value>,
     fabric: Option<serde_json::Value>,
     paper: Option<serde_json::Value>,
@@ -256,6 +278,7 @@ struct ModApiEntry {
     answered_by: Option<AnsweredBy>,
     owner: Option<String>,
     collect_validator: Option<String>,
+    isolate: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +299,16 @@ impl Hook {
                 hook: name.clone(),
                 error: error.to_string(),
             })?;
+        // This transport is implemented only for can_equip's stack. Validate here,
+        // before either host or guest generation can accept a different hook.
+        if let Some(parameter) = &entry.prepared
+            && (name != "can_equip" || parameter != "stack")
+        {
+            return Err(CatalogError::InvalidHook {
+                hook: name,
+                error: "prepared is supported only as prepared = \"stack\" on can_equip".into(),
+            });
+        }
         let doc = entry
             .doc
             .filter(|doc| !doc.trim().is_empty())
@@ -296,13 +329,32 @@ impl Hook {
         ) {
             return Err(CatalogError::InvalidContract(name));
         }
+        if entry.stack_count.is_some() {
+            if api.contract != Contract::Collect || api.out.is_none() || api.answered_by.is_some() {
+                return Err(CatalogError::InvalidHook {
+                    hook: name,
+                    error: "stack_count requires a mutable Vec<ItemStack> collect output".into(),
+                });
+            }
+            if !entry.call.is_empty() {
+                let output = entry
+                    .call
+                    .iter()
+                    .find(|(parameter, _)| Some(parameter) == api.out.as_ref())
+                    .and_then(|(_, ty)| syn::parse_str::<syn::Type>(ty).ok());
+                validate_stack_count_output(&name, output.as_ref())?;
+            }
+        }
         let answered_by_mod = api.answered_by.is_some();
         if answered_by_mod
             && (!matches!(api.contract, Contract::Replace | Contract::Collect) || scope.is_some())
         {
             return Err(CatalogError::AnsweredNeedsGlobalOutput(name));
         }
-        if api.owner.is_some() && (api.contract != Contract::Listen || scope.is_some()) {
+        // An owner names the one mod a global listener, or an answered replace hook, is told of.
+        let owner_contract = api.contract == Contract::Listen
+            || (api.contract == Contract::Replace && answered_by_mod);
+        if api.owner.is_some() && (!owner_contract || scope.is_some()) {
             return Err(CatalogError::OwnerNeedsGlobalListener(name));
         }
         // A validator checks the entries a mod edits in place; an answered collector's mods
@@ -314,6 +366,15 @@ impl Hook {
                 || syn::parse_str::<syn::Path>(validator).is_err())
         {
             return Err(CatalogError::InvalidContract(name));
+        }
+        // Isolation is the cancel loop's own: a listener that unwinds rolls the outputs back
+        // to the requested ones and is skipped for the hook for the session (arismoko/horizon#2414 ruling).
+        let isolate = api.isolate.unwrap_or(false);
+        if isolate && (api.contract != Contract::Cancel || scope.is_some()) {
+            return Err(CatalogError::InvalidHook {
+                hook: name.clone(),
+                error: "isolate is for a global cancel hook".into(),
+            });
         }
         let counterparts = Counterparts {
             neoforge: counterparts(&name, "neoforge", entry.neoforge)?,
@@ -331,6 +392,7 @@ impl Hook {
             answered_by_mod,
             owner: api.owner,
             collect_validator: api.collect_validator,
+            isolate,
             scope,
             host: entry.host,
             context: entry.context,
@@ -338,6 +400,47 @@ impl Hook {
             version: entry.version.unwrap_or(1),
             cancellable: entry.cancellable,
             call: entry.call,
+            prepared: entry.prepared,
+            stack_count: entry.stack_count,
+        })
+    }
+}
+
+/// Validate a declared or resolved native output at the catalog boundary.
+pub(crate) fn validate_stack_count_output(
+    name: &str,
+    output: Option<&syn::Type>,
+) -> Result<(), CatalogError> {
+    let valid = (|| {
+        let syn::Type::Reference(reference) = output? else {
+            return None;
+        };
+        reference.mutability?;
+        let syn::Type::Path(path) = &*reference.elem else {
+            return None;
+        };
+        let vec = path.path.segments.last()?;
+        if vec.ident != "Vec" {
+            return None;
+        }
+        let syn::PathArguments::AngleBracketed(args) = &vec.arguments else {
+            return None;
+        };
+        if args.args.len() != 1 {
+            return None;
+        }
+        let syn::GenericArgument::Type(syn::Type::Path(item)) = args.args.first()? else {
+            return None;
+        };
+        (item.path.segments.last()?.ident == "ItemStack").then_some(())
+    })()
+    .is_some();
+    if valid {
+        Ok(())
+    } else {
+        Err(CatalogError::InvalidHook {
+            hook: name.into(),
+            error: "stack_count requires a mutable Vec<ItemStack> collect output".into(),
         })
     }
 }
@@ -546,6 +649,7 @@ impl Declared {
                             "answered_by",
                             "owner",
                             "collect_validator",
+                            "isolate",
                         ] {
                             if let Some(value) = entry.remove(key) {
                                 api.insert(key.into(), value);
@@ -727,6 +831,7 @@ impl Hook {
             answered_by_mod: false,
             owner: None,
             collect_validator: None,
+            isolate: false,
             scope: None,
             host: None,
             context: None,
@@ -734,6 +839,8 @@ impl Hook {
             version: 1,
             cancellable: None,
             call: Vec::new(),
+            prepared: None,
+            stack_count: None,
         }
     }
 }
@@ -785,6 +892,31 @@ mod tests {
                 .any(|h| h.contract == Contract::Replace)
         );
         assert!(!catalog.draw_contexts.is_empty());
+    }
+
+    #[test]
+    fn prepared_is_rejected_on_other_hooks_at_catalog_boundary() {
+        let mut declaration = serde_json::json!({"name":"other_hook","doc":"Doc.","side":"server","target":"unused", "prepared":"stack", "mod_api":{"contract":"listen"}});
+        let error = Hook::parse(declaration.clone()).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "hook other_hook: prepared is supported only as prepared = \"stack\" on can_equip"
+        );
+        declaration["name"] = "can_equip".into();
+        assert_eq!(
+            Hook::parse(declaration.clone())
+                .unwrap()
+                .prepared
+                .as_deref(),
+            Some("stack")
+        );
+        declaration["prepared"] = "other".into();
+        assert!(
+            Hook::parse(declaration)
+                .unwrap_err()
+                .to_string()
+                .contains("only as prepared")
+        );
     }
 
     fn checkout(files: &[(&str, &str)]) -> std::path::PathBuf {
@@ -1065,9 +1197,21 @@ mod tests {
                 .as_deref(),
             Some("mod_id")
         );
+        // An answered replace hook may name the one mod it asks, too.
+        assert_eq!(
+            owned(json!({
+                "contract": "replace", "out": "o", "answered_by": "mod", "owner": "provider"
+            }))
+            .unwrap()
+            .owner
+            .as_deref(),
+            Some("provider")
+        );
         for api in [
             json!({"contract": "cancel", "out": "c", "owner": "mod_id"}),
             json!({"contract": "listen", "owner": "mod_id", "scope": "item", "key": "k"}),
+            json!({"contract": "replace", "out": "o", "owner": "mod_id"}),
+            json!({"contract": "collect", "out": "o", "answered_by": "mod", "owner": "mod_id"}),
         ] {
             assert_eq!(
                 owned(api).unwrap_err(),
@@ -1120,5 +1264,46 @@ mod tests {
                 .contains("invalid catalog-order")
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stack_count_tests {
+    use super::*;
+
+    #[test]
+    fn stack_count_requires_a_stack_collect_output_and_known_policy() {
+        let parse = |declaration: &str| Catalog::parse(&[("test.rs".into(), declaration.into())]);
+        assert!(
+            parse(
+                r#"trait Hooks { /// Doc.
+            #[hook(side="server", contract="listen", stack_count="trim")]
+            fn notice(); }"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                r#"trait Hooks { /// Doc.
+            #[hook(side="server", contract="collect", out="values", stack_count="trim")]
+            fn numbers(values: &mut Vec<u32>); }"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                r#"trait Hooks { /// Doc.
+            #[hook(side="server", contract="collect", out="drops", stack_count="unknown")]
+            fn fill(drops: &mut Vec<ItemStack>); }"#
+            )
+            .is_err()
+        );
+        let catalog = parse(
+            r#"trait Hooks { /// Doc.
+            #[hook(side="server", contract="collect", out="drops", stack_count="trim")]
+            fn fill(drops: &mut Vec<ItemStack>); }"#,
+        )
+        .unwrap();
+        assert_eq!(catalog.hooks[0].stack_count, Some(StackCount::Trim));
     }
 }

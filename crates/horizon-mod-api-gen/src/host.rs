@@ -4,6 +4,7 @@
 //! forwarding methods and the mob tick's goal view.
 use super::*;
 use heck::ToUpperCamelCase;
+use std::fmt::Write as _;
 
 /// Reads implemented by the scoped goal context over the active mob and its
 /// disjoint live mob loans. Players are read from the game's backend; other
@@ -128,7 +129,7 @@ pub(super) const GOAL_VIEW_READS: &[&str] = &[
     "mob_no_action_time",
 ];
 
-/// The handle types whose backend reads are entity data (#1077): a read taking
+/// The handle types whose backend reads are entity data (arismoko/horizon#1077): a read taking
 /// one first answers the tick's own view of that entity — the snapshot, the
 /// player the tick sees — and is refused where that carries it not. Every
 /// other backend read (a level, a chunk, a block entity, a registry key)
@@ -143,7 +144,7 @@ const GOAL_VIEW_ENTITY_ARGS: &[&str] = &[
     "MerchantRef",
 ];
 
-/// The `Host` methods that find entities (#1077): the goal view answers these
+/// The `Host` methods that find entities (arismoko/horizon#1077): the goal view answers these
 /// by its own rules (the ticking mob, the player the tick sees, the snapshot,
 /// else `None`) instead of forwarding them, so nothing asks the game's taken
 /// mob list. Everything else the view forwards to the game host it carries.
@@ -282,6 +283,8 @@ fn area_tiers(camel: &str, file: syn::File) -> Result<BTreeMap<Tier, Vec<Entry>>
                         | "Levels"
                         | "Messages"
                         | "Players"
+                        | "Profiles"
+                        | "RuntimeLevels"
                         | "RenderAssets"
                         | "InstanceGroups"
                 )
@@ -433,7 +436,8 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                 ) {
                     return Err(format!("{name}: unknown access level {level}"));
                 }
-                let (setup, args, checked_write) = boundary_arguments(&entry.sig, name)?;
+                let raw_text = entry.attrs.iter().any(|a| a.path().is_ident("raw_text"));
+                let (setup, args, checked_write) = boundary_arguments(&entry.sig, name, raw_text)?;
                 let static_call = entry.attrs.iter().any(|a| a.path().is_ident("static_call"));
                 let args = if static_call {
                     args
@@ -446,7 +450,16 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                 let call = if entry.attrs.iter().any(|a| a.path().is_ident("service")) {
                     "self".into()
                 } else {
-                    format!("Game::{name}({args})")
+                    let target = entry
+                        .attrs
+                        .iter()
+                        .find(|attr| attr.path().is_ident("game_method"))
+                        .map_or_else(
+                            || Ok(entry.sig.ident.clone()),
+                            |attr| attr.parse_args::<syn::Ident>(),
+                        )
+                        .map_err(|error| format!("{name}: {error}"))?;
+                    format!("Game::{target}({args})")
                 };
                 let crosses_output = match &entry.sig.output {
                     syn::ReturnType::Type(_, ty) => boundary_value(ty),
@@ -492,6 +505,9 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                         Some(error) if outer_type(error, "LevelReadError") => format!(
                             "{call}.try_into_api().unwrap_or(Err(mod_api::LevelReadError::Unavailable))"
                         ),
+                        Some(error) if outer_type(error, "GameRuleReadError") => format!(
+                            "{call}.try_into_api().expect(\"game rule values convert infallibly\")"
+                        ),
                         Some(_) => format!(
                             "{call}.try_into_api().unwrap_or_else(|error| Err(error.into_write_error().into()))"
                         ),
@@ -503,10 +519,18 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                 let typed_access_error = result_error(&entry.sig.output).filter(|error| {
                     outer_type(error, "LevelReadError") || outer_type(error, "LevelWriteError")
                 });
+                let default_on_unavailable = entry
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.path().is_ident("default_on_unavailable"));
                 let access = if let Some(error) = typed_access_error {
                     let error = error.to_token_stream();
                     format!(
                         "if !mod_api::__private::access_allowed({name:?}, mod_api::__private::LoadAccess::{level}) {{ return Err({error}::Unavailable); }}"
+                    )
+                } else if default_on_unavailable {
+                    format!(
+                        "if !mod_api::__private::access_allowed({name:?}, mod_api::__private::LoadAccess::{level}) {{ return Default::default(); }}"
                     )
                 } else {
                     format!(
@@ -516,6 +540,62 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                 code.push_str(&format!("{sig} {{ {access} {setup} {call} }}\n"));
             }
             code.push_str("}\n");
+            if matches!(tier, Tier::Host | Tier::Backend | Tier::ClientBackend) {
+                let area_trait = area.trait_name(*tier);
+                writeln!(code,"#[deny(unconditional_recursion)] impl mod_api::prelude::{area_trait} for crate::game::equip_host::EquipHost<'_, '_> {{").unwrap();
+                for entry in entries {
+                    let name = &entry.name;
+                    let sig = entry.sig.to_token_stream();
+                    if entry
+                        .sig
+                        .receiver()
+                        .is_some_and(|receiver| receiver.mutability.is_some())
+                    {
+                        let unused = entry
+                            .sig
+                            .inputs
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                FnArg::Typed(arg) => {
+                                    Some(format!("let _ = {};", arg.pat.to_token_stream()))
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        writeln!(code,"{sig} {{ {unused} panic!(\"mutable access through an observation-only equipment Host\") }}").unwrap();
+                        continue;
+                    }
+                    let args = signature_args(&entry.sig, name)?;
+                    let tail = if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(",{args}")
+                    };
+                    let call = format!(
+                        "<Game<'_> as mod_api::prelude::{area_trait}>::{name}(self.game{tail})"
+                    );
+                    let cached = match name.as_str() {
+                        "entity_kind" => Some(("entity", "self.row.kind")),
+                        "entity_position" => Some(("entity", "self.row.position")),
+                        "living" => Some((
+                            "entity",
+                            "self.row.living.then_some(LivingRef::new(entity))",
+                        )),
+                        "living_health" => Some(("living.entity()", "self.row.health")),
+                        "living_max_health" => Some(("living.entity()", "self.row.max_health")),
+                        "living_alive" => Some(("living.entity()", "self.row.alive")),
+                        "living_equipment" => Some(("living.entity()", "self.equipment(slot)")),
+                        "living_hand_item" => Some((
+                            "living.entity()",
+                            "self.equipment(match hand { Hand::Main => EquipmentSlot::MainHand, Hand::Off => EquipmentSlot::OffHand })",
+                        )),
+                        _ => None,
+                    };
+                    let cached=cached.map(|(entity,value)|format!("if {entity}==self.row.entity {{ mod_api::__private::check_access({name:?},mod_api::__private::LoadAccess::WorldOnly); return {value}; }}")).unwrap_or_default();
+                    writeln!(code, "{sig} {{ {cached} {call} }}").unwrap();
+                }
+                code.push_str("}\n");
+            }
         }
     }
     let parsed = syn::parse_file(&code).map_err(|e| e.to_string())?;
@@ -603,10 +683,13 @@ fn outer_type(ty: &Type, expected: &str) -> bool {
 /// The conversion code for a host method's boundary arguments, the arguments to pass on, and
 /// whether it is a checked write (`&mut self`, a `Result`, a converted value). A checked write
 /// refuses an invalid value with its error; a read converts a borrowed stack without the write
-/// limits, and any other refused value makes the method return its default.
+/// limits, and any other refused value makes the method return its default. With `raw_text`
+/// (`#[raw_text]`) a `Text` argument reaches the game's method as the mod's own value instead of
+/// the engine's, for a method that must read what the engine form drops (typed payload tags).
 fn boundary_arguments(
     sig: &syn::Signature,
     method: &str,
+    raw_text: bool,
 ) -> Result<(String, String, bool), String> {
     let mutable = sig
         .receiver()
@@ -631,7 +714,7 @@ fn boundary_arguments(
             return Err(format!("{method}: unsupported argument"));
         };
         let name = pat.ident.to_string();
-        let text = text_value(&arg.ty);
+        let text = text_value(&arg.ty) && !raw_text;
         if !boundary_value(&arg.ty) && !text {
             args.push(name);
             continue;
@@ -805,7 +888,7 @@ fn handle_method(
     sig.inputs = rest.into_iter().collect();
     let mut docs = doc_comments(&entry.attrs, name, true)?;
     // The reads a mob's goal tick answers from its view carry the snapshot rule where a mod reads
-    // them (#1077).
+    // them (arismoko/horizon#1077).
     if GOAL_VIEW_READS.contains(&name) {
         docs.push_str("///\n/// In a mob's goal tick ([`GoalContext::host`](crate::GoalContext::host)) this reads\n/// the active mob or a disjoint live mob when available; player reads use the\n/// game host. Other unsupported reads retain their typed refusal.\n");
     }
@@ -825,13 +908,16 @@ fn handle_method(
         format!("{backend}(host).expect(\"registry key metadata requires a game host\").{call}")
     } else if returns("bool") {
         format!("{backend}(host).map(|backend| backend.{call}).unwrap_or(false)")
+    } else if returns("CommandResult") {
+        // An unresolved command source has neither a successful run nor feedback.
+        format!("{backend}(host).map(|backend| backend.{call}).unwrap_or_default()")
     } else if returns("Result") {
         format!(
             "{backend}(host).map_or_else(|| Err(crate::NoBackend::no_backend()), |backend| backend.{call})"
         )
     } else {
         return Err(format!(
-            "{name}: a {receiver} helper returns Option, bool or Result, the value a host without a backend refuses"
+            "{name}: a {receiver} helper returns Option, bool, CommandResult or Result, the value a host without a backend refuses"
         ));
     };
     Ok(Some((
@@ -924,14 +1010,14 @@ pub(super) fn generate(root: &Path) -> Result<(String, String), String> {
         supertraits("ClientBackendMut"),
     );
     let host = format!(
-        "// @generated by cargo run -p xtask -- mod-api; do not edit.\nuse super::*;\n{imports}/// Services supplied by the game to trait mods.\n/// Each method's default panics with its name, so a test double implements only what its test calls; the game implements every one.\n/// The backend accessors are the exception: they default to None, so a double without a backend answers every handle's typed refusal.\n/// Its methods are declared by area in `host/<area>.rs`; `use mod_api::prelude::*` names every area trait.\npub trait Host: {host_supers} {{\n#[doc(hidden)] fn backend(&self) -> Option<BackendRef<'_>> {{ None }}\n#[doc(hidden)] fn capability_providers(&self) -> &'static dyn CapabilityProviders {{ &InstalledProviders }}\n}}\n/// What only the server's hooks are given: writes to the world.\npub trait ServerHost: Host + {server_supers} {{\n#[doc(hidden)] fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {{ None }}\n}}\n/// What only the client's hooks are given: the client's own services.\npub trait ClientHost: Host + {client_supers} {{\n#[doc(hidden)] fn client_backend_mut(&mut self) -> Option<ClientBackendMutRef<'_>> {{ None }}\n}}\n{sides}#[doc(hidden)] pub trait Backend: {backend_supers} {{}}\n#[doc(hidden)] pub trait BackendMut: {backend_mut_supers} {{}}\n#[doc(hidden)] pub trait ClientBackendMut: {client_backend_mut_supers} {{}}\n{methods}"
+        "// @generated by cargo run -p xtask -- mod-api; do not edit.\nuse super::*;\n{imports}/// Services supplied by the game to trait mods.\n/// Methods default to a named panic unless they specify a default value on refusal. The game implements every method.\n/// The backend accessors are the exception: they default to None, so a double without a backend answers every handle's typed refusal.\n/// Its methods are declared by area in `host/<area>.rs`; `use mod_api::prelude::*` names every area trait.\npub trait Host: {host_supers} {{\n#[doc(hidden)] fn backend(&self) -> Option<BackendRef<'_>> {{ None }}\n#[doc(hidden)] fn capability_providers(&self) -> &'static dyn CapabilityProviders {{ &InstalledProviders }}\n}}\n/// What only the server's hooks are given: writes to the world.\npub trait ServerHost: Host + {server_supers} {{\n#[doc(hidden)] fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {{ None }}\n}}\n/// What only the client's hooks are given: the client's own services.\npub trait ClientHost: Host + {client_supers} {{\n#[doc(hidden)] fn client_backend_mut(&mut self) -> Option<ClientBackendMutRef<'_>> {{ None }}\n}}\n{sides}#[doc(hidden)] pub trait Backend: {backend_supers} {{}}\n#[doc(hidden)] pub trait BackendMut: {backend_mut_supers} {{}}\n#[doc(hidden)] pub trait ClientBackendMut: {client_backend_mut_supers} {{}}\n{methods}"
     );
     syn::parse_file(&host).map_err(|e| format!("generated Host: {e}"))?;
     let goal_view = goal_view(&areas, &reads, &host_methods)?;
     Ok((host, goal_view))
 }
 
-/// The goal view's generated impls (#1077): the backend ones forward the snapshot-backed
+/// The goal view's generated impls (arismoko/horizon#1077): the backend ones forward the snapshot-backed
 /// reads to the engine context's `r_*` methods, refuse their typed refusal for entity data the
 /// tick's view does not carry, and forward every other backend read — the level's own: blocks,
 /// loaded chunks, time, height, weather, block entities — to the real backend of the game host
@@ -1128,7 +1214,7 @@ mod tests {
         let method = entry(
             "fn read(&self, ingredient: &Ingredient) -> Result<Arc<[ItemKey]>, IngredientKeysError>;",
         );
-        let (setup, _, checked_write) = boundary_arguments(&method.sig, "read").unwrap();
+        let (setup, _, checked_write) = boundary_arguments(&method.sig, "read", false).unwrap();
         assert!(!checked_write);
         assert!(setup.contains("return Err(mod_api::NoBackend::no_backend())"));
         assert!(!setup.contains("Default::default()"));
@@ -1137,7 +1223,7 @@ mod tests {
     #[test]
     fn borrowed_stacks_are_read_without_write_validation_outside_checked_writes() {
         let read = entry("fn item_resource_damageable(&self, stack: &ItemStack) -> bool;");
-        let (setup, args, checked_write) = boundary_arguments(&read.sig, "read").unwrap();
+        let (setup, args, checked_write) = boundary_arguments(&read.sig, "read", false).unwrap();
         assert!(!checked_write);
         assert!(setup.contains("crate::game::api_values::stack_value(stack)"));
         assert!(!setup.contains("try_into_engine"));
@@ -1145,11 +1231,11 @@ mod tests {
         let write = entry(
             "fn living_apply_consume_effect(&mut self, stack: &ItemStack) -> Result<bool, StackWriteError>;",
         );
-        let (setup, _, checked_write) = boundary_arguments(&write.sig, "write").unwrap();
+        let (setup, _, checked_write) = boundary_arguments(&write.sig, "write", false).unwrap();
         assert!(checked_write);
         assert!(setup.contains("stack.try_into_engine(self.items())?"));
         let owned = entry("fn drop_at(&mut self, stack: ItemStack) -> bool;");
-        let (setup, _, _) = boundary_arguments(&owned.sig, "owned").unwrap();
+        let (setup, _, _) = boundary_arguments(&owned.sig, "owned", false).unwrap();
         assert!(setup.contains("stack.try_into_engine(self.items())"));
     }
 
@@ -1184,6 +1270,17 @@ mod tests {
             .unwrap();
         assert!(code.contains("host : & mut dyn ClientHost"));
         assert!(code.contains("client_backend_mut_of(host)"));
+        // A command result refuses with an unsuccessful run and no feedback.
+        let command = entry(
+            "fn entity_run_command_with_output(&mut self, entity: EntityRef, line: &str, level: PermissionLevel) -> CommandResult;",
+        );
+        let (handle, code) = handle_method(&command, Tier::BackendMut, &handles)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle, "EntityRef");
+        assert!(code.contains(
+            "backend_mut_of(host).map(|backend| backend.entity_run_command_with_output(self, line, level)).unwrap_or_default()"
+        ));
         // A `Result` method refuses with its error's `NoBackend` value on a host without a game.
         let tried = entry("fn level_attempt(&mut self, level: LevelRef) -> Result<u8, Refused>;");
         let (_, code) = handle_method(&tried, Tier::BackendMut, &handles)
@@ -1227,7 +1324,7 @@ mod tests {
             (
                 "fn entity_x(&self, entity: EntityRef);",
                 Tier::Backend,
-                "returns Option, bool or Result",
+                "returns Option, bool, CommandResult or Result",
             ),
             (
                 "fn entity_x(&mut self, entity: EntityRef) -> bool;",
@@ -1279,16 +1376,26 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_text_argument_reaches_the_game_unconverted() {
+        let read = entry("fn read_text(&self, text: &Text) -> Result<Tag, TextFormError>;");
+        let (setup, args, _) = boundary_arguments(&read.sig, "read_text", true).unwrap();
+        assert!(setup.is_empty());
+        assert_eq!(args, "text");
+        let (setup, _, _) = boundary_arguments(&read.sig, "read_text", false).unwrap();
+        assert!(setup.contains("text.try_into_engine(&())?"));
+    }
+
+    #[test]
     fn text_arguments_refuse_before_even_checked_stack_writes() {
         let text = entry("fn set_text(&mut self, text: &Text) -> Result<(), TextFormError>;");
-        let (setup, args, checked) = boundary_arguments(&text.sig, "set_text").unwrap();
+        let (setup, args, checked) = boundary_arguments(&text.sig, "set_text", false).unwrap();
         assert!(!checked);
         assert!(setup.contains("text.try_into_engine(&())?"));
         assert_eq!(args, "&text");
         let mixed = entry(
             "fn update(&mut self, stack: ItemStack, text: Option<&Text>) -> Result<Text, Refused>;",
         );
-        let (setup, args, checked) = boundary_arguments(&mixed.sig, "update").unwrap();
+        let (setup, args, checked) = boundary_arguments(&mixed.sig, "update", false).unwrap();
         assert!(checked);
         assert!(setup.contains("stack.try_into_engine(self.items())?"));
         assert!(setup.contains("text.try_into_engine(&())?"));
@@ -1327,6 +1434,14 @@ mod tests {
                             .parse_args::<syn::Ident>()
                             .is_ok_and(|lint| lint == "unconditional_recursion")
                 }));
+                // The generator also emits a read-only EquipHost implementation.
+                // This assertion covers Game's complete backend surface.
+                let syn::Type::Path(receiver) = &*item.self_ty else {
+                    panic!("expected named host")
+                };
+                if receiver.path.segments.last().unwrap().ident != "Game" {
+                    continue;
+                }
                 let owner = item
                     .trait_
                     .unwrap()

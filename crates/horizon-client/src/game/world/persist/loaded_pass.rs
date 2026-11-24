@@ -8,20 +8,37 @@ impl Game<'_> {
         let loaded = std::mem::take(&mut self.world.loaded_entities);
         for (key, tags) in loaded {
             let count = tags.len();
-            for tag in tags {
-                self.spawn_loaded_entity(key, tag, None);
+            for pending in tags {
+                let (tag, reason) = pending.into_parts();
+                self.spawn_loaded_entity_reason(key, tag, None, reason);
             }
             self.native_entities_load(self.dim.id(), [key.0, key.1], count);
         }
     }
 
-    /// Install one disk record or explicitly owned live transfer through the same
+    /// Install one fixture record or explicitly owned live transfer through the same
     /// metadata and join boundary. The transfer token belongs only to this call.
+    #[cfg(test)]
     pub(in crate::game) fn spawn_loaded_entity(
+        &mut self,
+        key: ChunkKey,
+        tag: Tag,
+        transferred: Option<crate::game::entity_initialization::TransferredEntityState>,
+    ) {
+        self.spawn_loaded_entity_reason(
+            key,
+            tag,
+            transferred,
+            horizon_client::world::EntityLoadReason::Ordinary,
+        );
+    }
+
+    pub(in crate::game) fn spawn_loaded_entity_reason(
         &mut self,
         key: ChunkKey,
         mut tag: Tag,
         transferred: Option<crate::game::entity_initialization::TransferredEntityState>,
+        reason: horizon_client::world::EntityLoadReason,
     ) {
         let player_uuid = self.level.player_uuid;
         // A world older builds named by the offline profile names the player that
@@ -41,6 +58,17 @@ impl Game<'_> {
         // Whatever was added since the last tick joins before this one.
         self.native_joins_flush(false, 0);
         let kind = entity_nbt::kind(&tag).unwrap_or_default();
+        // `EntityType.by` finds no type for a player or a kind outside the registry: nothing
+        // loads. A mod's kind (another namespace) is the missing-mod gate's to decide.
+        self.load_entity_types();
+        if transferred.is_none()
+            && (kind == "minecraft:player"
+                || (self.entity_types_loaded()
+                    && !super::super::general::quarantined_kind(&kind)
+                    && !self.entity_type_exists(&kind)))
+        {
+            return;
+        }
         let is_mob = self.res.mob_types().contains_key(kind.as_str());
         if transferred.is_none()
             && from_disk
@@ -61,7 +89,9 @@ impl Game<'_> {
             }
             return;
         }
-        drop_unleashable_leash(&mut tag, &kind, is_mob);
+        if !super::super::general::quarantined_kind(&kind) {
+            drop_unleashable_leash(&mut tag, &kind, is_mob);
+        }
         let uuid = entity_nbt::uuid(&tag);
         // This shortcut deduplicates disk copies, never explicit runtime ownership.
         if transferred.is_none() && uuid.is_some_and(|u| self.restored_vehicle(u).is_some()) {
@@ -94,14 +124,32 @@ impl Game<'_> {
         ) || horizon_client::projectiles::thrown_type(&kind).is_some())
             && let Some(at) = entity_nbt::position(&tag)
         {
-            self.persist
-                .anon
-                .insert(anon_key(&kind, at), (at, tag.clone()));
+            let key = anon_key(&kind, at);
+            let was = self.persist.anon.insert(key.clone(), (at, tag.clone()));
+            self.journal_anon((key, was));
         }
+        // Each tree has one loader: object-backed vehicles retain every rider for
+        // their recursive loader; other kinds load the same ordered slots below.
+        let passengers = (transferred.is_none() && !super::super::general::quarantined_kind(&kind))
+            .then(|| {
+                let own_loader = is_mob
+                    || super::super::boats::any_boat_wood(&kind).is_some()
+                    || super::super::minecarts::CartKind::from_id(&kind).is_some()
+                    || kind == "minecraft:tnt";
+                self.take_unmodeled_passengers(&mut tag, own_loader)
+            })
+            .flatten();
+        let before = self.next_entity;
         // Kinds outside `entity_lists!` first, then the listed kinds
         // (`Entity::load_nbt`), then whatever else is a compound.
         let transferring = transferred.is_some();
-        let unloaded = if let Some(state) = transferred {
+        let unloaded = if kind == "minecraft:tnt"
+            && !is_mob
+            && reason == horizon_client::world::EntityLoadReason::TeleportedTnt
+        {
+            self.load_tnt_with_portal(tag, uuid, transferred, true);
+            Ok(())
+        } else if let Some(state) = transferred {
             self.load_listed_transferred(&kind, uuid, player_uuid, tag, state)
         } else {
             self.load_unlisted(key, &kind, uuid, tag)
@@ -123,6 +171,12 @@ impl Game<'_> {
                 self.persist.unknown.entry(key).or_default().push(tag);
             }
         }
+        if let Some(id) =
+            ((before + 1)..=self.next_entity).find(|id| self.level_entity(*id as i32).is_some())
+            && let Some(passengers) = passengers
+        {
+            self.load_passengers(id, passengers);
+        }
         // PersistentEntitySectionManager.addEntity: every kind that
         // just joined tells the mods; a moved one does not join.
         if moved {
@@ -130,5 +184,19 @@ impl Game<'_> {
         } else {
             self.native_joins_flush(from_disk, 0);
         }
+    }
+}
+
+impl EntityMemory {
+    /// Puts back the raw record `kept` holds, or takes out the one a spawn added where none was:
+    /// the abort of a transaction whose spawn wrote over it (`journal_anon`).
+    pub(in crate::game) fn put_back_anon(
+        &mut self,
+        (key, was): ((String, [u64; 3]), Option<(Vec3, Tag)>),
+    ) {
+        match was {
+            Some(record) => self.anon.insert(key, record),
+            None => self.anon.remove(&key),
+        };
     }
 }

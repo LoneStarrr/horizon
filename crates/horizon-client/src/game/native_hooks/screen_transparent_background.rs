@@ -2,7 +2,7 @@ use super::*;
 
 /// The hook points. Each does nothing in Horizon.
 impl Game<'_> {
-    /// `Screen.renderTransparentBackground`: draws the translucent dark background
+    /// `Screen.extractTransparentBackground`: draws the translucent dark background
     /// behind an in-game screen (inventory, container, creative, book, sign, editor).
     /// Set `canceled` (or return `Flow::Cancel`) to suppress the vanilla dark gradient,
     /// allowing a mod to draw its own background or apply menu background blur
@@ -37,7 +37,14 @@ impl Game<'_> {
     pub(in crate::game) fn menu_blur_radius(&self) -> f32 {
         self.settings.menu_blur as f32
     }
-    /// `Screen.renderMenuBackground`: draws the tiled menu background (32x32) across `rect`
+    /// `GuiGraphics.blurBeforeThisStratum`: the vertices drawn so far in `batch` are the blurred
+    /// background (`HudBatch::blur_at`, as `Screen.extractBlurredBackground` marks the in-game HUD),
+    /// and this frame asks for the menu blur (`menu_blur`). API @API:screen_transparent_background@.
+    pub(in crate::game) fn native_blur_behind(&self, batch: &mut HudBatch) {
+        batch.blur_at = batch.vertices.len() as u32;
+        self.screen_blur_requested.set(true);
+    }
+    /// `Screen.extractMenuBackground`: draws the tiled menu background (32x32) across `rect`
     /// (`[x, y, w, h]` in GUI pixels). If `in_world` is true, uses the dark translucent
     /// texture (`gui/inworld_menu_background`); otherwise uses the opaque dirt-like
     /// texture (`gui/menu_background`). API @API:screen_transparent_background@.

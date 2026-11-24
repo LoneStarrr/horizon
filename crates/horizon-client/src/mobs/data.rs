@@ -5,7 +5,7 @@
 //! type's spawn placement and the client's keyframe animation definitions.
 use super::keyframes::Animation;
 use super::path::PathType;
-use crate::blocks::{BlockFacts, Fluid};
+use crate::blocks::{BlockFacts, Fluid, StateFacts};
 use horizon_assets::resource_source::ResourceRoot;
 use horizon_world::registry::BlockStateId;
 pub use mod_api::entity::mobs::PathComputationType;
@@ -22,6 +22,11 @@ const WATER: u16 = 2;
 const AIR: u16 = 4;
 /// Set in a state's override byte once a mod part answered `isPathfindable` for it.
 const OVERRIDDEN: u8 = 0x80;
+/// Precomputed static adjacent-hazard bits stored in [`ResolvedState::adjacent`].
+pub(super) const ADJ_SWEET_BERRY_BUSH: u8 = 1 << 0;
+pub(super) const ADJ_ALWAYS_BURNING: u8 = 1 << 1;
+pub(super) const ADJ_VANILLA_FIRE: u8 = 1 << 2;
+pub(super) const ADJ_WATER_FLUID: u8 = 1 << 3;
 /// `isValidSpawn` for a typical monster (zombie).
 pub const VALID_SPAWN: u16 = 8;
 /// `isValidSpawn` for ocelots/parrots (leaves allowed).
@@ -45,12 +50,119 @@ fn path_bit(kind: PathComputationType) -> u16 {
     }
 }
 
+/// Vanilla's state-based burning-block predicate, shared by spawn safety and
+/// the default block adjacent-path answer.
+pub(super) fn vanilla_burning_block(block: &str, emits_light: bool, in_fire_tag: bool) -> bool {
+    in_fire_tag
+        || matches!(
+            block,
+            "minecraft:lava" | "minecraft:magma_block" | "minecraft:lava_cauldron"
+        )
+        || matches!(block, "minecraft:campfire" | "minecraft:soul_campfire") && emits_light
+}
+
+/// `WalkNodeEvaluator.checkNeighbourBlocks`: the type a neighbour of type `t` gives a node.
+pub(super) fn vanilla_adjacent(t: PathType) -> Option<PathType> {
+    match t {
+        PathType::Damaging => Some(PathType::DamagingInNeighbor),
+        PathType::Fire | PathType::Lava => Some(PathType::FireInNeighbor),
+        PathType::Water => Some(PathType::WaterBorder),
+        PathType::DamageCautious => Some(PathType::DamageCautious),
+        _ => None,
+    }
+}
+
+/// Precomputed `ADJ_*` bits from a state's static [`StateFacts`] for
+/// `WalkNodeEvaluator.checkNeighbourBlocks`.
+pub(super) fn adjacent_flags_for_facts(facts: &StateFacts) -> u8 {
+    let mut flags = 0u8;
+    let name = &*facts.name;
+    if name == "minecraft:sweet_berry_bush" {
+        flags |= ADJ_SWEET_BERRY_BUSH;
+    } else if vanilla_burning_block(name, facts.emission > 0, false) {
+        flags |= ADJ_ALWAYS_BURNING;
+    } else if matches!(name, "minecraft:fire" | "minecraft:soul_fire") {
+        flags |= ADJ_VANILLA_FIRE;
+    }
+    if matches!(facts.fluid, Fluid::Water | Fluid::Modded) {
+        flags |= ADJ_WATER_FLUID;
+    }
+    flags
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StateData {
     pub path: PathType,
     pub flags: u16,
     /// Collision shape top (0 when the shape is empty).
     pub top: f32,
+}
+impl StateData {
+    /// `getPathTypeFromState` once the state's `isPathfindable(LAND)` answer is `land`. The
+    /// export holds vanilla's type for the block's own answer, and only the last steps read it
+    /// (`Blocked`, else `Water` for a water state, else `Open`), after air and every type a
+    /// block has of its own; `air` and `water` say what the state is.
+    fn path_with_land(self, land: bool, air: bool, water: bool) -> PathType {
+        let own_type = matches!(
+            self.path,
+            PathType::Blocked | PathType::Water | PathType::Open
+        );
+        if land == (self.flags & LAND != 0) || air || !own_type {
+            self.path
+        } else if !land {
+            PathType::Blocked
+        } else if water {
+            PathType::Water
+        } else {
+            PathType::Open
+        }
+    }
+}
+/// One state's answers once its mod parts were asked (see [`MobData::resolve_parts`]). Atomics,
+/// so a `/reload` replaces them while the shared [`MobData`] is read.
+#[derive(Debug)]
+pub struct ResolvedState {
+    /// [`OVERRIDDEN`] plus one bit per [`PathComputationType`] once a part answered
+    /// `isPathfindable`; zero while the block answers.
+    pathfindable: AtomicU8,
+    /// `getPathTypeFromState`, as `PathType as u8`.
+    path: AtomicU8,
+    /// Precomputed `ADJ_*` adjacent-hazard bits from [`StateFacts`].
+    adjacent: AtomicU8,
+}
+impl ResolvedState {
+    /// The answers of a state no part was asked about: the export's plus its
+    /// precomputed static adjacent-hazard bits.
+    fn exported(data: &StateData, facts: &StateFacts) -> Self {
+        Self {
+            pathfindable: AtomicU8::new(0),
+            path: AtomicU8::new(data.path as u8),
+            adjacent: AtomicU8::new(adjacent_flags_for_facts(facts)),
+        }
+    }
+    #[inline]
+    pub(super) fn path_type(&self) -> PathType {
+        PathType::ALL[usize::from(self.path.load(Ordering::Relaxed))]
+    }
+    #[inline]
+    pub(super) fn adjacent_flags(&self) -> u8 {
+        self.adjacent.load(Ordering::Relaxed)
+    }
+}
+/// What [`MobData::resolve_parts`] asks of each state's mod parts, in vanilla's order. A
+/// question is `None` when no part answers it, and every state keeps the block's answer.
+#[derive(Default)]
+pub struct PartAnswers<'a> {
+    /// `isPathfindable`, by state id: the [`Self::pathfindable_bit`] of each
+    /// [`PathComputationType`] the state's parts answered true, given the block's own answer
+    /// ([`MobData::block_pathfindable`]). One entry per state of [`MobData::states`].
+    pub pathfindable: Option<&'a [u8]>,
+}
+impl PartAnswers<'_> {
+    /// The bit `kind` sets in a [`Self::pathfindable`] entry.
+    pub fn pathfindable_bit(kind: PathComputationType) -> u8 {
+        path_bit(kind) as u8
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -61,9 +173,9 @@ pub enum Placement {
 }
 pub struct MobData {
     pub states: Vec<StateData>,
-    /// Each state's `isPathfindable` answers a mod part gave (see [`MobData::set_pathfindable`]),
-    /// by state: [`OVERRIDDEN`] plus one bit per [`PathComputationType`]. Zero for the rest.
-    pub pathfindable_overrides: std::sync::OnceLock<Vec<AtomicU8>>,
+    /// What the mods' block parts made of each state, by state (see [`MobData::resolve_parts`]).
+    /// Empty until parts first resolve: every state then answers as the export says.
+    pub resolved: std::sync::OnceLock<Vec<ResolvedState>>,
     pub placements: HashMap<String, Placement>,
     /// Each entity type's `SpawnPlacements.getHeightmapType`.
     pub heightmaps: HashMap<String, String>,
@@ -139,43 +251,84 @@ impl MobData {
             .map(|v| Self::from_json(&v).animations)
             .unwrap_or_default()
     }
-    /// `BlockState.isPathfindable(type)`: the block's own answer, or the one a mod part gave.
-    pub fn pathfindable(&self, state: BlockStateId, kind: PathComputationType) -> bool {
-        let given = self
-            .pathfindable_overrides
+    fn resolved_state(&self, state: BlockStateId) -> Option<&ResolvedState> {
+        self.resolved
             .get()
             .and_then(|table| table.get(state.0 as usize))
-            .map_or(0, |slot| slot.load(Ordering::Relaxed));
+    }
+    /// The per-state resolved table, initialized lazily on first adjacency lookup
+    /// or on [`Self::resolve_parts`].
+    pub(super) fn resolved_states(&self, facts: &BlockFacts) -> &[ResolvedState] {
+        self.resolved.get_or_init(|| {
+            self.states
+                .iter()
+                .enumerate()
+                .map(|(i, data)| ResolvedState::exported(data, facts.get(BlockStateId(i as u32))))
+                .collect()
+        })
+    }
+    /// `BlockState.isPathfindable(type)` using an already-fetched resolved table.
+    #[inline]
+    pub(super) fn pathfindable_in(
+        &self,
+        resolved: &[ResolvedState],
+        state: BlockStateId,
+        kind: PathComputationType,
+    ) -> bool {
+        let given = resolved
+            .get(state.0 as usize)
+            .map_or(0, |slot| slot.pathfindable.load(Ordering::Relaxed));
         if given & OVERRIDDEN != 0 {
             u16::from(given) & path_bit(kind) != 0
         } else {
             self.state(state).flags & path_bit(kind) != 0
         }
     }
-    /// Replace the answers mod parts gave. With `asked`, `answer` is called once per state and
-    /// type with the block's own answer, so the answers depend on the state and the type alone;
-    /// without it, every state answers as its block does.
-    pub fn set_pathfindable(
-        &self,
-        asked: bool,
-        answer: impl Fn(BlockStateId, PathComputationType, bool) -> bool,
-    ) {
-        let table = self
-            .pathfindable_overrides
-            .get_or_init(|| self.states.iter().map(|_| AtomicU8::new(0)).collect());
-        for (i, slot) in table.iter().enumerate() {
+    /// `BlockState.isPathfindable(type)`: the block's own answer, or the one a mod part gave.
+    pub fn pathfindable(&self, state: BlockStateId, kind: PathComputationType) -> bool {
+        let given = self
+            .resolved_state(state)
+            .map_or(0, |slot| slot.pathfindable.load(Ordering::Relaxed));
+        if given & OVERRIDDEN != 0 {
+            u16::from(given) & path_bit(kind) != 0
+        } else {
+            self.state(state).flags & path_bit(kind) != 0
+        }
+    }
+    /// The block's own `isPathfindable(kind)`, the export's, whatever a mod part answered.
+    pub fn block_pathfindable(&self, state: BlockStateId, kind: PathComputationType) -> bool {
+        self.state(state).flags & path_bit(kind) != 0
+    }
+    /// Vanilla static classification after state-only `isPathfindable` resolution.
+    /// Positional path-type overrides are applied by `MobWorld`, never stored here.
+    pub fn path_type(&self, state: BlockStateId) -> PathType {
+        self.resolved_state(state)
+            .map_or_else(|| self.state(state).path, ResolvedState::path_type)
+    }
+    /// Keep each state's mod-part answers, asked once by the game's per-state resolver: they
+    /// depend on the state alone, so path finding and spawning read them with nothing
+    /// dispatched. Called when parts install, at world load and on every `/reload`; a question
+    /// with no answer in `answers` gives every state its block's answer again. `facts` says
+    /// which states are air and which hold water.
+    pub fn resolve_parts(&self, facts: &BlockFacts, answers: &PartAnswers<'_>) {
+        let table = self.resolved_states(facts);
+        for ((i, data), slot) in self.states.iter().enumerate().zip(table) {
             let state = BlockStateId(i as u32);
-            let given = if asked {
-                PathComputationType::ALL
-                    .into_iter()
-                    .filter(|&kind| {
-                        answer(state, kind, self.state(state).flags & path_bit(kind) != 0)
-                    })
-                    .fold(OVERRIDDEN, |bits, kind| bits | path_bit(kind) as u8)
+            let given = answers
+                .pathfindable
+                .map_or(0, |answers| OVERRIDDEN | answers[i]);
+            let land = if given & OVERRIDDEN != 0 {
+                u16::from(given) & LAND != 0
             } else {
-                0
+                data.flags & LAND != 0
             };
-            slot.store(given, Ordering::Relaxed);
+            let f = facts.get(state);
+            let water = f.fluid == Fluid::Water;
+            let path = data.path_with_land(land, facts.is_air(state), water);
+            slot.pathfindable.store(given, Ordering::Relaxed);
+            slot.path.store(path as u8, Ordering::Relaxed);
+            slot.adjacent
+                .store(adjacent_flags_for_facts(f), Ordering::Relaxed);
         }
     }
     pub fn entity_has(&self, tag: &str, entity: &str) -> bool {
@@ -224,7 +377,7 @@ impl MobData {
             .map(|(k, a)| (k.clone(), Animation::parse(a)))
             .collect();
         Self {
-            pathfindable_overrides: Default::default(),
+            resolved: Default::default(),
             states,
             placements,
             heightmaps,
@@ -287,7 +440,7 @@ impl MobData {
             })
             .collect();
         Self {
-            pathfindable_overrides: Default::default(),
+            resolved: Default::default(),
             states,
             placements: HashMap::new(),
             heightmaps: HashMap::new(),
@@ -375,5 +528,134 @@ impl MobData {
         table.get(s as usize).copied().unwrap_or_else(|| {
             self.placement(&format!("minecraft:{}", super::species::def(s).name))
         })
+    }
+}
+
+#[cfg(test)]
+#[path = "path_type_tests.rs"]
+mod path_type_tests;
+
+#[cfg(test)]
+mod adjacent_flags_tests {
+    use super::*;
+    use crate::blocks::{RenderShape, Sounds};
+    use std::sync::Arc;
+
+    fn make_fact(name: &str, full: bool, emission: u8, fluid: Fluid) -> StateFacts {
+        let sound: Arc<str> = Arc::from("");
+        StateFacts {
+            name: Arc::from(name),
+            emission,
+            dynamic_light: false,
+            dampening: 0,
+            skylight_down: true,
+            shape_occlusion: false,
+            can_occlude: full,
+            solid_render: full,
+            hardness: 1.0,
+            requires_tool: false,
+            replaceable: !full,
+            random_ticks: false,
+            block_entity: false,
+            render_shape: RenderShape::Model,
+            destroy_overlay: true,
+            full_collision: full,
+            friction: 0.6,
+            explosion_resistance: 1.0,
+            item: Arc::from(name),
+            pick_item: Arc::from(name),
+            sounds: Sounds {
+                volume: 1.0,
+                pitch: 1.0,
+                break_sound: sound.clone(),
+                step: sound.clone(),
+                place: sound.clone(),
+                hit: sound.clone(),
+                fall: sound,
+            },
+            fluid,
+            fluid_level: u8::from(fluid != Fluid::None),
+            fluid_falling: false,
+            waterlogged: false,
+            random_offset: false,
+            outline_offset: false,
+            legacy_solid: full,
+            sturdy_full: 0,
+            classes: Arc::from([]),
+            outline: Arc::from([]),
+            outline_edges: Arc::from([]),
+            map_color: 0,
+        }
+    }
+
+    #[test]
+    fn adjacent_flags_match_vanilla_predicates_and_survive_resolve_parts() {
+        let facts = BlockFacts {
+            states: vec![
+                make_fact("minecraft:air", false, 0, Fluid::None),
+                make_fact("minecraft:stone", true, 0, Fluid::None),
+                make_fact("minecraft:sweet_berry_bush", false, 0, Fluid::None),
+                make_fact("minecraft:lava", false, 15, Fluid::Lava),
+                make_fact("minecraft:magma_block", true, 3, Fluid::None),
+                make_fact("minecraft:lava_cauldron", true, 15, Fluid::None),
+                make_fact("minecraft:campfire", false, 15, Fluid::None),
+                make_fact("minecraft:campfire", false, 0, Fluid::Water),
+                make_fact("minecraft:soul_campfire", false, 10, Fluid::None),
+                make_fact("minecraft:soul_campfire", false, 0, Fluid::None),
+                make_fact("minecraft:fire", false, 15, Fluid::None),
+                make_fact("minecraft:soul_fire", false, 10, Fluid::None),
+                make_fact("minecraft:water", false, 0, Fluid::Water),
+                make_fact("mod:custom_fluid", false, 0, Fluid::Modded),
+            ],
+            air: BlockStateId(0),
+            woods: Default::default(),
+            sign_texts: Default::default(),
+        };
+        let expected_flags = [
+            0,
+            0,
+            ADJ_SWEET_BERRY_BUSH,
+            ADJ_ALWAYS_BURNING,
+            ADJ_ALWAYS_BURNING,
+            ADJ_ALWAYS_BURNING,
+            ADJ_ALWAYS_BURNING,
+            ADJ_WATER_FLUID,
+            ADJ_ALWAYS_BURNING,
+            0,
+            ADJ_VANILLA_FIRE,
+            ADJ_VANILLA_FIRE,
+            ADJ_WATER_FLUID,
+            ADJ_WATER_FLUID,
+        ];
+        let data = MobData::fallback(&facts);
+        let table = data.resolved_states(&facts);
+        assert_eq!(table.len(), expected_flags.len());
+        for (i, &want) in expected_flags.iter().enumerate() {
+            assert_eq!(table[i].adjacent_flags(), want, "state index {i}");
+        }
+        // Lazy initialization must preserve exported path_type and pathfindable.
+        assert_eq!(data.path_type(BlockStateId(1)), PathType::Blocked);
+        assert!(!data.pathfindable(BlockStateId(1), PathComputationType::Land));
+        // Overriding stone to land-pathfindable updates path & pathfindable while keeping adjacent flags.
+        let mut overrides = vec![0u8; facts.states.len()];
+        overrides[1] = PartAnswers::pathfindable_bit(PathComputationType::Land);
+        data.resolve_parts(
+            &facts,
+            &PartAnswers {
+                pathfindable: Some(&overrides),
+            },
+        );
+        assert_eq!(data.path_type(BlockStateId(1)), PathType::Open);
+        assert!(data.pathfindable_in(table, BlockStateId(1), PathComputationType::Land));
+        for (i, &want) in expected_flags.iter().enumerate() {
+            assert_eq!(table[i].adjacent_flags(), want, "after resolve_parts {i}");
+        }
+        // Clearing overrides restores stone to Blocked and preserves adjacent flags.
+        data.resolve_parts(&facts, &PartAnswers::default());
+        assert_eq!(data.path_type(BlockStateId(1)), PathType::Blocked);
+        assert!(!data.pathfindable_in(table, BlockStateId(1), PathComputationType::Land));
+        // Out-of-bounds state id falls back cleanly without panicking.
+        assert!(!data.pathfindable_in(table, BlockStateId(9999), PathComputationType::Land));
+        assert_eq!(adjacent_flags_for_facts(facts.get(BlockStateId(9999))), 0);
     }
 }

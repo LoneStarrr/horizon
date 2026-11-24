@@ -55,6 +55,10 @@ pub(crate) struct TestLevel {
     pub block_events_ready: bool,
     /// Positions that refuse fluids, fire and piston moves, as a land claim would.
     pub guarded: HashSet<BlockPos>,
+    /// The states `template_suppressed` names: blocks of a mod that is off.
+    pub suppressed: HashSet<BlockStateId>,
+    /// How many times `allow_fluid_tick` was asked.
+    pub fluid_asks: std::cell::Cell<u32>,
     /// What `adjust_signal` answers at a position: the weak and direct signal,
     /// and the only direction they go in, if any.
     pub signals: HashMap<BlockPos, (i32, i32, Option<Direction>)>,
@@ -103,8 +107,12 @@ pub(crate) struct TestLevel {
     /// `ShulkerBoxBlockEntity.isClosed` at a position: `true` for a shut lid,
     /// `false` for an open box. Positions not listed have no block entity.
     pub shulker_closed: HashMap<BlockPos, bool>,
+    pub shulker_progress: HashMap<BlockPos, f32>,
     /// The containers `container_open` reports as open.
     pub opened: HashSet<BlockPos>,
+    /// `Level.getWorldBorder`, for `within_world_border`: centred on the
+    /// origin at vanilla's default size unless a test moves it.
+    pub border: horizon_core::geometry::border::BorderGeometry,
 }
 impl TestLevel {
     pub(super) fn new(b: &Behaviours) -> Self {
@@ -131,6 +139,8 @@ impl TestLevel {
             tick_ready: true,
             block_events_ready: true,
             guarded: HashSet::new(),
+            suppressed: HashSet::new(),
+            fluid_asks: Default::default(),
             fire_asks: Default::default(),
             source_asks: Default::default(),
             lava_asks: Default::default(),
@@ -147,7 +157,14 @@ impl TestLevel {
             note_players: std::cell::RefCell::new(Vec::new()),
             refuse_portals: false,
             shulker_closed: HashMap::new(),
+            shulker_progress: HashMap::new(),
             opened: HashSet::new(),
+            border: horizon_core::geometry::border::BorderGeometry::new(
+                [0.0, 0.0],
+                5.999_996_8e7,
+                29_999_984,
+            )
+            .unwrap(),
         }
     }
 }
@@ -156,6 +173,10 @@ impl LevelAccess for TestLevel {
     fn cake_can_eat(&self, vanilla: bool) -> bool {
         self.cake_asks.set(self.cake_asks.get() + 1);
         self.cake_answer.unwrap_or(vanilla)
+    }
+    fn within_world_border(&self, pos: BlockPos) -> bool {
+        self.border
+            .is_within_bounds(f64::from(pos.x), f64::from(pos.z), 0.0)
     }
     fn should_tick_blocks_at(&self, _chunk: ChunkPos) -> bool {
         self.block_events_ready
@@ -172,6 +193,9 @@ impl LevelAccess for TestLevel {
     }
     fn shulker_is_closed(&self, pos: BlockPos) -> Option<bool> {
         self.shulker_closed.get(&pos).copied()
+    }
+    fn shulker_lid_progress(&self, pos: BlockPos) -> Option<f32> {
+        self.shulker_progress.get(&pos).copied()
     }
     fn adjust_has_analog_output(&self, state: BlockStateId, vanilla: bool) -> bool {
         vanilla || self.analog_states.contains(&state)
@@ -280,7 +304,11 @@ impl LevelAccess for TestLevel {
         self.events.push(event);
     }
     fn allow_fluid_tick(&self, pos: BlockPos, _fluid: &'static str) -> bool {
+        self.fluid_asks.set(self.fluid_asks.get() + 1);
         !self.guarded.contains(&pos)
+    }
+    fn template_suppressed(&self, state: BlockStateId) -> bool {
+        self.suppressed.contains(&state)
     }
     fn allow_spread(&self, _kind: Spread, _from: BlockPos, to: BlockPos) -> bool {
         !self.guarded.contains(&to)
@@ -448,16 +476,25 @@ impl<'f> World<'f> {
     }
     pub(super) fn tick(&mut self) {
         self.level.time += 1;
+        self.ticks.begin_handling_tick();
         self.f
             .behaviours
             .tick_scheduled(&mut self.level, &mut self.ticks);
+        self.ticks.end_handling_tick();
     }
-    /// Scheduled ticks, block events and block entities, as `ServerLevel.tick`.
+    /// Scheduled ticks, block events and block entities, as `ServerLevel.tick`:
+    /// the ticks and the events inside `handlingTick` (ServerLevel.java:360,
+    /// :412), the block entities below it (:455).
     fn full_tick(&mut self) {
-        self.tick();
+        self.level.time += 1;
+        self.ticks.begin_handling_tick();
+        self.f
+            .behaviours
+            .tick_scheduled(&mut self.level, &mut self.ticks);
         self.f
             .behaviours
             .run_block_events(&mut self.level, &mut self.ticks);
+        self.ticks.end_handling_tick();
         self.f
             .behaviours
             .tick_block_entities(&mut self.level, &mut self.ticks);
@@ -822,6 +859,71 @@ fn block_update_notifications_follow_client_and_invisible_flags() {
     }
 }
 
+/// Two floating redstone wires in a row, at (1, 64, 0) and (2, 64, 0), and a
+/// stone changed at (0, 64, 0) whose neighbours are notified, with `max` as the
+/// level's chained neighbour update limit (`None`: the default). A wire breaks
+/// when an update reaches it (`RedStoneWireBlock.neighborChanged`, no support
+/// below); the second only breaks if the first's removal is allowed to update
+/// its own neighbours in turn. Tells which of the two broke.
+fn wires_broken_by_updates(f: &Fixture, max: Option<i32>) -> (bool, bool) {
+    let mut w = World::new(f);
+    if let Some(max) = max {
+        w.ticks.set_max_chained_neighbor_updates(max);
+    }
+    let wire = w.id("redstone_wire", &[]);
+    let (first, second) = (BlockPos::new(1, 64, 0), BlockPos::new(2, 64, 0));
+    w.put(first, wire);
+    w.put(second, wire);
+    let stone = w.b().table.block_by_name("minecraft:stone").unwrap();
+    w.b()
+        .update_neighbors_at(&mut w.level, &mut w.ticks, BlockPos::new(0, 64, 0), stone);
+    (w.get(first) != wire, w.get(second) != wire)
+}
+
+/// `CollectingNeighborUpdater.addAndRun` drops an update as too many only when
+/// `maxChainedNeighborUpdates >= 0 && count >= maxChainedNeighborUpdates`, and
+/// the count restarts at 0 when a chain ends. The dedicated server's
+/// `max-chained-neighbor-updates` is that limit: 0 lets no update through, 1
+/// lets the first notification through and drops what it sets off, a negative
+/// value is no limit.
+#[test]
+fn max_chained_neighbor_updates_limits_a_chain_and_a_negative_value_lifts_it() {
+    let Some(f) = fixture() else { return };
+    assert_eq!(wires_broken_by_updates(f, None), (true, true), "default");
+    assert_eq!(wires_broken_by_updates(f, Some(-1)), (true, true), "-1");
+    assert_eq!(wires_broken_by_updates(f, Some(1)), (true, false), "1");
+    assert_eq!(wires_broken_by_updates(f, Some(0)), (false, false), "0");
+}
+
+/// `CollectingNeighborUpdater.addAndRun` logs once per chain, when the count
+/// first passes the limit, naming the position of the first update it drops:
+/// `Too many chained neighbor updates. Skipping the rest. First skipped
+/// position: 1, 63, 0` (`BlockPos.toShortString`). With the limit 1 the first
+/// notification (of the stone's neighbours) is let through and the first wire
+/// breaks. Its removal (`RedStoneWireBlock.affectNeighborsAfterRemoval`, run by
+/// `LevelChunk.setBlockState` before `Level.setBlock` updates the neighbours)
+/// notifies the neighbours of each of its own neighbours in `Direction.values()`
+/// order, the one below first: that, at (1, 63, 0), is the first update dropped;
+/// the ones after it are dropped without a line.
+#[test]
+fn passing_max_chained_neighbor_updates_logs_one_error_with_the_first_skipped_position() {
+    let Some(f) = fixture() else { return };
+    // The crate's one test logger: this thread's errors only, as the tests run side by side.
+    crate::test_log::capture();
+    wires_broken_by_updates(f, Some(1));
+    let mine: Vec<String> = crate::test_log::with_records(|records| {
+        records
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Error)
+            .map(|(_, line)| line.clone())
+            .collect()
+    });
+    assert_eq!(
+        mine,
+        ["Too many chained neighbor updates. Skipping the rest. First skipped position: 1, 63, 0"]
+    );
+}
+
 /// `WeatheringCopperChestBlock.randomTick`: a copper chest someone has open
 /// skips `changeOverTime` and its draws; a closed one draws (#11378).
 #[test]
@@ -1050,8 +1152,10 @@ fn tick_block_hook_can_change_the_block_and_skip_its_own_tick() {
     let pos = BlockPos::new(1, 1, 1);
     // The due ticks run as the game runs them, stepped (scheduled_begin,
     // scheduled_step, scheduled_finish), or as tests do, through
-    // tick_scheduled.
+    // tick_scheduled; both inside the level tick's `handlingTick`
+    // (ServerLevel.java:360-412).
     let run = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
+        ticks.begin_handling_tick();
         if stepped {
             assert!(b.scheduled_begin(level, ticks, false));
             while b.scheduled_step(level, ticks, false) {}
@@ -1059,6 +1163,7 @@ fn tick_block_hook_can_change_the_block_and_skip_its_own_tick() {
         } else {
             b.tick_scheduled(level, ticks);
         }
+        ticks.end_handling_tick();
     };
     // One tick of the block at `pos` falls due.
     let due = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
@@ -1839,6 +1944,7 @@ impl World<'_> {
             may_build: true,
             can_eat: true,
             game_master: false,
+            respawn_point: None,
         };
         let hit = horizon_core::geometry::Vec3::new(
             f64::from(pos.x) + 0.5,
@@ -1868,6 +1974,7 @@ impl World<'_> {
             may_build: true,
             can_eat: false,
             game_master: false,
+            respawn_point: None,
         };
         let hit = horizon_core::geometry::Vec3::new(
             f64::from(pos.x) + 0.5,
@@ -1909,6 +2016,7 @@ impl World<'_> {
             may_build: true,
             can_eat: true,
             game_master: false,
+            respawn_point: None,
         };
         let hit = horizon_core::geometry::Vec3::new(
             f64::from(pos.x) + 0.5,
@@ -1966,31 +2074,6 @@ fn use_on_a_block_says_which_branch_answered() {
         w.use_branch(pos, Some("minecraft:bone_meal")),
         (InteractionResult::Pass, UseBranch::ItemOn)
     );
-}
-
-#[test]
-fn glowstone_charges_a_respawn_anchor_up_to_four() {
-    // RespawnAnchorBlock.useItemOn: glowstone on an anchor below 4 charges
-    // charges it and the click ends (SUCCESS), so no glowstone is placed (#3034).
-    let mut w = world!();
-    let pos = BlockPos::new(0, 1, 0);
-    let empty = w.id("respawn_anchor", &[("charges", "0")]);
-    w.put(pos, empty);
-    for charges in 1..=4 {
-        assert_eq!(
-            w.use_item(pos, "minecraft:glowstone"),
-            InteractionResult::Success
-        );
-        assert_eq!(w.prop(pos, "charges"), charges.to_string());
-    }
-    // A full anchor can't be charged: TRY_WITH_EMPTY_HAND, then useWithoutItem
-    // (the respawn point), which leaves the charges alone.
-    w.use_item(pos, "minecraft:glowstone");
-    assert_eq!(w.prop(pos, "charges"), "4");
-    // Anything else on an empty anchor passes, so the item is used instead.
-    w.put(pos, empty);
-    assert_eq!(w.use_item(pos, "minecraft:stone"), InteractionResult::Pass);
-    assert_eq!(w.prop(pos, "charges"), "0");
 }
 
 #[test]
@@ -2380,6 +2463,105 @@ fn tnt_duper_3856_client_neighbor_does_not_prime_or_remove_tnt() {
     assert_eq!(w.level.random.next_long(), random.next_long());
 }
 
+/// RedStoneWireBlock.neighborChanged works out the wire's power only when
+/// `!level.isClientSide()`: a client's wire keeps the power the server sent.
+/// A client that moved the redstone block away from its wire (the piston
+/// event it replays) turned the wire off itself, a tick before the server, so
+/// a piston clock's wire never showed lit (#16864). The server still does.
+#[test]
+fn a_client_wire_keeps_the_servers_power_when_a_neighbour_changes() {
+    for client in [true, false] {
+        let mut w = world!();
+        let f = w.f;
+        w.level.client_side = client;
+        let pos = BlockPos::new(0, 1, 0);
+        w.put(pos.offset(0, -1, 0), w.id("stone", &[]));
+        w.put(pos, w.id("redstone_wire", &[("power", "15")]));
+        let air = w.id("air", &[]);
+        f.behaviours.handle_neighbor_changed(
+            &mut w.level,
+            &mut w.ticks,
+            pos,
+            f.behaviours.block(air),
+        );
+        let expected = if client { "15" } else { "0" };
+        assert_eq!(w.prop(pos, "power"), expected, "client={client}");
+    }
+}
+
+/// RedStoneWireBlock.affectNeighborsAfterRemoval takes a `ServerLevel`: only a
+/// server's removed wire works out its neighbours' power and notifies them.
+/// A client's (a wire a replayed piston destroys) leaves the wire beside it at
+/// the power the server sent and notifies nothing (#16864).
+#[test]
+fn a_client_wire_removed_leaves_its_neighbours_alone() {
+    use std::cell::RefCell;
+    struct Heard {
+        inner: TestLevel,
+        seen: RefCell<Vec<BlockPos>>,
+    }
+    impl crate::level::BlockEntityNeighbors for Heard {}
+    impl LevelAccess for Heard {
+        fn block_state(&self, pos: BlockPos) -> BlockStateId {
+            self.inner.block_state(pos)
+        }
+        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
+            self.inner.set_raw(pos, state)
+        }
+        fn is_loaded(&self, pos: BlockPos) -> bool {
+            self.inner.is_loaded(pos)
+        }
+        fn random(&mut self) -> &mut LegacyRandom {
+            self.inner.random()
+        }
+        fn game_time(&self) -> i64 {
+            self.inner.game_time()
+        }
+        fn is_client_side(&self) -> bool {
+            self.inner.client_side
+        }
+        fn observe_neighbor_changed(
+            &self,
+            _: &mut Ticks,
+            pos: BlockPos,
+            _: BlockStateId,
+            _: BlockId,
+            _: bool,
+        ) {
+            self.seen.borrow_mut().push(pos);
+        }
+    }
+    let w = world!();
+    let b = w.b();
+    let stone = w.id("stone", &[]);
+    let removed = w.id("redstone_wire", &[("power", "15")]);
+    let beside = w.id("redstone_wire", &[("power", "14")]);
+    let (gone, kept) = (BlockPos::new(0, 1, 0), BlockPos::new(1, 1, 0));
+    for client in [true, false] {
+        let mut level = Heard {
+            inner: TestLevel::new(b),
+            seen: RefCell::new(Vec::new()),
+        };
+        level.inner.client_side = client;
+        for pos in [gone, kept] {
+            level.set_raw(pos.offset(0, -1, 0), stone);
+        }
+        level.set_raw(kept, beside);
+        let mut ticks = Ticks::new(0);
+        b.sim(&mut level, &mut ticks)
+            .affect_neighbors_after_removal(removed, gone, false);
+        let power = b.table.int(level.block_state(kept), b.props.power);
+        let heard = level.seen.borrow().len();
+        if client {
+            assert_eq!(power, 14, "a client's wire keeps the server's power");
+            assert_eq!(heard, 0, "a client's removed wire notifies nothing");
+        } else {
+            assert_eq!(power, 0, "the server works the power out again");
+            assert!(heard > 0);
+        }
+    }
+}
+
 #[test]
 fn tnt_duper_3856_client_placement_does_not_prime_tnt() {
     let mut w = world!();
@@ -2391,6 +2573,43 @@ fn tnt_duper_3856_client_placement_does_not_prime_tnt() {
     w.set(pos, tnt);
     assert_eq!(w.get(pos), tnt);
     assert!(w.level.events.is_empty());
+}
+
+/// `LevelChunk.setBlockState` runs `onPlace` on the server only, and
+/// `Level.blockUpdated` (the neighbour report of a set) does nothing on a
+/// client: a client's copy of the level takes the state the server sent and
+/// waits for the server's own block events. Shape updates, which both sides
+/// run, still keep it consistent.
+#[test]
+fn a_client_placement_runs_no_on_place_and_no_neighbour_report() {
+    let mut w = world!();
+    w.level.client_side = true;
+    w.floor(0, 3, "stone");
+    let fire_pos = BlockPos::new(0, 1, 0);
+    let door_pos = BlockPos::new(2, 1, 0);
+    let door = w.id(
+        "oak_door",
+        &[
+            ("half", "lower"),
+            ("facing", "east"),
+            ("hinge", "left"),
+            ("open", "false"),
+            ("powered", "false"),
+        ],
+    );
+    w.put(door_pos, door);
+    assert!(w.set(fire_pos, w.id("fire", &[])));
+    assert_eq!(
+        w.ticks.blocks.count(),
+        0,
+        "onPlace runs on a server only: no client-side fire tick"
+    );
+    assert!(w.set(fire_pos.offset(1, 0, 0), w.id("redstone_block", &[])));
+    assert_eq!(
+        w.prop(door_pos, "open"),
+        "false",
+        "a client takes no neighbour report from a set: the door stays as the server left it"
+    );
 }
 
 #[test]
@@ -2454,7 +2673,11 @@ fn tnt_duper_3856_piston_keeps_original_and_primes_one_tnt() {
                 base,
                 f.behaviours.block(power),
             );
+            // The event runs inside the level tick's `handlingTick`
+            // (ServerLevel.java:360-412).
+            w.ticks.begin_handling_tick();
             f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+            w.ticks.end_handling_tick();
         }
         let primed = w
             .level
@@ -2550,6 +2773,41 @@ fn a_client_replays_a_pistons_block_event() {
     assert!(w.ticks.moving_pistons.is_empty());
 }
 
+/// MC-254385: a client that predicted a piston facing elsewhere than the
+/// server's replays the extension on its own piston, then takes the server's
+/// base without shape updates. The head it pushed can't survive there, but
+/// `Block.updateOrDestroy` destroys nothing on a client, so it stays.
+#[test]
+fn a_client_keeps_the_head_of_a_piston_the_server_turned() {
+    let mut w = world!();
+    w.floor(0, 10, "stone");
+    w.level.client_side = true;
+    let base = BlockPos::new(0, 1, 0);
+    let east = w.id("piston", &[("facing", "east")]);
+    let north = w.id("piston", &[("facing", "north"), ("extended", "true")]);
+    let block = w.id("redstone_block", &[]);
+    w.put(base, east);
+    w.put(BlockPos::new(-1, 1, 0), block);
+    assert!(w.f.behaviours.client_block_event(
+        &mut w.level,
+        &mut w.ticks,
+        base,
+        0,
+        Direction::North as i32,
+    ));
+    // The server's state on the acknowledgement (flags 19: no shape updates).
+    w.put(base, north);
+    for _ in 0..10 {
+        w.level.time += 1;
+        w.f.behaviours
+            .client_tick_block_entities(&mut w.level, &mut w.ticks);
+    }
+    assert_eq!(
+        w.name(BlockPos::new(1, 1, 0)),
+        "piston_head[facing=east,short=false,type=normal]"
+    );
+}
+
 /// A client's copy of a move doesn't start the pistons the moved block
 /// powers (`checkIfExtend` is server-only): their own block events come from
 /// the server.
@@ -2604,6 +2862,43 @@ fn dripstone_fills_cauldrons() {
         w.tick();
     }
     assert_eq!(w.name(BlockPos::new(0, 5, 0)), "water_cauldron[level=1]");
+}
+
+/// `PointedDripstoneBlock.canGrow`: the fluid two blocks above the tip must be
+/// water AND a source (`FluidState.is(Fluids.WATER)` and `isSource`), so
+/// flowing and falling water, which are other fluids of the family, grow nothing.
+#[test]
+fn a_dripstone_tip_grows_only_under_a_water_source() {
+    let mut w = world!();
+    let block = w.id("dripstone_block", &[]);
+    let tip = w.id(
+        "pointed_dripstone",
+        &[("vertical_direction", "down"), ("thickness", "tip")],
+    );
+    let stone = w.id("stone", &[]);
+    let top = BlockPos::new(0, 9, 0);
+    // Whether any pointed dripstone stands in the column besides the first tip.
+    let grown = |w: &World| {
+        (0..9).any(|y| {
+            w.name(BlockPos::new(0, y, 0))
+                .starts_with("pointed_dripstone")
+        })
+    };
+    for (level, expect) in [("0", true), ("1", false), ("8", false)] {
+        w.put(BlockPos::new(0, 11, 0), w.id("water", &[("level", level)]));
+        w.put(BlockPos::new(0, 10, 0), block);
+        w.put(top, tip);
+        w.put(BlockPos::new(0, 2, 0), stone);
+        for y in 0..9 {
+            if y != 2 {
+                w.put(BlockPos::new(0, y, 0), w.id("air", &[]));
+            }
+        }
+        for _ in 0..4000 {
+            w.b().random_tick(&mut w.level, &mut w.ticks, top);
+        }
+        assert_eq!(grown(&w), expect, "water level {level}");
+    }
 }
 
 #[test]
@@ -3273,6 +3568,40 @@ fn open_shulker_box_supports_only_through_its_base_plate() {
             !sim.can_support_center(pos, facing),
             "open box facing {facing:?} lid side"
         );
+    }
+}
+
+#[test]
+fn a_shulker_box_stops_conducting_redstone_when_its_lid_moves() {
+    let mut w = world!();
+    let box_pos = BlockPos::new(0, 1, 0);
+    let stone_pos = BlockPos::new(2, 1, 0);
+    w.put(box_pos, w.id("shulker_box", &[("facing", "up")]));
+    w.put(stone_pos, w.id("stone", &[]));
+    w.level.shulker_closed.remove(&box_pos);
+    let box_state = w.get(box_pos);
+    let stone_state = w.get(stone_pos);
+    {
+        let sim = w.b().sim(&mut w.level, &mut w.ticks);
+        assert!(
+            sim.is_redstone_conductor(box_state, box_pos),
+            "a closed box is a full cube"
+        );
+        assert!(
+            sim.is_redstone_conductor(stone_state, stone_pos),
+            "a full block still conducts"
+        );
+    }
+    w.level.shulker_closed.insert(box_pos, false);
+    for (progress, conducts) in [(0.0, true), (0.1, false), (1.0, false)] {
+        w.level.shulker_progress.insert(box_pos, progress);
+        let sim = w.b().sim(&mut w.level, &mut w.ticks);
+        assert_eq!(
+            sim.is_redstone_conductor(box_state, box_pos),
+            conducts,
+            "shulker lid progress {progress}"
+        );
+        assert!(sim.is_redstone_conductor(stone_state, stone_pos));
     }
 }
 
@@ -4611,7 +4940,7 @@ fn fresh_chunk_block_events_do_not_wait_for_ticking_readiness() {
         w.set(BlockPos::new(0, 0, 0), w.id("redstone_block", &[]));
         w.set(pos, piston);
         assert_eq!(w.ticks.block_events.len(), 1, "placement queues an event");
-        w.f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+        w.f.behaviours.tick_level_blocks(&mut w.level, &mut w.ticks);
         assert_eq!(
             w.prop(pos, "extended"),
             ticketed.to_string(),
@@ -4629,7 +4958,7 @@ fn fresh_chunk_block_events_do_not_wait_for_ticking_readiness() {
             );
         } else {
             w.level.block_events_ready = true;
-            w.f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+            w.f.behaviours.tick_level_blocks(&mut w.level, &mut w.ticks);
             assert_eq!(
                 w.prop(pos, "extended"),
                 "true",
@@ -4672,9 +5001,11 @@ mod removal {
     include!("tests/removal.rs");
 }
 mod fluid_tick;
-
+mod interact;
 mod pistons;
+mod portals;
 mod redstone;
+mod respawn_anchor;
 
 /// `ShulkerBoxBlockEntity.doNeighborUpdates`: the neighbours' shape updates
 /// (flag 3) and then their `neighborChanged`, at the four points in

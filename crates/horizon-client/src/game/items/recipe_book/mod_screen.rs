@@ -260,13 +260,13 @@ impl Game<'_> {
     }
     fn mod_book_button(&self, batch: &HudBatch) -> (f32, f32) {
         self.mod_book_layout(batch.width, self.mod_book_open())
-            .map_or((0.0, 0.0), |layout| layout.toggle)
+            .map_or((0.0, 0.0), |layout| {
+                layout.shifted_toggle(self.screen_room_shift(batch))
+            })
     }
-    pub(super) fn draw_mod_book(&mut self, batch: &mut HudBatch) {
+    pub(super) fn draw_mod_book(&mut self, batch: &mut HudBatch) -> Option<Vec<(Text, u32)>> {
         self.refresh_mod_book();
-        let Some((open, filtering)) = self.mod_book_flags() else {
-            return;
-        };
+        let (open, filtering) = self.mod_book_flags()?;
         let (bx, by) = self.mod_book_button(batch);
         batch.sprite(
             &self.gui.atlas,
@@ -283,7 +283,7 @@ impl Game<'_> {
         }
         self.draw_mod_book_ghosts(batch);
         if !open {
-            return;
+            return None;
         }
         let (xo, yo) = self.book_origin(batch);
         let search = match self.recipe_ui.search.as_mut() {
@@ -303,9 +303,7 @@ impl Game<'_> {
             None => Search::default(),
         };
         let ui = &self.recipe_ui.custom;
-        let Some(presentation) = &ui.presentation else {
-            return;
-        };
+        let presentation = ui.presentation.as_ref()?;
         let buttons: Vec<_> = presentation
             .recipes
             .iter()
@@ -322,9 +320,7 @@ impl Game<'_> {
         let text_width = |s: &str| HudBatch::text_width(&self.gui.atlas, s) as i32;
         let layout = Layout {
             book: BookType::Crafting,
-            width: batch.width as i32,
-            height: batch.height as i32,
-            narrow: self.mod_book_overlay(batch.width),
+            origin: (xo as i32, yo as i32),
             mouse: (self.cursor.0 as i32, self.cursor.1 as i32),
             index: self.swap_index(),
             filtering,
@@ -364,9 +360,7 @@ impl Game<'_> {
                 }
             }
         }
-        if let Some(lines) = self.paint_book(batch, &calls) {
-            self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
-        }
+        self.paint_book(batch, &calls)
     }
     pub(super) fn mod_book_click(&mut self, right: bool) -> bool {
         self.native_net.placement.client.click();

@@ -41,15 +41,10 @@ fn own_attribute(m: &Mob, name: &str) -> Option<Attr> {
     finalize::command_attr(short).filter(|a| finalize::default_value(m, *a).is_some())
 }
 
-/// `write` on one of the mob's own attributes; a lower max health cuts its
-/// health (`LivingEntity.onAttributeUpdated`).
+/// `write` on one of the mob's own attributes. A lower max health marks the attribute dirty;
+/// the mob's next tick cuts its health (`LivingEntity.refreshDirtyAttributes`, `finalize::refresh`).
 fn write_own_attribute(m: &mut Mob, a: Attr, write: AttributeWrite) -> bool {
-    let done = write.apply_to_mob(m, a);
-    if a == Attr::MaxHealth && m.health > m.attrs.max_health {
-        m.health = m.attrs.max_health;
-        m.needs_sync = true;
-    }
-    done
+    write.apply_to_mob(m, a)
 }
 
 /// An attribute write on a mob that is in no level yet (`finalize_spawn`'s
@@ -88,10 +83,14 @@ impl Game<'_> {
             }
             collect_equipment(&catalog, items, m);
         }
-        for a in self.armor_stands.iter_mut() {
-            if a.equipment.is_empty() && !a.live.has_worn() {
+        for i in 0..self.armor_stands.len() {
+            // Looked at without a `&mut`, which the list counts as a touch: most stands wear
+            // nothing and never did.
+            let stand = &self.armor_stands[i];
+            if stand.equipment.is_empty() && !stand.live.has_worn() {
                 continue;
             }
+            let a = &mut self.armor_stands[i];
             let changed = a.live.collect_equipment_changes(
                 &catalog,
                 "minecraft:armor_stand",
@@ -117,7 +116,7 @@ impl Game<'_> {
 
     /// `collectEquipmentChanges` of the mob `id` right away: equipment a mod
     /// wrote through a handle takes its attribute modifiers on the live map
-    /// at once — its armor and the reads of #940 — not at the tick's pass.
+    /// at once — its armor and the reads of arismoko/horizon#940 — not at the tick's pass.
     /// The tick's own pass remains the safety net for the other writers.
     pub(super) fn collect_mob_equipment_attributes(&mut self, id: u32) {
         if self.remote.is_some() || self.options.execution_role.is_client() {
@@ -319,7 +318,7 @@ impl Game<'_> {
         // A finalize write drops the mob's live map (its seed changed), which
         // takes the equipment's modifiers with it: collect them again at
         // once, so the next read — a hit's armor, the attribute sync — sees
-        // them (#941).
+        // them (arismoko/horizon#941).
         if let Target::Mob(id) = t {
             self.collect_mob_equipment_attributes(id);
         }
@@ -497,9 +496,9 @@ mod tests {
     }
 
     /// A held stack with its own `attribute_modifiers` hits by them, not by
-    /// its item type's defaults (#941).
+    /// its item type's defaults (arismoko/horizon#941).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_changed_held_stack_hits_by_its_own_modifiers() {
         use horizon_client::mobs::gear;
         use horizon_core::nbt::Tag;
@@ -541,12 +540,12 @@ mod tests {
         });
     }
 
-    /// The mob's attribute packet is its live map's instances (#941): base
+    /// The mob's attribute packet is its live map's instances (arismoko/horizon#941): base
     /// and each modifier once — the equipment's own rows and `/attribute`'s
     /// writes among them — with no modifier applied twice, and no instance
     /// for an attribute nothing created.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn the_mob_attribute_packet_is_the_live_maps_instances() {
         use horizon_core::nbt::Tag;
         use mod_api::EquipmentSlot;
@@ -608,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_base_write_preserves_covered_for_damage_and_attribute_sync() {
         with_game(|game| {
             let kind = game
@@ -675,13 +674,13 @@ mod tests {
         });
     }
 
-    /// The armor a hit reads follows the live map at once (#941): a stack a
+    /// The armor a hit reads follows the live map at once (arismoko/horizon#941): a stack a
     /// mod or `/item` changed protects by its own `attribute_modifiers`, a
     /// `/attribute` write takes effect without a tick, a horse's body piece
     /// armors it by its stack's rows, and the save keeps a written base and
     /// modifier.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_hits_armor_follows_the_live_map_at_once() {
         use AttributeOperation::*;
         use ModifierLifetime::*;
@@ -765,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_zombie_reads_its_defaults() {
         with_game(|game| {
             spawn(game);
@@ -785,7 +784,7 @@ mod tests {
     /// A read of a mob that wears nothing builds its map once and keeps it,
     /// so the next reads allocate nothing.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_read_builds_the_map_once() {
         with_game(|game| {
             spawn(game);
@@ -807,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_held_sword_raises_the_attack_damage_until_it_is_put_away() {
         with_game(|game| {
             spawn(game);
@@ -834,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_stand_and_the_dragon_wear_armor_modifiers() {
         with_game(|game| {
             spawn(game);
@@ -858,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_stale_handle_reads_none() {
         with_game(|game| {
             spawn(game);
@@ -874,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_saved_base_and_modifier_are_read_and_saved_again() {
         use horizon_core::nbt::Tag;
         with_game(|game| {
@@ -905,7 +904,7 @@ mod tests {
     /// The live map takes a held stack's own `attribute_modifiers`, and
     /// another stack of the same item with other components is a change.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_stacks_own_modifiers_replace_its_items() {
         use horizon_core::nbt::Tag;
         with_game(|game| {
@@ -936,7 +935,7 @@ mod tests {
     /// read while the same stacks are worn, and reads them again when one
     /// changes: here a chestplate with its own list.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn gear_knockback_is_read_again_only_when_the_gear_changes() {
         use horizon_core::nbt::Tag;
         with_game(|game| {
@@ -999,7 +998,7 @@ mod tests {
     /// A mob's movement speed is kept where its gameplay reads it: a mod's
     /// permanent modifier is saved, a transient one is not, both count at once.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mods_modifiers_on_a_mobs_speed_reach_its_gameplay() {
         use AttributeOperation::*;
         use ModifierLifetime::*;
@@ -1057,7 +1056,7 @@ mod tests {
     /// An attribute only the live map keeps keeps a mod's writes when the map
     /// is built again, and saves the permanent ones.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mods_writes_outlive_a_rebuilt_map() {
         use AttributeOperation::*;
         use ModifierLifetime::*;
@@ -1125,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_stand_the_dragon_and_a_player_take_writes() {
         use AttributeOperation::*;
         use ModifierLifetime::*;
@@ -1210,7 +1209,7 @@ mod tests {
     /// A mod's answer to `item_attribute_modifier` is what the zombie's
     /// gameplay reads: its knockback and its live map.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mods_item_modifiers_reach_the_wearer() {
         // The game's stack snapshots, which the hook needs, as its startup installs them;
         // without this the test passes only after another test in the process installed them.

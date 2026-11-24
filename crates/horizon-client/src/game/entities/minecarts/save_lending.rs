@@ -100,6 +100,7 @@ impl Game<'_> {
         mut damage: f32,
         creative: bool,
         fire: bool,
+        hit: CartHit,
     ) -> bool {
         let id = self.carts[i].id;
         let join = self.carts[i].join;
@@ -131,6 +132,9 @@ impl Game<'_> {
             // (so ignite) a TNT cart whatever damage it has taken.
             cart_is_destroyed(creative, c.damage, fire && c.kind == CartKind::Tnt)
         });
+        // VehicleEntity.hurtServer: `gameEvent(ENTITY_DAMAGE, source.getEntity())`.
+        let hurt_at = self.carts[i].position.components();
+        self.entity_event_by("minecraft:entity_damage", hurt_at, hit.by);
         if destroyed {
             let speed = self.carts[i].velocity.x * self.carts[i].velocity.x
                 + self.carts[i].velocity.z * self.carts[i].velocity.z;
@@ -169,12 +173,17 @@ impl Game<'_> {
                         return;
                     }
                     game.release_vehicle_container(id);
-                    let Some(i) = game.carts.iter().position(|c| {
+                    let Some(_i) = game.carts.iter().position(|c| {
                         c.id == id && c.join == join && !game.persist.removals.contains(&target)
                     }) else {
                         return;
                     };
+                    game.unpack_loot(super::super::container_loot::LootTarget::Cart(id), None);
                     let _save_lease = horizon_client::join_seq::visibility::PassLease::enter();
+                    let Some(i) = game.carts.iter().position(|c| c.id == id && c.join == join)
+                    else {
+                        return;
+                    };
                     let c = game.carts.remove(i);
                     let at = c.position.components();
                     // AbstractMinecartContainer.remove: contents drop even when
@@ -189,9 +198,11 @@ impl Game<'_> {
                             .rules
                             .bool_at(horizon_client::gamerules::vanilla::ENTITY_DROPS)
                     {
-                        game.spawn_item_own(ItemStack::new(c.kind.item(), 1), at, 10);
+                        game.spawn_item_own(game.cart_drop(c.kind, c.id), at, 10);
                         let empty = vec![None; c.items.len()];
                         game.drop_vehicle_contents(at, &empty);
+                        // ...and angers the piglins that see the player who broke it.
+                        game.cart_destroy_angers(hit, c.kind);
                     }
                     game.retain_removed_vehicle(id, super::super::persist::RemovedVehicle::Cart(c));
                 });

@@ -23,9 +23,10 @@ mod mod_properties;
 mod special;
 pub use fluid_container::{FluidAppearance, FluidContainer, FluidContainerTextures};
 pub use mod_properties::{
-    is_item_model_type, is_mod_id, is_range_property, is_select_property, is_tint_source,
-    keep_mod_ids, register_item_models, register_range_properties, register_select_properties,
-    register_tint_sources,
+    SpecialModelSlot, is_item_model_type, is_mod_id, is_range_property, is_select_property,
+    is_skull_kind, is_tint_source, keep_mod_ids, register_item_models, register_range_properties,
+    register_select_properties, register_skull_kinds, register_special_model_types,
+    register_tint_sources, special_model_slot,
 };
 pub use special::{SpecialKind, SpecialModel};
 
@@ -189,6 +190,10 @@ impl DisplayContext {
         Self::Fixed,
         Self::OnShelf,
     ];
+    pub const COUNT: usize = Self::ALL.len();
+    pub const fn index(self) -> usize {
+        self as usize
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -278,6 +283,18 @@ pub fn identifier(name: &str) -> Result<String> {
         return Err(err("invalid resource identifier"));
     }
     Ok(format!("{namespace}:{path}"))
+}
+/// Whether `name` is already a canonical `namespace:path` identifier (so [`identifier`] would
+/// return `Ok(name.to_owned())` without allocation).
+fn is_canonical_identifier(name: &str) -> bool {
+    let Some((namespace, path)) = name.split_once(':') else {
+        return false;
+    };
+    let valid = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-".contains(&c);
+    !namespace.is_empty()
+        && !path.contains(':')
+        && namespace.bytes().all(valid)
+        && path.bytes().all(|c| valid(c) || c == b'/')
 }
 fn ident(v: &Value) -> Result<String> {
     identifier(&string(v)?)
@@ -427,6 +444,17 @@ pub enum ItemModelNode {
         transformation: Option<Mat4>,
         model: SpecialModel,
     },
+    /// A `minecraft:special` model of a type a native mod registered
+    /// (`register_special_model_renderer`): per stack, its renderer answers which resource models
+    /// draw, each posed and tinted, with `base`'s display transforms, particle and GUI light.
+    RegisteredSpecial {
+        base: String,
+        transformation: Option<Mat4>,
+        /// The `model` object's `type`, resolved to its renderer's slot.
+        slot: SpecialModelSlot,
+        /// The `model` object, converted once at load.
+        config: Arc<horizon_core::nbt::Tag>,
+    },
     FluidContainer(FluidContainer),
     BundleSelectedItem,
     /// A node of a type a native mod registered (`register_item_models`): per stack, its mod
@@ -448,6 +476,24 @@ pub struct SwitchCase {
 }
 
 impl ItemModelNode {
+    /// Whether this node tree always resolves to the exact same layers, transforms, and tints
+    /// for a plain stack (no component patch) regardless of [`Context`] (owner, level, display
+    /// context, seed, count) or [`ItemEnv`] callbacks.
+    pub fn is_static_without_components(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Model(leaf) => leaf.tints.iter().all(TintSource::is_constant),
+            Self::Composite { models, .. } => models.iter().all(Self::is_static_without_components),
+            Self::Condition { .. }
+            | Self::Select { .. }
+            | Self::RangeDispatch { .. }
+            | Self::Special { .. }
+            | Self::RegisteredSpecial { .. }
+            | Self::FluidContainer(_)
+            | Self::BundleSelectedItem
+            | Self::Registered { .. } => false,
+        }
+    }
     pub fn decode(v: &Value) -> Result<Self> {
         let m = object(v)?;
         let kind = ident(required(m, "type")?)?;
@@ -564,20 +610,30 @@ impl ItemModelNode {
                         .transpose()?,
                 }
             }
-            "minecraft:special" if SpecialModel::is_foreign(required(m, "model")?) => {
-                SpecialModel::warn_foreign_once(required(m, "model")?);
-                // The mod's own renderer is not run: the base model stands in.
-                Self::Model(ModelLeaf {
-                    model: ident(required(m, "base")?)?,
-                    transformation: optional_transformation(m)?,
-                    tints: Vec::new(),
-                })
+            "minecraft:special" => {
+                let model = required(m, "model")?;
+                let base = ident(required(m, "base")?)?;
+                let transformation = optional_transformation(m)?;
+                // A type a mod registered, vanilla's included, is drawn by its renderer; any other
+                // type that isn't vanilla's is an error naming it (`SpecialModel::decode`), so the
+                // item draws the missing model.
+                match registered_special_type(model)? {
+                    Some(slot) => Self::RegisteredSpecial {
+                        base,
+                        transformation,
+                        slot,
+                        config: Arc::new(
+                            horizon_core::json_nbt::json_to_tag(model)
+                                .map_err(|_| err("invalid special model data"))?,
+                        ),
+                    },
+                    None => Self::Special {
+                        base,
+                        transformation,
+                        model: SpecialModel::decode(model)?,
+                    },
+                }
             }
-            "minecraft:special" => Self::Special {
-                base: ident(required(m, "base")?)?,
-                transformation: optional_transformation(m)?,
-                model: SpecialModel::decode(required(m, "model")?)?,
-            },
             "minecraft:bundle/selected_item" => Self::BundleSelectedItem,
             // NeoForge's own item model type, which the engine owns. It is matched ahead of
             // the types mods register, so no mod can take it over.
@@ -624,12 +680,22 @@ impl ItemModelNode {
                 entries.iter().for_each(|(_, m)| m.dependencies(out));
                 fallback.iter().for_each(|f| f.dependencies(out));
             }
-            Self::Special { base, .. } => out.push(base.clone()),
+            Self::Special { base, .. } | Self::RegisteredSpecial { base, .. } => {
+                out.push(base.clone())
+            }
             Self::Registered { models, .. } => {
                 models.iter().for_each(|(_, m)| m.dependencies(out));
             }
         }
     }
+}
+/// The slot of a `minecraft:special` model's `model` object's `type` when a native mod
+/// registered it.
+fn registered_special_type(model: &Value) -> Result<Option<SpecialModelSlot>> {
+    Ok(special_model_slot(&ident(required(
+        object(model)?,
+        "type",
+    )?)?))
 }
 impl SwitchCase {
     fn decode(property: &SelectProperty, v: &Value) -> Result<Self> {
@@ -678,6 +744,11 @@ pub enum TintSource {
     },
 }
 impl TintSource {
+    /// Whether this tint depends only on static model data (never on stack components,
+    /// owner, level, or host [`ItemEnv`] callbacks).
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant(_))
+    }
     fn decode(v: &Value) -> Result<Self> {
         let m = object(v)?;
         let default = || rgb(required(m, "default")?);
@@ -839,7 +910,9 @@ impl SelectProperty {
                 DisplayContext::by_name(&s).ok_or_else(|| err("invalid display context"))?;
                 Value::String(s)
             }
-            Self::Component(_) => v.clone(),
+            Self::Component(component) => {
+                crate::component_codec::canonicalize_component_json(component, v.clone())
+            }
         })
     }
 }
@@ -1159,6 +1232,20 @@ pub trait ItemEnv {
         _models: &mut Vec<String>,
     ) {
     }
+    /// What a mod's registered special model type (`slot`) draws for `stack` in the model node
+    /// of `base` and the model object `config` (the same allocation for the node until resources
+    /// reload): the resource models its renderer answered, each posed in the model's space and
+    /// tinted, prepared for drawing when the answer was accepted. `None` when its renderer refused
+    /// or failed, and the layer draws the missing model; nothing draws for an empty answer.
+    fn special_model_parts(
+        &self,
+        _slot: SpecialModelSlot,
+        _base: &str,
+        _config: &Arc<horizon_core::nbt::Tag>,
+        _stack: &StackView,
+    ) -> Option<PreparedParts> {
+        None
+    }
     /// `PotionContents.getColorOr` for the potion/effects part: the mixed
     /// effect colour, or `None` when the contents have no visible effects.
     fn potion_effect_color(&self, _potion_contents: &Value) -> Option<i32> {
@@ -1221,12 +1308,44 @@ pub enum LayerContent {
     },
     /// `MissingItemModel`.
     Missing,
+    /// What a mod's registered special model type drew for the stack, prepared for drawing
+    /// (`ItemEnv::special_model_parts`): each part's geometry is its own model's quads, posed
+    /// under the layer's transform; the display transforms, particle and GUI light are `base`'s,
+    /// as vanilla's `SpecialModelWrapper` takes them from its base model.
+    Parts(PreparedParts),
     Special {
         base: String,
         model: SpecialModel,
         /// What `extractArgument` reads from the stack.
         argument: Value,
     },
+}
+/// A special model renderer's answer as the item renderer prepared it to draw, its models baked
+/// once (`item_render::PreparedSpecial` in the client), so a draw looks nothing up by name. Kept
+/// as long as the answer is; equal only to itself.
+#[derive(Clone)]
+pub struct PreparedParts(pub Arc<dyn std::any::Any + Send + Sync>);
+impl std::fmt::Debug for PreparedParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedParts")
+    }
+}
+impl PartialEq for PreparedParts {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+/// One resource model a mod's special model renderer draws.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecialPart {
+    /// The model's id (`mymod:item/skillet_pan`), drawn as the model resource itself.
+    pub model: String,
+    /// Where it is drawn, in the special model's space (blocks, as the base model's elements
+    /// over 16).
+    pub pose: Mat4,
+    /// ARGB per tint index, as an item model's `tints`; a quad whose index is past them draws
+    /// white.
+    pub tints: Vec<i32>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
@@ -1287,8 +1406,7 @@ impl ItemModels {
         let Some(Value::String(model_id)) = components.get("minecraft:item_model") else {
             return;
         };
-        let id = identifier(model_id).unwrap_or_else(|_| model_id.clone());
-        let definition = self.definitions.get(&id);
+        let definition = self.definition_for(model_id);
         out.oversized_in_gui = definition.is_some_and(|d| d.oversized_in_gui);
         let mut state = Resolve {
             models: self,
@@ -1301,6 +1419,56 @@ impl ItemModels {
             Some(d) => state.node(out, &d.model, &Mat4::IDENTITY),
             None => state.missing(out, &Mat4::IDENTITY),
         }
+    }
+    fn definition_for(&self, model_id: &str) -> Option<&ClientItem> {
+        if is_canonical_identifier(model_id) {
+            self.definitions.get(model_id)
+        } else {
+            let id = identifier(model_id).unwrap_or_else(|_| model_id.to_owned());
+            self.definitions.get(&id)
+        }
+    }
+    fn static_definition(&self, item: &str) -> Option<&ClientItem> {
+        if item == "minecraft:air" {
+            return None;
+        }
+        let prototype = self.prototypes.get(item)?;
+        if prototype_has_foil(item, prototype) {
+            return None;
+        }
+        let Value::String(model_id) = prototype.get("minecraft:item_model")? else {
+            return None;
+        };
+        let definition = self.definition_for(model_id)?;
+        definition
+            .model
+            .is_static_without_components()
+            .then_some(definition)
+    }
+    /// Whether a plain stack of `item` (count > 0, no component patch, no prototype foil)
+    /// resolves identically regardless of [`Context`] or [`ItemEnv`].
+    pub fn is_static_item(&self, item: &str) -> bool {
+        self.static_definition(item).is_some()
+    }
+    /// Every prototype item id whose plain stack resolves statically (see [`Self::is_static_item`]).
+    pub fn static_item_ids(&self) -> Vec<String> {
+        self.prototypes
+            .keys()
+            .filter(|item| self.is_static_item(item))
+            .cloned()
+            .collect()
+    }
+    /// Resolve a plain stack of `item` (count > 0, no component patch) without constructing a
+    /// [`StackView`], [`Context`], or calling [`ItemEnv`]. Returns `None` for air or any item
+    /// whose definition is dynamic, missing, or carries prototype foil.
+    pub fn resolve_static(&self, item: &str) -> Option<ResolvedItem> {
+        let definition = self.static_definition(item)?;
+        let mut out = ResolvedItem {
+            layers: Vec::new(),
+            oversized_in_gui: definition.oversized_in_gui,
+        };
+        append_static_node(&mut out, &definition.model, &Mat4::IDENTITY);
+        Some(out)
     }
     /// `ItemModelResolver.shouldPlaySwapAnimation`.
     pub fn hand_animation_on_swap(&self, stack: &StackView) -> bool {
@@ -1346,6 +1514,61 @@ fn depth_scale(z: f32) -> Mat4 {
 
 fn compose(parent: &Mat4, own: &Option<Mat4>) -> Mat4 {
     own.as_ref().map_or(*parent, |t| parent.mul(t))
+}
+
+fn prototype_has_foil(item: &str, prototype: &Components) -> bool {
+    if let Some(v) = prototype.get("minecraft:enchantment_glint_override") {
+        return v.as_bool().unwrap_or(false);
+    }
+    let enchanted = prototype
+        .get("minecraft:enchantments")
+        .is_some_and(enchantments_present);
+    enchanted
+        || (item == "minecraft:compass" && prototype.contains_key("minecraft:lodestone_tracker"))
+}
+
+fn append_static_node(out: &mut ResolvedItem, node: &ItemModelNode, parent: &Mat4) {
+    match node {
+        ItemModelNode::Empty => {}
+        ItemModelNode::Model(leaf) => {
+            let transform = compose(parent, &leaf.transformation);
+            let tints = leaf
+                .tints
+                .iter()
+                .map(|t| match t {
+                    TintSource::Constant(v) => *v,
+                    _ => unreachable!("is_static_without_components guarantees constant tints"),
+                })
+                .collect();
+            out.layers.push(Layer {
+                content: LayerContent::Model {
+                    model: leaf.model.clone(),
+                },
+                tints,
+                foil: FoilType::None,
+                transform,
+            });
+        }
+        ItemModelNode::Composite {
+            models,
+            transformation,
+        } => {
+            let child = compose(parent, transformation);
+            for m in models {
+                append_static_node(out, m, &child);
+            }
+        }
+        ItemModelNode::Condition { .. }
+        | ItemModelNode::Select { .. }
+        | ItemModelNode::RangeDispatch { .. }
+        | ItemModelNode::Special { .. }
+        | ItemModelNode::RegisteredSpecial { .. }
+        | ItemModelNode::FluidContainer(_)
+        | ItemModelNode::BundleSelectedItem
+        | ItemModelNode::Registered { .. } => {
+            unreachable!("is_static_without_components rejected dynamic node")
+        }
+    }
 }
 
 impl Resolve<'_> {
@@ -1502,6 +1725,30 @@ impl Resolve<'_> {
                         FoilType::None
                     },
                     transform,
+                });
+            }
+            ItemModelNode::RegisteredSpecial {
+                base,
+                transformation,
+                slot,
+                config,
+            } => {
+                let content = match self
+                    .env
+                    .special_model_parts(*slot, base, config, self.stack)
+                {
+                    Some(prepared) => LayerContent::Parts(prepared),
+                    None => LayerContent::Missing,
+                };
+                out.layers.push(Layer {
+                    content,
+                    tints: Vec::new(),
+                    foil: if self.has_foil() {
+                        FoilType::Standard
+                    } else {
+                        FoilType::None
+                    },
+                    transform: compose(parent, transformation),
                 });
             }
             ItemModelNode::FluidContainer(container) => {
@@ -1721,7 +1968,9 @@ impl Resolve<'_> {
             SelectProperty::ContextDimension => {
                 self.ctx.level.map(|l| Value::String(l.dimension.clone()))
             }
-            SelectProperty::Component(component) => self.component(component).cloned(),
+            SelectProperty::Component(component) => self
+                .component(component)
+                .map(|v| crate::component_codec::canonicalize_component_json(component, v.clone())),
         }
     }
     fn numeric(&self, property: &NumericProperty) -> f32 {

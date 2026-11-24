@@ -12,7 +12,7 @@ pub(in crate::game) use fire::{
     BlockDropsCall, BlockScreenEffectDrawCall, ConnectsToCall, EntityChangeBlockPreCall,
     ItemAfterVerticalCollisionCall, UpdateShapeCall,
 };
-use mod_api::{BlockEntityDataSource, BlockEntityRef};
+use mod_api::{BlockEntityDataSource, BlockEntityRef, ClockAdjustment};
 
 use super::native_data_maps::DataMapType;
 use super::{
@@ -25,6 +25,8 @@ use super::{
     native_panel_recipes::RecipePage,
 };
 use horizon_client::block_contact::Pending;
+#[cfg(test)]
+use horizon_client::mobs::Damage;
 use horizon_client::{
     atlas_sources::qualified,
     biome::{BiomeColors, SpawnEntry},
@@ -48,7 +50,7 @@ use horizon_client::{
     keybinds,
     lan::menu::Slots,
     merchant::MerchantOffer,
-    mobs::{Damage, Who},
+    mobs::Who,
     mod_list::{self, Installed, KeyMapping, NativePage, NativeSetting, NativeSettingValue},
     music::{Music, MusicLayer},
     particles::{ParticleOptions, ParticleType},
@@ -65,6 +67,7 @@ use horizon_core::{
 };
 use horizon_world::level::{BonemealCheck, PlaceContext};
 use mod_api::CommandSource;
+use mod_api::ExportState;
 use mod_api::GameMode;
 use mod_api::GameTests;
 pub use mod_api::game::{PhantomSpawnResult, Shake, SleepProblem};
@@ -73,11 +76,12 @@ use mod_api::{
     CauldronInteractions, ClientAudioOptions, ClientChatOptions, ClientGraphicsOptions,
     ClientGuiOptions, ClientInputOptions, ClientMiningPrediction, ClientModifiers,
     ClientReloadListeners, ColorResolvers, CommandInvocation, EnchantmentDamageEffects,
-    EnchantmentInfo, EntityRef, GameRuleActor, HandRender, InsideEffects, InteractionAttempt,
-    InteractionKey, JsonAnimationType, LayerDefinition, LifecycleContext, LivingRef,
-    LoadConditions, NoteBlockChange, ParticleProviders, PathComputationType, Placement, PlayerRef,
-    PoiTypeExtensions, RecipeBookCategory, ScreenId, ScreenOpening, ScreenshotImage,
-    ServerReloadListeners, ServerTickPhase, TicketController, ToolUse, VillagerProfessions,
+    EnchantmentInfo, EntityLayers, EntityRef, EntityRenderers, GameRuleActor, HandRender,
+    InsideEffects, InteractionAttempt, InteractionKey, ItemEntityRef, JsonAnimationType,
+    LayerDefinition, LifecycleContext, LivingRef, LoadConditions, NoteBlockChange,
+    ParticleProviders, PathComputationType, Placement, PlayerRef, PoiTypeExtensions,
+    RecipeBookCategory, ScreenId, ScreenOpening, ScreenshotImage, ServerReloadListeners,
+    ServerTickPhase, SpecialModelRenderers, TicketController, ToolUse, VillagerProfessions,
     WorldPhase,
 };
 use mod_api::{
@@ -87,13 +91,15 @@ use mod_api::{
 };
 use mod_api::{
     BlockKey, DebugEntry, DebugRenderer, EffectKey, GuiLayer, HiddenParts, MapDecorationType,
-    ParticleGroup, PosedParts, RuntimeSprite, TaskId, TextureAtlasRegistration,
+    ParticleGroup, PosedParts, RuntimeSprite, SkullModel, TaskId, TextureAtlasRegistration,
 };
 pub(crate) use mod_api::{
-    BlockRim, ClientPacket, ClientPayload, ColoredLight, ExplosionStart, ItemFished, LootDrops,
-    PanelEvent, PortalShape, ScreenView,
+    BlockRim, ClientPacket, ClientPayload, ColoredLight, ContainerLootFilled, ExplosionStart,
+    ItemFished, LootDrops, PanelEvent, PortalShape, ScreenView,
 };
-use mod_api::{CameraType, Despawn, Identifier, MobRef, PermissionLevel, SoundPlay, SoundRef};
+use mod_api::{
+    CameraType, Despawn, Identifier, MobRef, PermissionLevel, RailShape, SoundPlay, SoundRef,
+};
 use std::{
     collections::HashMap,
     fs,
@@ -119,6 +125,7 @@ pub(in crate::game) use add_attribute_tooltips::HookedAttributeTooltips;
 pub(in crate::game) use bounce_restitution::install_block_contact_hooks;
 pub(in crate::game) use fishing_medium::NativeFishingMedium;
 pub(in crate::game) use living_change_target::NativeHookHost;
+pub(in crate::game) use living_death::death_listened;
 include!("shared.rs");
 
 use mod_api::ModBlockEntity;

@@ -1,4 +1,4 @@
-# Exact-build native Rust dylib probe (#797)
+# Exact-build native Rust dylib probe (arismoko/horizon#797)
 
 This is a developer probe, not a native loader. It does not start gameplay, publish
 an SDK, change launcher routing, or claim a stable Rust ABI.
@@ -36,7 +36,6 @@ process exit. Assertions check:
 
 - The shared dependency's static address and counter, with ordered mutations
   through both separately loaded consumers.
-- Actual `mod_points` registry address identity and cross-image/thread writes.
 - Actual `mod_api` crash detail registry writes from the shared dependency, read
   by the executable.
 - Actual `mod_api` native-call TLS, entered by the executable and observed by
@@ -49,7 +48,7 @@ process exit. Assertions check:
   bindings (`LD_DEBUG=bindings`) must send every allocator call, std's own
   included, to the game. Windows binds each import to the DLL it names, with no
   interposition: exactly one image may export the allocator, and every image
-  calling it must import it from that one (#2394). The shipped route's
+  calling it must import it from that one (arismoko/horizon#2394). The shipped route's
   executable is checked the same way, and at run time every allocator in it must
   draw from one heap. The counting-allocator experiment records on Windows why:
   a `#[global_allocator]` in a dylib beside std's DLL splits from it.

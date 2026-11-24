@@ -48,6 +48,21 @@ impl Game<'_> {
         }
     }
 
+    /// `Entity.setSprinting` for a mob: sets its shared sprinting flag and
+    /// marks it for sync, so tracking players see it. False for players and
+    /// guests (their own client reports the sprint), armor stands, the dragon
+    /// and a stale handle.
+    pub(super) fn living_set_sprinting(&mut self, living: LivingRef, sprinting: bool) -> bool {
+        let Some(Target::Mob(id)) = self.native_living_target(living) else {
+            return false;
+        };
+        self.mobs.iter_mut().find(|m| m.id == id).is_some_and(|m| {
+            m.extra.sprinting = sprinting;
+            m.needs_sync = true;
+            true
+        })
+    }
+
     /// `LivingEntity.swing(hand, DEFAULT, sendToSwingingEntity)`: starts the
     /// arm swing (shortened by haste, lengthened by mining fatigue) unless
     /// one is under way and past its first half, and tells the players
@@ -432,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn an_item_used_in_either_hand_is_released_once() {
         with_uses(|game, uses, player| {
             uses.lock().unwrap().release_on_stop = Some(player);
@@ -476,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_start_a_mod_refuses_starts_nothing() {
         with_uses(|game, uses, player| {
             game.offhand = Some(ItemStack::new("minecraft:bow", 1));
@@ -488,7 +503,7 @@ mod tests {
 
     /// A player whose use button is up lets go on the next tick.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_use_with_the_button_up_is_released_on_its_next_tick() {
         with_uses(|game, uses, player| {
             game.right = false;
@@ -503,7 +518,7 @@ mod tests {
     /// A use a mod's own tick released stays released, and finishes nothing:
     /// the tick that called it has no use left to go on with.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_use_released_from_its_own_tick_stays_released() {
         with_uses(|game, uses, player| {
             let items = ["minecraft:apple", "minecraft:potion", "minecraft:shield"];
@@ -531,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mob_uses_either_hand_until_it_is_released() {
         use horizon_items::equipment::{MAINHAND, OFFHAND};
         with_uses(|game, uses, _| {
@@ -611,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mob_swings_while_its_hand_and_loot_flags_live_on_the_mob_handle() {
         with_game(|game| {
             for (id, kind) in [(12, "minecraft:zombie"), (13, "minecraft:cow")] {
@@ -670,7 +685,7 @@ mod tests {
     /// worth of `20 * (30 - count)` ticks as for a player, the timer a write set
     /// running first.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mobs_stuck_arrows_and_stingers_fall_out_in_its_ticks() {
         with_game(|game| {
             floor_and_zombies(game);
@@ -700,7 +715,7 @@ mod tests {
     /// A spear's use counts its own ticks, which a write to the ticks left
     /// moves: the next tick goes on from there.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mobs_spear_use_goes_on_from_the_ticks_a_write_left() {
         use horizon_items::equipment::MAINHAND;
         with_game(|game| {
@@ -724,7 +739,7 @@ mod tests {
     /// A waypoint write is `/waypoint modify`: what it stores is what the command
     /// stores, for the entities the command takes.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_waypoint_write_on_a_mob_is_kept_with_the_waypoint() {
         use super::super::commands::Target;
         with_game(|game| {
@@ -750,7 +765,7 @@ mod tests {
     /// style and colour, and a spin shows in the flags the players around get,
     /// counts down in the guest's ticks and ends when asked to.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_guests_waypoint_and_riptide_writes_reach_the_players_around() {
         use horizon_protocol::{
             entity_data::Value,
@@ -846,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_keeps_its_stuck_arrows_and_item_use_timer() {
         use super::super::lan::LanSettings;
         use horizon_client::lan::{Joined, NetConfig, PlayerSender, guest::Guest, hub::HubConfig};
@@ -880,6 +895,7 @@ mod tests {
                 max_players: 2,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             game.lan_host(settings, net, config).unwrap();
             let (tx, _rx) = std::sync::mpsc::channel();
@@ -960,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_mobs_swing_reaches_clients_with_the_hand_asked_for() {
         use super::super::lan::LanSettings;
         use horizon_client::lan::{
@@ -996,6 +1012,7 @@ mod tests {
                 max_players: 2,
                 integrated: true,
                 levels: game.level_shapes,
+                level_seeds: game.levels.runtime.seeds(),
             };
             game.lan_host(settings, net, config).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1058,6 +1075,30 @@ mod tests {
                 }
             }
             assert_eq!(sent, [1, 0, 0]);
+        });
+    }
+}
+
+#[cfg(test)]
+mod sprint_tests {
+    use super::super::native_entity_refs::tests::with_game;
+    use horizon_core::geometry::Vec3;
+    use horizon_client::mobs::Mob;
+
+    #[test]
+    #[ignore = "daily"]
+    fn living_set_sprinting_writes_a_mob_and_marks_it_for_sync() {
+        with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            let kind = game.res.mob_types().get("minecraft:zombie").unwrap().clone();
+            game.mobs.push(Mob::new(42, kind, Vec3::ZERO, 0.0));
+            let living = game.living(game.entity(42).unwrap()).unwrap();
+            game.mobs[0].needs_sync = false;
+            assert!(game.living_set_sprinting(living, true));
+            assert!(game.mobs[0].extra.sprinting);
+            assert!(game.mobs[0].needs_sync);
+            assert!(game.living_set_sprinting(living, false));
+            assert!(!game.mobs[0].extra.sprinting);
         });
     }
 }

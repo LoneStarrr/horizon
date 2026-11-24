@@ -110,10 +110,8 @@ pub struct PreparedModelDraw {
 /// The CPU entity pipelines a prepared draw is ordered against.
 pub struct EntityRangePass<'a> {
     pub pipeline: &'a wgpu::RenderPipeline,
-    pub hdr_pipeline: &'a wgpu::RenderPipeline,
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
-    pub hdr: bool,
 }
 
 /// One slice of the ordinary entity stream, then the instanced copies at its end.
@@ -192,7 +190,7 @@ pub fn fill_instance_ranges(
     }
 }
 
-/// Draw entity ranges and prepared runs in stream order. An HDR mark follows its color draw.
+/// Draw entity ranges and prepared runs in stream order.
 pub fn draw_ordered<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     entities: &EntityRangePass<'a>,
@@ -208,10 +206,6 @@ pub fn draw_ordered<'a>(
             pass.set_vertex_buffer(0, entities.vertices.slice(..));
             pass.set_index_buffer(entities.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(first..last, 0, 0..1);
-            if entities.hdr {
-                pass.set_pipeline(entities.hdr_pipeline);
-                pass.draw_indexed(first..last, 0, 0..1);
-            }
         }
         let Some(run) = span.run else {
             continue;
@@ -225,10 +219,7 @@ pub fn draw_ordered<'a>(
         let Ok(range) = models.indices(draw.generation, draw.slot) else {
             continue;
         };
-        models.draw_run(pass, false, instances, range, run);
-        if entities.hdr {
-            models.draw_run(pass, true, instances, range, run);
-        }
+        models.draw_run(pass, instances, range, run);
     }
     pass.set_pipeline(entities.pipeline);
     pass.set_vertex_buffer(0, entities.vertices.slice(..));
@@ -260,7 +251,6 @@ pub struct PreparedModels {
     indices: wgpu::Buffer,
     ranges: Vec<Option<(u32, u32)>>,
     pipeline: wgpu::RenderPipeline,
-    hdr_pipeline: wgpu::RenderPipeline,
 }
 
 impl PreparedModels {
@@ -381,22 +371,6 @@ impl PreparedModels {
             "fs_entity",
             wgpu::ColorWrites::ALL,
         );
-        // Bias 0, the same as the CPU entity mark (`hdr_mark_pipeline`). The colour
-        // pass writes depth at bias 128, so this mark fails the depth test and the
-        // world keeps no scene gain. A bias of 128 here made instanced copies brighter
-        // in scRGB than the CPU route.
-        let hdr_pipeline = make(
-            "Prepared model HDR mark",
-            wgpu::BlendState::REPLACE,
-            false,
-            wgpu::DepthBiasState {
-                constant: 0,
-                slope_scale: 0.0,
-                clamp: 0.0,
-            },
-            "fs_hdr_mark",
-            wgpu::ColorWrites::ALPHA,
-        );
         let scope_error = checks.pop().map(|error| error.to_string());
         copy_after_scope(scope_error.clone(), || {
             map_bytes(&vertex_buffer, bytemuck::cast_slice(vertices))
@@ -410,15 +384,13 @@ impl PreparedModels {
             indices: index_buffer,
             ranges,
             pipeline,
-            hdr_pipeline,
         })
     }
 
-    /// Draw `run.count` copies starting at `run.first`. `hdr` is the alpha mark, not a second mesh.
+    /// Draw `run.count` copies starting at `run.first`.
     pub fn draw_run<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        hdr: bool,
         instance: &'a wgpu::Buffer,
         range: (u32, u32),
         run: InstanceRun,
@@ -426,11 +398,7 @@ impl PreparedModels {
         if run.count == 0 {
             return;
         }
-        pass.set_pipeline(if hdr {
-            &self.hdr_pipeline
-        } else {
-            &self.pipeline
-        });
+        pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_vertex_buffer(1, instance.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -441,18 +409,16 @@ impl PreparedModels {
         );
     }
 
-    /// Draw one copy from `instance` at `instance_index`. `hdr` is the alpha mark, not a second mesh.
+    /// Draw one copy from `instance` at `instance_index`.
     pub fn draw_at<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        hdr: bool,
         instance: &'a wgpu::Buffer,
         range: (u32, u32),
         instance_index: u32,
     ) {
         self.draw_run(
             pass,
-            hdr,
             instance,
             range,
             InstanceRun {
@@ -462,15 +428,14 @@ impl PreparedModels {
         );
     }
 
-    /// Draw the first copy. `hdr` selects the alpha mark; it is a second pass, not a different mesh.
+    /// Draw the first copy.
     pub fn draw<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        hdr: bool,
         instance: &'a wgpu::Buffer,
         range: (u32, u32),
     ) {
-        self.draw_at(pass, hdr, instance, range, 0);
+        self.draw_at(pass, instance, range, 0);
     }
 }
 
@@ -750,8 +715,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs software Vulkan"]
+    #[ignore = "daily"]
     fn oversized_prepared_upload_returns_an_error() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);

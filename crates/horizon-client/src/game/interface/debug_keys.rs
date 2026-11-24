@@ -554,17 +554,17 @@ impl Game<'_> {
     pub(super) fn debug_tps_line(&self, d: &mut debug_overlay::Displayer) {
         if self.player.is_some() {
             let [tx, rx] = self.debug_charts.packet_rates.map(|n| n.round() as i64);
+            let target_ms = || {
+                horizon_core::java_number::format_fixed(f64::from(1000.0 / self.clock.rate()), 1)
+            };
             let (target, status) = if self.clock.sprinting() {
                 ("-".to_owned(), " (sprinting)")
             } else if self.clock.stepping() {
-                (
-                    format!("{:.1}", 1000.0 / self.clock.rate()),
-                    " (frozen - stepping)",
-                )
+                (target_ms(), " (frozen - stepping)")
             } else if self.clock.frozen() {
-                (format!("{:.1}", 1000.0 / self.clock.rate()), " (frozen)")
+                (target_ms(), " (frozen)")
             } else {
-                (format!("{:.1}", 1000.0 / self.clock.rate()), "")
+                (target_ms(), "")
             };
             if self.remote.is_none() || self.integrated.is_some() {
                 let tick_ms = self
@@ -573,8 +573,9 @@ impl Game<'_> {
                     .map_or(self.debug_charts.smoothed_tick_ms, |server| {
                         server.smoothed_tick_ms()
                     });
+                let tick_ms = horizon_core::java_number::format_fixed(f64::from(tick_ms), 1);
                 d.line(format!(
-                    "Integrated server @ {tick_ms:.1}/{target} ms{status}, {tx} tx, {rx} rx",
+                    "Integrated server @ {tick_ms}/{target} ms{status}, {tx} tx, {rx} rx",
                 ));
             } else if let Some(remote) = &self.remote {
                 d.line(format!(
@@ -734,7 +735,7 @@ impl Game<'_> {
             DebugAction::CopyLocation if player => {
                 self.debug_translated("debug.copy_location.message");
                 if let Some(p) = &self.player {
-                    use horizon_client::java_text::format_fixed2 as f2;
+                    use horizon_core::java_number::format_fixed2 as f2;
                     let command = format!(
                         "/execute in {} run tp @s {} {} {} {} {}",
                         self.dim.id(),
@@ -944,7 +945,8 @@ impl Game<'_> {
     pub(super) fn block_entity_tag(&self, pos: [i32; 3]) -> Option<Tag> {
         let e = self.world.block_entities.get(&(pos[0], pos[1], pos[2]))?;
         let name = self.data_block_name(pos);
-        let mut tag = horizon_client::save::encode_block_entity((pos[0], pos[1], pos[2]), e, &name);
+        let mut tag =
+            horizon_client::save::block_entity_encode::encode((pos[0], pos[1], pos[2]), e, &name);
         if let Tag::Compound(c) = &mut tag {
             for key in ["id", "x", "y", "z", "keepPacked"] {
                 c.remove(&key.into());
@@ -1000,7 +1002,7 @@ impl Game<'_> {
     /// `KeyboardHandler.copyCreateEntityCommand`: the data without its UUID
     /// or position.
     fn copy_create_entity_command(&mut self, kind: &str, pos: Vec3, tag: Option<Tag>) {
-        use horizon_client::java_text::format_fixed2 as f2;
+        use horizon_core::java_number::format_fixed2 as f2;
         let mut command = format!("/summon {kind} {} {} {}", f2(pos.x), f2(pos.y), f2(pos.z));
         if let Some(mut tag) = tag {
             if let Tag::Compound(c) = &mut tag {
@@ -1052,9 +1054,15 @@ impl Game<'_> {
                 lerpf(m.previous_head_pitch, m.head_pitch),
                 lerpf(m.previous_head_yaw, m.head_yaw),
             );
-            g.hitbox(
+            // `EntityHitboxDebugRenderer.showHitboxes` draws the entity's AABB,
+            // not its dimensions: an open shulker's box grows past the 1x1x1
+            // that its width and height describe.
+            let b = m.bounds_at(Vec3::new(pos[0], pos[1], pos[2]));
+            let (min, max) = (b.min_position(), b.max_position());
+            g.entity_box(
+                [min.x, min.y, min.z],
+                [max.x, max.y, max.z],
                 pos,
-                (m.width(), m.height()),
                 m.eye_height() as f32,
                 true,
                 view,
@@ -1109,12 +1117,13 @@ impl Game<'_> {
         }
         for a in self.armor_stands.iter().filter(|a| !a.invisible) {
             // ArmorStand.getDimensions: a marker has none, a small one is
-            // half scale with its eyes at 0.9875.
-            let (size, eye) = match (a.marker, a.small) {
-                (true, _) => ((0.0, 0.0), 0.0),
-                (_, true) => ((0.25, 0.9875), 0.9875),
-                _ => ((0.5, 1.975), 1.7775),
-            };
+            // half scale with its eyes at 0.9875; both times its `minecraft:scale`.
+            let size = a.box_size();
+            let eye = match (a.marker, a.small) {
+                (true, _) => 0.0,
+                (_, true) => 0.9875,
+                _ => 1.7775,
+            } * a.scale;
             g.hitbox(
                 at(a.previous, a.position),
                 size,

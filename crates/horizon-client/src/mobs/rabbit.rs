@@ -25,6 +25,24 @@ const CLIENT_JUMP_DURATION: usize = 5;
 /// The killer bunny's variant id (`Rabbit.Variant.EVIL`).
 pub const EVIL: u8 = 99;
 
+/// `Rabbit.getRandomRabbitVariant(level, pos)`: one `nextInt(100)` from the
+/// level's random, then the biome's tags pick the variant. The roll is drawn
+/// even where a tag decides alone (the gold rabbit).
+pub fn random_variant(white: bool, gold: bool, random: &mut impl RandomSource) -> u8 {
+    let roll = random.next_int_bound(100).unwrap_or(0);
+    if white {
+        if roll < 80 { 1 } else { 3 }
+    } else if gold {
+        4
+    } else if roll < 50 {
+        0
+    } else if roll < 90 {
+        5
+    } else {
+        2
+    }
+}
+
 /// Rabbit.registerGoals.
 pub fn register(m: &mut Mob) {
     let food = m.kind.food.clone();
@@ -465,6 +483,7 @@ mod tests {
             &json!({"children": {"head": {}, "left_hind_foot": {}}}),
         ));
         let kind = Arc::new(MobType {
+            shadow: None,
             id: "minecraft:rabbit".into(),
             species: Species::Rabbit,
             width: 0.4,
@@ -484,6 +503,7 @@ mod tests {
             jump_strength: 0.42,
             attributes: Arc::default(),
             item_stack_limits: Default::default(),
+            attribute_bounds: Default::default(),
             gravity: 0.08,
             safe_fall_distance: 3.0,
             fall_damage_multiplier: 1.0,

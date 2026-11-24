@@ -1,3 +1,4 @@
+// game-module-visibility: pub(crate)
 //! The dedicated server (net.minecraft.server.Main and DedicatedServer):
 //! `horizon-client --dedicated [--nogui] [--port N] [--world NAME]
 //! [--universe DIR] [--initSettings]`. It reads server.properties and
@@ -9,7 +10,9 @@
 use super::{Game, Options, lan::LanSettings, world_loading::WorldRequest};
 use horizon_client::{
     Result,
-    lan::{LoginGate, NetConfig, NetLog, OnlineMode, hub::HubConfig},
+    lan::{
+        LoginGate, NetConfig, NetLog, OnlineMode, hub::HubConfig, viewed_levels::areas as viewed,
+    },
     server::{
         eula, profiles,
         properties::{GAME_MODES, ServerProperties, SystemEntropy},
@@ -37,9 +40,10 @@ use std::{
 };
 
 mod biome_regions;
+mod missing_mods;
+pub(crate) use missing_mods::is_missing_mods_refusal;
 pub(super) mod events;
 mod management;
-mod predicate_graph;
 pub(super) mod report;
 mod status;
 mod transfer;
@@ -151,23 +155,6 @@ impl Watchdog {
     }
 }
 
-/// Double.toString for the magnitudes positions have (no exponent form
-/// between 1e-3 and 1e7).
-pub(super) fn java_double(v: f64) -> String {
-    if v == 0.0 || (1e-3..1e7).contains(&v.abs()) {
-        format!("{v:?}")
-    } else {
-        let s = format!("{v:E}");
-        let (m, e) = s.split_once('E').unwrap_or((&s, "0"));
-        let m = if m.contains('.') {
-            m.to_owned()
-        } else {
-            format!("{m}.0")
-        };
-        format!("{m}E{e}")
-    }
-}
-
 /// What the startup read before the game's resources were loaded.
 struct Setup {
     props: ServerProperties,
@@ -175,7 +162,26 @@ struct Setup {
     level_name: String,
     port: Option<u16>,
     started: Instant,
+    /// `--allowMissingMods`: open a world whose saved mods are missing (`missing_mods`).
+    allow_missing_mods: bool,
 }
+/// Whether `horizon-server` runs this game, and so starts it again after a `/restart`.
+pub(super) fn supervised() -> bool {
+    std::env::var_os(super::launch_api::SUPERVISED_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// `/restart` (Horizon's own, on a server `horizon-server` runs): like `/stop`, then the process exits
+/// with a code that asks the supervisor to start the game again. `stop` is the server loop's flag.
+/// Unsupervised nothing would start the game again, so it says so and stops nothing.
+pub(super) fn request_restart(supervised: bool, stop: &mut bool) -> Text {
+    if !supervised {
+        return Text::translate("horizon.commands.restart.unsupervised", &[]);
+    }
+    super::exit_code::set_restart_requested();
+    *stop = true;
+    Text::translate("horizon.commands.restart.restarting", &[])
+}
+
 static SETUP: OnceLock<Mutex<Option<Setup>>> = OnceLock::new();
 /// usercache.json (Services.nameToIdCache): used by the server thread only.
 static USER_CACHE: Mutex<Option<UserCache>> = Mutex::new(None);
@@ -193,6 +199,12 @@ pub(super) fn player_joined(id: u128, name: &str) {
 /// A player in the user cache by id, on a dedicated server.
 pub(super) fn cached_user_by_id(id: u128) -> Option<NameAndId> {
     USER_CACHE.lock().unwrap().as_mut()?.get_by_id(id)
+}
+
+/// A player in the user cache by name (any case) while their entry hasn't expired, on a
+/// dedicated server: no profile lookup, no offline player.
+pub(super) fn cached_user_by_name(name: &str) -> Option<NameAndId> {
+    USER_CACHE.lock().unwrap().as_ref()?.find_by_name(name)
 }
 
 /// `server.toml`'s `[anticheat]`, beside server.properties when horizon-server runs the game; the
@@ -276,6 +288,62 @@ fn load_combat() -> bool {
     }
 }
 
+/// `server.toml`'s `[entities]` (docs/server.md): `villager_lobotomize` and its check interval. Off without
+/// the file or the section, and (with an error logged) when the section is wrong.
+fn load_entities() {
+    let text = std::fs::read_to_string("server.toml").unwrap_or_default();
+    match parse_entities(&text) {
+        Ok((on, interval)) => {
+            if on {
+                log(
+                    "INFO",
+                    &format!(
+                        "villagers that cannot move skip their brain, rechecked every {interval} ticks (server.toml [entities])"
+                    ),
+                );
+            }
+            horizon_client::mobs::villager::lobotomy::configure(on, interval);
+        }
+        Err(e) => log(
+            "ERROR",
+            &format!("server.toml: {e}; villagers keep their brains"),
+        ),
+    }
+}
+
+/// The `[entities]` section of a `server.toml`: (`villager_lobotomize`, its check interval in ticks). The
+/// section's other keys (`dab`...) belong to other settings, so they are skipped here; `horizon-server` refuses
+/// typos when it reads the file.
+fn parse_entities(text: &str) -> std::result::Result<(bool, u32), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(default)]
+    struct Entities {
+        villager_lobotomize: bool,
+        villager_lobotomize_check_interval: u32,
+    }
+    impl Default for Entities {
+        fn default() -> Self {
+            Self {
+                villager_lobotomize: false,
+                villager_lobotomize_check_interval:
+                    horizon_client::mobs::villager::lobotomy::DEFAULT_INTERVAL,
+            }
+        }
+    }
+    let mut table = toml::from_str::<toml::Table>(text).map_err(|e| e.to_string())?;
+    let Some(section) = table.remove("entities") else {
+        return Ok((
+            false,
+            Entities::default().villager_lobotomize_check_interval,
+        ));
+    };
+    let e: Entities = section.try_into().map_err(|e| format!("[entities]: {e}"))?;
+    if e.villager_lobotomize_check_interval == 0 {
+        return Err("[entities]: villager_lobotomize_check_interval must be at least 1".into());
+    }
+    Ok((e.villager_lobotomize, e.villager_lobotomize_check_interval))
+}
+
 /// The secret for Velocity's player information forwarding, from `forwarding.secret` beside server.properties.
 /// No file means no forwarding. A file that is empty or can't be read stops the start, because an empty secret
 /// would let anyone sign a login, and a typo must not leave a server open that was meant to be behind a proxy.
@@ -316,6 +384,17 @@ fn overload_warning(behind: Duration, tick: Duration) -> String {
     )
 }
 
+/// `ServerGamePacketListenerImpl.tick`'s idle kick: a player whose last action is more than
+/// `minutes` (`player-idle-timeout`, none when 0 or less) behind, counted here in ticks, is kicked,
+/// unless the End poem is showing (`ServerPlayer.wonGame`): its client sends no action until it
+/// asks to respawn.
+fn idles_out(idle_ticks: u64, minutes: i32, won_game: bool) -> bool {
+    let Ok(minutes @ 1..) = u64::try_from(minutes) else {
+        return false;
+    };
+    !won_game && idle_ticks > minutes * 1200
+}
+
 /// Log4j's console pattern: `[HH:mm:ss] [thread/LEVEL]: message`.
 pub(super) fn log(level: &str, message: &str) {
     log_from("Server thread", level, message);
@@ -349,7 +428,7 @@ thread_local! {
 }
 
 /// Runs `f` and returns the lines it logged.
-fn capture_log(f: impl FnOnce()) -> Vec<String> {
+pub(in crate::game) fn capture_log(f: impl FnOnce()) -> Vec<String> {
     CAPTURE.set(Some(Vec::new()));
     f();
     CAPTURE.take().unwrap_or_default()
@@ -363,9 +442,9 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
     let mut world = None;
     let mut port = None;
     let mut init_settings = false;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        let name = arg.trim_start_matches('-');
+    let mut allow_missing_mods = false;
+    for argument in crate::entry::dedicated_arguments::parse(&args) {
+        let (name, value) = argument?;
         match name {
             "nogui"
             | "demo"
@@ -374,27 +453,34 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
             | "eraseCache"
             | "recreateRegionFiles"
             | "safeMode"
-            | "jfrProfile" => {}
+            | "jfrProfile"
+            | "game-tests" => {}
             "initSettings" => init_settings = true,
+            name if name == horizon_client::save::level_mods::ALLOW_FLAG => {
+                allow_missing_mods = true
+            }
             "help" => {
+                let allow = missing_mods::in_english(|| {
+                    horizon_client::lang::get("horizon.missing_mods.server.help")
+                });
                 eprintln!(
-                    "Option                Description\n------                -----------\n--help\n--initSettings        Initializes 'server.properties' and 'eula.txt', then quits\n--nogui\n--port <Integer>      (default: -1)\n--universe <String>   (default: .)\n--world <String>"
+                    "Option                Description\n------                -----------\n--allowMissingMods    {allow}\n--help\n--game-tests          Enables test-only mod content (or HORIZON_GAME_TESTS=1/true)\n--initSettings        Initializes 'server.properties' and 'eula.txt', then quits\n--nogui\n--port <Integer>      (default: -1)\n--universe <String>   (default: .)\n--world <String>"
                 );
                 return Ok(false);
             }
-            "universe" => universe = PathBuf::from(it.next().ok_or("--universe needs a value")?),
-            "world" => world = Some(it.next().ok_or("--world needs a value")?.clone()),
+            "universe" => universe = PathBuf::from(value.expect("parsed operand")),
+            "world" => world = Some(value.expect("parsed operand").to_owned()),
             "port" => {
-                let v: i32 = it.next().ok_or("--port needs a value")?.parse()?;
+                let v: i32 = value.expect("parsed operand").parse()?;
                 port = u16::try_from(v).ok();
             }
             "serverId" | "pidFile" => {
-                let value = it.next().ok_or("missing value")?;
+                let value = value.expect("parsed operand");
                 if name == "pidFile" {
                     std::fs::write(value, std::process::id().to_string())?;
                 }
             }
-            _ => return Err(format!("{arg} is not a recognized option").into()),
+            _ => return Err(format!("{name} is not a recognized option").into()),
         }
     }
     let started = Instant::now();
@@ -406,6 +492,7 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
     // A dedicated server's tree: /op, /ban, /whitelist... (single player's
     // server thread is an integrated one and never gets here).
     horizon_client::command::vanilla::set_dedicated_commands(true);
+    horizon_client::command::vanilla::set_supervised_commands(supervised());
     // Horizon's own commands are the owner's choice, off as on vanilla.
     if props
         .raw
@@ -466,6 +553,7 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
             level_name,
             port,
             started,
+            allow_missing_mods,
         });
     Ok(true)
 }
@@ -536,6 +624,28 @@ fn parse_whitelist_bypass(text: &str) -> std::result::Result<Vec<String>, String
     Ok(out)
 }
 impl Lists {
+    /// The console's `/ban` of one player (`BanPlayerCommands.banPlayers`): whether they are banned now.
+    /// One banned already (`isBanned`) is left as they are, their first reason kept.
+    fn ban(&mut self, user: &NameAndId, reason: Option<String>) -> bool {
+        !self.bans.contains(user)
+            && self.bans.add(BanEntry::new(
+                user.clone(),
+                Some("Server".into()),
+                None,
+                reason,
+            ))
+    }
+
+    /// The console's `/ban-ip` (`BanIpCommands.banIp`): whether the address is banned now. One banned
+    /// already (`isBanned`) is left as it is.
+    fn ban_ip(&mut self, ip: &str, reason: Option<String>) -> bool {
+        let ip = ip.to_owned();
+        !self.ip_bans.contains(&ip)
+            && self
+                .ip_bans
+                .add(BanEntry::new(ip, Some("Server".into()), None, reason))
+    }
+
     fn load() -> Self {
         let mut l = Self {
             ops: OpList::new("ops.json"),
@@ -632,8 +742,10 @@ impl Lists {
         if !self.whitelisted(user) {
             return Some(translatable("multiplayer.disconnect.not_whitelisted", &[]));
         }
-        let ip = address.ip().to_string();
-        if self.ip_bans.contains(&ip)
+        let entries = self.ip_bans.entries();
+        let key =
+            ip_ban_key(entries.iter().map(|e| e.user.as_str()), address.ip()).map(str::to_owned);
+        if let Some(ip) = key
             && let Some(ban) = self.ip_bans.get(&ip).cloned()
         {
             let mut reason = translatable_tag(
@@ -653,6 +765,20 @@ impl Lists {
         }
         None
     }
+}
+
+/// The `banned-ips.json` key that bans `ip`: its own text or another spelling of the same address, as a
+/// file written by vanilla has it (Java writes `::1` as `0:0:0:0:0:0:0:1`) or an IPv4 address in its
+/// `::ffff:` form. Keys that are not addresses never match.
+fn ip_ban_key<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    ip: std::net::IpAddr,
+) -> Option<&'a str> {
+    let ip = ip.to_canonical();
+    keys.into_iter().find(|key| {
+        key.parse::<std::net::IpAddr>()
+            .is_ok_and(|k| k.to_canonical() == ip)
+    })
 }
 
 /// DedicatedServerProperties.LEGACY_PRESET_NAMES: the old `level-type`
@@ -684,16 +810,6 @@ fn parse_identifier(text: &str) -> Option<String> {
     };
     (valid(namespace, &[]) && valid(path, &['/'])).then(|| format!("{namespace}:{path}"))
 }
-
-/// The world's packs failed to load: the start ends before Ready, as vanilla's `Main` does.
-#[derive(Debug)]
-struct DatapacksRefused;
-impl std::fmt::Display for DatapacksRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Failed to load datapacks, can't proceed with server load")
-    }
-}
-impl std::error::Error for DatapacksRefused {}
 
 impl Game<'_> {
     /// DedicatedServerProperties.createDimensions for a world that doesn't
@@ -800,6 +916,10 @@ struct ServerState {
     lists: Arc<Mutex<Lists>>,
     console: mpsc::Receiver<String>,
     empty_ticks: i32,
+    /// Since when nobody is on, and how many of [`GIVE_BACK_AFTER`]'s passes ran since
+    /// ([`Game::give_memory_back_when_empty`]).
+    empty_since: Option<Instant>,
+    given_back: usize,
     /// The mutable `DedicatedServer.pauseWhenEmptySeconds` setting.
     pause_when_empty_seconds: i32,
     /// When the last passes of the loop ended, for the tick rate horizon-server shows.
@@ -847,9 +967,9 @@ fn save_all_reply(saved: bool) -> Text {
 }
 
 /// `BanIpCommands.banIp`'s `commands.banip.info`: the count of affected players and
-/// `EntitySelector.joinNames` of them (a gray ", " between names). None when no one is affected,
-/// as vanilla sends no line then.
-fn ban_ip_info(names: &[&str]) -> Option<Text> {
+/// `EntitySelector.joinNames` of them (their `Player.getDisplayName`, a gray ", " between
+/// them). None when no one is affected, as vanilla sends no line then.
+fn ban_ip_info(names: &[Text]) -> Option<Text> {
     if names.is_empty() {
         return None;
     }
@@ -857,12 +977,7 @@ fn ban_ip_info(names: &[&str]) -> Option<Text> {
         "commands.banip.info",
         &[
             Text::literal(names.len().to_string()),
-            horizon_client::scoreboard_cmd::format_list(
-                names
-                    .iter()
-                    .map(|n| Text::literal((*n).to_owned()))
-                    .collect(),
-            ),
+            horizon_client::scoreboard_cmd::format_list(names.to_vec()),
         ],
     ))
 }
@@ -870,6 +985,43 @@ fn ban_ip_info(names: &[&str]) -> Option<Text> {
 /// `MinecraftServer.isAutoSave`: all of Horizon's server levels share this save flag.
 fn auto_save(state: &ServerState) -> bool {
     state.lists.lock().unwrap().autosave
+}
+
+/// How long after the last player left (or the start, with nobody on) the server gives its memory
+/// back: once the chunks around the players are unloaded, then again once the slower ones (saved
+/// last, or kept a while by a ticket) are gone. Horizon's own: vanilla's JVM keeps its heap.
+const GIVE_BACK_AFTER: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
+
+/// The passes of [`GIVE_BACK_AFTER`] due at `now` and not yet run: nobody on since `empty_since`
+/// (None while someone is), `given_back` passes run since.
+fn give_back_due(empty_since: Option<Instant>, given_back: usize, now: Instant) -> bool {
+    empty_since.is_some_and(|since| {
+        GIVE_BACK_AFTER
+            .get(given_back)
+            .is_some_and(|after| now.duration_since(since) >= *after)
+    })
+}
+
+/// `MinecraftServer.tickServer`'s pause-when-empty count. `pause_after` is its
+/// `pauseWhenEmptySeconds() * 20`; while that is above 0, a tick with no player and no
+/// `/tick sprint` running (`ServerTickRateManager.isSprinting`) adds one to `empty_ticks`, and any
+/// other tick sets it back to 0. A `/pregen` task keeps the server busy as a player would: paused,
+/// nothing would post-process its chunks. Returns whether the server is paused this tick.
+fn count_empty_tick(
+    empty_ticks: &mut i32,
+    pause_after: i32,
+    players: usize,
+    pregen: bool,
+    sprinting: bool,
+) -> bool {
+    if pause_after > 0 {
+        if players == 0 && !pregen && !sprinting {
+            *empty_ticks += 1;
+        } else {
+            *empty_ticks = 0;
+        }
+    }
+    pause_after > 0 && *empty_ticks >= pause_after
 }
 
 /// `MinecraftServer.setAutoSave`: enable or disable periodic saves and report whether it changed.
@@ -912,6 +1064,10 @@ impl Game<'_> {
     fn run_dedicated_inner(&mut self, startup_began: &mut bool) -> Result<()> {
         // This thread ticks the server (MinecraftServer.spin's priority).
         horizon_threads::favour_current();
+        // Multiple hosted servers would otherwise all select the same core.
+        let _core = horizon_threads::server_core::dedicated_enabled()
+            .then(super::integrated::take_server_core)
+            .flatten();
         self.join_world_rest()?;
         let Setup {
             props,
@@ -919,6 +1075,7 @@ impl Game<'_> {
             level_name,
             port,
             started,
+            allow_missing_mods,
         } = SETUP
             .get()
             .and_then(|m| m.lock().unwrap().take())
@@ -929,6 +1086,9 @@ impl Game<'_> {
         let new_world = !world_dir.join("level.dat").exists();
         if new_world {
             self.write_world_gen(&world_dir, &props)?;
+        } else {
+            // Before anything writes the world: a refusal leaves it as it was saved.
+            self.check_missing_mods(&world_dir, allow_missing_mods)?;
         }
         // The console thread starts first, as in initServer.
         let (tx, console) = mpsc::channel();
@@ -1030,17 +1190,16 @@ impl Game<'_> {
         let folder = world_dir.to_string_lossy().into_owned();
         // The mods' common and server configs, read before the server starts.
         self.native_configs_server_start(&world_dir, true);
-        // MinecraftServer.loadLevel's start: nothing is loaded yet.
-        *startup_began = true;
-        self.native_server_about_to_start(true);
-        self.native_server_starting(true);
-        self.native_lifecycle_open_started();
-        // The registries the server sends are read while the world prepares.
-        let sync = super::lan::preload_sync_data(&self.res.core.item_data);
         if !new_world {
             biome_regions::choose(&world_dir)?;
         }
-        self.load_world(WorldRequest::new(
+        // Read before the levels are made: each one's block ticks take it (`Levels::new_ticks`).
+        self.levels
+            .set_max_chained_neighbor_updates(props.max_chained_neighbor_updates);
+        // `max-world-size` limits every level's border (`MinecraftServer.createLevels`): set before
+        // the world's levels read their borders.
+        self.levels.set_absolute_max_size(props.max_world_size);
+        let prepared = self.prepare_world_and_rules(WorldRequest::new(
             &folder,
             Some(&level_name),
             Some(props.seed),
@@ -1048,24 +1207,15 @@ impl Game<'_> {
             None,
             Arc::new(crate::game::api_values::game_rule_registry()),
         )?)?;
-        // WorldLoader: the world's packs must load before the server starts. The data store is read
-        // now rather than at the first tick (reading parses functions; it runs none), and a broken
-        // predicate graph stops the start before anything listens (a partial check: predicate_graph.rs).
-        self.ensure_datapacks();
-        if let Err(error) = predicate_graph::check(&self.fns.store.predicates) {
-            let level = match error {
-                predicate_graph::GraphError::Unbound(_) => "ERROR",
-                predicate_graph::GraphError::Recursive(_) => "WARN",
-            };
-            for line in error.lines() {
-                log(level, &line);
-            }
-            log(
-                "WARN",
-                "Failed to load datapacks, can't proceed with server load. You can either fix your datapacks or reset to vanilla with --safeMode",
-            );
-            return Err(Box::new(DatapacksRefused));
-        }
+        *startup_began = true;
+        self.native_server_about_to_start(true);
+        self.native_server_starting(true);
+        self.native_lifecycle_open_started();
+        // The registries the server sends are read while the world prepares.
+        let sync = super::lan::sync::preload_sync_data(&self.res.core.item_data);
+        // `finish_open_world` loads the data packs, which admits the reloadable registries (WorldLoader)
+        // before the server listens or reports Ready.
+        self.finish_open_world(prepared)?;
         if new_world {
             self.level.hardcore = props.hardcore;
         }
@@ -1073,7 +1223,7 @@ impl Game<'_> {
         self.level.position = None;
         // DedicatedServer.initServer: worldData.setGameType; forceDifficulty.
         // `load_world` restored difficulty from level.dat; server.properties wins
-        // (vanilla's forceDifficulty), including health_rules used for despawn (#4694).
+        // (vanilla's forceDifficulty), including health_rules used for despawn (arismoko/horizon#4694).
         self.set_default_game_mode(game_mode);
         // MinecraftServer.setDifficulty: a hardcore world is always hard.
         self.ui.difficulty = if self.level.hardcore {
@@ -1211,6 +1361,7 @@ impl Game<'_> {
             simulation_distance: props.simulation_distance.clamp(2, 32),
             dimension: self.dim.id().to_owned(),
             levels: self.level_shapes,
+            level_seeds: self.levels.runtime.seeds(),
             seed: self.level.seed,
             max_players: props.max_players.max(0) as usize,
             integrated: false,
@@ -1251,6 +1402,8 @@ impl Game<'_> {
         let anticheat_on = anticheat.enabled;
         let chat_filter = load_chat_filter();
         self.set_pvp_legacy_rules(load_combat());
+        self.read_runtime_level_cap(|key| props.raw.get(key));
+        load_entities();
         // Horizon's far ring (docs/hosting.md): server.toml's `max_view_distance`.
         let far = props
             .raw
@@ -1269,6 +1422,19 @@ impl Game<'_> {
             }
             host.hub.set_anticheat(anticheat);
             host.hub.set_chat_filter(chat_filter);
+            // The viewed areas' chunk caps (arismoko/horizon#3716): server.toml's `max_viewed_*` settings.
+            let (caps, clamped) = viewed::ViewedCaps::from_properties(|key| props.raw.get(key));
+            if let Some(asked) = clamped {
+                let max = viewed::MAX_LOADED_PER_PLAYER;
+                log(
+                    "WARN",
+                    &format!(
+                        "max_viewed_loaded_chunks is {asked}, but a client keeps at most {max} \
+                         columns of a viewed level: using {max}"
+                    ),
+                );
+            }
+            host.hub.viewed.caps = caps;
             host.hub.spawn_protection = props.spawn_protection;
             host.hub.chat_spam_threshold = props.chat_spam_threshold_seconds.wrapping_mul(20);
             host.hub.command_spam_threshold = props.command_spam_threshold_seconds.wrapping_mul(20);
@@ -1297,6 +1463,8 @@ impl Game<'_> {
             lists,
             console,
             empty_ticks: 0,
+            empty_since: None,
+            given_back: 0,
             pause_when_empty_seconds: props.pause_when_empty_seconds,
             ticks: Default::default(),
             paused: false,
@@ -1376,17 +1544,15 @@ impl Game<'_> {
             // Vanilla reads pauseWhenEmptySeconds on every tick, so management changes take effect
             // without restarting the server.
             let pause_after = state.pause_when_empty_seconds.wrapping_mul(20);
-            if pause_after > 0 {
-                // A `/pregen` task keeps the server busy as a player would:
-                // paused, nothing would post-process its chunks.
-                if players == 0 && self.pregen_level().is_none() {
-                    state.empty_ticks += 1;
-                } else {
-                    state.empty_ticks = 0;
-                }
-            }
-            let paused = pause_after > 0 && state.empty_ticks >= pause_after;
+            let paused = count_empty_tick(
+                &mut state.empty_ticks,
+                pause_after,
+                players,
+                self.pregen_level().is_some(),
+                self.clock.sprinting(),
+            );
             state.paused = paused;
+            self.give_memory_back_when_empty(&mut state, players, Instant::now());
             if paused && state.empty_ticks == pause_after {
                 log(
                     "INFO",
@@ -1513,10 +1679,10 @@ impl Game<'_> {
         if self.is_dedicated_server() {
             if self.level.spawn.is_none() {
                 let [x, y, z] = loop {
-                    self.update_world();
                     if let Some(pos) = self.find_world_spawn()? {
                         break pos;
                     }
+                    self.update_world();
                     if Instant::now() > deadline {
                         return Err("the spawn area did not load".into());
                     }
@@ -1533,8 +1699,11 @@ impl Game<'_> {
             return Ok(());
         }
         while self.player.is_none() {
-            self.update_world();
             self.spawn_player()?;
+            if self.player.is_some() {
+                break;
+            }
+            self.update_world();
             if Instant::now() > deadline {
                 return Err("the spawn area did not load".into());
             }
@@ -1542,6 +1711,27 @@ impl Game<'_> {
         }
         self.player = None;
         Ok(())
+    }
+
+    /// Once nobody is on for a while ([`GIVE_BACK_AFTER`]), drop what was kept only to send chunks
+    /// again and have every thread give back to the OS the memory its heap holds free, so an empty
+    /// server sits near what it took at the start rather than at its busiest.
+    fn give_memory_back_when_empty(&self, state: &mut ServerState, players: usize, now: Instant) {
+        if players > 0 {
+            state.empty_since = None;
+            state.given_back = 0;
+            return;
+        }
+        let since = *state.empty_since.get_or_insert(now);
+        if !give_back_due(Some(since), state.given_back, now) {
+            return;
+        }
+        state.given_back += 1;
+        if let Some(host) = &self.lan {
+            host.hub.encoder.forget_cache();
+        }
+        horizon_client::lan::conn::forget_shared_frames();
+        horizon_threads::release_everywhere();
     }
 
     /// The chunks to keep loaded: the players' (lan_update_streaming). While
@@ -1606,13 +1796,14 @@ impl Game<'_> {
         let Some(host) = self.lan.as_mut() else {
             return;
         };
-        let limit = u64::try_from(minutes).unwrap_or(0) * 1200;
         let idle: Vec<u32> = host
             .hub
             .guests
             .iter()
             .filter(|g| {
-                g.participates_online() && host.hub.ticks.saturating_sub(g.last_action_tick) > limit
+                let idle_ticks = host.hub.ticks.saturating_sub(g.last_action_tick);
+                let won_game = host.play.get(&g.conn).is_some_and(|play| play.won_game);
+                g.participates_online() && idles_out(idle_ticks, minutes, won_game)
             })
             .map(|g| g.conn)
             .collect();
@@ -1740,8 +1931,7 @@ impl Game<'_> {
         self.console_broadcast = Some(inform);
         self.console_command(state, line);
         self.console_broadcast = None;
-        if let Some(host) = self.lan.as_ref() {
-            crash_fixture("hub", || host.hub.guests.iter().any(|g| g.placed));
+        if self.lan.is_some() {
             self.run_level_teleports();
             self.send_admin_feedback(None);
         }
@@ -1754,7 +1944,13 @@ impl Game<'_> {
     /// and the level in place is put back afterwards.
     pub(super) fn as_console_in_overworld<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let back = console_level(self.dim).and_then(|dim| self.enter_command_level(dim));
+        let source = super::commands::execute::Source {
+            silent: false,
+            ..self.server_source()
+        };
+        let outer = self.command_source.replace(source);
         let out = self.as_console(f);
+        self.command_source = outer;
         if let Some(back) = back {
             self.enter_command_level(back);
         }
@@ -1772,10 +1968,25 @@ impl Game<'_> {
         };
         let rest: Vec<&str> = words.collect();
         let lit = |s: &str| Text::literal(s.to_owned());
+        #[cfg(feature = "state-digest")]
+        if command == "digest-sync" {
+            match self.as_console_in_overworld(|g| g.state_digest_sync(&rest)) {
+                Ok(()) => log("INFO", "digest-sync done"),
+                Err(e) => log("WARN", &format!("digest-sync: {e}")),
+            }
+            return;
+        }
         match command {
             "stop" => {
                 self.console_reply(Text::translate("commands.stop.stopping", &[]));
                 state.lists.lock().unwrap().stop = true;
+            }
+            // Horizon's own, unlike its tree entry also here without the supervisor, to say why it does nothing.
+            "restart" => {
+                let mut lists = state.lists.lock().unwrap();
+                let reply = request_restart(supervised(), &mut lists.stop);
+                drop(lists);
+                self.console_reply(reply);
             }
             // Horizon's own, on the console only: a performance report (report.rs).
             "horizon-report" | "horizon-trace" => {
@@ -1968,12 +2179,7 @@ impl Game<'_> {
                     return;
                 };
                 let reason = (rest.len() > 1).then(|| rest[1..].join(" "));
-                let added = state.lists.lock().unwrap().bans.add(BanEntry::new(
-                    user.clone(),
-                    Some("Server".into()),
-                    None,
-                    reason.clone(),
-                ));
+                let added = state.lists.lock().unwrap().ban(&user, reason.clone());
                 if added {
                     self.console_reply(Text::translate(
                         "commands.ban.success",
@@ -2003,12 +2209,7 @@ impl Game<'_> {
                     return;
                 };
                 let reason = (rest.len() > 1).then(|| rest[1..].join(" "));
-                let added = state.lists.lock().unwrap().ip_bans.add(BanEntry::new(
-                    ip.clone(),
-                    Some("Server".into()),
-                    None,
-                    reason.clone(),
-                ));
+                let added = state.lists.lock().unwrap().ban_ip(&ip, reason.clone());
                 if !added {
                     self.console_reply(Text::translate("commands.banip.failed", &[]));
                     return;
@@ -2035,7 +2236,10 @@ impl Game<'_> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let names: Vec<&str> = banned.iter().map(|(_, n)| n.as_str()).collect();
+                let names: Vec<Text> = banned
+                    .iter()
+                    .map(|(uuid, name)| self.player_text(name, *uuid))
+                    .collect();
                 if let Some(info) = ban_ip_info(&names) {
                     self.console_reply(info);
                 }
@@ -2122,10 +2326,11 @@ impl Game<'_> {
                     translatable("multiplayer.disconnect.kicked", &[])
                 };
                 self.kick_uuid(user.id, reason);
+                // `KickCommand.kickPlayers` names them by `Player.getDisplayName`.
                 self.console_reply(Text::translate(
                     "commands.kick.success",
                     &[
-                        lit(&user.name),
+                        self.player_text(&user.name, user.id),
                         if rest.len() > 1 {
                             lit(&rest[1..].join(" "))
                         } else {
@@ -2137,7 +2342,15 @@ impl Game<'_> {
             "say" if !rest.is_empty() => {
                 // SayCommand from the console: an unsigned system chat
                 // message of type say_command, logged as not secure.
-                let message = rest.join(" ");
+                let message = match self.console_say_message(line) {
+                    Ok(message) => message,
+                    Err(replies) => {
+                        for text in replies {
+                            self.console_reply(text);
+                        }
+                        return;
+                    }
+                };
                 // An RCON client's `say` is `[Rcon] message`, and its reply stays empty: the line is
                 // the console's own log, not a message to the source.
                 let name = if self.rcon_source { "Rcon" } else { "Server" };
@@ -2171,6 +2384,29 @@ impl Game<'_> {
                 }
             }
         }
+    }
+
+    /// The message of a console `say` line as `SayCommand` takes it: the line is parsed as the
+    /// dispatcher parses a player's, so a bad selector fails the command (the error lines are the
+    /// `Err`), and a good one becomes the names it selects.
+    fn console_say_message(&mut self, line: &str) -> std::result::Result<String, Vec<Text>> {
+        self.as_console_in_overworld(|g| {
+            let dispatcher = g.ui.dispatcher.0.clone();
+            let parse = dispatcher.parse(line, &g.ui.registries);
+            match parse.executable() {
+                Ok((ctx, _)) => match ctx.get("message") {
+                    Some(horizon_client::command::Arg::Str(s)) => {
+                        Ok(g.expand_selectors(s).plain())
+                    }
+                    _ => Ok(line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+                },
+                Err(e) => {
+                    g.chat_capture = Some(Vec::new());
+                    g.syntax_failure(&e, line);
+                    Err(g.chat_capture.take().unwrap_or_default())
+                }
+            }
+        })
     }
 
     fn console_whitelist(&mut self, state: &mut ServerState, rest: &[&str]) {
@@ -2397,26 +2633,42 @@ impl Game<'_> {
     }
 
     pub(super) fn kick_uuid(&mut self, uuid: u128, reason: Tag) {
-        if let Some(h) = self.lan.as_mut() {
-            let conns: Vec<u32> = h
-                .hub
+        let conns: Vec<u32> = self.lan.as_ref().map_or_else(Vec::new, |h| {
+            h.hub
                 .guests
                 .iter()
                 .filter(|g| g.participates_online() && g.uuid == uuid)
                 .map(|g| g.conn)
-                .collect();
-            for conn in conns {
-                h.hub.kick(conn, reason.clone());
-                if let Some(g) = h.hub.guest(conn) {
-                    events::record(
-                        "kick",
-                        &g.name,
-                        uuid,
-                        serde_json::json!({ "reason": g.left_reason }),
-                    );
-                }
-            }
+                .collect()
+        });
+        for conn in conns {
+            self.kick_conn(conn, reason.clone());
         }
+    }
+
+    /// `Hub::kick`, with the server's `kick` event recorded. Whether it started the guest's
+    /// disconnect: false for a missing guest and one whose disconnect is already pending or who is hearing `player_leaving`.
+    pub(super) fn kick_conn(&mut self, conn: u32, reason: Tag) -> bool {
+        let Some(h) = self.lan.as_mut() else {
+            return false;
+        };
+        if h.hub
+            .guest(conn)
+            .is_none_or(|g| g.disconnect_pending || g.leaving)
+        {
+            return false;
+        }
+        h.hub.kick(conn, reason);
+        let Some(g) = h.hub.guest(conn) else {
+            return false;
+        };
+        events::record(
+            "kick",
+            &g.name,
+            g.uuid,
+            serde_json::json!({ "reason": g.left_reason }),
+        );
+        true
     }
 
     /// MinecraftServer.stopServer: players saved and sent away, worlds saved.
@@ -2470,7 +2722,8 @@ impl Game<'_> {
 }
 
 /// `tools/test_dedicated_crash_save.py`'s fixture: with `HORIZON_CRASH_FIXTURE` naming `point`
-/// (`guest`: during a placed guest's turn, `hub`: after a console line while a player is in),
+/// (`guest`: during a placed guest's turn, `hub`: in the network tick, with the hub out of the
+/// game and a player in),
 /// the tick panics there, to see what crash teardown keeps.
 /// `armed` is asked only when the variable names `point`, so the tick pays one
 /// load of a `OnceLock` without it.
@@ -2525,17 +2778,8 @@ impl Game<'_> {
         } else {
             log("ERROR", &format!("The server thread panicked: {message}"));
         }
-        let acting = self.lan_acting;
-        let hub_lost = self.lan.is_none();
-        if let (Some(conn), Some(host)) = (acting, self.lan.as_mut()) {
-            host.hub
-                .guests
-                .update_connection(conn, |guest| guest.placed = false);
-        }
-        if hub_lost {
-            warn("The panic interrupted the network tick: players are not saved, only the world");
-        } else if acting.is_some() {
-            warn("The panic interrupted a player's turn: that player keeps the last saved file");
+        if let Some(warning) = self.keep_interrupted_players() {
+            warn(warning);
         }
         if integrated {
             // `IntegratedServer.stopServer`'s steps; `save_guest` skips the guest unplaced above.
@@ -2554,7 +2798,7 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn broadcast_console_destination_follows_role_not_launch_marker() {
         use crate::game::execution_role::ExecutionRole;
         let mut resources = None;
@@ -2586,6 +2830,52 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    /// `banned-ips.json` holds addresses as text: one written by vanilla spells `::1` as Java does
+    /// (`0:0:0:0:0:0:0:1`), and an IPv4 player may arrive in its `::ffff:` form. The same address bans
+    /// whatever its spelling; other addresses and keys that are no address do not.
+    #[test]
+    fn an_ip_ban_matches_the_address_not_its_spelling() {
+        use super::ip_ban_key;
+        let keys = [
+            "203.0.113.7",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:198.51.100.2",
+            "not an address",
+        ];
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.7")), Some("203.0.113.7"));
+        assert_eq!(
+            ip_ban_key(keys, ip("::ffff:203.0.113.7")),
+            Some("203.0.113.7")
+        );
+        assert_eq!(ip_ban_key(keys, ip("::1")), Some("0:0:0:0:0:0:0:1"));
+        assert_eq!(
+            ip_ban_key(keys, ip("198.51.100.2")),
+            Some("::ffff:198.51.100.2")
+        );
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.8")), None);
+        assert_eq!(ip_ban_key(keys, ip("::2")), None);
+    }
+
+    /// `/restart` without `horizon-server` refuses and stops nothing; with it, it asks the server loop to end.
+    #[test]
+    fn restart_without_a_supervisor_does_nothing_and_says_why() {
+        let mut stop = false;
+        let reply = super::request_restart(false, &mut stop);
+        assert!(!stop);
+        assert!(!super::super::exit_code::restart_requested());
+        assert_eq!(
+            reply.translation_key(),
+            Some("horizon.commands.restart.unsupervised")
+        );
+        let reply = super::request_restart(true, &mut stop);
+        assert!(stop);
+        assert_eq!(
+            reply.translation_key(),
+            Some("horizon.commands.restart.restarting")
+        );
+    }
+
     /// A console line runs in the overworld even after a server tick left the nether in place.
     #[test]
     fn console_commands_run_in_the_overworld() {
@@ -2609,11 +2899,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(super::ban_ip_info(&[]).is_none());
-        let one = super::ban_ip_info(&["Alex"]).unwrap();
+        let name = |n| super::Text::literal(n).with_color(horizon_client::text::RED);
+        let one = super::ban_ip_info(&[name("Alex")]).unwrap();
         assert_eq!(one.translation_key(), Some("commands.banip.info"));
         let a = args(&one);
         assert!(a[0].contains('1') && a[1].contains("Alex"), "{a:?}");
-        let two = super::ban_ip_info(&["Alex", "Steve"]).unwrap();
+        let two = super::ban_ip_info(&[name("Alex"), name("Steve")]).unwrap();
         let a = args(&two);
         assert!(a[0].contains('2'), "{a:?}");
         assert!(
@@ -2623,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn console_name_lookup_skips_fake_players() {
         crate::game::native_guest_turn_tests::with_guests(|game| {
             let level = game.level("minecraft:overworld").unwrap();
@@ -2640,7 +2931,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn console_and_management_ip_ban_sets_skip_fake_players() {
         crate::game::native_guest_turn_tests::with_guests(|game| {
             let level = game.level("minecraft:overworld").unwrap();
@@ -2659,6 +2950,25 @@ mod tests {
         });
     }
     #[test]
+    fn entities_section_is_off_by_default_and_keeps_the_other_settings_keys() {
+        use super::parse_entities;
+        assert_eq!(parse_entities(""), Ok((false, 100)));
+        assert_eq!(
+            parse_entities(
+                "[entities]\nvillager_lobotomize = true\nvillager_lobotomize_check_interval = 40\n"
+            ),
+            Ok((true, 40))
+        );
+        assert_eq!(
+            parse_entities(
+                "[entities]\ndab = true\nmax_collisions = 8\nvillager_lobotomize = true\n"
+            ),
+            Ok((true, 100))
+        );
+        assert!(parse_entities("[entities]\nvillager_lobotomize_check_interval = 0\n").is_err());
+    }
+
+    #[test]
     fn whitelist_bypass_file_takes_uuid_prefixes_and_refuses_junk() {
         let ok =
             parse_whitelist_bypass("# Bedrock\n00000000-0000-0000-0009-  # floodgate\n\n").unwrap();
@@ -2668,6 +2978,23 @@ mod tests {
             "a short prefix would match nearly everyone"
         );
         assert!(parse_whitelist_bypass("not-a-uuid-at-all").is_err());
+    }
+
+    /// ServerGamePacketListenerImpl.tick: a player idle past `player-idle-timeout` minutes is kicked,
+    /// unless the End poem is showing (`ServerPlayer.wonGame`), which sends no action.
+    #[test]
+    fn a_player_watching_the_end_credits_is_not_kicked_for_idling() {
+        use super::idles_out;
+        // 5 minutes: 6000 ticks. One more is over the limit.
+        assert!(!idles_out(6000, 5, false));
+        assert!(idles_out(6001, 5, false));
+        assert!(!idles_out(6001, 5, true));
+        assert!(!idles_out(1_000_000, 5, true));
+        // The credits are over (won_game false again): the same idle time kicks.
+        assert!(idles_out(1_000_000, 5, false));
+        // 0 or less: no timeout.
+        assert!(!idles_out(1_000_000, 0, false));
+        assert!(!idles_out(1_000_000, -3, false));
     }
 
     /// `SaveAllCommand.saveAll`: a save that throws is the `ERROR_FAILED` the
@@ -2692,6 +3019,67 @@ mod tests {
             overload_warning(std::time::Duration::from_millis(13_027), tick),
             "Can't keep up! Is the server overloaded? Running 13027ms or 260 ticks behind"
         );
+    }
+
+    /// MinecraftServer.tickServer: a tick only counts toward pause-when-empty with no player and
+    /// no `/tick sprint` running (`ServerTickRateManager.isSprinting`); a sprint on an empty server
+    /// keeps the count at 0, so it is never paused, and the count starts again after it.
+    #[test]
+    fn a_sprint_on_an_empty_server_does_not_count_toward_the_pause() {
+        let pause_after = 60 * 20;
+        let mut empty_ticks = 0;
+        // One server tick: (players, a `/pregen` task, a `/tick sprint`) -> paused.
+        let tick = |empty_ticks: &mut i32, players, pregen, sprinting| {
+            super::count_empty_tick(empty_ticks, pause_after, players, pregen, sprinting)
+        };
+        for _ in 0..2000 {
+            assert!(!tick(&mut empty_ticks, 0, false, true));
+        }
+        assert_eq!(empty_ticks, 0);
+        // The sprint ended: 1200 empty ticks later the server pauses, not before.
+        for n in 1..=pause_after {
+            assert_eq!(
+                tick(&mut empty_ticks, 0, false, false),
+                n == pause_after,
+                "tick {n}"
+            );
+        }
+        // A sprint that starts while paused resumes the server at once.
+        assert!(!tick(&mut empty_ticks, 0, false, true));
+        assert_eq!(empty_ticks, 0);
+        // A player, or a `/pregen` task, resets the count too.
+        empty_ticks = 5;
+        assert!(!tick(&mut empty_ticks, 1, false, false));
+        assert_eq!(empty_ticks, 0);
+        empty_ticks = 5;
+        assert!(!tick(&mut empty_ticks, 0, true, false));
+        assert_eq!(empty_ticks, 0);
+        // pause-when-empty-seconds=0 never pauses and leaves the count alone.
+        empty_ticks = 5;
+        assert!(!super::count_empty_tick(
+            &mut empty_ticks,
+            0,
+            0,
+            false,
+            false
+        ));
+        assert_eq!(empty_ticks, 5);
+    }
+
+    /// An empty server gives its memory back 5 s after the last player left and again at 30 s,
+    /// then no more until someone has been on again (the loop then starts from None).
+    #[test]
+    fn an_empty_server_gives_memory_back_twice() {
+        use std::time::{Duration, Instant};
+        let left = Instant::now();
+        let at = |s: u64| left + Duration::from_secs(s);
+        let due = |given_back, s| super::give_back_due(Some(left), given_back, at(s));
+        assert!(!due(0, 4));
+        assert!(due(0, 5));
+        assert!(!due(1, 29));
+        assert!(due(1, 30));
+        assert!(!due(2, 3600));
+        assert!(!super::give_back_due(None, 0, at(3600)));
     }
 
     /// A `panic!("literal")` carries a `&str`, a formatted one a `String`; anything else is
@@ -2726,6 +3114,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn console_logging_survives_closed_stdout() {
         if let Some(home) = std::env::var_os(CHILD_HOME) {
             horizon_client::logging::init(std::path::Path::new(&home), "Server thread");
@@ -2762,6 +3151,7 @@ mod tests {
             fs::create_dir(&home).unwrap();
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "game::dedicated::tests::console_logging_survives_closed_stdout",
                     "--nocapture",
@@ -2801,6 +3191,46 @@ mod tests {
             assert_log_lines(&fs::read_to_string(home.join("logs/latest.log")).unwrap());
             fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    /// `BanPlayerCommands.banPlayers` skips a player who `isBanned`, and `BanIpCommands.banIp` refuses an
+    /// address that is: the console's `/ban` and `/ban-ip` of one banned already change nothing (the first
+    /// reason stays, and the console hears "Nothing changed"), whatever reason they give.
+    #[test]
+    fn the_console_does_not_ban_again_who_is_banned_already() {
+        use super::{BanList, Lists, NameAndId};
+        let dir = std::env::temp_dir().join(format!("horizon-console-ban-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut lists = Lists {
+            ops: super::OpList::new(dir.join("ops.json")),
+            white: super::WhiteList::new(dir.join("whitelist.json")),
+            bans: BanList::new(dir.join("banned-players.json")),
+            ip_bans: super::IpBanList::new(dir.join("banned-ips.json")),
+            use_whitelist: false,
+            enforce_whitelist: false,
+            op_level: 4,
+            player_idle_timeout: 0,
+            stop: false,
+            autosave: true,
+            whitelist_bypass: Vec::new(),
+        };
+        let alpha = NameAndId {
+            id: 0x5ca1ab1e,
+            name: "Alpha".into(),
+        };
+        assert!(lists.ban(&alpha, Some("cheating".into())));
+        assert!(!lists.ban(&alpha, Some("again".into())));
+        assert!(!lists.ban(&alpha, None));
+        let reason = lists.bans.get(&alpha).and_then(|b| b.reason.clone());
+        assert_eq!(reason.as_deref(), Some("cheating"));
+        assert!(lists.ban_ip("1.2.3.4", Some("spam".into())));
+        assert!(!lists.ban_ip("1.2.3.4", Some("more spam".into())));
+        let reason = lists
+            .ip_bans
+            .get(&"1.2.3.4".to_owned())
+            .and_then(|b| b.reason.clone());
+        assert_eq!(reason.as_deref(), Some("spam"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A temporary ban (`/tempban`, the chat filter's) keeps the player out and says when it ends;
@@ -2884,5 +3314,158 @@ mod tests {
         assert!(lists.bans.remove(&steve));
         assert!(lists.can_login(address, &steve).is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod console_source_tests {
+    use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
+    use horizon_client::chunk::Chunk;
+    use horizon_core::position::ChunkPos;
+    use std::sync::Arc;
+
+    /// Runs `command` as the console does and returns whether it worked and every message it printed.
+    fn console(game: &mut Game<'_>, command: &str) -> (bool, String) {
+        game.chat_capture = Some(Vec::new());
+        let ok = game.as_console_in_overworld(|g| g.run_command(command));
+        let said = game.chat_capture.take().unwrap_or_default();
+        let said = said
+            .iter()
+            .map(|t| t.component().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (ok, said)
+    }
+
+    /// `MinecraftServer.createCommandSourceStack`: the console's source has no entity and is named "Server"
+    /// (an RCON client's, `RconConsoleSource`, "Rcon"): `/me` says so, and `teammsg`, which needs an entity,
+    /// refuses it (`permissions.requires.entity`) instead of running as the player in place.
+    #[test]
+    #[ignore = "daily"]
+    fn the_console_runs_as_the_server_not_the_player_in_place() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        let (ok, said) = console(&mut game, "me waves");
+        assert!(
+            ok && said.contains("chat.type.emote") && said.contains("\"Server\""),
+            "{said}"
+        );
+        game.rcon_source = true;
+        let (ok, said) = console(&mut game, "me waves");
+        assert!(ok && said.contains("\"Rcon\""), "{said}");
+        game.rcon_source = false;
+        let (ok, said) = console(&mut game, "teammsg hi");
+        assert!(
+            !ok && said.contains("permissions.requires.entity"),
+            "{said}"
+        );
+        // The console's source is put back after each line.
+        assert!(game.command_source.is_none());
+    }
+
+    /// `say` at the console: the message goes through `MessageArgument`, as a player's does. A selector
+    /// becomes the names it selects (none for the console's own `@s`), and a bad one fails the command
+    /// instead of reaching the players as the text that was typed.
+    #[test]
+    #[ignore = "daily"]
+    fn the_consoles_say_resolves_and_checks_its_selectors() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut resources = None;
+        let res = resources.insert(loaded.resources);
+        let mut game = Game::new(
+            res,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert_eq!(game.console_say_message("say hello"), Ok("hello".to_owned()));
+        assert_eq!(
+            game.console_say_message("say hello @s").map(|m| m.trim_end().to_owned()),
+            Ok("hello".to_owned())
+        );
+        let (ok, _) = console(&mut game, "summon pig 0 80 0 {NoAI:1b}");
+        assert!(ok);
+        assert_eq!(
+            game.console_say_message("say hi @e[type=pig]"),
+            Ok("hi Pig".to_owned())
+        );
+        let failed = game
+            .console_say_message("say @e[type=nothing]")
+            .expect_err("an unknown entity type fails the command");
+        assert_eq!(
+            failed.first().map(|t| t.plain()).as_deref(),
+            Some("Invalid or unknown entity type 'minecraft:nothing'")
+        );
     }
 }

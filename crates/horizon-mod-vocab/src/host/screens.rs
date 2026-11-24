@@ -17,22 +17,26 @@ pub trait ScreensClientHost {
     #[access(ClientSetup)]
     fn set_preset_editor_dimensions(&self, dimensions: Compound) -> bool;
     /// Side: client.
-    /// The block of the mod screen that is open (`native_screen`), as the
+    /// The block of the mod screen that is open (`screen`), as the
     /// server named it when the block opened its menu type; None when no mod
     /// screen is open. 401.
     #[access(ClientSetup)]
     fn screen_pos(&self) -> Option<[i32; 3]>;
     /// Side: client.
     /// What the block's mod wrote for the mod screen that is open
-    /// (`native_menu_extra_data` on the server), empty when it wrote nothing;
-    /// None when no mod screen is open. @API:menu_extra_data@.
-    /// Not on wasm: it returns a borrowed view of the screen's bytes, which crosses only as a resource.
+    /// (`menu_extra_data` on the server), empty when it wrote nothing;
+    /// None when no mod screen is open. The same for a menu `PlayerRef::open_mod_menu`
+    /// opened with its `extra`. A copy, so native and wasm read it alike. @API:menu_extra_data@.
     #[access(ClientSetup)]
-    fn screen_extra_data(&self) -> Option<&[u8]>;
+    fn screen_extra_data(&self) -> Option<Vec<u8>>;
+    /// What started this level load, while `screen` is its selected registered
+    /// transition screen. None outside the load or for a different screen.
+    #[access(ClientSetup)]
+    fn dimension_transition_cause(&self, screen: &str) -> Option<DimensionTransitionCause>;
     /// Side: client.
     /// Where the open screen draws outside its `rect`, and where mods draw
     /// over it: the recipe book's panel, the creative tab rows, the active
-    /// effects beside the inventory, then whatever `native_screen_exclusion_areas`
+    /// effects beside the inventory, then whatever `screen_exclusion_areas`
     /// adds. Each is `[x, y, width, height]` in GUI pixels; an empty or
     /// non-finite one is dropped. A mod that lays out its own panels
     /// (a recipe viewer) keeps them clear of these. Client-side; empty with
@@ -59,7 +63,7 @@ pub trait ScreensClientHost {
     /// Side: client.
     /// Opens a screen of mod `mod_id`'s own over the world: the screen hooks
     /// fire over it as over any other, so the mod draws it in
-    /// `native_screen_render_post` and takes its clicks, scroll, keys and
+    /// `screen_render_post` and takes its clicks, scroll, keys and
     /// typing there; the mouse is freed, and Escape closes it. Every mod's own
     /// screen has the `ScreenView.id` `mod`, so a mod's screen hooks
     /// check `native_mod_screen()` is its own before drawing. It doesn't pause
@@ -76,10 +80,63 @@ pub trait ScreensClientHost {
     #[access(WorldOnly)]
     fn mod_screen_close(&mut self, mod_id: &str);
     /// Side: client.
+    /// Closes the open screen as its Escape key does: a container screen
+    /// closes as the player's container close (`ServerboundContainerClosePacket`
+    /// with the menu's id, then the client menu closed), a pause menu closes
+    /// to the game, and another screen runs its own close. The sign editor
+    /// sends its sign update (`ServerboundSignUpdatePacket`), as Escape does.
+    /// The screen hooks fire as for Escape. The death screen does not close
+    /// this way. False when no screen is open (or, outside a world, when it
+    /// cannot act).
+    #[access(WorldOnly)]
+    fn close_screen(&mut self) -> bool;
+    /// Queues the primary window's normal Quit Game action after the current
+    /// hook dispatch. The game follows its usual shutdown path, including
+    /// saving and stopping an integrated server when one is open.
+    /// Returns true when the request is queued. Returns false for a headless
+    /// client, a splitscreen guest, a server, a load phase without client
+    /// services, or a quit already queued or in progress.
+    ///
+    /// Not on wasm: process-wide quit is a native client action.
+    #[access(ClientSetup)]
+    #[default_on_unavailable]
+    fn request_client_quit(&self) -> bool;
+    /// Shows the branded loading overlay over the current screen for `desired_ms` milliseconds
+    /// starting with its first frame. Its progress runs from zero to full, then the underlying
+    /// screen is shown again, without loading resources or a world. Escape or the controller's
+    /// Back/Start button dismisses it early.
+    /// Returns false for a zero duration, an existing preview, a real load, scripted run or
+    /// shutdown, or without the primary window's client (including headless and server contexts).
+    ///
+    /// Not on wasm: this previews the native loading-overlay style hook. The unavailable host
+    /// default is false.
+    #[access(ClientSetup)]
+    #[default_on_unavailable]
+    fn preview_loading_overlay(&self, desired_ms: u32) -> bool;
+    /// Side: client.
+    /// Opens the player's inventory as the inventory key does: locally, with
+    /// no packet (the player menu is always open on the server). Riding a
+    /// vehicle with its own inventory sends the open-inventory player command
+    /// (`ServerboundPlayerCommandPacket`), as the key does. False with a
+    /// screen already open, for a spectator, in a portal transition, or with
+    /// no world.
+    #[access(WorldOnly)]
+    fn open_inventory(&mut self) -> bool;
+    /// Side: client.
+    /// The sign the sign editor is on, its block position and side; None when
+    /// no sign editor is open or outside a world.
+    #[access(ClientSetup)]
+    fn sign_editor(&self) -> Option<SignEditView>;
+    /// Side: client.
     /// The mod whose own screen is open, if one is (Escape, or another screen
     /// replacing it, closes it).
     #[access(ClientSetup)]
     fn mod_screen(&self) -> Option<&str>;
+    /// Side: client.
+    /// Name of the active Options page (`"key_binds"`, `"controls"`, `"main"`, etc.)
+    /// when `Screen::Options` is open, or `None` when another screen is active.
+    #[access(ClientSetup)]
+    fn options_page(&self) -> Option<String>;
     /// Side: client.
     /// The open menu's title (the block's name, or the one it was given),
     /// as plain text.
@@ -93,10 +150,47 @@ pub trait ScreensClientHost {
     /// The same screen identifier provided to screen hooks.
     #[access(ClientSetup)]
     fn observed_screen_id(&self) -> Option<ScreenId>;
+    /// The topmost open screen, including dialogs and prompts, without needing a rendered view.
+    /// `None` during normal play or when no screen represented by the screen hooks is open.
+    /// A covering screen does not report an underlying screen's menu.
+    ///
+    /// Available in read-only client hooks, including `Hooks::item_tooltip`. The enchanting
+    /// table reports `id == "inventory"` and `menu.as_deref() == Some("minecraft:enchantment")`
+    /// on native and wasm alike.
+    #[access(ClientSetup)]
+    fn current_screen(&self) -> Option<ScreenIdentity>;
     /// Side: client.
     /// Whether a specific key is currently held down.
     /// `key` is the vanilla physical key name (`key.keyboard.left.shift`, for example).
     /// Unknown names are not down. Modifier combinations use `ClientHost::modifiers`.
     #[access(ClientSetup)]
     fn is_key_down(&self, key: &str) -> bool;
+    /// Side: client.
+    /// Takes a screenshot as the screenshot key (F2) does (`Screenshot.grab`): the
+    /// next frame is read back at the size F2 saves (the game's resolution times the
+    /// screenshot quality), the `screenshot` hook runs on it as for F2, so every mod's
+    /// screenshot listener sees it, and it is written to the player's `screenshots`
+    /// folder under vanilla's file name, with F2's chat line. `Ok` means queued: the
+    /// files are written, or the hook cancels them, after the next frame. Unlike F2's,
+    /// its files never replace one: each is written to a temporary file and published
+    /// only under a name no file has (a name the hook picked that exists keeps the
+    /// existing file and reports failure), a failed write leaves no partial file, and
+    /// a name the hook picked may create at most one new folder (a deeper one reports
+    /// failure). One screenshot runs at a time, and all mods together may write 4 GiB
+    /// of screenshots per game session, each counted at its uncompressed size after the
+    /// hook (4 bytes a pixel, 6 more for an HDR copy) and at least 1 MiB: about 500 at
+    /// 1920 by 1080, and never more than 4096. A capture that would pass the budget is
+    /// not written and reports failure. Refused with nothing
+    /// queued, by name, as [`ScreenshotError`] lists: one still in progress, the
+    /// session's budget used up, no screenshots folder, or no window here. Native and
+    /// wasm alike.
+    #[access(ClientSetup)]
+    fn request_screenshot(&mut self) -> Result<(), ScreenshotError>;
+    /// Side: client.
+    /// The already selected splash text on the main title screen. None on other
+    /// screens, when Hide Splash Texts is enabled, or if no splash was selected.
+    /// Still available in the title's render hooks if Pre cancels stock drawing.
+    #[access(ClientSetup)]
+    #[default_on_unavailable]
+    fn title_splash(&self) -> Option<String>;
 }

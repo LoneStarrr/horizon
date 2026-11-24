@@ -17,6 +17,9 @@ impl Game<'_> {
         power: f32,
         inaccuracy: f32,
     ) -> Option<ProjectileRef> {
+        if self.entity_ids_exhausted() {
+            return None;
+        }
         if self.remote.is_some() || ![offset, power, inaccuracy].into_iter().all(f32::is_finite) {
             return None;
         }
@@ -28,7 +31,7 @@ impl Game<'_> {
             return None;
         }
         // A stack whose `projectile_spawned` effects the engine cannot all
-        // apply yet (#2670) is refused before anything is made or drawn,
+        // apply yet (arismoko/horizon#2670) is refused before anything is made or drawn,
         // rather than spawned without some of them.
         if !self.projectile_spawned_effects_applied(stack) {
             return None;

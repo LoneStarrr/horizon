@@ -12,6 +12,25 @@ use horizon_core::random::RandomSource;
 pub(super) fn is_shulker_box(name: &str) -> bool {
     name.ends_with("shulker_box")
 }
+/// The custom statistic a container block's `useWithoutItem` awards when it
+/// opens: `ChestBlock.getOpenChestStat` is `Stats.OPEN_CHEST` for every chest
+/// block (`CopperChestBlock` extends `ChestBlock` and does not override it),
+/// with `TrappedChestBlock`'s `TRIGGER_TRAPPED_CHEST` the only override;
+/// `BarrelBlock` awards `OPEN_BARREL`, `ShulkerBoxBlock` `OPEN_SHULKER_BOX`,
+/// and a hopper, dropper or dispenser `INSPECT_HOPPER`/`_DROPPER`/`_DISPENSER`.
+/// The ender chest's `OPEN_ENDERCHEST` comes from its own path.
+pub(super) fn open_stat(name: &str) -> Option<&'static str> {
+    match name {
+        "minecraft:trapped_chest" => Some("trigger_trapped_chest"),
+        "minecraft:barrel" => Some("open_barrel"),
+        "minecraft:hopper" => Some("inspect_hopper"),
+        "minecraft:dropper" => Some("inspect_dropper"),
+        "minecraft:dispenser" => Some("inspect_dispenser"),
+        n if is_chest_block(n) => Some("open_chest"),
+        n if is_shulker_box(n) => Some("open_shulker_box"),
+        _ => None,
+    }
+}
 impl Game<'_> {
     /// `ServerPlayerGameMode.useItemOn` for a spectator: the block's menu
     /// (`BlockState.getMenuProvider`) opens, and nothing else happens. The
@@ -60,7 +79,7 @@ impl Game<'_> {
             .chunks
             .get(&(key.0 >> 4, key.2 >> 4))
             .and_then(|c| c.saved.as_ref())
-            .is_some_and(|s| s.rolled_loot.iter().any(|r| r.pos == key))
+            .is_some_and(|s| s.pending_loot.contains_key(&key))
         {
             self.send_overlay_message(
                 Text::translate("container.spectatorCantOpen", &[])
@@ -517,13 +536,15 @@ impl Game<'_> {
             .as_deref()
             .is_some_and(is_shulker_box)
         {
-            batch.sprite_region(
+            // `ShulkerBoxScreen.extractBackground`.
+            batch.texture_blit(
                 atlas,
                 "gui/container/shulker_box",
                 [ox, oy, 176.0, 167.0],
-                256.0,
-                256.0,
+                [0.0; 2],
+                [256.0; 2],
             );
+            self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
             // ShulkerBoxScreen draws the menu's title: the box's custom name
             // (BaseContainerBlockEntity.getDisplayName) or its default name.
             let title = self.remote_menu_title().unwrap_or_else(|| {
@@ -540,21 +561,18 @@ impl Game<'_> {
         }
         let rows = self.chest_rows().unwrap_or(3);
         let top = rows as f32 * 18.0 + 17.0;
-        batch.sprite_region(
+        // `ContainerScreen.extractBackground`: two blits of the original texture;
+        // the player inventory starts at v = 126 even for fewer container rows.
+        let texture = "gui/container/generic_54";
+        batch.texture_blit(atlas, texture, [ox, oy, 176.0, top], [0.0; 2], [256.0; 2]);
+        batch.texture_blit_baked(
             atlas,
-            "gui/container/generic_54",
-            [ox, oy, 176.0, top],
-            256.0,
-            256.0,
+            texture,
+            [ox, oy + top, 176.0, 96.0],
+            [0.0, 126.0],
+            [256.0; 2],
         );
-        // The player half of the texture starts at v = 126.
-        if let Some(mut r) = atlas.sprites.get("gui/container/generic_54").copied() {
-            let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
-            r.v0 += 126.0 * dv;
-            r.v1 = r.v0 + 96.0 * dv;
-            r.u1 = r.u0 + 176.0 * du;
-            batch.rect_uv(ox, oy + top, 176.0, 96.0, r, u32::MAX);
-        }
+        self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let title = self.chest_title(rows);
         super::screen_info::name_container(|| title.plain());
         batch.text_styled(atlas, &title, ox + 8.0, oy + 6.0, grey, false);
@@ -586,7 +604,7 @@ mod tests {
     /// `ChestBlockEntity`'s opener counter plays the block's own hinge
     /// sound: a copper chest's, by weather state, not the wooden chest's.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_player_opens_and_closes_a_chest_with_its_own_hinge_sound() {
         let mut resources = None;
         let mut game = super::super::game_tests::tests::server_game(&mut resources);
@@ -668,7 +686,7 @@ mod reach_tests {
     /// asks both halves): breaking the half the player did not click ends the
     /// six-row menu instead of leaving a three-row one.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn breaking_the_other_half_closes_the_open_double_chest() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -722,7 +740,7 @@ mod lock_tests {
     /// `createMenu`, so the block is never set as the open container. A hand
     /// holding the lock's item opens it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_locked_container_refuses_the_local_players_open() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -777,7 +795,7 @@ mod lock_tests {
     /// `canOpen` of both halves, so a lock on the half the player did not
     /// click still refuses the six-row menu.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_lock_on_either_half_refuses_a_double_chest() {
         let mut resources = None;
         let mut game = server_game(&mut resources);
@@ -817,3 +835,7 @@ mod lock_tests {
         assert!(game.titles.overlay.is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "tests/container_open_stat_tests.rs"]
+mod container_open_stat_tests;

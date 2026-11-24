@@ -50,6 +50,7 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
     game.block_ticks
         .add_empty_chunk(ChunkPos::new(0, 0))
         .unwrap();
+    game.load_ticking_neighbourhood(0, 0);
     assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
     game
 }
@@ -65,7 +66,7 @@ const DRAGON: &str = "0000d127-0000-0000-0000-000000000001";
 const FIREBALL: &str = "0000d127-0000-0000-0000-000000000002";
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn a_summoned_dragon_fireball_moves_like_a_fireball() {
     let mut resources = None;
     let mut game = game(&mut resources);

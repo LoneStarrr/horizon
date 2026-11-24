@@ -4,7 +4,7 @@
 //! which mods were left out and why.
 use super::Bundle;
 use crate::i18n::trf;
-use horizon_mod_package::dependencies::Dependency;
+use horizon_platform::mod_package::dependencies::Dependency;
 use std::collections::BTreeSet;
 
 /// Why a mod was left out of a build.
@@ -16,6 +16,12 @@ pub enum Why {
     Clash(String),
     /// It needs this mod, which was left out.
     Needs(String),
+    /// It doesn't fit the build, or works on another build only: what the player reads about it.
+    Unfit(String),
+    /// It was made for a newer build: what the player reads about it.
+    Newer(String),
+    /// It was judged to fit the build, and its compile against it failed.
+    DidNotBuild,
 }
 
 /// A mod left out of a build.
@@ -50,6 +56,15 @@ impl LeftOut {
                 "{name} was left out: it needs {other}, which was left out",
                 &[("name", &self.id), ("other", other)],
             ),
+            Why::Unfit(line) => trf(
+                "{name} was left out of this build: {why}. It comes back when its author makes a version for this game.",
+                &[("name", &self.id), ("why", line.trim_end_matches('.'))],
+            ),
+            Why::Newer(line) => trf(
+                "{name} was left out of this build: {why}. It comes back when this instance is updated to the version it was made for.",
+                &[("name", &self.id), ("why", line.trim_end_matches('.'))],
+            ),
+            Why::DidNotBuild => super::fit::did_not_build(&self.id),
         }
     }
 
@@ -59,6 +74,9 @@ impl LeftOut {
             Why::OtherVersion => ("other-version", None),
             Why::Clash(other) => ("clash", Some(other)),
             Why::Needs(other) => ("needs", Some(other)),
+            Why::Unfit(line) => ("unfit", Some(line)),
+            Why::Newer(line) => ("newer", Some(line)),
+            Why::DidNotBuild => ("did-not-build", None),
         };
         serde_json::json!({"id": self.id, "version": self.version, "why": why, "with": with})
     }
@@ -71,6 +89,9 @@ impl LeftOut {
             why: match value["why"].as_str()? {
                 "clash" => Why::Clash(with()?),
                 "needs" => Why::Needs(with()?),
+                "unfit" => Why::Unfit(with()?),
+                "newer" => Why::Newer(with()?),
+                "did-not-build" => Why::DidNotBuild,
                 _ => Why::OtherVersion,
             },
         })
@@ -116,6 +137,33 @@ mod tests {
         super::super::bundle_in(&dir).unwrap().unwrap()
     }
 
+    #[test]
+    fn saved_left_out_labels_use_one_period_and_newer_mods_suggest_an_instance_update() {
+        let saved = serde_json::json!({
+            "id": "greeter",
+            "version": "1.0",
+            "why": "unfit",
+            "with": "It doesn't fit."
+        });
+        let mut left = LeftOut::from_json(&saved).unwrap();
+        assert_eq!(
+            left.label(),
+            "greeter was left out of this build: It doesn't fit. It comes back when its author makes a version for this game."
+        );
+
+        left.why = Why::Newer("It was made for a newer build.".into());
+        let mut saved = left.to_json();
+        assert_eq!(saved["why"], "newer");
+        assert_eq!(LeftOut::from_json(&saved), Some(left.clone()));
+        assert_eq!(
+            left.label(),
+            "greeter was left out of this build: It was made for a newer build. It comes back when this instance is updated to the version it was made for."
+        );
+
+        saved["why"] = "future-kind".into();
+        assert_eq!(LeftOut::from_json(&saved).unwrap().why, Why::OtherVersion);
+    }
+
     /// A helper that breaks a rule of the format is the mod's own source, not
     /// a Horizon it doesn't fit: the build fails with the tool's diagnostic
     /// (which names the injection and the code) rather than leaving the mod out
@@ -130,6 +178,10 @@ mod tests {
             id: id.into(),
             requirement: semver::VersionReq::STAR,
             optional,
+            side: horizon_platform::mod_package::manifest::Side::Both,
+            reason: None,
+            url: None,
+            order: mod_vocab::DependencyOrder::After,
         };
         let (on_lib, on_addon, maybe_lib) = (
             [dep("lib", false)],
@@ -143,7 +195,7 @@ mod tests {
             (&maybe, &maybe_lib),
             (&other, &[]),
         ];
-        let left = with_dependents(&[LeftOut::new(&lib, Why::OtherVersion)], &mods);
+        let left = with_dependents(&[LeftOut::new(&lib, Why::Unfit("why".into()))], &mods);
         let ids: Vec<&str> = left.iter().map(|l| l.id.as_str()).collect();
         assert_eq!(ids, ["lib", "addon", "extra"]);
         assert_eq!(
@@ -151,8 +203,13 @@ mod tests {
             "extra was left out: it needs addon, which was left out"
         );
         // What a build's record keeps reads back the same.
-        for l in &left {
+        let did_not_build = LeftOut::new(&other, Why::DidNotBuild);
+        for l in left.iter().chain([&did_not_build]) {
             assert_eq!(LeftOut::from_json(&l.to_json()).as_ref(), Some(l));
         }
+        assert_eq!(
+            left[0].label(),
+            "lib was left out of this build: why. It comes back when its author makes a version for this game."
+        );
     }
 }

@@ -7,35 +7,12 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from tests.test_ci_concurrency import expression_value, yaml
 from tools.ci import ignored_shards, ignored_tests
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ClientStopgap(unittest.TestCase):
-    def test_actual_yaml_routes_only_two_exact_client_selectors(self):
-        job = yaml.safe_load((ROOT / '.github/workflows/dyna-ci.yml').read_text())["jobs"]["ignored-tests-shards"]
-        expression = job["runs-on"]
-        selectors = ignored_shards.expand(ignored_shards.SHARDS) + [
-            "horizon-client", "horizon-client#1of1", "horizon-client#1of3",
-            "horizon-client#2of3", "horizon-client#3of3", "horizon-client-lib#1of2",
-        ]
-        for selector in selectors:
-            with self.subTest(selector=selector):
-                actual = expression
-                if expression.startswith('${{'):
-                    source = expression.removeprefix('${{').removesuffix('}}').strip()
-                    tree = ast.parse(source.replace('&&', ' and ').replace('||', ' or '), mode='eval')
-                    # Validate context identity before adapting to the shared evaluator.
-                    # In particular github.shard must not receive matrix selector data.
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.Name):
-                            self.assertIn(node.id, ('matrix', 'true', 'false'))
-                    actual = expression_value(source.replace('matrix.', 'github.'), {"shard": selector})
-                expected = "dyna-xlarge" if selector in ("horizon-client#1of2", "horizon-client#2of2") else "dyna-large"
-                self.assertEqual(actual, expected)
-
     def test_wrapper_command_threads_for_canonical_and_direct_selectors(self):
         selectors = ignored_shards.expand(ignored_shards.SHARDS) + [
             "horizon-client", "horizon-client#1of1", "horizon-client#1of3",

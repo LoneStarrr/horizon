@@ -96,14 +96,13 @@ pub fn register(m: &mut Mob) {
 /// `TraderLlama.DEFAULT_DESPAWN_DELAY`.
 pub const DEFAULT_DESPAWN_DELAY: i32 = 47999;
 /// `Llama.finalizeSpawn` and `AbstractChestedHorse.randomizeAttributes`:
-/// health 15 to 30, a coat and the strength.
-pub fn finalize(m: &mut Mob) {
-    let r = &mut m.random;
-    let health =
-        15.0 + r.next_int_bound(8).unwrap_or(0) as f32 + r.next_int_bound(9).unwrap_or(0) as f32;
+/// the strength and a coat, then health 15 to 30.
+pub fn finalize(m: &mut Mob, r: &mut impl RandomSource) {
     let max = if r.next_float() < 0.04 { 5 } else { 3 };
     let strength = 1 + r.next_int_bound(max).unwrap_or(0);
     let variant = r.next_int_bound(4).unwrap_or(0);
+    let health =
+        15.0 + r.next_int_bound(8).unwrap_or(0) as f32 + r.next_int_bound(9).unwrap_or(0) as f32;
     set_base(m, Attr::MaxHealth, f64::from(health));
     m.health = health;
     m.extra.variant2 = strength as u8;
@@ -217,10 +216,21 @@ pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
     }
 }
 /// The coat texture (`LlamaRenderer`).
-pub fn texture(m: &Mob) -> String {
-    let baby = if m.is_baby() { "_baby" } else { "" };
-    let coat = VARIANTS[(m.extra.variant as usize).min(3)];
-    format!("entity/llama/llama_{coat}{baby}")
+pub fn texture(m: &Mob) -> &'static str {
+    const ADULT: [&str; 4] = [
+        "entity/llama/llama_creamy",
+        "entity/llama/llama_white",
+        "entity/llama/llama_brown",
+        "entity/llama/llama_gray",
+    ];
+    const BABY: [&str; 4] = [
+        "entity/llama/llama_creamy_baby",
+        "entity/llama/llama_white_baby",
+        "entity/llama/llama_brown_baby",
+        "entity/llama/llama_gray_baby",
+    ];
+    let i = (m.extra.variant as usize).min(3);
+    if m.is_baby() { BABY[i] } else { ADULT[i] }
 }
 /// The carpet colour on the llama, if it wears one.
 pub(super) fn carpet(m: &Mob) -> Option<&str> {
@@ -230,7 +240,7 @@ pub(super) fn carpet(m: &Mob) -> Option<&str> {
         .and_then(|i| i.strip_suffix("_carpet"))
 }
 /// `LlamaDecorLayer`: the carpet of an adult, else the trader's blanket.
-pub fn decor(m: &Mob) -> Option<(String, String)> {
+pub fn decor(m: &Mob) -> Option<(&'static str, std::borrow::Cow<'static, str>)> {
     let baby = m.is_baby();
     let model = if baby {
         "llama_baby#decor"
@@ -240,15 +250,34 @@ pub fn decor(m: &Mob) -> Option<(String, String)> {
     if let Some(color) = carpet(m)
         && !baby
     {
-        return Some((model.into(), format!("entity/equipment/llama_body/{color}")));
+        let texture = match color {
+            "white" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/white"),
+            "orange" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/orange"),
+            "magenta" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/magenta"),
+            "light_blue" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/light_blue"),
+            "yellow" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/yellow"),
+            "lime" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/lime"),
+            "pink" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/pink"),
+            "gray" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/gray"),
+            "light_gray" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/light_gray"),
+            "cyan" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/cyan"),
+            "purple" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/purple"),
+            "blue" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/blue"),
+            "brown" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/brown"),
+            "green" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/green"),
+            "red" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/red"),
+            "black" => std::borrow::Cow::Borrowed("entity/equipment/llama_body/black"),
+            other => std::borrow::Cow::Owned(format!("entity/equipment/llama_body/{other}")),
+        };
+        return Some((model, texture));
     }
     is_trader(m).then(|| {
-        let name = if baby {
-            "trader_llama_baby"
+        let texture = if baby {
+            "entity/equipment/llama_body/trader_llama_baby"
         } else {
-            "trader_llama"
+            "entity/equipment/llama_body/trader_llama"
         };
-        (model.into(), format!("entity/equipment/llama_body/{name}"))
+        (model, std::borrow::Cow::Borrowed(texture))
     })
 }
 #[cfg(test)]
@@ -269,6 +298,7 @@ mod tests {
         assert!(fives > 0 && fives < 200);
     }
     #[test]
+    #[ignore = "daily"]
     fn breeding_experience_uses_only_the_parent_random_when_drops_are_enabled() {
         super::super::world::with_test_world(&[], |_, types| {
             for kind in ["minecraft:llama", "minecraft:horse", "minecraft:cow"] {
@@ -278,7 +308,7 @@ mod tests {
                     Vec3::ZERO,
                     0.0,
                 );
-                parent.random = LegacyRandom::new(0);
+                parent.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(0));
                 assert_eq!(super::super::breeding_experience(&mut parent, false), None);
                 assert_eq!(parent.random.state(), 25_214_903_917);
                 assert_eq!(
@@ -290,6 +320,7 @@ mod tests {
         });
     }
     #[test]
+    #[ignore = "daily"]
     fn breeding_experience_is_drawn_in_the_goal_unless_a_mod_must_decide() {
         let mut kind = None;
         super::super::world::with_test_world(&[], |_, types| {
@@ -305,7 +336,7 @@ mod tests {
             register(&mut m);
             m
         };
-        let partner = [llama(2, 2.5).seen(None)];
+        let partner = [llama(2, 2.5).seen(None, &crate::items::Items::empty())];
         super::super::world::with_test_world(&partner, |w, _| {
             for (ask_mods, mob_drops) in
                 [(false, true), (true, true), (false, false), (true, false)]
@@ -317,7 +348,7 @@ mod tests {
                     ..w.clone()
                 };
                 let mut m = llama(1, 0.5);
-                m.random = LegacyRandom::new(0);
+                m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(0));
                 let mut events = Vec::new();
                 let mut goals = std::mem::take(&mut m.ai.goals);
                 let mut test_level = crate::health::TestLevel::new(0);

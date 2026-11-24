@@ -93,10 +93,7 @@ fn resource_root(scratch: &std::path::Path) -> std::path::PathBuf {
             jars: vec![],
         }],
         &root,
-        &horizon_mod_package::enabled::EnabledMods::new([(
-            "tank".into(),
-            horizon_mod_package::Side::Both,
-        )]),
+        &horizon_mod_package::enabled::EnabledMods::new([("tank".into(), mod_api::Side::Both)]),
     )
     .unwrap();
     root
@@ -132,7 +129,7 @@ fn drawn_with(game: &crate::game::Game<'_>, item: &str, model: &str) -> Vec<Laye
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES; process-wide mods"]
+#[ignore = "daily"]
 fn a_mod_container_draws_the_fluid_its_part_reports() {
     crate::game::in_own_process(
         "game::contained_fluid_tests::a_mod_container_draws_the_fluid_its_part_reports",

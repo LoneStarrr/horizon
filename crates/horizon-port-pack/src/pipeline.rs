@@ -135,7 +135,7 @@ pub fn carry(
             .ok()
     });
     let allowed = |b: &str| vanilla.as_ref().is_none_or(|v| v.contains(b));
-    let conventions = crate::worldgen::loader_biome_tags(work);
+    let conventions = crate::worldgen::loader_tags(work);
     let minecraft = minecraft(work);
     // A data-only jar is a data pack (`datapacks`), never also a content mod.
     let chosen = |r: &inventory::Record| {
@@ -339,14 +339,15 @@ pub fn port(
     work: &Path,
     resources: Option<&Path>,
     from: Option<&Path>,
+    hosts: &[&str],
     log: Log,
 ) -> Result<(fetch::Fetched, Vec<report::Row>), String> {
     let records = match read_json::<Vec<inventory::Record>>(&work.join("inventory.json")) {
         Ok(r) => r,
         Err(_) => inventory(work, false, log)?,
     };
-    crate::resourcepacks::fetch(work, log)?;
-    let fetched = fetch::fetch(work, &records, from, &portable, log)?;
+    crate::resourcepacks::fetch(work, hosts, log)?;
+    let fetched = fetch::fetch(work, &records, from, &portable, hosts, log)?;
     // The jars tell classes and tiers better than metadata alone.
     let records = inventory(work, true, log)?;
     let minecraft = minecraft(work);

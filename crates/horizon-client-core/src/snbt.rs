@@ -1,8 +1,7 @@
 //! Tag text output: `StringTagVisitor` (compact SNBT) and
-//! `TextComponentTagVisitor` (the coloured form commands print), plus Java's
-//! number formatting.
+//! `TextComponentTagVisitor` (the coloured form commands print).
 use crate::text::{self, Style, Text};
-pub use horizon_core::java_number::{java_double, java_float};
+use horizon_core::java_number::{double_to_string, float_to_string};
 use horizon_core::nbt::Tag;
 use horizon_world::snbt_text::string_of;
 pub use horizon_world::snbt_text::{quote_and_escape, to_snbt};
@@ -92,8 +91,8 @@ impl Pretty {
             Tag::Short(v) => self.number(&v.to_string(), "s"),
             Tag::Int(v) => self.number(&v.to_string(), ""),
             Tag::Long(v) => self.number(&v.to_string(), "L"),
-            Tag::Float(v) => self.number(&java_float(f32::from_bits(*v)), "f"),
-            Tag::Double(v) => self.number(&java_double(f64::from_bits(*v)), "d"),
+            Tag::Float(v) => self.number(&float_to_string(f32::from_bits(*v)), "f"),
+            Tag::Double(v) => self.number(&double_to_string(f64::from_bits(*v)), "d"),
             Tag::String(s) => self.quoted(&string_of(s), text::GREEN),
             Tag::ByteArray(a) => {
                 let v: Vec<i8> = a.iter().map(|b| *b as i8).collect();
@@ -366,8 +365,75 @@ pub fn java_hash_order(
             .unwrap_or(WRITE_ORDER.len())
     };
     let mut entries: Vec<_> = c.iter().collect();
+    if let Some(component_rank) = text_component_rank(c) {
+        entries.sort_by_key(|(k, _)| (hash_bucket(c.len(), k), component_rank(k)));
+        return entries;
+    }
     entries.sort_by_key(|(k, _)| (hash_bucket(c.len(), k), rank(k)));
     entries
+}
+/// `ComponentSerialization`'s write order for a compound that is a text
+/// component: the contents' fields (`PlainTextContents`, `TranslatableContents`,
+/// `KeybindContents`, `ScoreContents`, `SelectorContents`, `NbtContents` and its
+/// data source, `ObjectContents`: its `AtlasSprite` or `PlayerSprite`, then
+/// `fallback`), then `extra`, then `Style.Serializer`'s fields. A compound has
+/// one kind of contents, so their fields share one list. A compound with any
+/// other key, or with no contents key, is not one and keeps the default order.
+fn text_component_rank(
+    c: &horizon_core::nbt::Compound,
+) -> Option<impl Fn(&horizon_core::nbt::JavaString) -> usize> {
+    const ORDER: &[&str] = &[
+        "text",
+        "translate",
+        "atlas",
+        "sprite",
+        "player",
+        "hat",
+        "fallback",
+        "with",
+        "keybind",
+        "score",
+        "selector",
+        "nbt",
+        "interpret",
+        "plain",
+        "separator",
+        "block",
+        "entity",
+        "storage",
+        "extra",
+        "color",
+        "shadow_color",
+        "bold",
+        "italic",
+        "underlined",
+        "strikethrough",
+        "obfuscated",
+        "click_event",
+        "hover_event",
+        "insertion",
+        "font",
+    ];
+    const CONTENTS: &[&str] = &[
+        "text",
+        "translate",
+        "sprite",
+        "player",
+        "keybind",
+        "score",
+        "selector",
+        "nbt",
+    ];
+    let position = |k: &horizon_core::nbt::JavaString| {
+        let k = string_of(k);
+        ORDER.iter().position(|w| *w == k)
+    };
+    let is_component = c
+        .iter()
+        .any(|(k, _)| CONTENTS.contains(&string_of(k).as_str()))
+        && c.iter().all(|(k, _)| position(k).is_some());
+    is_component
+        .then_some(move |k: &horizon_core::nbt::JavaString| position(k).unwrap_or(ORDER.len()))
 }
 /// `NbtUtils.toPrettyComponent`: the coloured, unindented form.
 pub fn pretty(tag: &Tag) -> Text {
@@ -433,6 +499,40 @@ mod tests {
         assert_eq!(pretty(&tag).plain(), ordinary);
     }
     #[test]
+    fn a_text_component_keeps_the_codecs_order_in_a_shared_bucket() {
+        // ComponentSerialization writes the contents, then `extra`, then the
+        // style: `text` and `bold` share bucket 11; `keybind`, `extra` and
+        // `underlined` bucket 7.
+        let styled = parse_snbt(r#"{text:"Sum",color:"green",bold:1b}"#)
+            .unwrap()
+            .0;
+        assert_eq!(
+            pretty(&styled).plain(),
+            r#"{color: "green", text: "Sum", bold: 1b}"#
+        );
+        let keybind = parse_snbt(r#"{underlined:1b,extra:["a"],keybind:"key.jump"}"#)
+            .unwrap()
+            .0;
+        assert_eq!(
+            pretty(&keybind).plain(),
+            r#"{keybind: "key.jump", extra: ["a"], underlined: 1b}"#
+        );
+        // ObjectContents: `player` and `font` share bucket 15.
+        let player = parse_snbt(r#"{font:"minecraft:uniform",player:{name:"alex"}}"#)
+            .unwrap()
+            .0;
+        assert_eq!(
+            pretty(&player).plain(),
+            r#"{player: {name: "alex"}, font: "minecraft:uniform"}"#
+        );
+        // A compound with a key no text component has is not one: key order.
+        let other = parse_snbt(r#"{text:"Sum",bold:1b,count:1}"#).unwrap().0;
+        assert_eq!(
+            pretty(&other).plain(),
+            r#"{count: 1, bold: 1b, text: "Sum"}"#
+        );
+    }
+    #[test]
     fn mannequin_compound_orders_pose_before_immovable_in_shared_bucket() {
         let tag = parse_snbt(
             r#"{AbsorptionAmount:0.0f,Air:300s,Brain:{memories:{}},DeathTime:0s,FallFlying:0b,Fire:0s,Health:20.0f,HurtTime:0s,Invulnerable:0b,Motion:[0.0d,0.0d,0.0d],OnGround:0b,PortalCooldown:0,Pos:[2.5d,100.0d,2.5d],Rotation:[0.0f,0.0f],UUID:[I;369,0,0,1],attributes:[],current_impulse_context_reset_grace_time:0,description:{text:"Guard"},hide_description:1b,immovable:1b,pose:"crouching",profile:{name:"alex"}}"#,
@@ -478,15 +578,15 @@ mod tests {
     }
     #[test]
     fn java_number_text() {
-        assert_eq!(java_double(1.0), "1.0");
-        assert_eq!(java_double(0.1), "0.1");
-        assert_eq!(java_double(1.0e7), "1.0E7");
-        assert_eq!(java_double(12345678.9), "1.23456789E7");
-        assert_eq!(java_double(0.0001), "1.0E-4");
-        assert_eq!(java_double(-3.5), "-3.5");
-        assert_eq!(java_float(0.3), "0.3");
-        assert_eq!(java_float(100.0), "100.0");
-        assert_eq!(java_double(f64::NAN), "NaN");
+        assert_eq!(double_to_string(1.0), "1.0");
+        assert_eq!(double_to_string(0.1), "0.1");
+        assert_eq!(double_to_string(1.0e7), "1.0E7");
+        assert_eq!(double_to_string(12345678.9), "1.23456789E7");
+        assert_eq!(double_to_string(0.0001), "1.0E-4");
+        assert_eq!(double_to_string(-3.5), "-3.5");
+        assert_eq!(float_to_string(0.3), "0.3");
+        assert_eq!(float_to_string(100.0), "100.0");
+        assert_eq!(double_to_string(f64::NAN), "NaN");
     }
     #[test]
     fn pretty_form_is_coloured_without_changing_text() {

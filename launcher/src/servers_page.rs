@@ -17,6 +17,9 @@ mod glass_server_dialog;
 #[path = "glass_servers.rs"]
 mod glass_servers;
 use glass_servers::glass_setting_row;
+#[path = "servers_format.rs"]
+mod servers_format;
+use servers_format::{backup_label, bytes, uptime};
 
 /// One consent boundary for every launcher-managed start/restart route.
 fn run_managed_server(
@@ -76,35 +79,12 @@ pub(super) enum Field {
     AccentHex,
     /// The Shop's gift recipient (`wardrobe_page/shop/basket.rs`).
     ShopGift,
-}
-
-impl Field {
-    const ALL: [Field; 24] = [
-        Field::Name,
-        Field::Seed,
-        Field::Players,
-        Field::Command,
-        Field::AddPlayer,
-        Field::Motd,
-        Field::Port,
-        Field::Token,
-        Field::Email,
-        Field::InstanceName,
-        Field::InstanceGroup,
-        Field::InstanceVersion,
-        Field::InstanceModsFilter,
-        Field::ServerName,
-        Field::ServerAddress,
-        Field::ConsoleSearch,
-        Field::PreLaunch,
-        Field::Wrapper,
-        Field::LaunchEnv,
-        Field::PostExit,
-        Field::MemoryLimit,
-        Field::DeleteServer,
-        Field::AccentHex,
-        Field::ShopGift,
-    ];
+    /// The Wardrobe's search through what the player owns (`wardrobe_page.rs`).
+    WardrobeSearch,
+    /// A Java instance's own JVM arguments and window size (the instance sheet's Launch).
+    JavaArgs,
+    WindowWidth,
+    WindowHeight,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -170,6 +150,9 @@ pub(super) struct Create {
     /// The glass dialog's line under each world: its name and "Horizon · mode · size", read
     /// once when the dialog opens.
     details: HashMap<PathBuf, (String, String)>,
+    /// The glass dialog's world pictures by folder, made small in the background once it
+    /// opens (`worlds_page::icons`); empty until then.
+    icons: HashMap<PathBuf, std::sync::Arc<gpui::Image>>,
     mode: &'static str,
     difficulty: &'static str,
     max_players: u32,
@@ -355,9 +338,11 @@ impl Servers {
         if let Some(h) = self.focus_soon.take().and_then(|f| self.focus.get(&f)) {
             window.focus(h, cx);
         }
-        self.focused = Field::ALL
-            .into_iter()
-            .find(|f| self.focus.get(f).is_some_and(|h| h.is_focused(window)));
+        self.focused = self
+            .focus
+            .iter()
+            .find(|(_, h)| h.is_focused(window))
+            .map(|(f, _)| *f);
         if self.focused.is_some() && self.focused != self.selected {
             self.selected = None;
         }
@@ -414,48 +399,6 @@ pub(super) fn keep_running_through_update() {
 /// The player's own name, to let them in on a friends-only server: the Microsoft account that plays.
 fn own_name(accounts: &Accounts) -> Option<String> {
     accounts.selected().map(|a| a.name.clone())
-}
-
-fn bytes(n: u64) -> String {
-    match n {
-        0..1_000_000 => format!("{} kB", n.div_ceil(1000)),
-        1_000_000..1_000_000_000 => format!("{:.1} MB", n as f64 / 1e6),
-        _ => format!("{:.2} GB", n as f64 / 1e9),
-    }
-}
-
-/// A backup's date and kind from its name (`2026-10-19_11-28-57-manual.zip`, UTC), for people.
-fn backup_label(b: &Backup) -> (String, String) {
-    let stem = b.name.trim_end_matches(".zip");
-    let (when, kind) = match stem.get(..19) {
-        Some(when) if stem.len() > 20 => (when, &stem[20..]),
-        _ => return (stem.to_string(), String::new()),
-    };
-    let (date, time) = when.split_once('_').unwrap_or((when, ""));
-    let label = format!("{date} {} UTC", time.replace('-', ":"));
-    let kind = match kind {
-        "auto" => "Automatic".to_string(),
-        "manual" => "Made by hand".to_string(),
-        "before-update" => "Before an update".to_string(),
-        // horizon-server writes the tag with dashes (before-v2026-10-19-10).
-        k if k.starts_with("before-v")
-            && k[8..].chars().all(|c| c.is_ascii_digit() || c == '-') =>
-        {
-            format!("Before updating to {}", k[7..].replace('-', "."))
-        }
-        k if k.starts_with("before-") => format!("Before updating to {}", &k[7..]),
-        k => k.to_string(),
-    };
-    (label, kind)
-}
-
-fn uptime(secs: u64) -> String {
-    match secs {
-        0..60 => format!("{secs} s"),
-        60..3600 => format!("{} min", secs / 60),
-        3600..86_400 => format!("{} h {:02} min", secs / 3600, secs / 60 % 60),
-        _ => format!("{} d {} h", secs / 86_400, secs / 3600 % 24),
-    }
 }
 
 impl Launcher {
@@ -1000,6 +943,35 @@ impl Launcher {
         } else {
             Default::default()
         };
+        // Decoding and shrinking each world's picture reads a file of up to 4096 px a side, so a
+        // long saves folder is done off the UI thread; the rows show their pictures when it ends.
+        if glass {
+            let folders: Vec<PathBuf> = worlds.iter().map(|(_, path)| path.clone()).collect();
+            let task = cx.background_executor().spawn(async move {
+                let icons = worlds_page::icons(folders.iter().map(PathBuf::as_path));
+                (folders, icons)
+            });
+            cx.spawn(async move |this, cx| {
+                let (folders, icons) = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    // A dialog opened again meanwhile takes these pictures only when it lists
+                    // the same worlds, whose pictures they are.
+                    let Some(create) = &mut this.servers.create else {
+                        return;
+                    };
+                    if create
+                        .worlds
+                        .iter()
+                        .map(|(_, path)| path)
+                        .eq(folders.iter())
+                    {
+                        create.icons = icons;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         self.servers.problem = None;
         self.servers.create_scroll = Scrollbar::default();
         self.servers.create = Some(Create {
@@ -1015,6 +987,7 @@ impl Launcher {
             eula_missing: false,
             friends,
             details,
+            icons: HashMap::new(),
         });
     }
 
@@ -1113,6 +1086,7 @@ impl Launcher {
                         f,
                         Field::InstanceModsFilter
                             | Field::ConsoleSearch
+                            | Field::WardrobeSearch
                             | Field::Motd
                             | Field::Port
                             | Field::Token
@@ -1169,6 +1143,7 @@ impl Launcher {
                             f,
                             Field::InstanceModsFilter
                                 | Field::ConsoleSearch
+                                | Field::WardrobeSearch
                                 | Field::AccentHex
                                 | Field::Motd
                                 | Field::Port
@@ -1302,6 +1277,10 @@ impl Launcher {
             | Field::InstanceVersion
             | Field::InstanceModsFilter
             | Field::ConsoleSearch
+            | Field::WardrobeSearch
+            | Field::JavaArgs
+            | Field::WindowWidth
+            | Field::WindowHeight
             | Field::DeleteServer
             | Field::AccentHex => {}
             Field::PreLaunch | Field::Wrapper | Field::LaunchEnv | Field::PostExit => {
@@ -1488,7 +1467,7 @@ impl Launcher {
         if self.servers.list.is_empty() {
             return page
                 .child(centered(
-                    tr("No server yet. Create one: it takes a few seconds, and with the defaults (tick the EULA, press Create) you get a friends-only survival world."),
+                    tr("No server yet. Create one: it takes a few seconds, and with the defaults (accept Minecraft's terms, press Create) you get a friends-only survival world."),
                     &t,
                 ))
                 .children(partner);
@@ -1598,10 +1577,10 @@ impl Launcher {
         let mut n = notice(p.message.clone(), &t).items_center();
         if let Some(fix) = p.fix {
             let label = match &fix {
-                Fix::UsePort(port) => format!("Use port {port}"),
-                Fix::Prepare => "Prepare the game files".into(),
-                Fix::AgreeEula => "I agree to the EULA".into(),
-                Fix::ShowLog => "Open the logs".into(),
+                Fix::UsePort(port) => trf("Use port {port}", &[("port", &port.to_string())]),
+                Fix::Prepare => tr("Prepare the game files").into(),
+                Fix::AgreeEula => tr("I agree to the EULA").into(),
+                Fix::ShowLog => tr("Open the logs").into(),
             };
             n = n.child(
                 button("problem-fix", label, Kind::Secondary, &t)
@@ -3128,7 +3107,9 @@ impl Launcher {
         } else if worlds.is_empty() {
             text(theme::CAPTION)
                 .text_color(t.muted)
-                .child("You have no single-player world yet: play one first, or choose New world.")
+                .child(tr(
+                    "You have no single-player world yet: play one first, or choose New world.",
+                ))
                 .into_any_element()
         } else {
             let mut list = div().flex().flex_col().gap(px(2.));
@@ -3167,11 +3148,9 @@ impl Launcher {
                 .flex_col()
                 .gap(px(6.))
                 .child(list)
-                .child(
-                    text(theme::CAPTION)
-                        .text_color(t.muted)
-                        .child("The server gets a copy: your single-player world stays as it is."),
-                )
+                .child(text(theme::CAPTION).text_color(t.muted).child(tr(
+                    "The server gets a copy: your single-player world stays as it is.",
+                )))
                 .into_any_element()
         };
         let modes = segments("create-mode", &MODES, mode, &t, pick(|c, v| c.mode = v));
@@ -3258,7 +3237,7 @@ impl Launcher {
                     .text_color(t.accent)
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.8))
-                    .child("Read it")
+                    .child(tr("Read it"))
                     .on_click(|_, _, cx| cx.open_url(servers::EULA_URL)),
             );
         let body = div()
@@ -3275,12 +3254,12 @@ impl Launcher {
             .child(
                 text(theme::HEADING)
                     .text_color(t.ink)
-                    .child("Create a server"),
+                    .child(tr("Create a server")),
             )
-            .child(text(theme::CAPTION).text_color(t.muted).child(
-                "Everything has a default: tick the EULA and Create makes a friends-only survival \
-                 world. You can change all of it later.",
-            ))
+            .child(text(theme::CAPTION).text_color(t.muted).child(tr(
+                "Everything has a default: accept Minecraft's terms and Create makes a friends-only survival \
+                world. You can change all of it later, from the server's Settings tab.",
+            )))
             .child(row(
                 "Name",
                 self.field(Field::Name, "My server", 400., cx)
@@ -3368,11 +3347,11 @@ impl Launcher {
                 text(theme::CAPTION)
                     .flex_1()
                     .text_color(t.danger)
-                    .child("Tick the EULA box to create the server."),
+                    .child(tr("Tick the EULA box to create the server.")),
             );
         }
-        let cancel = button("create-cancel", "Cancel", Kind::Secondary, &t);
-        let create = button("create-go", "Create", Kind::Primary, &t);
+        let cancel = button("create-cancel", tr("Cancel"), Kind::Secondary, &t);
+        let create = button("create-go", tr("Create"), Kind::Primary, &t);
         foot = if creating {
             foot.child(disabled(cancel)).child(disabled(create))
         } else {
@@ -3457,7 +3436,7 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "servers_page::tests::managed_start_and_restart_require_consent_before_running_the_supervisor", "--nocapture"])
+                .args(["--include-ignored", "--exact", "servers_page::tests::managed_start_and_restart_require_consent_before_running_the_supervisor", "--nocapture"])
                 .env(CHILD, "1")
                 .env("HORIZON_LAUNCHER_HOME", root.path().join("launcher"))
                 .env("HORIZON_HOME", root.path().join("cache"))
@@ -3481,14 +3460,15 @@ mod tests {
         std::fs::write(root.path().join("server.toml"), config).unwrap();
         let package = root
             .path()
-            .join(horizon_mod_package::mod_list::DIR)
+            .join(horizon_platform::mod_package::mod_list::DIR)
             .join("needs_jar");
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join("horizon-mod.toml"), format!(
             "id='needs_jar'\nname='Needs jar'\nversion='1'\napi='0.2'\ncapabilities=['registries']\n[[jar]]\nid='fixture'\nversion='1'\nsha512='{}'\n", "a".repeat(128)
         )).unwrap();
         std::fs::write(
-            root.path().join(horizon_mod_package::mod_list::FILE),
+            root.path()
+                .join(horizon_platform::mod_package::mod_list::FILE),
             "mod.needs_jar:true\n",
         )
         .unwrap();
@@ -3538,5 +3518,33 @@ mod tests {
         assert_eq!(backup_label(&b("odd.zip")), ("odd".into(), String::new()));
         assert_eq!(bytes(5_292_542), "5.3 MB");
         assert_eq!(uptime(3725), "1 h 02 min");
+    }
+
+    /// horizon-server lists every zip in its `backups/`, so a zip put there by hand reaches the
+    /// page too. It is shown by its name: no date is read from its first bytes, and a name whose
+    /// 21st byte falls inside a character does not end the page.
+    #[test]
+    fn a_backup_named_by_hand_is_shown_by_its_name() {
+        let b = |name: &str| Backup {
+            name: name.into(),
+            bytes: 1,
+            modified: None,
+        };
+        for name in [
+            "резервная копия",
+            "my world before the big update",
+            "2026-10-19 11-28-57-manual",
+            "2026-10-19_11-28-57",
+            "2026-10-19_11-28-57-",
+        ] {
+            assert_eq!(
+                backup_label(&b(&format!("{name}.zip"))),
+                (name.to_string(), String::new())
+            );
+        }
+        assert_eq!(
+            backup_label(&b("2026-10-19_11-28-57-копия.zip")),
+            ("2026-10-19 11:28:57 UTC".into(), "копия".into())
+        );
     }
 }

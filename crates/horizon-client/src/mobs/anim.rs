@@ -3,6 +3,7 @@
 //! part poses before the model is drawn.
 use super::{Mob, Part, keyframes::AnimationState, living::wrap};
 use crate::fast_hash::{FxHashMap, FxHashSet};
+use crate::first_person::SwingAnimation;
 use horizon_core::geometry::trig::Mth;
 use horizon_core::use_animation::UseAnimation;
 use std::collections::HashMap;
@@ -91,6 +92,9 @@ pub struct AnimState {
     /// with their previous-tick copies for interpolation.
     pub v: [f32; 8],
     pub vo: [f32; 8],
+    /// The running swing's own animation (`SwingState.currentSwing.animation()`):
+    /// the base duration and type a `ClientboundSwingAnimationPacket` names.
+    pub swing_animation: SwingAnimation,
 }
 impl AnimState {
     pub fn begin_tick(&mut self) {
@@ -281,6 +285,10 @@ pub struct State {
     pub swing: f32,
     pub baby: bool,
     pub partial: f32,
+}
+/// `LivingEntityRenderer.isEntityUpsideDown`: named Dinnerbone or Grumm.
+pub fn upside_down(m: &Mob) -> bool {
+    matches!(m.custom_name.as_deref(), Some("Dinnerbone" | "Grumm"))
 }
 /// `WalkAnimationState.position(partial)`: babies' legs move 3 times as far.
 pub fn walk_position(m: &Mob, alpha: f32) -> f32 {
@@ -762,8 +770,13 @@ pub(super) fn humanoid(p: &mut Poses, s: &State, h: &Hum) {
         p.get("left_arm")[1] += 3.2;
         p.get("right_arm")[1] += 3.2;
     }
-    bob(p, "right_arm", s.age, 1.0);
-    bob(p, "left_arm", s.age, -1.0);
+    // AnimationUtils.bobModelPart leaves an arm holding a spyglass still.
+    if h.right != ArmPose::Spyglass {
+        bob(p, "right_arm", s.age, 1.0);
+    }
+    if h.left != ArmPose::Spyglass {
+        bob(p, "left_arm", s.age, -1.0);
+    }
     if h.swim > 0.0 {
         swim(p, s.pos, h);
     }
@@ -1314,6 +1327,43 @@ mod flight_pose_tests {
             }
         }
     }
+    /// `HumanoidModel.setupAnim`: `AnimationUtils.bobModelPart` leaves the arm
+    /// holding a spyglass still, and bobs the other one.
+    #[test]
+    fn a_spyglass_arm_keeps_still_while_the_other_bobs() {
+        let mut p = Poses {
+            map: ["head", "right_arm", "left_arm"]
+                .into_iter()
+                .map(|n| (key(n), [0.0; 9]))
+                .collect(),
+            dummy: [0.0; 9],
+            skipped: Default::default(),
+            hidden: Default::default(),
+            version: 0,
+        };
+        let s = State {
+            pos: 0.0,
+            speed: 0.0,
+            age: 5.0,
+            y_rot: 0.0,
+            x_rot: 0.0,
+            swing: 0.0,
+            baby: false,
+            partial: 0.0,
+        };
+        humanoid(&mut p, &s, &Hum::new(ArmPose::Spyglass, ArmPose::Empty));
+        // The pose alone, the head looking straight: no bob on the pitch or the roll.
+        assert_eq!(p.get("right_arm")[3], -1.919_862_2);
+        assert_eq!(p.get("right_arm")[5], 0.0);
+        // The empty left arm takes the bob, a roll and a pitch.
+        assert!(
+            p.get("left_arm")[5].abs() > 0.09,
+            "{}",
+            p.get("left_arm")[5]
+        );
+        assert_ne!(p.get("left_arm")[3], 0.0);
+    }
+
     /// EndermanModel.setupAnim (#4565): humanoid_pub forwards isPassenger so the
     /// riding leg y/z survive; only xRot is halved and clamped to ±0.4 after.
     #[test]

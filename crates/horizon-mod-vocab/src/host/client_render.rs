@@ -26,14 +26,14 @@ pub trait ClientRenderClientHost {
     #[access(PublishedResources)]
     fn instance_group_destroy(&self, group: InstanceGroupRef) -> Result<(), GroupError>;
     /// Side: client.
-    /// Asks `native_block_render_visibility` again for every state and, when the answers differ
+    /// Asks `block_render_visibility` again for every state and, when the answers differ
     /// from those in use, remeshes every loaded section with them. Call it when your answer changes (a toggle key, a scan
     /// finishing) and once when the player joins, not every frame: a rebuild takes the workers a
     /// few seconds. With no part answering, nothing is asked and the mesher keeps its no-mod path.
     #[access(WorldOnly)]
     fn refresh_render_visibility(&mut self);
     /// Side: client.
-    /// Asks `native_biome_colors` again for every biome and, when the colours
+    /// Asks `biome_colors` again for every biome and, when the colours
     /// differ from those in use, rebuilds every loaded section and the far
     /// terrain with them (`LevelRenderer.allChanged`, as changing Biome Blend
     /// does). Call it when your colours change (a new season, a new day of a
@@ -49,6 +49,10 @@ pub trait ClientRenderClientHost {
     /// `MOD_IMAGE_SIZE`; false when it is not that
     /// size. The upload costs a texture patch of the image, so send one when the
     /// image changed, not every frame.
+    ///
+    /// The slot exists whenever a client mod, native or wasm, is loaded: the atlas packs it at
+    /// load and on a resource reload, with no mixin and no opt-in. It is one image for all mods
+    /// together: a second mod's write replaces the first's.
     #[access(WorldOnly)]
     fn mod_image(&mut self, width: u32, height: u32, rgba: &[u8]) -> bool;
     /// Side: client.
@@ -80,11 +84,33 @@ pub trait ClientRenderClientHost {
     fn texture_sprites(&self, textures: &[&str]) -> Vec<Option<SpriteRef>>;
     /// Side: client.
     /// Published asset/data read: available in Setup, Reloading and World.
+    /// For a client mod reading the player's own block textures (resource packs included) on the CPU: a map
+    /// averaging each block's top colour, a software renderer. Each sprite's (`block_sprites`, `texture_sprites`)
+    /// RGBA8, rows top to bottom, square, every one the arrays' edge (`rgba.len()` is edge × edge × 4): the pixels
+    /// the arrays were filled with when the resources loaded, so an animated sprite's is the frame it starts on.
+    /// None for a sprite past the arrays' layers, and for all of them on a client that loaded no pixels. The
+    /// pixels are kept compressed once the GPU has them: one call uncompresses them all once, so ask for every
+    /// sprite at once and again only when `block_sprites_version` changes. `Err`, reading nothing, for more than
+    /// 256 MiB of pixels in one call (`MAX_SPRITE_PIXEL_BYTES`, the default texture budget: every layer fits
+    /// unless the player raised `textureBudgetMiB`; ask in parts then).
+    #[access(PublishedResources)]
+    fn sprite_pixels(&self, sprites: &[SpriteRef]) -> Result<Vec<Option<Vec<u8>>>, String>;
+    /// Side: client.
+    /// Published asset/data read: available in Setup, Reloading and World.
     /// For a client mod: where GUI sprite `sprite` lies in the GUI atlas and its size, none for one the atlas lacks
     /// (a server's metrics-only atlas lacks them all). The atlas names vanilla's sprites by path alone
     /// (`gui/sprites/container/slot`) and a mod's with its namespace (`mymod:gui/panel`).
     #[access(PublishedResources)]
     fn gui_sprite(&self, sprite: &Identifier) -> Option<AtlasRegion>;
+    /// Side: client.
+    /// For a client mod drawing a player's model itself (a 3D map, a portrait): where the player's
+    /// skin and cape lie in the GUI atlas, and whether the model is slim, as this client draws that
+    /// player: the downloaded skin once it is in the atlas, the profile's default until then. The
+    /// regions hold for this frame (a later download or another player's skin can take a slot),
+    /// so ask each frame you draw. None for an entity that is not a player or a mannequin this
+    /// client shows, and for a stale handle.
+    #[access(WorldOnly)]
+    fn player_skin(&self, entity: EntityRef) -> Option<PlayerSkin>;
     /// Side: client.
     /// Published asset/data read: available in Setup, Reloading and World.
     /// For a client mod: changes each time the resources load (a resource pack turned on or off can move every

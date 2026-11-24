@@ -286,6 +286,7 @@ mod defend_trader_tests {
     /// through `TargetingConditions.DEFAULT`, which never accepts a
     /// spectator.
     #[test]
+    #[ignore = "daily"]
     fn a_trader_llama_does_not_defend_the_trader_from_a_spectator() {
         let mut outcomes = Vec::new();
         if !with_test_world(&[], |w, _| {
@@ -299,7 +300,7 @@ mod defend_trader_tests {
                 let mut owner = Mob::new(2, Arc::new(owner_kind), Vec3::new(1.5, 64.0, 0.5), 0.0);
                 owner.ai.last_hurt_by = Some(Who::Player);
                 owner.ai.last_hurt_by_time = 5;
-                let seen = [owner.seen(None)];
+                let seen = [owner.seen(None, &crate::items::Items::empty())];
                 let world = crate::mobs::MobWorld {
                     others: &seen,
                     ..world

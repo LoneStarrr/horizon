@@ -2,9 +2,16 @@
 //! `compareWeapons`, `canReplaceEqualItem` and the per-species gates that
 //! decide whether a mob takes an item off the ground at all (`wantsToPickUp`,
 //! `canHoldItem`). `game/mobs/mob_looting.rs` reads the item data and calls these.
+#[path = "equip_decision.rs"]
+mod decision;
+#[path = "equip_source.rs"]
+mod source;
 use super::Species;
 use crate::items::ItemStack;
+pub use decision::{EquipAnswer, EquipDecision, EquipEntityStamp, EquipStamp};
+use horizon_core::equipment_slot::EquipmentSlot;
 use horizon_core::nbt::Tag;
+pub use source::{EquipInput, source_stamp, source_stamp_at};
 use std::collections::{HashMap, HashSet};
 
 /// An `EquipmentSlot`, in the order `finalize::item` and `drops::SLOTS` keep
@@ -38,6 +45,17 @@ impl Slot {
     /// The `drops::SLOTS` index (`set_item`, `item`, `set_drop_chance`).
     pub fn index(self) -> usize {
         self as usize
+    }
+    /// The `EquipmentSlot` of the same name.
+    pub(super) fn equipment(self) -> EquipmentSlot {
+        match self {
+            Slot::MainHand => EquipmentSlot::MainHand,
+            Slot::OffHand => EquipmentSlot::OffHand,
+            Slot::Feet => EquipmentSlot::Feet,
+            Slot::Legs => EquipmentSlot::Legs,
+            Slot::Chest => EquipmentSlot::Chest,
+            Slot::Head => EquipmentSlot::Head,
+        }
     }
 }
 
@@ -158,6 +176,18 @@ fn names(units: &[u16], id: &str) -> bool {
 /// lends the menu one for the click, with its read-only `Host` and the target behind it. A menu
 /// that has none (a data-only consumer) keeps the component's answer.
 pub trait CanEquip {
+    /// Prepare the immutable input before candidate traversal.
+    fn prepare(&self, _stack: &ItemStack, _entity: u32, _kind: &str) -> bool {
+        true
+    }
+    /// Recheck retained answer preconditions before applying a menu placement.
+    fn can_apply(&self, _stack: &ItemStack, _entity: u32) -> bool {
+        true
+    }
+    /// O(1) gate before creating a source decision or converting its payload.
+    fn listens(&self, _stack: &ItemStack) -> bool {
+        true
+    }
     /// May `stack` go into the equipment slot `slot` of the entity `entity` of type `kind`? `data`
     /// is the stack's `equippable` answer (`LivingEntity.isEquippableInSlot`), which the parts of
     /// its item may change.
@@ -183,18 +213,27 @@ pub fn slot_for(equip_slot: Option<&str>) -> Option<Slot> {
 
 /// `EquipmentSlotGroup.test`: whether a modifier the item records for `group`
 /// counts in `slot`.
-fn group_matches(group: &str, slot: Slot) -> bool {
+pub(super) fn group_matches(group: &str, slot: EquipmentSlot) -> bool {
     match group {
         "any" => true,
-        "hand" => matches!(slot, Slot::MainHand | Slot::OffHand),
-        "armor" => slot.is_armor(),
-        "mainhand" => slot == Slot::MainHand,
-        "offhand" => slot == Slot::OffHand,
-        "head" => slot == Slot::Head,
-        "chest" => slot == Slot::Chest,
-        "legs" => slot == Slot::Legs,
-        "feet" => slot == Slot::Feet,
-        // `body` and `saddle` are slots this pass never equips into.
+        "hand" => matches!(slot, EquipmentSlot::MainHand | EquipmentSlot::OffHand),
+        // `EquipmentSlot.isArmor`: the humanoid armour and a body's animal armour.
+        "armor" => matches!(
+            slot,
+            EquipmentSlot::Feet
+                | EquipmentSlot::Legs
+                | EquipmentSlot::Chest
+                | EquipmentSlot::Head
+                | EquipmentSlot::Body
+        ),
+        "mainhand" => slot == EquipmentSlot::MainHand,
+        "offhand" => slot == EquipmentSlot::OffHand,
+        "head" => slot == EquipmentSlot::Head,
+        "chest" => slot == EquipmentSlot::Chest,
+        "legs" => slot == EquipmentSlot::Legs,
+        "feet" => slot == EquipmentSlot::Feet,
+        "body" => slot == EquipmentSlot::Body,
+        "saddle" => slot == EquipmentSlot::Saddle,
         _ => false,
     }
 }
@@ -217,7 +256,7 @@ pub fn attribute_with(
         ..
     } in modifiers
     {
-        if kind != attribute || !group_matches(group, slot) {
+        if kind != attribute || !group_matches(group, slot.equipment()) {
             continue;
         }
         value += match operation.as_str() {

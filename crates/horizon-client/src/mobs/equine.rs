@@ -7,7 +7,7 @@ use super::{
     anim::{Poses, State},
     goals::{
         Breed, Cx, Float, FollowParent, Goal, LookAtPlayer, MOVE, Panic, RandomLookAround, Stroll,
-        Tempt, goal_clone,
+        Tempt, goal_clone, reduced,
     },
 };
 use horizon_core::geometry::Vec3;
@@ -160,8 +160,12 @@ pub fn rear_offset(m: &Mob) -> [f64; 3] {
     [0.0, 0.15 * stand * scale, -0.7 * stand * scale]
 }
 /// `AbstractHorse.isImmobile`: no goals while it eats or rears. A mount its
-/// rider steers still takes their input (`travelRidden`).
+/// rider steers still takes their input (`travelRidden`). `Llama.isImmobile`:
+/// only while it eats (a loaded `EatingHaystack`; it never grazes).
 pub fn immobile(m: &Mob) -> bool {
+    if super::llama::is_llama(m.species()) {
+        return m.extra.flag;
+    }
     can_rear(m.species()) && (m.extra.flag || m.extra.counter > 0) && !controlled(m)
 }
 /// `AbstractHorse.onElasticLeashPull`: a lead pulled taut ends the horse's
@@ -242,9 +246,14 @@ pub fn register(m: &mut Mob) {
 /// the jump, zombie horses a smaller jump and their own speed. The health and
 /// speed are attribute bases (`setBaseValue`), so the server syncs them to
 /// the clients that draw the mount's hearts.
-pub fn finalize(m: &mut Mob) {
+pub fn finalize(m: &mut Mob, r: &mut impl RandomSource) {
     let species = m.species();
-    let r = &mut m.random;
+    // Horse.finalizeSpawn picks the coat and markings before it calls
+    // AbstractHorse.finalizeSpawn, which randomizes the attributes.
+    if species == Species::Horse {
+        m.extra.variant = r.next_int_bound(7).unwrap_or(0) as u8;
+        m.extra.variant2 = r.next_int_bound(5).unwrap_or(0) as u8;
+    }
     let health = matches!(species, Species::Horse | Species::Donkey | Species::Mule).then(|| {
         15.0 + r.next_int_bound(8).unwrap_or(0) as f32 + r.next_int_bound(9).unwrap_or(0) as f32
     });
@@ -257,8 +266,6 @@ pub fn finalize(m: &mut Mob) {
             );
             m.extra.vector[0] =
                 0.4 + r.next_double() * 0.2 + r.next_double() * 0.2 + r.next_double() * 0.2;
-            m.extra.variant = r.next_int_bound(7).unwrap_or(0) as u8;
-            m.extra.variant2 = r.next_int_bound(5).unwrap_or(0) as u8;
         }
         Species::Donkey | Species::Mule => m.extra.vector[0] = 0.5,
         Species::ZombieHorse => {
@@ -476,6 +483,14 @@ impl RunAroundLikeCrazy {
         Self { pos: None }
     }
 }
+
+/// `RunAroundLikeCrazyGoal.tick`'s roll: `nextInt(this.adjustedTickDelay(50))`.
+/// The goal has no `requiresUpdateEveryTick`, so it runs on the full selector
+/// updates and `adjustedTickDelay` is `reducedTickDelay(50)`.
+fn buck_roll(m: &mut Mob) -> bool {
+    m.random.next_int_bound(reduced(50)).unwrap_or(1) == 0
+}
+
 impl Goal for RunAroundLikeCrazy {
     goal_clone!();
     fn flags(&self) -> u8 {
@@ -501,11 +516,8 @@ impl Goal for RunAroundLikeCrazy {
         // `canContinueToUse` has no `isMobControlled` check (RunAroundLikeCrazyGoal:47).
         !m.extra.tame && !m.ai.nav.is_done() && is_vehicle(m)
     }
-    fn every_tick(&self) -> bool {
-        true
-    }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        if m.extra.tame || m.random.next_int_bound(50).unwrap_or(1) != 0 {
+        if m.extra.tame || !buck_roll(m) {
             return;
         }
         let temper = temper(m);
@@ -843,9 +855,9 @@ pub fn ridden_step(m: &mut Mob, context: &LoopContext) {
         return;
     }
     if super::camel::is_camel(m.species()) {
-        // Camel.tickRidden / getRiddenInput: forward stands it up; no input
-        // while sitting; the jump is a dash.
-        if r.forward > 0.0 && super::camel::sitting(m) {
+        // Camel.tickRidden / getRiddenInput: forward stands it up once a pose
+        // transition is over; no input while sitting; the jump is a dash.
+        if r.forward > 0.0 && super::camel::sitting(m) && !super::camel::in_transition(m) {
             let mut ev = Vec::new();
             super::camel::stand_up(m, &mut ev);
         }
@@ -1060,31 +1072,89 @@ pub fn grazes(s: Species) -> bool {
     is_equine(s) && !super::camel::is_camel(s) && !super::llama::is_llama(s)
 }
 /// Body texture and the markings overlay.
-pub fn texture(m: &Mob) -> String {
-    let baby = if m.is_baby() { "_baby" } else { "" };
+pub fn texture(m: &Mob) -> &'static str {
+    let baby = m.is_baby();
     match m.species() {
         Species::Horse => {
-            let c = COLORS[(m.extra.variant as usize).min(6)];
-            format!("entity/horse/horse_{c}{baby}")
+            const ADULT: [&str; 7] = [
+                "entity/horse/horse_white",
+                "entity/horse/horse_creamy",
+                "entity/horse/horse_chestnut",
+                "entity/horse/horse_brown",
+                "entity/horse/horse_black",
+                "entity/horse/horse_gray",
+                "entity/horse/horse_darkbrown",
+            ];
+            const BABY: [&str; 7] = [
+                "entity/horse/horse_white_baby",
+                "entity/horse/horse_creamy_baby",
+                "entity/horse/horse_chestnut_baby",
+                "entity/horse/horse_brown_baby",
+                "entity/horse/horse_black_baby",
+                "entity/horse/horse_gray_baby",
+                "entity/horse/horse_darkbrown_baby",
+            ];
+            let i = (m.extra.variant as usize).min(6);
+            if baby { BABY[i] } else { ADULT[i] }
         }
-        Species::Donkey => format!("entity/horse/donkey{baby}"),
-        Species::Mule => format!("entity/horse/mule{baby}"),
-        Species::SkeletonHorse => format!("entity/horse/horse_skeleton{baby}"),
-        Species::Camel => format!("entity/camel/camel{baby}"),
-        Species::CamelHusk => "entity/camel/camel_husk".into(),
-        _ => format!("entity/horse/horse_zombie{baby}"),
+        Species::Donkey => {
+            if baby {
+                "entity/horse/donkey_baby"
+            } else {
+                "entity/horse/donkey"
+            }
+        }
+        Species::Mule => {
+            if baby {
+                "entity/horse/mule_baby"
+            } else {
+                "entity/horse/mule"
+            }
+        }
+        Species::SkeletonHorse => {
+            if baby {
+                "entity/horse/horse_skeleton_baby"
+            } else {
+                "entity/horse/horse_skeleton"
+            }
+        }
+        Species::Camel => {
+            if baby {
+                "entity/camel/camel_baby"
+            } else {
+                "entity/camel/camel"
+            }
+        }
+        Species::CamelHusk => "entity/camel/camel_husk",
+        _ => {
+            if baby {
+                "entity/horse/horse_zombie_baby"
+            } else {
+                "entity/horse/horse_zombie"
+            }
+        }
     }
 }
-pub fn markings(m: &Mob) -> Option<String> {
+pub fn markings(m: &Mob) -> Option<&'static str> {
     if m.species() != Species::Horse {
         return None;
     }
-    let mk = MARKINGS[(m.extra.variant2 as usize).min(4)];
-    if mk.is_empty() {
-        return None;
-    }
-    let baby = if m.is_baby() { "_baby" } else { "" };
-    Some(format!("entity/horse/horse_markings_{mk}{baby}"))
+    const ADULT: [Option<&str>; 5] = [
+        None,
+        Some("entity/horse/horse_markings_white"),
+        Some("entity/horse/horse_markings_whitefield"),
+        Some("entity/horse/horse_markings_whitedots"),
+        Some("entity/horse/horse_markings_blackdots"),
+    ];
+    const BABY: [Option<&str>; 5] = [
+        None,
+        Some("entity/horse/horse_markings_white_baby"),
+        Some("entity/horse/horse_markings_whitefield_baby"),
+        Some("entity/horse/horse_markings_whitedots_baby"),
+        Some("entity/horse/horse_markings_blackdots_baby"),
+    ];
+    let i = (m.extra.variant2 as usize).min(4);
+    if m.is_baby() { BABY[i] } else { ADULT[i] }
 }
 /// The model key prefix for the species.
 pub fn model_name(s: Species) -> &'static str {
@@ -1305,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources"]
+    #[ignore = "daily"]
     fn tame_listener_defers_the_successful_tame() {
         use horizon_core::random::{LegacyRandom, RandomSource};
         assert!(crate::mobs::world::with_test_world(&[], |world, _| {
@@ -1320,7 +1390,7 @@ mod tests {
                 };
                 let mut m = horse(Species::Horse);
                 m.extra.equine_temper = 100;
-                m.random = LegacyRandom::new(seed);
+                m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(seed));
                 let mut test_level = crate::health::TestLevel::new(0);
                 let level = &mut test_level.level();
                 let mut events = Vec::new();
@@ -1355,7 +1425,7 @@ mod tests {
     /// The existing goal reads the loaded counter; only its failed attempt
     /// modifies it, with the gameplay clamp. The random continuation is kept.
     #[test]
-    #[ignore = "needs prepared resources for the existing mob world fixture"]
+    #[ignore = "daily"]
     fn temper_preservation_reaches_the_existing_taming_consumer() {
         use horizon_core::random::LegacyRandom;
         let ran = crate::mobs::world::with_test_world(&[], |w, types| {
@@ -1487,7 +1557,7 @@ mod tests {
     fn rolled_health_and_speed_are_attribute_bases() {
         for species in [Species::Horse, Species::Donkey, Species::Mule] {
             let mut m = horse(species);
-            finalize(&mut m);
+            finalize(&mut m, &mut horizon_core::random::LegacyRandom::new(0));
             assert!((15.0..=30.0).contains(&m.attrs.max_health));
             assert_eq!(
                 base_value(&m, Attr::MaxHealth),
@@ -1496,7 +1566,7 @@ mod tests {
             assert_eq!(m.health, m.attrs.max_health);
         }
         let mut m = horse(Species::Horse);
-        finalize(&mut m);
+        finalize(&mut m, &mut horizon_core::random::LegacyRandom::new(0));
         assert_eq!(base_value(&m, Attr::MovementSpeed), m.attrs.speed);
     }
 
@@ -1563,6 +1633,24 @@ mod tests {
         assert!(m.extra.counter > 0);
         stand_tick(&mut m);
         assert_eq!(m.extra.counter, 0);
+    }
+
+    /// `Llama.isImmobile` is `isDeadOrDying() || isEating()`: an eating llama
+    /// runs no goals, and a llama does not stand (#18677).
+    #[test]
+    fn an_eating_llama_is_immobile() {
+        for (species, id) in [
+            (Species::Llama, "minecraft:llama"),
+            (Species::TraderLlama, "minecraft:trader_llama"),
+        ] {
+            let mut m = equine(1, species, id);
+            assert!(!immobile(&m), "{id}");
+            m.extra.flag = true;
+            assert!(immobile(&m), "{id} eating");
+            m.extra.flag = false;
+            m.extra.counter = 5;
+            assert!(!immobile(&m), "{id} has no standing");
+        }
     }
 
     #[test]
@@ -1632,6 +1720,7 @@ mod tests {
     /// untamed horse with a mob on its back bolts; a zombie horse with a mob
     /// rider is `isMobControlled()` and does not.
     #[test]
+    #[ignore = "daily"]
     fn a_mob_riding_an_untamed_horse_starts_the_bolt() {
         use crate::mobs::world::with_built_test_world;
         let mut horse = horse(Species::Horse);
@@ -1692,6 +1781,50 @@ mod tests {
         );
     }
 
+    /// `ZombieHorse.addBehaviourGoals` tempts with `#minecraft:zombie_horse_food`,
+    /// which `VanillaItemTagsProvider` fills with the red mushroom alone
+    /// (`ZombieHorse.isFood` reads the same tag): a player holding one tempts a
+    /// zombie horse, one holding its family's wheat does not.
+    #[test]
+    fn a_red_mushroom_tempts_a_zombie_horse() {
+        use crate::mobs::world::{test_player, with_test_world};
+        let tempted = |hand: &str| -> Option<bool> {
+            let mut out = None;
+            let ran = with_test_world(&[], |w, types| {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(5.5, 64.0, 0.5));
+                p.main_hand = Some(hand.into());
+                world.player = Some(p);
+                let kind = Arc::new(types.types["minecraft:zombie_horse"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                register(&mut m);
+                m.on_ground = true;
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                out = Some(goals.is_running("Tempt"));
+                m.ai.goals = goals;
+            });
+            let _ = ran;
+            out
+        };
+        let Some(mushroom) = tempted("minecraft:red_mushroom") else {
+            return;
+        };
+        assert!(mushroom, "a red mushroom tempts a zombie horse");
+        assert_eq!(
+            tempted("minecraft:wheat"),
+            Some(false),
+            "wheat is horse food, not zombie horse food"
+        );
+    }
+
     /// The zombie-horse half of the test above, built like `horse`.
     fn zombie_horse() -> Mob {
         let mut m = horse(Species::ZombieHorse);
@@ -1728,7 +1861,7 @@ mod follow_mommy_tests {
                 .map(|(i, (name, x, bred))| {
                     let mut m = mob(i as u32 + 2, name, Vec3::new(*x, 1.0, 0.5));
                     m.extra.bred = *bred;
-                    m.seen(None)
+                    m.seen(None, &crate::items::Items::empty())
                 })
                 .collect();
             let mut foal = mob(1, "minecraft:horse", Vec3::new(0.5, 1.0, 0.5));
@@ -1778,6 +1911,7 @@ mod follow_mommy_tests {
     /// to the nearest bred `AbstractHorse` within 16 blocks while it is more
     /// than two blocks away.
     #[test]
+    #[ignore = "daily"]
     fn a_bred_foal_paths_to_the_nearest_bred_horse() {
         let Some(_) = target_pos((true, true, false), &[]) else {
             return;
@@ -1844,3 +1978,40 @@ mod follow_mommy_tests {
 #[cfg(test)]
 #[path = "bolt_pos_tests.rs"]
 mod bolt_pos_tests;
+
+#[cfg(test)]
+mod goal_timing_tests {
+    use super::*;
+    use crate::mobs::sensor_scan_tests::kind;
+    use horizon_core::random::{EntityRandom, LegacyRandom, RandomSource};
+
+    /// `RunAroundLikeCrazyGoal` has no `requiresUpdateEveryTick`, so its `tick`
+    /// runs on the full selector updates only, and the roll there is
+    /// `nextInt(adjustedTickDelay(50))` = `nextInt(reducedTickDelay(50))` = 25,
+    /// one draw per full update rather than one per game tick.
+    #[test]
+    fn a_bolting_horse_rolls_a_buck_every_twenty_five_full_updates() {
+        assert!(
+            !RunAroundLikeCrazy::new().every_tick(),
+            "RunAroundLikeCrazyGoal ticks on full updates only"
+        );
+        let told_apart = (0..100_000).any(|seed| {
+            (LegacyRandom::new(seed).next_int_bound(25) == Ok(0))
+                != (LegacyRandom::new(seed).next_int_bound(50) == Ok(0))
+        });
+        assert!(
+            told_apart,
+            "the seeds must tell nextInt(25) from nextInt(50)"
+        );
+        for seed in 0..256 {
+            let at_25 = LegacyRandom::new(seed).next_int_bound(25) == Ok(0);
+            let mut m = Mob::new(1, kind(), Vec3::ZERO, 0.0);
+            m.random = EntityRandom::own(LegacyRandom::new(seed));
+            assert_eq!(
+                buck_roll(&mut m),
+                at_25,
+                "seed {seed}: the roll is nextInt(25)"
+            );
+        }
+    }
+}

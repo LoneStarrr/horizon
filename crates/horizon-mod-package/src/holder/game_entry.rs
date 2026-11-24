@@ -30,7 +30,11 @@ pub fn acquire(selection: &LaunchArguments) -> Option<Capture> {
             Ok(())
         })();
         if let Err(error) = result {
-            eprintln!("Horizon: cannot acquire launcher cache leases: {error}");
+            if is_refusal(&error) {
+                eprintln!("Horizon: {error}");
+            } else {
+                eprintln!("Horizon: cannot acquire launcher cache leases: {error}");
+            }
             std::process::exit(78);
         }
         return None;
@@ -83,7 +87,11 @@ fn acquire_standalone(
         if std::fs::symlink_metadata(data.join("run-leases")).is_err() {
             continue;
         }
-        match Registry::existing(data) {
+        // Only ancestors of the data root may be aliases. Keep the root leaf and
+        // registry descendants no-follow, as when the launcher creates the registry.
+        crate::runtime_leases::checked(data, true).map_err(lease_error)?;
+        let data = data.canonicalize()?;
+        match Registry::existing(&data) {
             Ok(registry) => {
                 found = Some((data, registry));
                 break;
@@ -94,7 +102,7 @@ fn acquire_standalone(
     let Some((data, registry)) = found else {
         return Ok(None);
     };
-    let paths = lease_paths(executable, selection, data, &std::env::current_dir()?)?;
+    let paths = lease_paths(executable, selection, &data, &std::env::current_dir()?)?;
     let snapshots = paths
         .iter()
         .map(|(path, complete)| Snapshot::capture(path, *complete))
@@ -108,6 +116,37 @@ fn acquire_standalone(
     }))
 }
 
+/// Resolve aliases before a missing selected suffix, so deletion cannot make a
+/// managed home appear to be outside its canonical launcher data directory.
+fn canonical_candidate(path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                if ancestor != path {
+                    resolved.push(path.strip_prefix(ancestor).expect("selected path ancestor"));
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Only the launcher's macOS game bundle relocates the image below its installation.
+/// Snapshot capture requires the returned installation's `.installed` marker.
+#[cfg(target_os = "macos")]
+fn installation(folder: &Path) -> &Path {
+    if folder.ends_with("Horizon.app/Contents/MacOS") {
+        folder.ancestors().nth(3).unwrap_or(folder)
+    } else {
+        folder
+    }
+}
+
 /// Canonical managed units and their enclosing units, shared by launcher and game.
 /// Cleanup locks unit identities, so a child must also protect deletable ancestors.
 pub fn lease_paths(
@@ -119,11 +158,14 @@ pub fn lease_paths(
     // Normalize both sides, including Windows' extended-path prefix and macOS /tmp aliases.
     let data = data.canonicalize()?;
     let data = data.as_path();
-    let install = executable
+    let program = executable
         .parent()
         .ok_or(io::ErrorKind::InvalidInput)?
         .canonicalize()?;
-    let install = install.as_path();
+    #[cfg(target_os = "macos")]
+    let install = installation(&program);
+    #[cfg(not(target_os = "macos"))]
+    let install = program.as_path();
     if install.ancestors().any(|path| {
         path.file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with(".trash-"))
@@ -137,6 +179,10 @@ pub fn lease_paths(
                 .any(|part| part.as_os_str() == "target")
     });
     let mut paths = vec![(install.to_path_buf(), complete)];
+    // The holder checks that the program's own folder is leased (`Entry::check_image`).
+    if program != install {
+        paths.push((program.clone(), false));
+    }
     let mut candidates = vec![
         selection.context.game_dir.clone(),
         selection.context.home.clone(),
@@ -149,11 +195,7 @@ pub fn lease_paths(
         }
     }
     for path in candidates {
-        let path = match path.canonicalize() {
-            Ok(path) => path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => path,
-            Err(error) => return Err(error),
-        };
+        let path = canonical_candidate(&path)?;
         if path.starts_with(data) && !paths.iter().any(|(existing, _)| *existing == path) {
             paths.push((path, false));
         }
@@ -211,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn missing_registration_is_displayed_and_information_does_not_register() {
         const ACTOR: &str = "HORIZON_MISSING_LEASE_ACTOR";
         if let Some(mode) = std::env::var_os(ACTOR) {
@@ -254,6 +297,7 @@ mod tests {
         let run = |mode| {
             Command::new(&executable)
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "holder::game_entry::tests::missing_registration_is_displayed_and_information_does_not_register",
                     "--nocapture",
@@ -275,11 +319,18 @@ mod tests {
         let output = run("game");
         assert_eq!(output.status.code(), Some(78));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("unregistered"), "{stderr}");
+        let line = stderr
+            .lines()
+            .find(|line| line.starts_with("Horizon: "))
+            .unwrap_or_else(|| panic!("{stderr}"));
         assert!(
-            stderr.contains("this managed installation has unregistered cache directories; use Horizon Launcher Play from the same launcher data directory with the intended instance and installed version (horizon-launcher play --instance <instance> --version <tag>)"),
+            line.ends_with(
+                " isn't registered by the launcher. Start Horizon with the launcher's Play button."
+            ),
             "{stderr}"
         );
+        assert!(line.contains("fast") && !line.contains(r"\\?\"), "{stderr}");
+        assert!(!stderr.contains("cannot acquire"), "{stderr}");
         assert!(!stderr.contains("start the launcher once"), "{stderr}");
     }
 
@@ -334,7 +385,90 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
+    fn managed_launch_from_a_macos_app_bundle_leases_the_installation() {
+        // The launcher starts the game on macOS from <version>/Horizon.app/Contents/MacOS, whose
+        // programs are hard links to the version's: the marker stays in the version folder (arismoko/horizon#3812).
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let data = root_path.join("launcher");
+        let install = data.join("versions/game");
+        let programs = install.join("Horizon.app/Contents/MacOS");
+        let game = root_path.join("instance");
+        for directory in [&programs, &game] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(install.join(".installed"), "").unwrap();
+        let executable = programs.join("game");
+        std::fs::write(&executable, "test image").unwrap();
+        let mut command = Command::new(&executable);
+        command.current_dir(&game).env("HORIZON_HOME", &game);
+        let selection = LaunchArguments::for_command(&command).unwrap();
+        let trees = managed_lease_paths(&executable, &selection, &data, &game).unwrap();
+        let complete: Vec<_> = trees.iter().filter(|(_, complete)| *complete).collect();
+        assert_eq!(complete, [&(install.clone(), true)]);
+        // The holder's image check asks for the program's own folder.
+        assert!(trees.contains(&(programs.clone(), false)));
+        let program = Program {
+            executable: executable.into_os_string(),
+            arguments: vec![],
+            environment: vec![],
+            directory: game,
+            raw_windows: None,
+        };
+        let _prepared = Prepared::new(data, trees, program, &selection.context).unwrap();
+    }
+
+    #[test]
+    fn flat_and_lookalike_layouts_require_completion_beside_the_image() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().canonicalize().unwrap();
+        let mut layouts = vec![
+            "flat",
+            "Other.app/Contents/MacOS",
+            "Horizon.app/Contents/extra/MacOS",
+        ];
+        if !cfg!(target_os = "macos") {
+            layouts.push("Horizon.app/Contents/MacOS");
+        }
+        for layout in layouts {
+            let version = data.join("versions").join(layout.replace('/', "-"));
+            let folder = version.join(layout);
+            let game = data.join("instance");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::create_dir_all(&game).unwrap();
+            // An unrelated enclosing marker must not make this image complete.
+            std::fs::write(version.join(".installed"), "").unwrap();
+            let executable = folder.join("game");
+            std::fs::write(&executable, "test image").unwrap();
+            let mut command = Command::new(&executable);
+            command.current_dir(&game).env("HORIZON_HOME", &game);
+            let selection = LaunchArguments::for_command(&command).unwrap();
+            let trees = managed_lease_paths(&executable, &selection, &data, &game).unwrap();
+            assert_eq!(trees[0], (folder.clone(), true), "{layout}");
+            let program = || Program {
+                executable: executable.clone().into_os_string(),
+                arguments: vec![],
+                environment: vec![],
+                directory: game.clone(),
+                raw_windows: None,
+            };
+            let error = Prepared::new(data.clone(), trees.clone(), program(), &selection.context)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "{layout}");
+            std::fs::write(folder.join(".installed"), "").unwrap();
+            assert_eq!(
+                managed_lease_paths(&executable, &selection, &data, &game).unwrap(),
+                trees
+            );
+            Prepared::new(data.clone(), trees, program(), &selection.context).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn direct_entry_blocks_cleanup_and_refuses_busy_or_deleted_install() {
         if crate::runtime_leases::isolated_test() {
             return;
@@ -367,12 +501,14 @@ mod tests {
         ));
         drop(ownership);
         let cleanup = registry.lock(&directory, LockMode::Exclusive).unwrap();
-        assert_eq!(
-            acquire_standalone(&executable, &selection)
-                .err()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::WouldBlock
+        let error = acquire_standalone(&executable, &selection).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(is_refusal(&error));
+        assert!(
+            error.to_string().ends_with(
+                "game is being cleaned up by the launcher. Wait for it to finish, then start Horizon again."
+            ),
+            "{error}"
         );
         std::fs::remove_file(install.join(".installed")).unwrap();
         drop(cleanup);
@@ -382,7 +518,72 @@ mod tests {
         assert!(acquire_standalone(&executable, &selection).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
+    fn standalone_entry_resolves_data_root_ancestors_but_rejects_a_linked_root() {
+        if crate::runtime_leases::isolated_test() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let real = root_path.join("real");
+        let data = real.join("data");
+        let versions = data.join("versions");
+        let install = versions.join("game");
+        let home = data.join("home");
+        for path in [&install, &home] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(install.join(".installed"), b"").unwrap();
+        let alias = root_path.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let aliased_data = alias.join("data");
+        let registry = Registry::with_release(&aliased_data, Release::Close).unwrap();
+        let directories: Vec<_> = [&install, &versions, &home]
+            .into_iter()
+            .map(|path| open_directory(path).unwrap())
+            .collect();
+        for directory in &directories {
+            drop(registry.lock(directory, LockMode::Shared).unwrap());
+        }
+        let executable = aliased_data.join("versions/game/game");
+        let mut command = Command::new(&executable);
+        command
+            .current_dir(aliased_data.join("home"))
+            .env("HORIZON_HOME", aliased_data.join("home"));
+        let selection = LaunchArguments::for_command(&command).unwrap();
+        let ownership = acquire_standalone(&executable, &selection)
+            .unwrap()
+            .unwrap();
+        for directory in &directories {
+            assert!(matches!(
+                registry.lock(directory, LockMode::Exclusive),
+                Err(crate::runtime_leases::Error::Busy)
+            ));
+        }
+        drop(ownership);
+        let cleanup = registry.lock(&directories[0], LockMode::Exclusive).unwrap();
+        assert_eq!(
+            acquire_standalone(&executable, &selection)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(cleanup);
+        let linked_data = root_path.join("linked-data");
+        std::os::unix::fs::symlink(&data, &linked_data).unwrap();
+        let executable = linked_data.join("versions/game/game");
+        assert!(acquire_standalone(&executable, &selection).is_err());
+        std::fs::rename(data.join("run-leases"), data.join("held-registry")).unwrap();
+        std::os::unix::fs::symlink("held-registry", data.join("run-leases")).unwrap();
+        let executable = aliased_data.join("versions/game/game");
+        assert!(acquire_standalone(&executable, &selection).is_err());
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn unpublished_enclosing_unit_refuses_and_target_build_needs_no_install_marker() {
         if crate::runtime_leases::isolated_test() {
             return;
@@ -423,6 +624,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn symlinked_resources_are_leased_by_canonical_identity() {
         if crate::runtime_leases::isolated_test() {
             return;
@@ -458,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn acquired_snapshot_rechecks_completion_and_directory_identity() {
         if crate::runtime_leases::isolated_test() {
             return;
@@ -490,6 +693,21 @@ mod tests {
             std::fs::write(install.join(".installed"), b"").unwrap();
             assert!(acquire_snapshots(&registry, &[snapshot]).is_err());
         }
+    }
+
+    #[test]
+    fn refusals_name_the_folder_as_the_player_knows_it() {
+        let folder = Path::new(r"\\?\C:\Horizon\versions\nightly");
+        assert_eq!(
+            unregistered(folder),
+            r"C:\Horizon\versions\nightly isn't registered by the launcher. Start Horizon with the launcher's Play button."
+        );
+        assert_eq!(
+            busy(Some(Path::new(r"\\?\UNC\server\share\game"))),
+            r"\\server\share\game is being cleaned up by the launcher. Wait for it to finish, then start Horizon again."
+        );
+        assert!(is_refusal(&lease_error(crate::runtime_leases::Error::Busy)));
+        assert!(!is_refusal(&io::ErrorKind::NotFound.into()));
     }
 
     #[test]
